@@ -374,12 +374,27 @@ pub async fn connect_peer(
         let mut g = online_flags().lock().expect("online_flags lock");
         g.insert(address.clone(), online.clone());
     }
+    // CB auto-negotiates the ATT MTU during connection setup and exposes the
+    // usable per-write payload via maximumWriteValueLengthForType:. Reading it
+    // (rather than assuming 244) both prevents silent truncation on a link that
+    // negotiated a smaller MTU and unlocks larger writes (iOS commonly 512).
+    // Clamp: floor at the ATT-23 minimum, ceil at our fragment TARGET_MTU.
+    const WRITE_WITHOUT_RESPONSE: usize = 1; // CBCharacteristicWriteWithoutResponse
+    let negotiated: usize =
+        unsafe { msg_send![peripheral.0, maximumWriteValueLengthForType: WRITE_WITHOUT_RESPONSE] };
+    let write_mtu = negotiated.clamp(20, crate::ble_peer::TARGET_MTU as usize);
+    tracing::info!(
+        target: "ble_trace",
+        step = "apple_connect.mtu",
+        address = %address,
+        negotiated,
+        write_mtu,
+        "Apple BLE central: negotiated write MTU"
+    );
     let peer = Arc::new(ConnectedPeer {
         address: address.clone(),
         protocol,
-        // CB auto-negotiates ATT MTU with no public read-back API.
-        // 244 = ATT MTU 247 - 3-byte header (BLE 4.2+ baseline).
-        write_mtu: 244,
+        write_mtu,
         online: online.clone(),
         peripheral,
         delegate,
@@ -406,39 +421,33 @@ pub fn write_peer(address: &str, data: &[u8]) -> Result<(), String> {
         return Err(format!("peer {address} marked offline"));
     }
 
-    // The flag can flip back to false at any time after returning true
-    // (per Apple's docs); the ready-to-send delegate drains the queue.
-    let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
-    if ready {
-        unsafe { issue_write(&peer, data) };
-        return Ok(());
+    // Always enqueue, then drain, so every fragment leaves through the single
+    // FIFO path. Issuing directly on a "ready" radio would let a later
+    // fragment jump ahead of ones already queued from when it was busy, and
+    // the receiver would misparse the out-of-order envelope as a raw packet.
+    {
+        let mut g = pending_write().lock().expect("pending_write lock");
+        let q = g.entry(address.to_owned()).or_default();
+        if q.len() >= PENDING_WRITE_CAP {
+            q.pop_front();
+            tracing::warn!(
+                target: "ble_trace",
+                step = "central.write_overflow_drop",
+                peer = %address,
+                cap = PENDING_WRITE_CAP,
+                "Apple BLE central: pending-write ring overflowed, dropping oldest"
+            );
+        }
+        q.push_back(data.to_vec());
     }
-
-    let mut g = pending_write().lock().expect("pending_write lock");
-    let q = g.entry(address.to_owned()).or_default();
-    if q.len() >= PENDING_WRITE_CAP {
-        q.pop_front();
-        tracing::warn!(
-            target: "ble_trace",
-            step = "central.write_overflow_drop",
-            peer = %address,
-            cap = PENDING_WRITE_CAP,
-            "Apple BLE central: pending-write ring overflowed, dropping oldest"
-        );
-    }
-    q.push_back(data.to_vec());
-    tracing::debug!(
-        target: "ble_trace",
-        step = "central.write_queued",
-        peer = %address,
-        bytes = data.len(),
-        depth = q.len(),
-        "Apple BLE central: write queued (radio queue full)"
-    );
+    unsafe { drain_pending_writes(address) };
     Ok(())
 }
 
-/// Requeues at front if canSend flips false mid-drain.
+/// Drains queued writes in FIFO order while the radio can accept them. Holds
+/// the pending-write lock across the whole loop so a concurrent drain (or a
+/// [`write_peer`] enqueue) can't interleave and reorder fragments — an
+/// out-of-order envelope makes the receiver misparse the frame as a raw packet.
 unsafe fn drain_pending_writes(address: &str) {
     let peer = {
         let g = connected_peers().lock().expect("connected_peers lock");
@@ -451,23 +460,27 @@ unsafe fn drain_pending_writes(address: &str) {
         return;
     }
     let mut drained = 0usize;
+    let mut g = pending_write().lock().expect("pending_write lock");
+    let Some(q) = g.get_mut(address) else {
+        return;
+    };
     loop {
-        let entry = {
-            let mut g = pending_write().lock().expect("pending_write lock");
-            g.get_mut(address).and_then(|q| q.pop_front())
-        };
-        let Some(data) = entry else {
-            break;
-        };
-        let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
-        if !ready {
-            let mut g = pending_write().lock().expect("pending_write lock");
-            g.entry(address.to_owned()).or_default().push_front(data);
+        // Peek before popping: leave the fragment queued if the radio can't
+        // take it, so ordering is preserved for the next drain.
+        if q.front().is_none() {
             break;
         }
+        let ready: bool = unsafe { msg_send![peer.peripheral.0, canSendWriteWithoutResponse] };
+        if !ready {
+            break;
+        }
+        let Some(data) = q.pop_front() else {
+            break;
+        };
         unsafe { issue_write(&peer, &data) };
         drained += 1;
     }
+    drop(g);
     if drained > 0 {
         tracing::debug!(
             target: "ble_trace",
@@ -804,9 +817,14 @@ fn resolve_pending(address: &str, kind: CallbackKind, result: Result<(), String>
     }
 }
 
-/// English-locale, case-insensitive substring match against rotation
+/// English-locale, case-insensitive substring match against RPA-rotation
 /// signatures: `CBErrorPeripheralConnectionTimeout` (constant or localized
-/// "timed out unexpectedly") and "specified device has disconnected".
+/// "timed out unexpectedly"), which is how a rotated-address peer presents.
+///
+/// "The specified device has disconnected" (CBErrorPeripheralDisconnected) is
+/// deliberately NOT treated as rotation: it is the generic remote-initiated
+/// disconnect, and mapping it to Rotation cleared the reconnect backoff on
+/// every ordinary drop, letting a flapping peer churn without ever backing off.
 fn classify_disconnect_reason(err: Option<&str>) -> DisconnectReason {
     let Some(s) = err else {
         return DisconnectReason::OtherError;
@@ -814,7 +832,6 @@ fn classify_disconnect_reason(err: Option<&str>) -> DisconnectReason {
     let lower = s.to_ascii_lowercase();
     if lower.contains("timed out unexpectedly")
         || lower.contains("cberrorperipheralconnectiontimeout")
-        || lower.contains("specified device has disconnected")
     {
         DisconnectReason::Rotation
     } else {
@@ -1265,9 +1282,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_rotation_via_specified_device_disconnected() {
+    fn classify_specified_device_disconnected_is_not_rotation() {
+        // Generic remote-initiated disconnect must NOT clear reconnect backoff.
         let r = classify_disconnect_reason(Some("The specified device has disconnected from us."));
-        assert_eq!(r, DisconnectReason::Rotation);
+        assert_eq!(r, DisconnectReason::OtherError);
     }
 
     #[test]
