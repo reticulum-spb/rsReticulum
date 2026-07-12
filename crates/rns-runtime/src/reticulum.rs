@@ -48,6 +48,10 @@ fn interface_tasks() -> &'static std::sync::Mutex<HashMap<u64, JoinHandle<()>>> 
 struct InterfaceControlMetadata {
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
+    // Parent IFAC, inherited by accepted child connections (Python parity:
+    // spawned interfaces copy the listener's ifac_size/netname/netkey).
+    ifac_key: Option<[u8; 64]>,
+    ifac_size: usize,
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
@@ -1047,7 +1051,6 @@ pub async fn init(
                     client_config,
                     client_id,
                     transport_tx.clone(),
-                    None,
                 )
                 .await
                 {
@@ -1096,7 +1099,6 @@ pub async fn init(
                                 client_config,
                                 client_id,
                                 transport_tx.clone(),
-                                None,
                             )
                             .await
                             {
@@ -1347,13 +1349,15 @@ pub async fn init(
         let reg_controls = interface_controls.clone();
         tokio::spawn(async move {
             while let Some(sub_handle) = handle_rx.recv().await {
-                let (role, ingress_overrides) =
+                let (role, ingress_overrides, ifac_key, ifac_size) =
                     child_registration_from_parent(&reg_controls, sub_handle.parent_id);
                 register_interface_handle_with_role_and_overrides(
                     &reg_tx,
                     sub_handle,
                     role,
                     ingress_overrides,
+                    ifac_key,
+                    ifac_size,
                     &reg_controls,
                     false,
                 )
@@ -1539,6 +1543,8 @@ fn child_registration_from_parent(
 ) -> (
     rns_transport::messages::InterfaceRole,
     rns_transport::ingress::IngressOverrides,
+    Option<[u8; 64]>,
+    usize,
 ) {
     let parent_control = parent_id.and_then(|parent_id| {
         interface_controls
@@ -1555,10 +1561,16 @@ fn child_registration_from_parent(
     } else {
         rns_transport::messages::InterfaceRole::Normal
     };
-    let ingress_overrides = parent_control
-        .map(|control| control.ingress_overrides)
+    let (ingress_overrides, ifac_key, ifac_size) = parent_control
+        .map(|control| {
+            (
+                control.ingress_overrides,
+                control.ifac_key,
+                control.ifac_size,
+            )
+        })
         .unwrap_or_default();
-    (role, ingress_overrides)
+    (role, ingress_overrides, ifac_key, ifac_size)
 }
 
 fn discovered_backbone_client_mode(
@@ -1702,17 +1714,22 @@ async fn register_interface_handle_with_role(
         handle,
         role,
         rns_transport::ingress::IngressOverrides::default(),
+        None,
+        0,
         interface_controls,
         false,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn register_interface_handle_with_role_and_overrides(
     transport_tx: &mpsc::Sender<TransportMessage>,
     handle: rns_interface::traits::InterfaceHandle,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
+    ifac_key: Option<[u8; 64]>,
+    ifac_size: usize,
     interface_controls: &InterfaceControlMap,
     multipoint: bool,
 ) {
@@ -1732,6 +1749,8 @@ async fn register_interface_handle_with_role_and_overrides(
             InterfaceControlMetadata {
                 role,
                 ingress_overrides: ingress_overrides.clone(),
+                ifac_key,
+                ifac_size,
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -1745,8 +1764,8 @@ async fn register_interface_handle_with_role_and_overrides(
         bitrate: handle.bitrate,
         mtu: handle.mtu,
         tx: handle.tx,
-        ifac_key: None,
-        ifac_size: 0,
+        ifac_key,
+        ifac_size,
         announce_cap: ANNOUNCE_CAP,
         announce_allowed_at: 0.0,
         announce_rate_target: None,
@@ -1800,6 +1819,8 @@ async fn register_interface_with_post_init(
             InterfaceControlMetadata {
                 role: rns_transport::messages::InterfaceRole::Normal,
                 ingress_overrides: post_init.ingress_overrides.clone(),
+                ifac_key,
+                ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
@@ -2804,7 +2825,7 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
     let iface_handle =
-        rns_interface::tcp::spawn_tcp_client(config, id, handle.transport_tx.clone(), None)
+        rns_interface::tcp::spawn_tcp_client(config, id, handle.transport_tx.clone())
             .await
             .map_err(|e| format!("TCP client spawn failed: {e}"))?;
 
@@ -2837,7 +2858,20 @@ pub async fn spawn_tcp_server_runtime(
     listen_ip: &str,
     port: u16,
 ) -> Result<u64, String> {
+    spawn_tcp_server_runtime_with_ifac(handle, name, listen_ip, port, None).await
+}
+
+/// Spawn a TCP server interface at runtime with optional IFAC settings.
+/// Accepted client connections inherit the listener's IFAC.
+pub async fn spawn_tcp_server_runtime_with_ifac(
+    handle: &ReticulumHandle,
+    name: &str,
+    listen_ip: &str,
+    port: u16,
+    ifac: Option<RuntimeInterfaceIfacConfig>,
+) -> Result<u64, String> {
     let id = next_id(&handle.id_gen);
+    let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
     let iface_handle = rns_interface::tcp::spawn_tcp_server(
         config,
@@ -2849,12 +2883,24 @@ pub async fn spawn_tcp_server_runtime(
     .await
     .map_err(|e| format!("TCP server spawn failed: {e}"))?;
 
-    register_interface_handle(
-        &handle.transport_tx,
-        iface_handle,
-        &handle.interface_controls,
-    )
-    .await;
+    if let Some(post_init) = post_init {
+        let ifac_key = derive_ifac_key_from_post_init(&post_init);
+        register_interface_with_post_init(
+            &handle.transport_tx,
+            iface_handle,
+            &post_init,
+            ifac_key,
+            &handle.interface_controls,
+        )
+        .await;
+    } else {
+        register_interface_handle(
+            &handle.transport_tx,
+            iface_handle,
+            &handle.interface_controls,
+        )
+        .await;
+    }
     tracing::info!(name = %name, id, "runtime TCP server interface spawned");
     Ok(id)
 }
@@ -2940,7 +2986,31 @@ pub async fn spawn_backbone_server_runtime(
     prefer_ipv6: bool,
     device: Option<&str>,
 ) -> Result<u64, String> {
+    spawn_backbone_server_runtime_with_ifac(
+        handle,
+        name,
+        listen_ip,
+        port,
+        prefer_ipv6,
+        device,
+        None,
+    )
+    .await
+}
+
+/// Spawn a Backbone server interface at runtime with optional IFAC settings.
+/// Accepted client connections inherit the listener's IFAC.
+pub async fn spawn_backbone_server_runtime_with_ifac(
+    handle: &ReticulumHandle,
+    name: &str,
+    listen_ip: &str,
+    port: u16,
+    prefer_ipv6: bool,
+    device: Option<&str>,
+    ifac: Option<RuntimeInterfaceIfacConfig>,
+) -> Result<u64, String> {
     let id = next_id(&handle.id_gen);
+    let post_init = runtime_ifac_post_init(ifac, 16)?;
     let mut config = rns_interface::backbone::BackboneServerConfig::new(name, listen_ip, port);
     config.prefer_ipv6 = prefer_ipv6;
     config.device = device.map(ToString::to_string);
@@ -2955,12 +3025,24 @@ pub async fn spawn_backbone_server_runtime(
     .await
     .map_err(|e| format!("Backbone server spawn failed: {e}"))?;
 
-    register_interface_handle(
-        &handle.transport_tx,
-        iface_handle,
-        &handle.interface_controls,
-    )
-    .await;
+    if let Some(post_init) = post_init {
+        let ifac_key = derive_ifac_key_from_post_init(&post_init);
+        register_interface_with_post_init(
+            &handle.transport_tx,
+            iface_handle,
+            &post_init,
+            ifac_key,
+            &handle.interface_controls,
+        )
+        .await;
+    } else {
+        register_interface_handle(
+            &handle.transport_tx,
+            iface_handle,
+            &handle.interface_controls,
+        )
+        .await;
+    }
     tracing::info!(name = %name, id, "runtime Backbone server interface spawned");
     Ok(id)
 }
@@ -3266,6 +3348,8 @@ pub async fn spawn_ble_peer_runtime(
         iface_handle,
         rns_transport::messages::InterfaceRole::Normal,
         rns_transport::ingress::IngressOverrides::default(),
+        None,
+        0,
         &handle.interface_controls,
         true,
     )
@@ -3444,7 +3528,7 @@ async fn spawn_interface(
 ) -> Result<Vec<rns_interface::traits::InterfaceHandle>, String> {
     match iface_config {
         interface_factory::InterfaceConfig::TcpClient(c) => {
-            rns_interface::tcp::spawn_tcp_client(c.clone(), id, transport_tx, None)
+            rns_interface::tcp::spawn_tcp_client(c.clone(), id, transport_tx)
                 .await
                 .map(|h| vec![h])
                 .map_err(|e| format!("TCP client: {e}"))
@@ -4506,7 +4590,7 @@ egress_control = Yes
         .await;
         let _ = transport_rx.recv().await.expect("parent registration");
 
-        let (role, inherited) =
+        let (role, inherited, ifac_key, ifac_size) =
             child_registration_from_parent(&interface_controls, Some(parent_id));
         assert_eq!(role, rns_transport::messages::InterfaceRole::Normal);
         register_interface_handle_with_role_and_overrides(
@@ -4514,6 +4598,8 @@ egress_control = Yes
             test_interface_handle(child_id, Some(parent_id), "child"),
             role,
             inherited,
+            ifac_key,
+            ifac_size,
             &interface_controls,
             false,
         )
@@ -4562,6 +4648,8 @@ egress_control = Yes
                 test_interface_handle(id, None, role.as_str()),
                 role,
                 overrides.clone(),
+                None,
+                0,
                 &interface_controls,
                 false,
             )
@@ -4594,12 +4682,80 @@ egress_control = Yes
                 InterfaceControlMetadata {
                     role: rns_transport::messages::InterfaceRole::SharedServer,
                     ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
+                    ifac_key: None,
+                    ifac_size: 0,
                 },
             );
 
-        let (role, _) = child_registration_from_parent(&interface_controls, Some(parent_id));
+        let (role, _, _, _) = child_registration_from_parent(&interface_controls, Some(parent_id));
 
         assert_eq!(role, rns_transport::messages::InterfaceRole::LocalClient);
+    }
+
+    #[tokio::test]
+    async fn server_children_inherit_parent_ifac() {
+        let parent_id = 930_001;
+        let child_id = 930_002;
+        let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
+        let interface_controls: InterfaceControlMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let mut section = ConfigSection::new();
+        section.set("networkname", "testnet");
+        section.set("passphrase", "password");
+        let post_init =
+            interface_factory::InterfacePostInit::from_section(&section).with_default_ifac_size(16);
+        let ifac_key = derive_ifac_key_from_post_init(&post_init);
+        assert!(ifac_key.is_some());
+
+        register_interface_with_post_init(
+            &transport_tx,
+            test_interface_handle(parent_id, None, "ifac-parent"),
+            &post_init,
+            ifac_key,
+            &interface_controls,
+        )
+        .await;
+        let TransportMessage::RegisterInterface {
+            entry: parent_entry,
+            ..
+        } = transport_rx.recv().await.expect("parent registration")
+        else {
+            panic!("expected parent RegisterInterface");
+        };
+        assert_eq!(parent_entry.ifac_key, ifac_key);
+        assert_eq!(parent_entry.ifac_size, 16);
+
+        let (role, inherited, child_key, child_size) =
+            child_registration_from_parent(&interface_controls, Some(parent_id));
+        assert_eq!(child_key, ifac_key);
+        assert_eq!(child_size, 16);
+
+        register_interface_handle_with_role_and_overrides(
+            &transport_tx,
+            test_interface_handle(child_id, Some(parent_id), "ifac-child"),
+            role,
+            inherited,
+            child_key,
+            child_size,
+            &interface_controls,
+            false,
+        )
+        .await;
+        let TransportMessage::RegisterInterface { entry, .. } =
+            transport_rx.recv().await.expect("child registration")
+        else {
+            panic!("expected child RegisterInterface");
+        };
+        assert_eq!(entry.ifac_key, ifac_key);
+        assert_eq!(entry.ifac_size, 16);
+
+        for id in [parent_id, child_id] {
+            interface_tasks()
+                .lock()
+                .expect("interface_tasks mutex poisoned")
+                .remove(&id);
+        }
     }
 
     #[test]
