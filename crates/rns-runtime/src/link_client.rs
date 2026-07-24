@@ -1852,6 +1852,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_worker_identifies_over_established_link() {
+        let dest_hash = [0xCE; 16];
+        let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let responder_pub = responder_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &responder_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &responder_pub, &responder_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        let link_id = initiator.link_id;
+        let identity = Arc::new(Identity::new());
+        let expected_public_key = identity.get_public_key();
+        let (transport_tx, mut transport_rx) = mpsc::channel(4);
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let session = LinkSession {
+            transport_tx,
+            identity,
+            link: initiator,
+            event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+        };
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (inbound_tx, inbound_rx) = mpsc::channel(4);
+        let handle = LinkSessionHandle {
+            link_id,
+            command_tx,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
+        };
+        let worker = tokio::spawn(run_established_link_session(
+            session, command_rx, inbound_tx,
+        ));
+
+        handle.identify().await.unwrap();
+
+        let TransportMessage::Outbound(request) = transport_rx.recv().await.unwrap() else {
+            panic!("expected outbound Link identification");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.destination_hash, link_id);
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::LinkIdentify
+        );
+        assert_eq!(
+            responder
+                .handle_identification(&request.raw[offset..])
+                .unwrap(),
+            expected_public_key
+        );
+
+        handle.close().await.unwrap();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_worker_reuses_link_for_python_style_packet_proofs() {
         let dest_hash = [0xCD; 16];
         let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
