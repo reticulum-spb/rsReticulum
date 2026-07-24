@@ -32,6 +32,8 @@ pub enum ApplicationError {
     Identity(#[from] IdentityError),
     #[error("transport channel closed")]
     TransportClosed,
+    #[error("transport channel full")]
+    TransportFull,
     #[error("destination identity is not known")]
     UnknownIdentity,
     #[error("packet size {size} exceeds MTU {mtu}")]
@@ -483,6 +485,27 @@ pub async fn send_pre_encrypted_packet(
         }))
         .await
         .map_err(|_| ApplicationError::TransportClosed)?;
+    Ok(submission)
+}
+
+/// Non-blocking variant of [`send_pre_encrypted_packet`] for synchronous
+/// application state machines.
+pub fn try_send_pre_encrypted_packet(
+    runtime: &ReticulumHandle,
+    destination_hash: [u8; 16],
+    payload: &[u8],
+) -> Result<PacketSubmission, ApplicationError> {
+    let (raw, submission) = build_pre_encrypted_packet(destination_hash, payload)?;
+    runtime
+        .transport_tx
+        .try_send(TransportMessage::Outbound(OutboundRequest {
+            raw,
+            destination_hash,
+        }))
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ApplicationError::TransportFull,
+            mpsc::error::TrySendError::Closed(_) => ApplicationError::TransportClosed,
+        })?;
     Ok(submission)
 }
 
