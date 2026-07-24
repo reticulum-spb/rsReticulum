@@ -3574,6 +3574,81 @@ mod tests {
     }
 
     #[test]
+    fn link_payload_resource_round_trip_between_managers() {
+        fn active_link_entry(link: Link) -> ActiveLink {
+            ActiveLink {
+                link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            }
+        }
+        fn pump(rx: &mut mpsc::Receiver<TransportMessage>, receiver: &mut LinkManager) -> usize {
+            let mut delivered = 0;
+            while let Ok(message) = rx.try_recv() {
+                if let TransportMessage::Outbound(request) = message {
+                    receiver.handle_inbound_packet(&request.raw, 1);
+                    delivered += 1;
+                }
+            }
+            delivered
+        }
+
+        let (initiator, responder, identity_key) = handshaken_link_pair_with_identity();
+        let link_id = initiator.link_id;
+
+        let (tx_a, mut rx_a) = mpsc::channel(256);
+        let (_event_tx_a, event_rx_a) = mpsc::channel(16);
+        let mut lm_a = LinkManager::new(tx_a, event_rx_a, [0xA3; 16], None);
+        let (proof_tx, mut proof_rx) = mpsc::channel(4);
+        lm_a.set_outbound_resource_proof_channel(proof_tx);
+        lm_a.active_links
+            .insert(link_id, active_link_entry(initiator));
+
+        let (tx_b, mut rx_b) = mpsc::channel(256);
+        let (_event_tx_b, event_rx_b) = mpsc::channel(16);
+        let mut lm_b = LinkManager::new(tx_b, event_rx_b, [0xB3; 16], Some(identity_key));
+        let (completion_tx, mut completion_rx) = mpsc::channel(4);
+        lm_b.set_resource_completion_channel(completion_tx);
+        lm_b.active_links
+            .insert(link_id, active_link_entry(responder));
+
+        let payload = vec![0x5A; 2048];
+        let receipt = lm_a
+            .send_link_payload(&link_id, payload.clone(), false)
+            .expect("large payload queued");
+        let LinkPayloadSendReceipt::Resource(receipt) = receipt else {
+            panic!("large payload must use a Resource");
+        };
+
+        let mut completion = None;
+        let mut proof = None;
+        for _ in 0..256 {
+            pump(&mut rx_a, &mut lm_b);
+            pump(&mut rx_b, &mut lm_a);
+            lm_a.tick();
+            lm_b.tick();
+            completion = completion.or_else(|| completion_rx.try_recv().ok());
+            proof = proof.or_else(|| proof_rx.try_recv().ok());
+            if completion.is_some() && proof.is_some() {
+                break;
+            }
+        }
+
+        let completion = completion.expect("resource reassembled");
+        assert_eq!(completion.link_id, link_id);
+        assert_eq!(completion.resource_hash, receipt.resource_hash);
+        assert_eq!(completion.data, payload);
+        let proof = proof.expect("resource proof delivered");
+        assert_eq!(proof.link_id, link_id);
+        assert_eq!(proof.resource_hash, receipt.resource_hash);
+    }
+
+    #[test]
     fn backend_identity_signs_link_packet_delivery_proof() {
         let (identity, identity_ed25519_pub, signing_seed) = backend_identity(true);
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
