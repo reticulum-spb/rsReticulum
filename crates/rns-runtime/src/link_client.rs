@@ -70,6 +70,20 @@ pub struct LinkSession {
     channel_packets: Vec<[u8; 32]>,
 }
 
+/// An outbound Link whose identifier and handshake packet have been prepared,
+/// but not yet sent to the transport.
+///
+/// Preparation is synchronous so application state machines can reserve and
+/// report the final `link_id` before spawning the asynchronous handshake.
+pub struct PreparedLinkSession {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    identity: Identity,
+    destination_hash: [u8; 16],
+    public_key: [u8; 64],
+    link: Link,
+    request_data: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReceivedResource {
     pub data: Vec<u8>,
@@ -90,7 +104,98 @@ pub enum LinkPayloadSendReceipt {
     },
 }
 
+impl PreparedLinkSession {
+    pub fn id(&self) -> [u8; 16] {
+        self.link.link_id
+    }
+
+    /// Register the prepared Link, send its request and validate LRPROOF.
+    pub async fn establish(mut self, deadline: Duration) -> Result<LinkSession, LinkClientError> {
+        let link_id = self.id();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::RegisterDestination {
+                hash: link_id,
+                app_name: "application.link".into(),
+                delivery_tx: Some(event_tx),
+            },
+        )
+        .await?;
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_link_request_packet(self.destination_hash, &self.request_data),
+                destination_hash: self.destination_hash,
+            }),
+        )
+        .await?;
+
+        let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
+        let ed25519_bytes: [u8; 32] = self.public_key[32..]
+            .try_into()
+            .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
+        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
+            .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
+        let rtt_data = self
+            .link
+            .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
+            .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data),
+                destination_hash: link_id,
+            }),
+        )
+        .await?;
+        Ok(LinkSession {
+            transport_tx: self.transport_tx,
+            identity: Arc::new(self.identity),
+            link: self.link,
+            event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
+        })
+    }
+}
+
 impl LinkSession {
+    /// Prepare an outbound Link without performing any transport I/O.
+    pub fn prepare_with_public_key(
+        runtime: &ReticulumHandle,
+        identity: Identity,
+        destination_hash: [u8; 16],
+        public_key: [u8; 64],
+        hops: u8,
+    ) -> PreparedLinkSession {
+        Self::prepare_on_transport(
+            runtime.transport_tx.clone(),
+            identity,
+            destination_hash,
+            public_key,
+            hops,
+        )
+    }
+
+    fn prepare_on_transport(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        identity: Identity,
+        destination_hash: [u8; 16],
+        public_key: [u8; 64],
+        hops: u8,
+    ) -> PreparedLinkSession {
+        let (link, request_data) = Link::new_initiator(destination_hash, hops);
+        PreparedLinkSession {
+            transport_tx,
+            identity,
+            destination_hash,
+            public_key,
+            link,
+            request_data,
+        }
+    }
+
     /// Establish and validate a Link to a destination already learned through
     /// an announce. The local identity is not sent until [`identify`](Self::identify)
     /// is called.
@@ -131,52 +236,9 @@ impl LinkSession {
         hops: u8,
         deadline: Duration,
     ) -> Result<Self, LinkClientError> {
-        let (mut link, request_data) = Link::new_initiator(destination_hash, hops);
-        let link_id = link.link_id;
-        let (event_tx, mut event_rx) = mpsc::channel(256);
-        send_transport(
-            &runtime.transport_tx,
-            TransportMessage::RegisterDestination {
-                hash: link_id,
-                app_name: "application.link".into(),
-                delivery_tx: Some(event_tx),
-            },
-        )
-        .await?;
-        send_transport(
-            &runtime.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: build_link_request_packet(destination_hash, &request_data),
-                destination_hash,
-            }),
-        )
-        .await?;
-
-        let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
-        let ed25519_bytes: [u8; 32] = public_key[32..]
-            .try_into()
-            .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
-        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
-        let rtt_data = link
-            .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
-        send_transport(
-            &runtime.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data),
-                destination_hash: link_id,
-            }),
-        )
-        .await?;
-        Ok(Self {
-            transport_tx: runtime.transport_tx.clone(),
-            identity: Arc::new(identity),
-            link,
-            event_rx,
-            channel: None,
-            channel_packets: Vec::new(),
-        })
+        Self::prepare_with_public_key(runtime, identity, destination_hash, public_key, hops)
+            .establish(deadline)
+            .await
     }
 
     pub fn id(&self) -> [u8; 16] {
@@ -1534,6 +1596,21 @@ mod tests {
         let (header, _) = rns_wire::header::PacketHeader::unpack(&pkt).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
         assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Data);
+    }
+
+    #[test]
+    fn prepared_session_exposes_link_id_without_transport_io() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        let prepared = LinkSession::prepare_on_transport(
+            transport_tx,
+            Identity::new(),
+            [0xBC; 16],
+            [0xCD; 64],
+            1,
+        );
+
+        assert_ne!(prepared.id(), [0; 16]);
+        assert!(transport_rx.try_recv().is_err());
     }
 
     #[tokio::test]
