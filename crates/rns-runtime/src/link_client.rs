@@ -91,6 +91,7 @@ pub struct PreparedLinkSession {
 pub struct LinkSessionHandle {
     link_id: [u8; 16],
     command_tx: mpsc::Sender<LinkSessionCommand>,
+    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, LinkClientError>>>>,
 }
 
 enum LinkSessionCommand {
@@ -102,9 +103,6 @@ enum LinkSessionCommand {
         auto_compress: bool,
         deadline: Duration,
         result_tx: oneshot::Sender<Result<LinkPayloadSendReceipt, LinkClientError>>,
-    },
-    Receive {
-        result_tx: oneshot::Sender<Result<Vec<u8>, LinkClientError>>,
     },
     Close {
         result_tx: oneshot::Sender<Result<(), LinkClientError>>,
@@ -194,15 +192,17 @@ impl PreparedLinkSession {
     pub fn spawn(self, deadline: Duration) -> LinkSessionHandle {
         let link_id = self.id();
         let (command_tx, command_rx) = mpsc::channel(64);
+        let (inbound_tx, inbound_rx) = mpsc::channel(64);
         tokio::spawn(async move {
             let Ok(session) = self.establish(deadline).await else {
                 return;
             };
-            run_established_link_session(session, command_rx).await;
+            run_established_link_session(session, command_rx, inbound_tx).await;
         });
         LinkSessionHandle {
             link_id,
             command_tx,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
         }
     }
 }
@@ -237,10 +237,12 @@ impl LinkSessionHandle {
     }
 
     pub async fn recv(&self) -> Result<Vec<u8>, LinkClientError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.send_command(LinkSessionCommand::Receive { result_tx })
-            .await?;
-        recv_command_result(result_rx).await
+        self.inbound_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| LinkClientError::HandshakeFailed("Link session task stopped".into()))?
     }
 
     pub async fn close(&self) -> Result<(), LinkClientError> {
@@ -269,27 +271,39 @@ async fn recv_command_result<T>(
 async fn run_established_link_session(
     mut session: LinkSession,
     mut command_rx: mpsc::Receiver<LinkSessionCommand>,
+    inbound_tx: mpsc::Sender<Result<Vec<u8>, LinkClientError>>,
 ) {
-    while let Some(command) = command_rx.recv().await {
-        match command {
-            LinkSessionCommand::Identify { result_tx } => {
-                let _ = result_tx.send(session.identify().await);
+    loop {
+        tokio::select! {
+            command = command_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    LinkSessionCommand::Identify { result_tx } => {
+                        let _ = result_tx.send(session.identify().await);
+                    }
+                    LinkSessionCommand::SendPayload {
+                        data,
+                        auto_compress,
+                        deadline,
+                        result_tx,
+                    } => {
+                        let _ = result_tx
+                            .send(session.send_payload(data, auto_compress, deadline).await);
+                    }
+                    LinkSessionCommand::Close { result_tx } => {
+                        let result = session.close().await;
+                        let _ = result_tx.send(result);
+                        break;
+                    }
+                }
             }
-            LinkSessionCommand::SendPayload {
-                data,
-                auto_compress,
-                deadline,
-                result_tx,
-            } => {
-                let _ = result_tx.send(session.send_payload(data, auto_compress, deadline).await);
-            }
-            LinkSessionCommand::Receive { result_tx } => {
-                let _ = result_tx.send(session.recv().await);
-            }
-            LinkSessionCommand::Close { result_tx } => {
-                let result = session.close().await;
-                let _ = result_tx.send(result);
-                break;
+            packet = session.recv() => {
+                let closed = packet.is_err();
+                if inbound_tx.send(packet).await.is_err() || closed {
+                    break;
+                }
             }
         }
     }
@@ -1821,11 +1835,15 @@ mod tests {
             pending_packets: VecDeque::new(),
         };
         let (command_tx, command_rx) = mpsc::channel(4);
+        let (inbound_tx, inbound_rx) = mpsc::channel(4);
         let handle = LinkSessionHandle {
             link_id,
             command_tx,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
         };
-        let worker = tokio::spawn(run_established_link_session(session, command_rx));
+        let worker = tokio::spawn(run_established_link_session(
+            session, command_rx, inbound_tx,
+        ));
 
         let send = async {
             handle
