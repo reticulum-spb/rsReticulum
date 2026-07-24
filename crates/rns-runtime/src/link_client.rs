@@ -16,7 +16,10 @@ use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
-use rns_protocol::resource::{InboundTransfer, TransferAction};
+use rns_protocol::resource::{
+    InboundTransfer, MAX_EFFICIENT_SIZE, MultiSegmentInbound, MultiSegmentOutbound,
+    OutboundResource, OutboundTransfer, TransferAction,
+};
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{AnnounceHandlerEvent, OutboundRequest, TransportMessage};
@@ -44,6 +47,8 @@ pub enum LinkClientError {
     UnexpectedResponse(String),
     #[error("channel: {0}")]
     Channel(#[from] ChannelError),
+    #[error("resource: {0}")]
+    Resource(String),
 }
 
 #[derive(Clone)]
@@ -63,6 +68,13 @@ pub struct LinkSession {
     event_rx: mpsc::Receiver<DestinationEvent>,
     channel: Option<LinkChannel>,
     channel_packets: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceivedResource {
+    pub data: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
+    pub resource_hash: [u8; 32],
 }
 
 impl LinkSession {
@@ -139,6 +151,10 @@ impl LinkSession {
 
     pub fn rtt(&self) -> Duration {
         self.link.rtt.unwrap_or_default()
+    }
+
+    pub fn mdu(&self) -> usize {
+        self.link.mdu
     }
 
     pub fn remote_identity(&self) -> Option<&[u8; 64]> {
@@ -353,6 +369,358 @@ impl LinkSession {
                 return Ok(message);
             }
         }
+    }
+
+    /// Receive and reassemble the next Resource sent over this Link.
+    pub async fn recv_resource(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<ReceivedResource, LinkClientError> {
+        let link_id = self.id();
+        let future = async {
+            let mut transfers: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
+            let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
+            let mut multi: Option<MultiSegmentInbound> = None;
+            while let Some(event) = self.event_rx.recv().await {
+                let DestinationEvent::InboundPacket { raw, .. } = event else {
+                    continue;
+                };
+                let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if header.destination_hash != link_id {
+                    continue;
+                }
+                let body = &raw[offset..];
+                match header.context {
+                    rns_wire::context::PacketContext::ResourceAdv => {
+                        let plaintext = self.link.decrypt(body).map_err(|error| {
+                            LinkClientError::LinkCrypto(format!(
+                                "resource advertisement: {error:?}"
+                            ))
+                        })?;
+                        let adv = ResourceAdvertisement::unpack(&plaintext).map_err(|error| {
+                            LinkClientError::UnexpectedResponse(format!(
+                                "resource advertisement: {error}"
+                            ))
+                        })?;
+                        let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+                        let length = adv.random_hash.len().min(random_hash.len());
+                        random_hash[..length].copy_from_slice(&adv.random_hash[..length]);
+                        let mut transfer = InboundTransfer::from_advertisement(
+                            adv.num_parts,
+                            adv.transfer_size,
+                            adv.data_size,
+                            random_hash,
+                            adv.resource_hash,
+                            adv.flags,
+                            adv.get_map_hashes(),
+                            self.link.rtt.unwrap_or(Duration::from_millis(500)),
+                        )
+                        .map_err(|error| {
+                            LinkClientError::UnexpectedResponse(format!("resource: {error:?}"))
+                        })?;
+                        if let TransferAction::SendRequest(request) = transfer.request_next() {
+                            send_link_data(
+                                &self.transport_tx,
+                                &self.link,
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceReq,
+                                &request,
+                                true,
+                            )?;
+                        }
+                        segment_info.insert(
+                            adv.resource_hash,
+                            (adv.original_hash, adv.segment_index, adv.total_segments),
+                        );
+                        if adv.total_segments > 1 && multi.is_none() {
+                            multi = Some(MultiSegmentInbound::new(
+                                adv.total_segments,
+                                adv.original_hash,
+                            ));
+                        }
+                        transfers.insert(adv.resource_hash, transfer);
+                    }
+                    rns_wire::context::PacketContext::Resource => {
+                        let Some(resource_hash) = transfers.keys().next().copied() else {
+                            continue;
+                        };
+                        let transfer = transfers.get_mut(&resource_hash).expect("known transfer");
+                        let action = transfer.receive_part(body.to_vec());
+                        let completed = matches!(action, TransferAction::Complete);
+                        match action {
+                            TransferAction::SendRequest(request) => send_link_data(
+                                &self.transport_tx,
+                                &self.link,
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceReq,
+                                &request,
+                                true,
+                            )?,
+                            TransferAction::SendHmu(hmu) => send_link_data(
+                                &self.transport_tx,
+                                &self.link,
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceHmu,
+                                &hmu,
+                                true,
+                            )?,
+                            TransferAction::Failed(reason) => {
+                                return Err(LinkClientError::UnexpectedResponse(reason));
+                            }
+                            _ => {}
+                        }
+                        if transfer.resource.is_complete() || completed {
+                            let keys = self.link.session_keys().ok_or_else(|| {
+                                LinkClientError::LinkCrypto("missing resource keys".into())
+                            })?;
+                            let decrypt = move |data: &[u8]| {
+                                rns_link::encryption::link_decrypt(&keys, data).map_err(|_| {
+                                    rns_protocol::resource::ResourceError::DecryptFailed
+                                })
+                            };
+                            let (data, proof) =
+                                transfer.complete(Some(&decrypt)).map_err(|error| {
+                                    LinkClientError::UnexpectedResponse(format!(
+                                        "resource completion: {error:?}"
+                                    ))
+                                })?;
+                            let metadata = transfer.resource.metadata.clone();
+                            send_link_proof(&self.transport_tx, link_id, &proof)?;
+                            let (original_hash, segment_index, total_segments) = segment_info
+                                .remove(&resource_hash)
+                                .unwrap_or((resource_hash, 1, 1));
+                            transfers.remove(&resource_hash);
+                            if total_segments > 1 {
+                                let coordinator =
+                                    multi.as_mut().expect("multi-segment coordinator");
+                                coordinator.set_segment_data(segment_index, data).map_err(
+                                    |error| {
+                                        LinkClientError::UnexpectedResponse(format!(
+                                            "resource segment: {error:?}"
+                                        ))
+                                    },
+                                )?;
+                                if let Some(metadata) = metadata {
+                                    coordinator.set_metadata(metadata);
+                                }
+                                if coordinator.is_complete() {
+                                    let data = coordinator.reassemble().map_err(|error| {
+                                        LinkClientError::UnexpectedResponse(format!(
+                                            "resource reassembly: {error:?}"
+                                        ))
+                                    })?;
+                                    return Ok(ReceivedResource {
+                                        data,
+                                        metadata: coordinator.metadata.clone(),
+                                        resource_hash: original_hash,
+                                    });
+                                }
+                                continue;
+                            }
+                            return Ok(ReceivedResource {
+                                data,
+                                metadata,
+                                resource_hash,
+                            });
+                        }
+                    }
+                    rns_wire::context::PacketContext::ResourceHmu => {
+                        let plaintext = self.link.decrypt(body).map_err(|error| {
+                            LinkClientError::LinkCrypto(format!("resource HMU: {error:?}"))
+                        })?;
+                        let (resource_hash, segment, hashmap) =
+                            rns_protocol::resource::parse_hashmap_update(&plaintext).map_err(
+                                |error| {
+                                    LinkClientError::UnexpectedResponse(format!(
+                                        "resource HMU: {error:?}"
+                                    ))
+                                },
+                            )?;
+                        if let Some(transfer) = transfers.get_mut(&resource_hash)
+                            && let TransferAction::SendRequest(request) =
+                                transfer.hashmap_update(segment, &hashmap)
+                        {
+                            send_link_data(
+                                &self.transport_tx,
+                                &self.link,
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceReq,
+                                &request,
+                                true,
+                            )?;
+                        }
+                    }
+                    rns_wire::context::PacketContext::LinkClose => {
+                        return Err(LinkClientError::HandshakeFailed(
+                            "link closed during resource".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Err(LinkClientError::HandshakeFailed(
+                "resource channel closed".into(),
+            ))
+        };
+        timeout(deadline, future)
+            .await
+            .map_err(|_| LinkClientError::Timeout("resource"))?
+    }
+
+    /// Send a Resource and wait for its delivery proof.
+    pub async fn send_resource(
+        &mut self,
+        data: Vec<u8>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<[u8; 32], LinkClientError> {
+        self.send_resource_with_metadata(data, None, auto_compress, deadline)
+            .await
+    }
+
+    /// Send a Resource with optional metadata and wait for all segment proofs.
+    ///
+    /// Payloads larger than the efficient single-resource limit are split
+    /// automatically and retain one original resource hash across segments.
+    pub async fn send_resource_with_metadata(
+        &mut self,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<[u8; 32], LinkClientError> {
+        let keys = self
+            .link
+            .session_keys()
+            .ok_or_else(|| LinkClientError::LinkCrypto("missing resource keys".into()))?;
+        let encrypt = |plaintext: &[u8]| {
+            rns_link::encryption::link_encrypt(&keys, plaintext)
+                .unwrap_or_else(|_| plaintext.to_vec())
+        };
+        let (resource_hash, resources) = if data.len()
+            + metadata.as_ref().map_or(0, |m| m.len() + 3)
+            <= MAX_EFFICIENT_SIZE
+        {
+            let resource =
+                OutboundResource::with_options(data, auto_compress, metadata, None, Some(&encrypt))
+                    .map_err(|error| LinkClientError::Resource(format!("{error:?}")))?;
+            (resource.resource_hash, vec![resource])
+        } else {
+            let resource = MultiSegmentOutbound::with_options(
+                data,
+                auto_compress,
+                metadata,
+                None,
+                false,
+                Some(&encrypt),
+            )
+            .map_err(|error| LinkClientError::Resource(format!("{error:?}")))?;
+            (resource.original_hash, resource.segments)
+        };
+        let deadline = Instant::now() + deadline;
+        for resource in resources {
+            let transfer = OutboundTransfer::from_prebuilt(resource, self.rtt());
+            self.send_resource_transfer(transfer, deadline).await?;
+        }
+        Ok(resource_hash)
+    }
+
+    async fn send_resource_transfer(
+        &mut self,
+        mut transfer: OutboundTransfer,
+        deadline: Instant,
+    ) -> Result<(), LinkClientError> {
+        let resource_hash = transfer.resource.resource_hash;
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            return Err(LinkClientError::Resource(
+                "resource produced no advertisement".into(),
+            ));
+        };
+        let encrypted = self
+            .link
+            .encrypt(&advertisement)
+            .map_err(|error| LinkClientError::LinkCrypto(format!("resource ADV: {error:?}")))?;
+        self.send_context(rns_wire::context::PacketContext::ResourceAdv, encrypted)
+            .await?;
+
+        let link_id = self.id();
+        let future = async {
+            while let Some(event) = self.event_rx.recv().await {
+                let DestinationEvent::InboundPacket { raw, .. } = event else {
+                    continue;
+                };
+                let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if header.destination_hash != link_id {
+                    continue;
+                }
+                let body = &raw[offset..];
+                match header.context {
+                    rns_wire::context::PacketContext::ResourceReq => {
+                        let plaintext = self.link.decrypt(body).map_err(|error| {
+                            LinkClientError::LinkCrypto(format!("resource request: {error:?}"))
+                        })?;
+                        let packet_hash =
+                            rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+                        for action in transfer.handle_request_packet(packet_hash, &plaintext) {
+                            match action {
+                                TransferAction::SendPart(_, part) => {
+                                    self.send_context(
+                                        rns_wire::context::PacketContext::Resource,
+                                        part,
+                                    )
+                                    .await?;
+                                }
+                                TransferAction::SendHmu(hmu) => {
+                                    let encrypted = self.link.encrypt(&hmu).map_err(|error| {
+                                        LinkClientError::LinkCrypto(format!(
+                                            "resource HMU: {error:?}"
+                                        ))
+                                    })?;
+                                    self.send_context(
+                                        rns_wire::context::PacketContext::ResourceHmu,
+                                        encrypted,
+                                    )
+                                    .await?;
+                                }
+                                TransferAction::Failed(reason) => {
+                                    return Err(LinkClientError::Resource(reason));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    rns_wire::context::PacketContext::ResourcePrf => {
+                        if transfer.handle_proof(body) {
+                            return Ok(resource_hash);
+                        }
+                    }
+                    rns_wire::context::PacketContext::ResourceRcl => {
+                        return Err(LinkClientError::Resource(
+                            "resource rejected by receiver".into(),
+                        ));
+                    }
+                    rns_wire::context::PacketContext::LinkClose => {
+                        return Err(LinkClientError::HandshakeFailed(
+                            "link closed during resource send".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Err(LinkClientError::HandshakeFailed(
+                "resource channel closed".into(),
+            ))
+        };
+        timeout(time_remaining(deadline)?, future)
+            .await
+            .map_err(|_| LinkClientError::Timeout("resource proof"))??;
+        Ok(())
     }
 
     pub async fn close(&mut self) -> Result<(), LinkClientError> {
