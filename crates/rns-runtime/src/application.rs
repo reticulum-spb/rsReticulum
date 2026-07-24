@@ -495,9 +495,18 @@ pub fn try_send_pre_encrypted_packet(
     destination_hash: [u8; 16],
     payload: &[u8],
 ) -> Result<PacketSubmission, ApplicationError> {
+    try_send_pre_encrypted_packet_on_transport(&runtime.transport_tx, destination_hash, payload)
+}
+
+/// Transport-channel variant for embedders that do not retain a full
+/// [`ReticulumHandle`] in their synchronous application state.
+pub fn try_send_pre_encrypted_packet_on_transport(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination_hash: [u8; 16],
+    payload: &[u8],
+) -> Result<PacketSubmission, ApplicationError> {
     let (raw, submission) = build_pre_encrypted_packet(destination_hash, payload)?;
-    runtime
-        .transport_tx
+    transport_tx
         .try_send(TransportMessage::Outbound(OutboundRequest {
             raw,
             destination_hash,
@@ -574,6 +583,23 @@ mod tests {
         assert_eq!(&raw[offset..], b"LXMF ciphertext");
         assert_eq!(
             packet_hash_pair(&raw, HeaderType::Header1),
+            (submission.packet_hash, submission.truncated_hash)
+        );
+    }
+
+    #[test]
+    fn nonblocking_transport_api_submits_pre_encrypted_packet() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(1);
+        let submission =
+            try_send_pre_encrypted_packet_on_transport(&transport_tx, [0xAD; 16], b"ciphertext")
+                .unwrap();
+        let TransportMessage::Outbound(request) = transport_rx.try_recv().unwrap() else {
+            panic!("expected outbound packet");
+        };
+
+        assert_eq!(request.destination_hash, [0xAD; 16]);
+        assert_eq!(
+            packet_hash_pair(&request.raw, HeaderType::Header1),
             (submission.packet_hash, submission.truncated_hash)
         );
     }
