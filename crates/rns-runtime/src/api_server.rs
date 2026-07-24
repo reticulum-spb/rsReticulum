@@ -629,6 +629,7 @@ fn mode_to_str(mode: rns_interface::traits::InterfaceMode) -> &'static str {
         Roaming => "Roaming",
         Boundary => "Boundary",
         Gateway => "Gateway",
+        Internal => "Internal",
     }
 }
 

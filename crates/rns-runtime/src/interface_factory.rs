@@ -1268,6 +1268,7 @@ fn mode_to_str(mode: InterfaceMode) -> &'static str {
         InterfaceMode::Roaming => "Roaming",
         InterfaceMode::Boundary => "Boundary",
         InterfaceMode::Gateway => "Gateway",
+        InterfaceMode::Internal => "Internal",
     }
 }
 
