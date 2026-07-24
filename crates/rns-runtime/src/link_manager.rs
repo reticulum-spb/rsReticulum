@@ -3512,6 +3512,68 @@ mod tests {
     }
 
     #[test]
+    fn link_payload_packet_round_trip_between_managers() {
+        fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Bytes {
+            match rx.try_recv().expect("outbound packet queued") {
+                TransportMessage::Outbound(request) => request.raw,
+                _ => panic!("expected outbound packet"),
+            }
+        }
+        fn active_link_entry(link: Link) -> ActiveLink {
+            ActiveLink {
+                link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            }
+        }
+
+        let (initiator, responder, identity_key) = handshaken_link_pair_with_identity();
+        let link_id = initiator.link_id;
+
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (_event_tx_a, event_rx_a) = mpsc::channel(16);
+        let mut lm_a = LinkManager::new(tx_a, event_rx_a, [0xA2; 16], None);
+        let (proof_tx, mut proof_rx) = mpsc::channel(4);
+        lm_a.set_link_packet_proof_channel(proof_tx);
+        lm_a.active_links
+            .insert(link_id, active_link_entry(initiator));
+
+        let (tx_b, mut rx_b) = mpsc::channel(16);
+        let (_event_tx_b, event_rx_b) = mpsc::channel(16);
+        let mut lm_b = LinkManager::new(tx_b, event_rx_b, [0xB2; 16], Some(identity_key));
+        let (packet_tx, mut packet_rx) = mpsc::channel(4);
+        lm_b.set_link_packet_channel(packet_tx);
+        lm_b.active_links
+            .insert(link_id, active_link_entry(responder));
+
+        let payload = b"LXMF short Direct payload".to_vec();
+        let receipt = lm_a
+            .send_link_payload(&link_id, payload.clone(), true)
+            .expect("short payload queued");
+        let LinkPayloadSendReceipt::Packet(receipt) = receipt else {
+            panic!("short payload must use a Link packet");
+        };
+
+        let data = next_outbound(&mut rx_a);
+        lm_b.handle_inbound_packet(&data, 1);
+        assert_eq!(
+            packet_rx.try_recv().expect("payload delivered"),
+            (payload, link_id)
+        );
+
+        let proof = next_outbound(&mut rx_b);
+        lm_a.handle_inbound_packet(&proof, 1);
+        let proved = proof_rx.try_recv().expect("proof event delivered");
+        assert_eq!(proved.link_id, link_id);
+        assert_eq!(proved.packet_hash, receipt.packet_hash);
+    }
+
+    #[test]
     fn backend_identity_signs_link_packet_delivery_proof() {
         let (identity, identity_ed25519_pub, signing_seed) = backend_identity(true);
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
