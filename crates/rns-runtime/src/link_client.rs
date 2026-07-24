@@ -303,7 +303,11 @@ impl LinkSession {
                 };
                 if header.destination_hash != link_id
                     || header.flags.packet_type != rns_wire::flags::PacketType::Proof
-                    || header.context != rns_wire::context::PacketContext::LinkProof
+                    || !matches!(
+                        header.context,
+                        rns_wire::context::PacketContext::LinkProof
+                            | rns_wire::context::PacketContext::None
+                    )
                 {
                     continue;
                 }
@@ -1568,7 +1572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_payload_uses_packet_and_waits_for_matching_proof() {
+    async fn send_payload_accepts_python_style_packet_proof() {
         let dest_hash = [0xCD; 16];
         let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let responder_pub = responder_key.public_key();
@@ -1619,7 +1623,9 @@ mod tests {
                 hops: 0,
                 transport_id: None,
                 destination_hash: link_id,
-                context: rns_wire::context::PacketContext::LinkProof,
+                // Python Link.prove_packet() uses the default context for
+                // application packet proofs.
+                context: rns_wire::context::PacketContext::None,
             };
             let mut raw = header.pack();
             raw.extend_from_slice(&proof);
