@@ -97,6 +97,27 @@ impl LinkSession {
         }
         .ok_or(LinkClientError::PubkeyNotDiscovered)?;
 
+        Self::open_with_public_key(
+            runtime,
+            identity,
+            destination_hash,
+            public_key,
+            hops,
+            deadline,
+        )
+        .await
+    }
+
+    /// Establish a Link when the destination public key is already known
+    /// from a previously handled announce.
+    pub async fn open_with_public_key(
+        runtime: &ReticulumHandle,
+        identity: Identity,
+        destination_hash: [u8; 16],
+        public_key: [u8; 64],
+        hops: u8,
+        deadline: Duration,
+    ) -> Result<Self, LinkClientError> {
         let (mut link, request_data) = Link::new_initiator(destination_hash, hops);
         let link_id = link.link_id;
         let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -168,9 +189,21 @@ impl LinkSession {
             .identity
             .get_signing_key()
             .ok_or(LinkClientError::NoSigningKey)?;
+        self.identify_with(&public_key, &signing_key).await
+    }
+
+    /// Identify with application-owned public/signing keys.
+    ///
+    /// This supports routers that keep the Reticulum identity outside the
+    /// Link session while still reusing the common session implementation.
+    pub async fn identify_with(
+        &mut self,
+        public_key: &[u8; 64],
+        signing_key: &rns_crypto::ed25519::Ed25519PrivateKey,
+    ) -> Result<(), LinkClientError> {
         let payload = self
             .link
-            .identify(&public_key, &signing_key)
+            .identify(public_key, signing_key)
             .map_err(|error| LinkClientError::LinkCrypto(format!("identify: {error:?}")))?;
         self.send_context(rns_wire::context::PacketContext::LinkIdentify, payload)
             .await
