@@ -1878,6 +1878,38 @@ impl LinkManager {
         let mut to_remove = Vec::new();
 
         for (link_id, active) in &mut self.active_links {
+            let inbound_actions: Vec<_> = active
+                .inbound_resources
+                .iter_mut()
+                .filter_map(|(resource_hash, transfer)| {
+                    let action = transfer.check_timeout();
+                    (!matches!(action, TransferAction::None)).then_some((*resource_hash, action))
+                })
+                .collect();
+            for (resource_hash, action) in inbound_actions {
+                match action {
+                    TransferAction::SendRequest(payload) => {
+                        Self::send_resource_control_packet(
+                            &self.transport_tx,
+                            active,
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceReq,
+                            &payload,
+                        );
+                    }
+                    TransferAction::Failed(reason) => {
+                        tracing::warn!(
+                            link_id = hex::encode(link_id),
+                            resource = hex::encode(&resource_hash[..8]),
+                            reason,
+                            "inbound resource transfer timed out"
+                        );
+                        Self::remove_inbound_resource(active, &resource_hash);
+                    }
+                    _ => {}
+                }
+            }
+
             let timed_out_channel_sequences = active
                 .channel
                 .as_ref()
@@ -1921,9 +1953,6 @@ impl LinkManager {
                 active.link.record_tx(data.len());
             }
 
-            if !active.inbound_resources.is_empty() || !active.outbound_resources.is_empty() {
-                active.link.record_inbound();
-            }
             let action = active.link.tick();
             match action {
                 LinkAction::SendKeepalive => {
@@ -1979,6 +2008,60 @@ impl LinkManager {
             if self.close_active_link(link_id, CloseReason::Timeout, false) {
                 tracing::debug!(link_id = hex::encode(link_id), "link removed by tick");
             }
+        }
+    }
+
+    fn send_resource_control_packet(
+        transport_tx: &mpsc::Sender<TransportMessage>,
+        active: &mut ActiveLink,
+        link_id: &[u8; 16],
+        context: rns_wire::context::PacketContext,
+        payload: &[u8],
+    ) {
+        let Ok(encrypted) = active.link.encrypt(payload) else {
+            return;
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&encrypted);
+        active.link.record_tx(encrypted.len());
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }));
+    }
+
+    fn remove_inbound_resource(active: &mut ActiveLink, resource_hash: &[u8; 32]) {
+        active.link.untrack_resource(resource_hash);
+        active.inbound_resources.remove(resource_hash);
+
+        let Some(route) = active.segment_routing.remove(resource_hash) else {
+            return;
+        };
+        active.inbound_split_resources.remove(&route.original_hash);
+        let sibling_hashes: Vec<_> = active
+            .segment_routing
+            .iter()
+            .filter_map(|(hash, sibling)| {
+                (sibling.original_hash == route.original_hash).then_some(*hash)
+            })
+            .collect();
+        for sibling_hash in sibling_hashes {
+            active.segment_routing.remove(&sibling_hash);
+            active.inbound_resources.remove(&sibling_hash);
+            active.link.untrack_resource(&sibling_hash);
         }
     }
 
@@ -4094,6 +4177,58 @@ mod tests {
         let proof = proof_rx.try_recv().expect("resource proof event");
         assert_eq!(proof.link_id, link_id);
         assert_eq!(proof.resource_hash, receipt.resource_hash);
+    }
+
+    #[test]
+    fn tick_removes_timed_out_inbound_resource() {
+        let (_initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
+        let link_id = responder_link.link_id;
+        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xC3; 16], None);
+
+        let resource_hash = [0xA5; 32];
+        let mut transfer = InboundTransfer::from_advertisement(
+            1,
+            64,
+            64,
+            [0xB6; rns_protocol::resource::RANDOM_HASH_SIZE],
+            resource_hash,
+            rns_protocol::resource::ResourceFlags::default(),
+            vec![[0xC7; rns_protocol::resource::MAPHASH_LEN]],
+            std::time::Duration::from_millis(500),
+        )
+        .expect("valid inbound resource");
+        assert!(matches!(
+            transfer.request_next(),
+            TransferAction::SendRequest(_)
+        ));
+        transfer.retries_left = 0;
+        transfer.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        let mut inbound_resources = HashMap::new();
+        inbound_resources.insert(resource_hash, transfer);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources,
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        lm.tick();
+
+        let active = lm.active_links.get(&link_id).expect("link remains active");
+        assert!(
+            active.inbound_resources.is_empty(),
+            "timed-out resource buffer must be released"
+        );
     }
 
     #[test]
