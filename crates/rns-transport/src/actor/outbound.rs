@@ -32,6 +32,7 @@ impl TransportActor {
         // Link- and resource-level contexts manage their own receipts.
         if parsed.flags.packet_type == rns_wire::flags::PacketType::Data
             && parsed.flags.destination_type != rns_wire::flags::DestinationType::Plain
+            && parsed.flags.destination_type != rns_wire::flags::DestinationType::Link
         {
             let trunc_hash =
                 rns_wire::hash::truncated_packet_hash(&request.raw, parsed.flags.header_type);

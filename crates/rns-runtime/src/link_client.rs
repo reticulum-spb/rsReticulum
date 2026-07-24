@@ -178,22 +178,70 @@ impl LinkSession {
 
     /// Send one encrypted Link packet.
     pub async fn send(&self, data: &[u8]) -> Result<(), LinkClientError> {
+        self.send_tracked(data).await.map(|_| ())
+    }
+
+    /// Send one encrypted Link packet and return the hash addressed by its
+    /// delivery proof.
+    pub async fn send_tracked(&self, data: &[u8]) -> Result<[u8; 32], LinkClientError> {
         let encrypted = self
             .link
             .encrypt(data)
             .map_err(|error| LinkClientError::LinkCrypto(format!("packet: {error:?}")))?;
+        let raw = build_data_packet(
+            self.id(),
+            rns_wire::context::PacketContext::None,
+            &encrypted,
+        );
+        let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
         send_transport(
             &self.transport_tx,
             TransportMessage::Outbound(OutboundRequest {
-                raw: build_data_packet(
-                    self.id(),
-                    rns_wire::context::PacketContext::None,
-                    &encrypted,
-                ),
+                raw,
                 destination_hash: self.id(),
             }),
         )
-        .await
+        .await?;
+        Ok(packet_hash)
+    }
+
+    /// Wait for the next valid delivery proof for an application Link packet.
+    pub async fn recv_delivery_proof(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<[u8; 32], LinkClientError> {
+        let link_id = self.id();
+        let future = async {
+            while let Some(event) = self.event_rx.recv().await {
+                let DestinationEvent::InboundPacket { raw, .. } = event else {
+                    continue;
+                };
+                let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if header.destination_hash != link_id
+                    || header.flags.packet_type != rns_wire::flags::PacketType::Proof
+                    || header.context != rns_wire::context::PacketContext::LinkProof
+                {
+                    continue;
+                }
+                let proof = &raw[offset..];
+                let Some(packet_hash) = proof.get(..32).and_then(|hash| hash.try_into().ok())
+                else {
+                    continue;
+                };
+                if self.link.validate_packet_proof(&packet_hash, proof) {
+                    return Ok(packet_hash);
+                }
+            }
+            Err(LinkClientError::HandshakeFailed(
+                "destination channel closed".into(),
+            ))
+        };
+        timeout(deadline, future)
+            .await
+            .map_err(|_| LinkClientError::Timeout("packet delivery proof"))?
     }
 
     /// Receive the next encrypted application packet on this Link.

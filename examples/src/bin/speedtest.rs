@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rns_identity::identity::Identity;
@@ -8,6 +9,7 @@ use rns_runtime::link_session::{LinkListener, LinkListenerEvent};
 
 const APP_NAME: &str = "example_utilities.speedtest";
 const DATA_CAP: usize = 2 * 1024 * 1024;
+const WINDOW: usize = 16;
 
 #[tokio::main]
 async fn main() -> rns_examples::ExampleResult {
@@ -21,9 +23,26 @@ async fn main() -> rns_examples::ExampleResult {
         let data = rns_crypto::random::random_bytes(link.mdu());
         let started = Instant::now();
         let mut sent = 0;
+        let mut pending = VecDeque::new();
         while sent < DATA_CAP * 5 / 4 {
-            link.send(&data).await?;
+            pending.push_back(link.send_tracked(&data).await?);
             sent += data.len();
+            if pending.len() >= WINDOW {
+                let delivered = link.recv_delivery_proof(Duration::from_secs(30)).await?;
+                pending
+                    .iter()
+                    .position(|hash| *hash == delivered)
+                    .map(|index| pending.remove(index))
+                    .ok_or("proof for unknown speedtest packet")?;
+            }
+        }
+        while !pending.is_empty() {
+            let delivered = link.recv_delivery_proof(Duration::from_secs(30)).await?;
+            pending
+                .iter()
+                .position(|hash| *hash == delivered)
+                .map(|index| pending.remove(index))
+                .ok_or("proof for unknown speedtest packet")?;
         }
         let elapsed = started.elapsed().as_secs_f64();
         println!(
@@ -32,7 +51,6 @@ async fn main() -> rns_examples::ExampleResult {
             elapsed,
             sent as f64 * 8.0 / elapsed / 1_000_000.0
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
         return link.close().await.map_err(Into::into);
     }
 
@@ -55,7 +73,7 @@ async fn main() -> rns_examples::ExampleResult {
                     LinkListenerEvent::Packet { link_id, data } => {
                         let transfer = transfers.entry(link_id).or_insert((Instant::now(), 0));
                         transfer.1 += data.len();
-                        if transfer.1 > DATA_CAP {
+                        if transfer.1 >= DATA_CAP * 5 / 4 {
                             let elapsed = transfer.0.elapsed().as_secs_f64();
                             println!(
                                 "Received {} bytes in {:.3}s ({:.2} Mbit/s)",

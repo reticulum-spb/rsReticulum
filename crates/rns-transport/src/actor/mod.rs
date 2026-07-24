@@ -3273,6 +3273,27 @@ mod tests {
     }
 
     #[test]
+    fn outbound_link_data_does_not_create_transport_receipt() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (entry, mut rx) = make_test_interface("iface");
+        actor.interfaces.insert(1, entry);
+
+        let link_id = [0x67; 16];
+        let raw =
+            make_link_data_packet_with_context(link_id, 0, rns_wire::context::PacketContext::None);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: link_id,
+        });
+
+        assert!(rx.try_recv().is_ok(), "link packet should be emitted");
+        assert!(
+            actor.receipt_table.is_empty(),
+            "Link manages its own packet proofs; a transport receipt would consume them"
+        );
+    }
+
+    #[test]
     fn test_outbound_single_with_path() {
         let (mut actor, _tx) = TransportActor::new();
         let (entry1, mut rx1) = make_test_interface("iface1");
