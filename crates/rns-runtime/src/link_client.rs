@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_worker_sends_payload_with_python_style_packet_proof() {
+    async fn session_worker_reuses_link_for_python_style_packet_proofs() {
         let dest_hash = [0xCD; 16];
         let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let responder_pub = responder_key.public_key();
@@ -1887,57 +1887,51 @@ mod tests {
             session, command_rx, inbound_tx,
         ));
 
-        let send = async {
-            handle
-                .send_payload(
-                    b"short application payload".to_vec(),
-                    true,
-                    Duration::from_secs(1),
-                )
-                .await
-        };
-        let prove = async {
-            let TransportMessage::Outbound(request) = transport_rx.recv().await.unwrap() else {
-                panic!("expected outbound Link packet");
+        for payload in [b"first payload".as_slice(), b"second payload".as_slice()] {
+            let send = handle.send_payload(payload.to_vec(), true, Duration::from_secs(1));
+            let prove = async {
+                let TransportMessage::Outbound(request) = transport_rx.recv().await.unwrap() else {
+                    panic!("expected outbound Link packet");
+                };
+                let packet_hash =
+                    rns_wire::hash::packet_hash(&request.raw, rns_wire::flags::HeaderType::Header1);
+                let proof = responder.prove_packet_with_link_key(&packet_hash).unwrap();
+                let header = rns_wire::header::PacketHeader {
+                    flags: rns_wire::flags::PacketFlags {
+                        header_type: rns_wire::flags::HeaderType::Header1,
+                        context_flag: false,
+                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                        destination_type: rns_wire::flags::DestinationType::Link,
+                        packet_type: rns_wire::flags::PacketType::Proof,
+                    },
+                    hops: 0,
+                    transport_id: None,
+                    destination_hash: link_id,
+                    // Python Link.prove_packet() uses the default context for
+                    // application packet proofs.
+                    context: rns_wire::context::PacketContext::None,
+                };
+                let mut raw = header.pack();
+                raw.extend_from_slice(&proof);
+                event_tx
+                    .send(DestinationEvent::InboundPacket {
+                        raw: Bytes::from(raw),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+                packet_hash
             };
-            let packet_hash =
-                rns_wire::hash::packet_hash(&request.raw, rns_wire::flags::HeaderType::Header1);
-            let proof = responder.prove_packet_with_link_key(&packet_hash).unwrap();
-            let header = rns_wire::header::PacketHeader {
-                flags: rns_wire::flags::PacketFlags {
-                    header_type: rns_wire::flags::HeaderType::Header1,
-                    context_flag: false,
-                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                    destination_type: rns_wire::flags::DestinationType::Link,
-                    packet_type: rns_wire::flags::PacketType::Proof,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: link_id,
-                // Python Link.prove_packet() uses the default context for
-                // application packet proofs.
-                context: rns_wire::context::PacketContext::None,
-            };
-            let mut raw = header.pack();
-            raw.extend_from_slice(&proof);
-            event_tx
-                .send(DestinationEvent::InboundPacket {
-                    raw: Bytes::from(raw),
-                    interface_id: 0,
-                })
-                .await
-                .unwrap();
-            packet_hash
-        };
 
-        let (receipt, packet_hash) = tokio::join!(send, prove);
-        assert_eq!(
-            receipt.unwrap(),
-            LinkPayloadSendReceipt::Packet {
-                link_id,
-                packet_hash,
-            }
-        );
+            let (receipt, packet_hash) = tokio::join!(send, prove);
+            assert_eq!(
+                receipt.unwrap(),
+                LinkPayloadSendReceipt::Packet {
+                    link_id,
+                    packet_hash,
+                }
+            );
+        }
         drop(handle);
         worker.await.unwrap();
     }
