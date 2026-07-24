@@ -817,7 +817,7 @@ impl LinkSession {
     }
 
     async fn send_context(
-        &self,
+        &mut self,
         context: rns_wire::context::PacketContext,
         payload: Vec<u8>,
     ) -> Result<(), LinkClientError> {
