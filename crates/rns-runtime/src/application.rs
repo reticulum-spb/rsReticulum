@@ -58,6 +58,12 @@ pub struct PacketReceipt {
     pub rtt: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketSubmission {
+    pub packet_hash: [u8; 32],
+    pub truncated_hash: [u8; 16],
+}
+
 /// Build an announce packet for an application destination without registering
 /// it with the runtime.
 ///
@@ -457,6 +463,64 @@ pub async fn send_packet(
         .ok_or(ApplicationError::Timeout)
 }
 
+/// Send an application-prepared DATA payload without applying destination
+/// encryption a second time.
+///
+/// This is intended for protocols such as LXMF that define their own
+/// destination-encrypted payload representation while still delegating packet
+/// framing, MTU validation and transport submission to Reticulum.
+pub async fn send_pre_encrypted_packet(
+    runtime: &ReticulumHandle,
+    destination_hash: [u8; 16],
+    payload: &[u8],
+) -> Result<PacketSubmission, ApplicationError> {
+    let (raw, submission) = build_pre_encrypted_packet(destination_hash, payload)?;
+    runtime
+        .transport_tx
+        .send(TransportMessage::Outbound(OutboundRequest {
+            raw,
+            destination_hash,
+        }))
+        .await
+        .map_err(|_| ApplicationError::TransportClosed)?;
+    Ok(submission)
+}
+
+fn build_pre_encrypted_packet(
+    destination_hash: [u8; 16],
+    payload: &[u8],
+) -> Result<(Bytes, PacketSubmission), ApplicationError> {
+    let header = PacketHeader {
+        flags: PacketFlags {
+            header_type: HeaderType::Header1,
+            context_flag: false,
+            transport_type: TransportType::Broadcast,
+            destination_type: DestinationType::Single,
+            packet_type: PacketType::Data,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash,
+        context: PacketContext::None,
+    };
+    let mut raw = header.pack();
+    raw.extend_from_slice(payload);
+    if raw.len() > MTU {
+        return Err(ApplicationError::MtuExceeded {
+            size: raw.len(),
+            mtu: MTU,
+        });
+    }
+    let (packet_hash, truncated_hash) = packet_hash_pair(&raw, HeaderType::Header1);
+    Ok((
+        Bytes::from(raw),
+        PacketSubmission {
+            packet_hash,
+            truncated_hash,
+        },
+    ))
+}
+
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -473,6 +537,23 @@ fn proof_destination_hash(packet_hash: &[u8; 32]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_encrypted_packet_uses_single_data_framing() {
+        let destination_hash = [0xAC; 16];
+        let (raw, submission) =
+            build_pre_encrypted_packet(destination_hash, b"LXMF ciphertext").unwrap();
+        let (header, offset) = PacketHeader::unpack(&raw).unwrap();
+
+        assert_eq!(header.destination_hash, destination_hash);
+        assert_eq!(header.flags.destination_type, DestinationType::Single);
+        assert_eq!(header.flags.packet_type, PacketType::Data);
+        assert_eq!(&raw[offset..], b"LXMF ciphertext");
+        assert_eq!(
+            packet_hash_pair(&raw, HeaderType::Header1),
+            (submission.packet_hash, submission.truncated_hash)
+        );
+    }
 
     #[test]
     fn proof_is_addressed_to_truncated_packet_hash() {
