@@ -12,18 +12,31 @@ const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
 
 [reticulum]
-enable_transport = No
-share_instance = Yes
+enable_transport = no
+share_instance = yes
 instance_name = default
+
+# Interval in minutes at which remote blackhole sources
+# are updated. Defaults to one hour.
+# blackhole_update_interval = 60
+
+# When not running as a transport node, force the same,
+# static transport identity at every instance start.
+# Defaults to a new identity per start if transport is
+# disabled.
+# static_transport_identity = no
 
 [logging]
 loglevel = 4
+
+# You can disable timestamp inclusion in logs.
+# logtimestamps = no
 
 [interfaces]
 
 [[Default Interface]]
 type = AutoInterface
-enabled = Yes
+enabled = yes
 
 [[UDP Interface]]
 type = UDPInterface
@@ -60,7 +73,7 @@ bandwidth = 125000
 txpower = 7
 spreadingfactor = 8
 codingrate = 5
-flow_control = False
+flow_control = false
 
 [[Packet Radio KISS Interface]]
 type = KISSInterface
@@ -151,6 +164,7 @@ pub(crate) async fn main() {
         config_loglevel + args.verbose as i32 - args.quiet as i32
     };
     let level = tracing_level(verbosity);
+    let log_timestamps = rns_tools::config_log_timestamps(&config_dir);
 
     if args.service {
         if let Err(e) = fs::create_dir_all(&config_dir) {
@@ -168,13 +182,9 @@ pub(crate) async fn main() {
             );
             std::process::exit(1);
         }
-        tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_writer(LogFileWriter::new(log_path))
-            .with_ansi(false)
-            .init();
+        rns_tools::init_tracing(level, log_timestamps, false, LogFileWriter::new(log_path));
     } else {
-        tracing_subscriber::fmt().with_max_level(level).init();
+        rns_tools::init_tracing(level, log_timestamps, true, std::io::stdout);
     }
 
     tracing::info!("rnsd-rs {RS_RETICULUM_VERSION} starting");

@@ -1,6 +1,18 @@
 use super::*;
 use crate::now_f64;
 
+/// Python 1.3.8 Transport.PR_LOGLEVEL (Transport.py:220/306): path-request
+/// chatter logs at DEBUG on transport nodes, EXTREME (trace) on leaf nodes.
+macro_rules! pr_log {
+    ($actor:expr, $($arg:tt)*) => {
+        if $actor.is_transport_enabled {
+            debug!($($arg)*);
+        } else {
+            trace!($($arg)*);
+        }
+    };
+}
+
 impl TransportActor {
     pub(super) fn on_outbound(&mut self, request: crate::messages::OutboundRequest) {
         self.traffic.record_tx(0, request.raw.len() as u64); // interface 0 = local
@@ -76,6 +88,10 @@ impl TransportActor {
                         "outbound: routed via path"
                     );
 
+                    // Python 1.3.8 Transport.py:1153/1186: local_hops_delta
+                    // replaces the zero hops byte on the way out.
+                    let apply_delta = self.should_apply_delta(&parsed, target_interface);
+
                     // Transport nodes only forward Header2 packets whose transport_id
                     // matches their identity — Python hubs silently drop Header1 —
                     // so every directed send through a relay must be wrapped.
@@ -88,7 +104,11 @@ impl TransportActor {
                             };
                             let new_header = rns_wire::header::PacketHeader {
                                 flags: new_flags,
-                                hops: parsed.hops,
+                                hops: if apply_delta {
+                                    self.local_hops_delta
+                                } else {
+                                    parsed.hops
+                                },
                                 transport_id: Some(next_hop),
                                 destination_hash: parsed.destination_hash,
                                 context: parsed.context,
@@ -104,9 +124,15 @@ impl TransportActor {
                                 "outbound: wrapped Header1 -> Header2 for transport"
                             );
                             self.send_to_interface(target_interface, &new_raw);
+                        } else if apply_delta {
+                            let mangled = self.mangle_hops(&request.raw, &parsed, false);
+                            self.send_to_interface(target_interface, &mangled);
                         } else {
                             self.send_to_interface(target_interface, &request.raw);
                         }
+                    } else if apply_delta {
+                        let mangled = self.mangle_hops(&request.raw, &parsed, false);
+                        self.send_to_interface(target_interface, &mangled);
                     } else {
                         self.send_to_interface(target_interface, &request.raw);
                     }
@@ -147,7 +173,17 @@ impl TransportActor {
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
-            self.send_to_interface(interface_id, &request.raw);
+            // Python's outbound applies should_apply_delta on attached-
+            // interface sends too (Transport.py:1342-1345).
+            if self.should_apply_delta(&parsed, interface_id) {
+                let transport_insert = parsed.flags.packet_type
+                    == rns_wire::flags::PacketType::Announce
+                    && parsed.flags.header_type == rns_wire::flags::HeaderType::Header1;
+                let mangled = self.mangle_hops(&request.raw, &parsed, transport_insert);
+                self.send_to_interface(interface_id, &mangled);
+            } else {
+                self.send_to_interface(interface_id, &request.raw);
+            }
             if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
                 if let Some(entry) = self.interfaces.get_mut(&interface_id) {
                     entry.ingress.sent_announce();
@@ -207,6 +243,19 @@ impl TransportActor {
             );
             return;
         };
+
+        // Python 1.3.8 Transport.py:2164: a cached packet that fails to unpack
+        // (incl. hops >= PATHFINDER_M, Packet.py:247-248) is a miss — never
+        // replay the raw bytes.
+        if rns_wire::header::PacketHeader::unpack(&cached_raw)
+            .map_or(true, |(h, _)| h.hops >= PATHFINDER_M)
+        {
+            trace!(
+                dest = %hex::encode(dest),
+                "cache request: cached announce failed to parse, treating as miss"
+            );
+            return;
+        }
 
         debug!(
             dest = %hex::encode(dest),
@@ -268,7 +317,8 @@ impl TransportActor {
         };
 
         let Some(tag) = tag_bytes else {
-            trace!(
+            pr_log!(
+                self,
                 dest = %hex::encode(requested_dest),
                 "ignoring tagless path request"
             );
@@ -360,12 +410,19 @@ impl TransportActor {
                 .and_then(|hash| self.cached_announce_raw(&hash))
                 .map(|raw| (path.hops, raw));
             if let Some((hops, raw)) = cached_raw {
-                debug!(
+                // Python 1.3.8 Transport.py:2984: unparseable cached announce
+                // aborts the answer entirely (no fall-through to discovery).
+                let Some(response) =
+                    self.path_response_from_cached_announce(&raw, requested_dest, hops)
+                else {
+                    return;
+                };
+                pr_log!(
+                    self,
                     dest = %hex::encode(requested_dest),
                     hops,
                     "answering path request — path is known, queueing path response"
                 );
-                let response = self.path_response_from_cached_announce(&raw, requested_dest, hops);
                 let now = now_f64();
                 let path_on_local_client = self.is_local_client_interface(path.interface_id);
                 let response_delay = if is_from_local_client || path_on_local_client {
@@ -404,13 +461,16 @@ impl TransportActor {
             }
         }
 
+        // Python 1.3.8 Transport.py:2946-2947: recursive_prs forces discovery
+        // independent of interface mode (flag checked first).
         let should_search_unknown = self
             .interfaces
             .get(&interface_id)
-            .is_some_and(|iface| mode_discovers_unknown_paths(iface.mode));
+            .is_some_and(|iface| iface.recursive_prs || mode_discovers_unknown_paths(iface.mode));
 
         if is_from_local_client {
-            debug!(
+            pr_log!(
+                self,
                 dest = %hex::encode(requested_dest),
                 "forwarding path request from local shared client"
             );
@@ -450,7 +510,8 @@ impl TransportActor {
             );
             self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
         } else if self.has_local_client_interfaces() {
-            debug!(
+            pr_log!(
+                self,
                 dest = %hex::encode(requested_dest),
                 "forwarding path request to local shared clients"
             );
@@ -458,7 +519,8 @@ impl TransportActor {
                 self.send_path_request(requested_dest, local_id, None, false);
             }
         } else {
-            debug!(
+            pr_log!(
+                self,
                 dest = %hex::encode(requested_dest),
                 interface_id,
                 "ignoring unknown path request on non-discovery interface"
