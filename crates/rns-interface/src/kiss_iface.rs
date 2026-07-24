@@ -502,7 +502,13 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(handle.online.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handle.online.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("KISS interface did not return online after reconnect");
 
         handle.read_task.abort();
         drop(handle.tx);
