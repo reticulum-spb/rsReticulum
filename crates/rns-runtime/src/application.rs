@@ -58,6 +58,28 @@ pub struct PacketReceipt {
     pub rtt: Duration,
 }
 
+/// Build an announce packet for an application destination without registering
+/// it with the runtime.
+///
+/// This is useful for applications that already own destination registration
+/// through a Link manager but still need Reticulum's canonical announce wire
+/// format.
+pub fn build_announce_packet(
+    identity: &Identity,
+    app_name: &str,
+    app_data: Option<&[u8]>,
+    ratchet: Option<&[u8; 32]>,
+    path_response: bool,
+    tag: Option<&[u8]>,
+) -> Result<([u8; 16], Vec<u8>), ApplicationError> {
+    let mut destination =
+        Destination::new(Some(identity), Direction::In, DestType::Single, app_name)?;
+    let hash = destination.hash;
+    let packet =
+        destination.announce_packet(identity, app_data, ratchet, path_response, tag, now())?;
+    Ok((hash, packet))
+}
+
 /// A Destination registered with the running Reticulum transport.
 pub struct RegisteredDestination {
     runtime: ReticulumHandle,
@@ -469,5 +491,31 @@ mod tests {
             rns_crypto::sha::truncated_hash(&full_hash),
             "proof destination must not hash the packet hash a second time"
         );
+    }
+
+    #[test]
+    fn standalone_announce_uses_canonical_destination_hash() {
+        let identity = Identity::new();
+        let (hash, raw) = build_announce_packet(
+            &identity,
+            "example.service",
+            Some(b"hello"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            "example.service",
+        )
+        .unwrap();
+        let (header, _) = PacketHeader::unpack(&raw).unwrap();
+
+        assert_eq!(hash, destination.hash);
+        assert_eq!(header.destination_hash, destination.hash);
+        assert_eq!(header.flags.packet_type, PacketType::Announce);
     }
 }
