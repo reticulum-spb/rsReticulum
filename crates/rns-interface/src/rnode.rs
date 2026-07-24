@@ -102,13 +102,13 @@ pub const REQUIRED_FW_VER_MIN: u8 = 52;
 
 pub const RSSI_OFFSET: i32 = 157;
 
-pub const RECONNECT_WAIT: u64 = crate::serial_tcp_stream::RECONNECT_WAIT_SECS;
+pub const RECONNECT_WAIT: u64 = 5;
 
 pub const RADIO_STATE_ON: u8 = 0x01;
 pub const RADIO_STATE_OFF: u8 = 0x00;
 
 /// Default TCP port for RNode-over-IP.
-pub use crate::serial_tcp_stream::DEFAULT_TCP_PORT;
+pub const DEFAULT_TCP_PORT: u16 = 7633;
 
 #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 type RNodeStopRegistry = Mutex<HashMap<InterfaceId, mpsc::Sender<()>>>;
