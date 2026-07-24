@@ -792,7 +792,8 @@ impl TransportActor {
             .is_some_and(|entry| self.is_local_client_interface(entry.receiving_interface));
         let to_local_client = for_local_client || proof_for_local_client;
 
-        let link_request_for_this_instance = header.transport_id.is_none()
+        let link_request_for_this_instance = self.is_shared_instance_peer_interface(interface_id)
+            || header.transport_id.is_none()
             || header
                 .transport_id
                 .zip(self.transport_identity_hash)

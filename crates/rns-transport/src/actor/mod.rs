@@ -2675,6 +2675,43 @@ mod tests {
         assert_eq!(forwarded_header.transport_id, None);
     }
 
+    #[test]
+    fn shared_instance_peer_delivers_header2_link_request_to_local_destination() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.transport_identity_hash = Some([0xAA; 16]);
+
+        let (mut shared_peer, _peer_rx) = make_test_interface("shared_peer");
+        shared_peer.role = InterfaceRole::SharedInstancePeer;
+        actor.interfaces.insert(1, shared_peer);
+
+        let destination_hash = [0x55; 16];
+        let (destination_tx, mut destination_rx) = mpsc::channel(8);
+        actor.local_destinations.insert(destination_hash);
+        actor
+            .destination_channels
+            .insert(destination_hash, destination_tx);
+
+        let shared_daemon_identity = [0xBB; 16];
+        let raw = make_header2_link_request_packet(
+            shared_daemon_identity,
+            destination_hash,
+            0,
+            &[0x42; 64],
+        );
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+
+        assert!(matches!(
+            destination_rx.try_recv(),
+            Ok(crate::link_messages::DestinationEvent::LinkRequest { .. })
+        ));
+    }
+
     fn make_lrproof_packet_with_payload(link_id: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
