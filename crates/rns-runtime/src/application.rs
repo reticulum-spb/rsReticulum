@@ -214,7 +214,7 @@ impl RegisteredDestination {
         interface_id: u64,
     ) -> Result<(), ApplicationError> {
         let proof = identity.prove(&packet_hash, true)?;
-        let destination_hash = rns_crypto::sha::truncated_hash(&packet_hash);
+        let destination_hash = proof_destination_hash(&packet_hash);
         let header = PacketHeader {
             flags: PacketFlags {
                 header_type: HeaderType::Header1,
@@ -440,4 +440,34 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+fn proof_destination_hash(packet_hash: &[u8; 32]) -> [u8; 16] {
+    let mut destination_hash = [0u8; 16];
+    destination_hash.copy_from_slice(&packet_hash[..16]);
+    destination_hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_is_addressed_to_truncated_packet_hash() {
+        let raw = [
+            0x00, 0x00, // flags, hops
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, //
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, // destination
+            0x00, // context
+            0xAA, 0xBB, 0xCC, // payload
+        ];
+        let (full_hash, truncated_hash) = packet_hash_pair(&raw, HeaderType::Header1);
+
+        assert_eq!(proof_destination_hash(&full_hash), truncated_hash);
+        assert_ne!(
+            proof_destination_hash(&full_hash),
+            rns_crypto::sha::truncated_hash(&full_hash),
+            "proof destination must not hash the packet hash a second time"
+        );
+    }
 }
