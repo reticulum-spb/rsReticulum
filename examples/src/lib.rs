@@ -5,6 +5,8 @@
 //! surface of rsReticulum.
 
 use std::error::Error;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use rns_identity::destination::{DestType, Destination, Direction, ProofStrategy};
 use rns_identity::identity::Identity;
@@ -14,9 +16,54 @@ use rns_protocol::channel::Channel;
 use rns_protocol::channel_message::{ChannelMessageError, MessageBase};
 use rns_protocol::resource::{InboundResource, OutboundResource};
 
-pub type ExampleResult = Result<(), Box<dyn Error>>;
+pub type ExampleResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 const APP_NAME: &str = "example_utilities";
+
+pub async fn runtime(
+    config: Option<&str>,
+) -> Result<
+    (
+        rns_runtime::reticulum::ReticulumHandle,
+        rns_runtime::lifecycle::ShutdownSignal,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
+    let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
+    let handle = rns_runtime::reticulum::init(
+        config,
+        None,
+        shutdown.clone(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await?;
+    Ok((handle, shutdown))
+}
+
+pub fn option(name: &str) -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == name {
+            return args.next();
+        }
+    }
+    None
+}
+
+pub fn parse_hash(value: &str) -> Result<[u8; 16], Box<dyn Error + Send + Sync>> {
+    let bytes = hex::decode(value)?;
+    <[u8; 16]>::try_from(bytes.as_slice())
+        .map_err(|_| "destination hash must be 32 hexadecimal characters".into())
+}
+
+pub async fn read_line() -> Result<String, Box<dyn Error + Send + Sync>> {
+    Ok(tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok::<_, std::io::Error>(line.trim_end().to_string())
+    })
+    .await??)
+}
 
 /// A user-defined Channel message equivalent to `StringMessage` in Channel.py.
 #[derive(Debug, Default)]
@@ -40,7 +87,9 @@ impl MessageBase for StringMessage {
     }
 }
 
-fn single_destination(aspect: &str) -> Result<(Identity, Destination), Box<dyn Error>> {
+fn single_destination(
+    aspect: &str,
+) -> Result<(Identity, Destination), Box<dyn Error + Send + Sync>> {
     let identity = Identity::new();
     let mut destination = Destination::new(
         Some(&identity),

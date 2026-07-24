@@ -12,6 +12,8 @@ rns-wire = { workspace = true, features = ["std"] }
 rns-identity = { workspace = true }
 rns-link = { workspace = true }
 rns-protocol = { workspace = true }
+rns-runtime = { workspace = true }
 hex = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
