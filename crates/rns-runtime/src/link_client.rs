@@ -18,6 +18,9 @@ use rns_protocol::resource::{InboundTransfer, TransferAction};
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{AnnounceHandlerEvent, OutboundRequest, TransportMessage};
+use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+
+use crate::reticulum::ReticulumHandle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkClientError {
@@ -43,6 +46,254 @@ pub enum LinkClientError {
 pub struct LinkClient {
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: Arc<Identity>,
+}
+
+/// A reusable, established outbound Reticulum Link.
+///
+/// Unlike [`LinkClient`], this session stays open after one request and exposes
+/// packet, identification and request operations to applications.
+pub struct LinkSession {
+    transport_tx: mpsc::Sender<TransportMessage>,
+    identity: Arc<Identity>,
+    link: Link,
+    event_rx: mpsc::Receiver<DestinationEvent>,
+}
+
+impl LinkSession {
+    /// Establish and validate a Link to a destination already learned through
+    /// an announce. The local identity is not sent until [`identify`](Self::identify)
+    /// is called.
+    pub async fn open(
+        runtime: &ReticulumHandle,
+        identity: Identity,
+        destination_hash: [u8; 16],
+        hops: u8,
+        deadline: Duration,
+    ) -> Result<Self, LinkClientError> {
+        let public_key = match runtime
+            .query_control(TransportQuery::Recall { destination_hash })
+            .await
+        {
+            Some(TransportQueryResponse::Announce(Some(entry))) => entry.public_key,
+            _ => None,
+        }
+        .ok_or(LinkClientError::PubkeyNotDiscovered)?;
+
+        let (mut link, request_data) = Link::new_initiator(destination_hash, hops);
+        let link_id = link.link_id;
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        send_transport(
+            &runtime.transport_tx,
+            TransportMessage::RegisterDestination {
+                hash: link_id,
+                app_name: "application.link".into(),
+                delivery_tx: Some(event_tx),
+            },
+        )
+        .await?;
+        send_transport(
+            &runtime.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_link_request_packet(destination_hash, &request_data),
+                destination_hash,
+            }),
+        )
+        .await?;
+
+        let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
+        let ed25519_bytes: [u8; 32] = public_key[32..]
+            .try_into()
+            .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
+        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
+            .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
+        let rtt_data = link
+            .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
+            .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
+        send_transport(
+            &runtime.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data),
+                destination_hash: link_id,
+            }),
+        )
+        .await?;
+        Ok(Self {
+            transport_tx: runtime.transport_tx.clone(),
+            identity: Arc::new(identity),
+            link,
+            event_rx,
+        })
+    }
+
+    pub fn id(&self) -> [u8; 16] {
+        self.link.link_id
+    }
+
+    pub fn rtt(&self) -> Duration {
+        self.link.rtt.unwrap_or_default()
+    }
+
+    pub fn remote_identity(&self) -> Option<&[u8; 64]> {
+        self.link.remote_identity()
+    }
+
+    /// Identify the local identity to the remote Link peer.
+    pub async fn identify(&mut self) -> Result<(), LinkClientError> {
+        let public_key = self.identity.get_public_key();
+        let signing_key = self
+            .identity
+            .get_signing_key()
+            .ok_or(LinkClientError::NoSigningKey)?;
+        let payload = self
+            .link
+            .identify(&public_key, &signing_key)
+            .map_err(|error| LinkClientError::LinkCrypto(format!("identify: {error:?}")))?;
+        self.send_context(rns_wire::context::PacketContext::LinkIdentify, payload)
+            .await
+    }
+
+    /// Send one encrypted Link packet.
+    pub async fn send(&self, data: &[u8]) -> Result<(), LinkClientError> {
+        let encrypted = self
+            .link
+            .encrypt(data)
+            .map_err(|error| LinkClientError::LinkCrypto(format!("packet: {error:?}")))?;
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_data_packet(
+                    self.id(),
+                    rns_wire::context::PacketContext::None,
+                    &encrypted,
+                ),
+                destination_hash: self.id(),
+            }),
+        )
+        .await
+    }
+
+    /// Receive the next encrypted application packet on this Link.
+    pub async fn recv(&mut self) -> Result<Vec<u8>, LinkClientError> {
+        while let Some(event) = self.event_rx.recv().await {
+            match event {
+                DestinationEvent::LinkClosed { link_id } if link_id == self.id() => {
+                    return Err(LinkClientError::HandshakeFailed("link closed".into()));
+                }
+                DestinationEvent::InboundPacket { raw, .. } => {
+                    let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    if header.destination_hash != self.id() {
+                        continue;
+                    }
+                    if header.context == rns_wire::context::PacketContext::LinkClose
+                        && self.link.receive_teardown(&raw[offset..])
+                    {
+                        return Err(LinkClientError::HandshakeFailed(
+                            "link closed by remote".into(),
+                        ));
+                    }
+                    if header.flags.packet_type == rns_wire::flags::PacketType::Data
+                        && header.context == rns_wire::context::PacketContext::None
+                    {
+                        return self.link.decrypt(&raw[offset..]).map_err(|error| {
+                            LinkClientError::LinkCrypto(format!("packet: {error:?}"))
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(LinkClientError::HandshakeFailed(
+            "destination channel closed".into(),
+        ))
+    }
+
+    /// Send a request and wait for its response, including Resource responses.
+    pub async fn request(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        deadline: Duration,
+    ) -> Result<Vec<u8>, LinkClientError> {
+        let (encrypted, request_id) = self
+            .link
+            .request(path, data, deadline)
+            .map_err(|error| LinkClientError::LinkCrypto(format!("request: {error:?}")))?;
+        let packet = build_data_packet(
+            self.id(),
+            rns_wire::context::PacketContext::Request,
+            &encrypted,
+        );
+        let packet_request_id =
+            rns_wire::hash::truncated_packet_hash(&packet, rns_wire::flags::HeaderType::Header1);
+        self.link
+            .update_pending_request_id(&request_id, packet_request_id);
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: packet,
+                destination_hash: self.id(),
+            }),
+        )
+        .await?;
+        let link_id = self.link.link_id;
+        wait_for_response(
+            &self.transport_tx,
+            &mut self.event_rx,
+            &mut self.link,
+            link_id,
+            packet_request_id,
+            deadline,
+        )
+        .await
+    }
+
+    pub async fn close(&mut self) -> Result<(), LinkClientError> {
+        if let Some(payload) = self.link.teardown(CloseReason::InitiatorClosed) {
+            self.send_context(rns_wire::context::PacketContext::LinkClose, payload)
+                .await?;
+        }
+        let _ = self
+            .transport_tx
+            .send(TransportMessage::DeregisterDestination { hash: self.id() })
+            .await;
+        Ok(())
+    }
+
+    async fn send_context(
+        &self,
+        context: rns_wire::context::PacketContext,
+        payload: Vec<u8>,
+    ) -> Result<(), LinkClientError> {
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_data_packet(self.id(), context, &payload),
+                destination_hash: self.id(),
+            }),
+        )
+        .await
+    }
+}
+
+impl Drop for LinkSession {
+    fn drop(&mut self) {
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::DeregisterDestination { hash: self.id() });
+    }
+}
+
+async fn send_transport(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    message: TransportMessage,
+) -> Result<(), LinkClientError> {
+    transport_tx
+        .send(message)
+        .await
+        .map_err(|_| LinkClientError::TransportUnavailable)
 }
 
 impl LinkClient {

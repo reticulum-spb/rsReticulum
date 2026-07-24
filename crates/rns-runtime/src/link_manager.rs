@@ -460,6 +460,10 @@ impl LinkManager {
             LinkManagerCommand::Announce => {
                 if let Some(handler) = self.announce_handler.as_mut() {
                     handler();
+                } else if let Some(destination) = self.destination.as_ref() {
+                    self.send_destination_announce(AnnounceRequest::normal(
+                        destination.app_name.clone(),
+                    ));
                 }
                 true
             }
