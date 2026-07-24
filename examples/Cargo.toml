@@ -1,0 +1,17 @@
+[package]
+name = "rns-examples"
+description = "Rust counterparts and API coverage tests for Reticulum/Examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rns-crypto = { workspace = true, features = ["std"] }
+rns-wire = { workspace = true, features = ["std"] }
+rns-identity = { workspace = true }
+rns-link = { workspace = true }
+rns-protocol = { workspace = true }
+hex = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }

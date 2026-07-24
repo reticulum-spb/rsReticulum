@@ -11,6 +11,7 @@ members = [
     "crates/rns-runtime",
     "crates/rns-tools",
     "crates/rns-ratkey",
+    "examples",
 ]
 
 [workspace.package]

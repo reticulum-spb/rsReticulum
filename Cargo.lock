@@ -1767,6 +1767,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rns-examples"
+version = "1.0.1"
+dependencies = [
+ "hex",
+ "rmp-serde",
+ "rns-crypto",
+ "rns-identity",
+ "rns-link",
+ "rns-protocol",
+ "rns-wire",
+ "serde",
+]
+
+[[package]]
 name = "rns-identity"
 version = "1.0.1"
 dependencies = [

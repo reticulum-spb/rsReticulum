@@ -29,6 +29,7 @@ rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 ## Contents
 
 - [Build It](#build-it)
+- [Rust Examples](#rust-examples)
 - [Tool Usage](#tool-usage)
 - [Configuration](#configuration)
 - [Interface Support](#interface-support)
@@ -97,6 +98,23 @@ cargo build --release
 
 After the build, use the commands below with `./target/release/<tool>` on
 macOS/Linux or `.\target\release\<tool>.exe` on Windows.
+
+## Rust Examples
+
+The [`examples`](examples/README.md) workspace crate contains a Rust
+counterpart for every program in the reference implementation's
+`Reticulum/Examples` directory. They also serve as compile-time probes of the
+public application API:
+
+```bash
+cargo run -p rns-examples --bin minimal
+cargo run -p rns-examples --bin channel
+cargo run -p rns-examples --bin resource
+cargo test -p rns-examples
+```
+
+See the examples README for the coverage table and the application-level API
+gaps found while porting them.
 
 ## Tool Usage
 
