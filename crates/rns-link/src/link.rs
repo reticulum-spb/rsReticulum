@@ -680,6 +680,7 @@ impl Link {
         }
 
         self.remote_identity_pub = Some(public_key);
+        self.peer_ed25519_pub = Some(ed25519_pub_bytes);
         self.identified = true;
 
         Ok(public_key)
