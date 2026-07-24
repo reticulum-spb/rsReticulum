@@ -77,6 +77,19 @@ pub struct ReceivedResource {
     pub resource_hash: [u8; 32],
 }
 
+/// Proof-backed result of sending an application payload over a Link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkPayloadSendReceipt {
+    Packet {
+        link_id: [u8; 16],
+        packet_hash: [u8; 32],
+    },
+    Resource {
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+    },
+}
+
 impl LinkSession {
     /// Establish and validate a Link to a destination already learned through
     /// an announce. The local identity is not sent until [`identify`](Self::identify)
@@ -236,6 +249,41 @@ impl LinkSession {
         )
         .await?;
         Ok(packet_hash)
+    }
+
+    /// Send an application payload using the appropriate Link representation
+    /// and wait for its delivery proof.
+    ///
+    /// Payloads fitting the Link MDU use a single encrypted Link packet.
+    /// Larger payloads use the Resource protocol, including automatic
+    /// multi-segment splitting. The session remains open and can be reused
+    /// after this operation completes.
+    pub async fn send_payload(
+        &mut self,
+        data: Vec<u8>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<LinkPayloadSendReceipt, LinkClientError> {
+        let link_id = self.id();
+        if data.len() <= self.mdu() {
+            let expected_hash = self.send_tracked(&data).await?;
+            let expires = Instant::now() + deadline;
+            loop {
+                let packet_hash = self.recv_delivery_proof(time_remaining(expires)?).await?;
+                if packet_hash == expected_hash {
+                    return Ok(LinkPayloadSendReceipt::Packet {
+                        link_id,
+                        packet_hash,
+                    });
+                }
+            }
+        }
+
+        let resource_hash = self.send_resource(data, auto_compress, deadline).await?;
+        Ok(LinkPayloadSendReceipt::Resource {
+            link_id,
+            resource_hash,
+        })
     }
 
     /// Wait for the next valid delivery proof for an application Link packet.
@@ -1517,5 +1565,81 @@ mod tests {
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkClose);
         assert!(responder.receive_teardown(&request.raw[offset..]));
+    }
+
+    #[tokio::test]
+    async fn send_payload_uses_packet_and_waits_for_matching_proof() {
+        let dest_hash = [0xCD; 16];
+        let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let responder_pub = responder_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &responder_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &responder_pub, &responder_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+
+        let link_id = initiator.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(4);
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let mut session = LinkSession {
+            transport_tx,
+            identity: Arc::new(Identity::new()),
+            link: initiator,
+            event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
+        };
+
+        let send = async {
+            session
+                .send_payload(
+                    b"short application payload".to_vec(),
+                    true,
+                    Duration::from_secs(1),
+                )
+                .await
+        };
+        let prove = async {
+            let TransportMessage::Outbound(request) = transport_rx.recv().await.unwrap() else {
+                panic!("expected outbound Link packet");
+            };
+            let packet_hash =
+                rns_wire::hash::packet_hash(&request.raw, rns_wire::flags::HeaderType::Header1);
+            let proof = responder.prove_packet_with_link_key(&packet_hash).unwrap();
+            let header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Proof,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context: rns_wire::context::PacketContext::LinkProof,
+            };
+            let mut raw = header.pack();
+            raw.extend_from_slice(&proof);
+            event_tx
+                .send(DestinationEvent::InboundPacket {
+                    raw: Bytes::from(raw),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+            packet_hash
+        };
+
+        let (receipt, packet_hash) = tokio::join!(send, prove);
+        assert_eq!(
+            receipt.unwrap(),
+            LinkPayloadSendReceipt::Packet {
+                link_id,
+                packet_hash,
+            }
+        );
     }
 }
