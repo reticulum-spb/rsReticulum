@@ -1932,6 +1932,37 @@ mod tests {
                 }
             );
         }
+
+        let inbound_payload = b"backchannel payload";
+        let encrypted = responder.encrypt(inbound_payload).unwrap();
+        let inbound_raw =
+            build_data_packet(link_id, rns_wire::context::PacketContext::None, &encrypted);
+        let inbound_hash =
+            rns_wire::hash::packet_hash(&inbound_raw, rns_wire::flags::HeaderType::Header1);
+        event_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: inbound_raw,
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(handle.recv().await.unwrap(), inbound_payload);
+        let TransportMessage::Outbound(proof_request) = transport_rx.recv().await.unwrap() else {
+            panic!("expected outbound LINKPROOF");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof_request.raw).unwrap();
+        assert_eq!(
+            proof_header.flags.packet_type,
+            rns_wire::flags::PacketType::Proof
+        );
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::LinkProof
+        );
+        assert!(responder.validate_packet_proof(&inbound_hash, &proof_request.raw[proof_offset..]));
+
         drop(handle);
         worker.await.unwrap();
     }
