@@ -388,6 +388,16 @@ pub enum TransportQuery {
     GetRateTable,
     GetLinkCount,
     GetRecentAnnounces,
+    /// Point lookup into the same cache `GetRecentAnnounces` exposes in
+    /// full — mirrors Python `RNS.Identity.recall(destination_hash)`, which
+    /// reads `Identity.known_destinations` (populated unconditionally in
+    /// `Identity.validate_announce`, independent of any app-level announce
+    /// subscription). Added so applications (LXMF and otherwise) don't each
+    /// need to maintain their own duplicate announce/identity cache just to
+    /// answer "do we already know a public key for this destination hash" —
+    /// this was previously only answerable by fetching the entire table via
+    /// `GetRecentAnnounces` and filtering client-side.
+    Recall { destination_hash: [u8; 16] },
     GetNextHop {
         dest: [u8; 16],
     },
@@ -546,6 +556,9 @@ pub enum TransportQueryResponse {
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
+    /// Response to `Recall` — `None` if we've never seen a valid announce
+    /// for that destination hash (or it's expired/been evicted).
+    Announce(Option<AnnounceRpcEntry>),
     IntResult(i64),
     FloatResult(Option<f64>),
     StringResult(Option<String>),
