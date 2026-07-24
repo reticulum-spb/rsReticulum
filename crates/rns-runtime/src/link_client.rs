@@ -526,6 +526,8 @@ impl LinkSession {
                     .link
                     .decrypt(&raw[offset..])
                     .map_err(|error| LinkClientError::LinkCrypto(format!("packet: {error:?}")))?;
+                self.prove_application_packet(&raw, header.flags.header_type)
+                    .await?;
                 self.pending_packets.push_back(packet);
                 continue;
             }
@@ -577,9 +579,12 @@ impl LinkSession {
                     if header.flags.packet_type == rns_wire::flags::PacketType::Data
                         && header.context == rns_wire::context::PacketContext::None
                     {
-                        return self.link.decrypt(&raw[offset..]).map_err(|error| {
+                        let packet = self.link.decrypt(&raw[offset..]).map_err(|error| {
                             LinkClientError::LinkCrypto(format!("packet: {error:?}"))
-                        });
+                        })?;
+                        self.prove_application_packet(&raw, header.flags.header_type)
+                            .await?;
+                        return Ok(packet);
                     }
                 }
                 _ => {}
@@ -1100,6 +1105,30 @@ impl LinkSession {
             &self.transport_tx,
             TransportMessage::Outbound(OutboundRequest {
                 raw: build_data_packet(self.id(), context, &payload),
+                destination_hash: self.id(),
+            }),
+        )
+        .await
+    }
+
+    async fn prove_application_packet(
+        &mut self,
+        raw: &[u8],
+        header_type: rns_wire::flags::HeaderType,
+    ) -> Result<(), LinkClientError> {
+        let packet_hash = rns_wire::hash::packet_hash(raw, header_type);
+        let proof = self
+            .link
+            .prove_packet_with_link_key(&packet_hash)
+            .map_err(|error| LinkClientError::LinkCrypto(format!("packet proof: {error:?}")))?;
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: build_proof_packet(
+                    self.id(),
+                    rns_wire::context::PacketContext::LinkProof,
+                    &proof,
+                ),
                 destination_hash: self.id(),
             }),
         )
@@ -1757,6 +1786,19 @@ mod tests {
         let (header, _) = rns_wire::header::PacketHeader::unpack(&pkt).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
         assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Data);
+    }
+
+    #[test]
+    fn build_proof_packet_uses_link_proof_type() {
+        let packet = build_proof_packet(
+            [0xBD; 16],
+            rns_wire::context::PacketContext::LinkProof,
+            &[0x42],
+        );
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+        assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Proof);
+        assert_eq!(header.destination_hash, [0xBD; 16]);
+        assert_eq!(header.context, rns_wire::context::PacketContext::LinkProof);
     }
 
     #[test]
