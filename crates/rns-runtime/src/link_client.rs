@@ -14,6 +14,8 @@ use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use rns_link::link::{CloseReason, Link};
+use rns_protocol::channel::{ChannelError, LinkChannel};
+use rns_protocol::channel_message::MessageBase;
 use rns_protocol::resource::{InboundTransfer, TransferAction};
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
@@ -40,6 +42,8 @@ pub enum LinkClientError {
     LinkCrypto(String),
     #[error("unexpected response from remote: {0}")]
     UnexpectedResponse(String),
+    #[error("channel: {0}")]
+    Channel(#[from] ChannelError),
 }
 
 #[derive(Clone)]
@@ -57,6 +61,8 @@ pub struct LinkSession {
     identity: Arc<Identity>,
     link: Link,
     event_rx: mpsc::Receiver<DestinationEvent>,
+    channel: Option<LinkChannel>,
+    channel_packets: Vec<[u8; 32]>,
 }
 
 impl LinkSession {
@@ -122,6 +128,8 @@ impl LinkSession {
             identity: Arc::new(identity),
             link,
             event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
         })
     }
 
@@ -250,6 +258,103 @@ impl LinkSession {
         .await
     }
 
+    pub fn channel_ready(&self) -> bool {
+        self.channel
+            .as_ref()
+            .is_none_or(LinkChannel::is_ready_to_send)
+    }
+
+    /// Send a typed message over the Link Channel.
+    pub async fn send_channel(&mut self, message: &dyn MessageBase) -> Result<(), LinkClientError> {
+        self.ensure_channel()?;
+        let link_id = self.id();
+        let channel = self.channel.as_mut().expect("channel initialized");
+        let prepared = channel.prepare_send_tracked(message)?;
+        let raw = build_data_packet(
+            link_id,
+            rns_wire::context::PacketContext::Channel,
+            &prepared.data,
+        );
+        let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        channel.track_outbound_packet_hash(packet_hash, prepared.sequence);
+        self.channel_packets.push(packet_hash);
+        send_transport(
+            &self.transport_tx,
+            TransportMessage::Outbound(OutboundRequest {
+                raw,
+                destination_hash: link_id,
+            }),
+        )
+        .await
+    }
+
+    /// Receive the next typed Channel envelope.
+    pub async fn recv_channel(&mut self) -> Result<(u16, Vec<u8>), LinkClientError> {
+        self.ensure_channel()?;
+        loop {
+            let event =
+                self.event_rx.recv().await.ok_or_else(|| {
+                    LinkClientError::HandshakeFailed("link channel closed".into())
+                })?;
+            let DestinationEvent::InboundPacket { raw, .. } = event else {
+                continue;
+            };
+            let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if header.destination_hash != self.id() {
+                continue;
+            }
+            let body = &raw[offset..];
+            if header.flags.packet_type == rns_wire::flags::PacketType::Proof {
+                if let Some(index) = self
+                    .channel_packets
+                    .iter()
+                    .position(|hash| self.link.validate_packet_proof(hash, body))
+                {
+                    let hash = self.channel_packets.remove(index);
+                    self.channel
+                        .as_mut()
+                        .expect("channel initialized")
+                        .delivered_by_packet_hash(&hash, self.link.rtt_secs());
+                }
+                continue;
+            }
+            if header.context != rns_wire::context::PacketContext::Channel {
+                continue;
+            }
+            let packet_hash =
+                rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+            let proof = self
+                .link
+                .prove_packet_with_link_key(&packet_hash)
+                .map_err(|error| {
+                    LinkClientError::LinkCrypto(format!("channel proof: {error:?}"))
+                })?;
+            send_transport(
+                &self.transport_tx,
+                TransportMessage::Outbound(OutboundRequest {
+                    raw: build_proof_packet(
+                        self.id(),
+                        rns_wire::context::PacketContext::None,
+                        &proof,
+                    ),
+                    destination_hash: self.id(),
+                }),
+            )
+            .await?;
+            let delivered = self
+                .channel
+                .as_mut()
+                .expect("channel initialized")
+                .receive_data(body)?;
+            if let Some(message) = delivered.into_iter().next() {
+                return Ok(message);
+            }
+        }
+    }
+
     pub async fn close(&mut self) -> Result<(), LinkClientError> {
         if let Some(payload) = self.link.teardown(CloseReason::InitiatorClosed) {
             self.send_context(rns_wire::context::PacketContext::LinkClose, payload)
@@ -275,6 +380,22 @@ impl LinkSession {
             }),
         )
         .await
+    }
+
+    fn ensure_channel(&mut self) -> Result<(), LinkClientError> {
+        if self.channel.is_none() {
+            let keys = self
+                .link
+                .session_keys()
+                .ok_or_else(|| LinkClientError::LinkCrypto("missing session keys".into()))?;
+            self.channel = Some(LinkChannel::new_encrypted(
+                self.id(),
+                self.link.rtt_secs(),
+                keys,
+            ));
+            self.link.mark_channel_created();
+        }
+        Ok(())
     }
 }
 
