@@ -2,12 +2,12 @@
 //! does the full handshake (pubkey discovery → link → identify → request →
 //! response → close) over its own destination channel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use rns_crypto::ed25519::Ed25519PublicKey;
@@ -68,6 +68,7 @@ pub struct LinkSession {
     event_rx: mpsc::Receiver<DestinationEvent>,
     channel: Option<LinkChannel>,
     channel_packets: Vec<[u8; 32]>,
+    pending_packets: VecDeque<Vec<u8>>,
 }
 
 /// An outbound Link whose identifier and handshake packet have been prepared,
@@ -82,6 +83,32 @@ pub struct PreparedLinkSession {
     public_key: [u8; 64],
     link: Link,
     request_data: Vec<u8>,
+}
+
+/// Command handle for a runtime task that exclusively owns a reusable
+/// outbound [`LinkSession`].
+#[derive(Clone)]
+pub struct LinkSessionHandle {
+    link_id: [u8; 16],
+    command_tx: mpsc::Sender<LinkSessionCommand>,
+}
+
+enum LinkSessionCommand {
+    Identify {
+        result_tx: oneshot::Sender<Result<(), LinkClientError>>,
+    },
+    SendPayload {
+        data: Vec<u8>,
+        auto_compress: bool,
+        deadline: Duration,
+        result_tx: oneshot::Sender<Result<LinkPayloadSendReceipt, LinkClientError>>,
+    },
+    Receive {
+        result_tx: oneshot::Sender<Result<Vec<u8>, LinkClientError>>,
+    },
+    Close {
+        result_tx: oneshot::Sender<Result<(), LinkClientError>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +183,115 @@ impl PreparedLinkSession {
             event_rx,
             channel: None,
             channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
         })
+    }
+
+    /// Spawn a task that establishes and then exclusively owns this session.
+    ///
+    /// The returned handle is available immediately and retains the prepared
+    /// `link_id`; commands wait behind establishment in the task queue.
+    pub fn spawn(self, deadline: Duration) -> LinkSessionHandle {
+        let link_id = self.id();
+        let (command_tx, command_rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let Ok(session) = self.establish(deadline).await else {
+                return;
+            };
+            run_established_link_session(session, command_rx).await;
+        });
+        LinkSessionHandle {
+            link_id,
+            command_tx,
+        }
+    }
+}
+
+impl LinkSessionHandle {
+    pub fn id(&self) -> [u8; 16] {
+        self.link_id
+    }
+
+    pub async fn identify(&self) -> Result<(), LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::Identify { result_tx })
+            .await?;
+        recv_command_result(result_rx).await
+    }
+
+    pub async fn send_payload(
+        &self,
+        data: Vec<u8>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<LinkPayloadSendReceipt, LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::SendPayload {
+            data,
+            auto_compress,
+            deadline,
+            result_tx,
+        })
+        .await?;
+        recv_command_result(result_rx).await
+    }
+
+    pub async fn recv(&self) -> Result<Vec<u8>, LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::Receive { result_tx })
+            .await?;
+        recv_command_result(result_rx).await
+    }
+
+    pub async fn close(&self) -> Result<(), LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::Close { result_tx })
+            .await?;
+        recv_command_result(result_rx).await
+    }
+
+    async fn send_command(&self, command: LinkSessionCommand) -> Result<(), LinkClientError> {
+        self.command_tx
+            .send(command)
+            .await
+            .map_err(|_| LinkClientError::HandshakeFailed("Link session task stopped".into()))
+    }
+}
+
+async fn recv_command_result<T>(
+    receiver: oneshot::Receiver<Result<T, LinkClientError>>,
+) -> Result<T, LinkClientError> {
+    receiver
+        .await
+        .map_err(|_| LinkClientError::HandshakeFailed("Link session task stopped".into()))?
+}
+
+async fn run_established_link_session(
+    mut session: LinkSession,
+    mut command_rx: mpsc::Receiver<LinkSessionCommand>,
+) {
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            LinkSessionCommand::Identify { result_tx } => {
+                let _ = result_tx.send(session.identify().await);
+            }
+            LinkSessionCommand::SendPayload {
+                data,
+                auto_compress,
+                deadline,
+                result_tx,
+            } => {
+                let _ = result_tx.send(session.send_payload(data, auto_compress, deadline).await);
+            }
+            LinkSessionCommand::Receive { result_tx } => {
+                let _ = result_tx.send(session.recv().await);
+            }
+            LinkSessionCommand::Close { result_tx } => {
+                let result = session.close().await;
+                let _ = result_tx.send(result);
+                break;
+            }
+        }
     }
 }
 
@@ -285,13 +420,13 @@ impl LinkSession {
     }
 
     /// Send one encrypted Link packet.
-    pub async fn send(&self, data: &[u8]) -> Result<(), LinkClientError> {
+    pub async fn send(&mut self, data: &[u8]) -> Result<(), LinkClientError> {
         self.send_tracked(data).await.map(|_| ())
     }
 
     /// Send one encrypted Link packet and return the hash addressed by its
     /// delivery proof.
-    pub async fn send_tracked(&self, data: &[u8]) -> Result<[u8; 32], LinkClientError> {
+    pub async fn send_tracked(&mut self, data: &[u8]) -> Result<[u8; 32], LinkClientError> {
         let encrypted = self
             .link
             .encrypt(data)
@@ -354,45 +489,57 @@ impl LinkSession {
         deadline: Duration,
     ) -> Result<[u8; 32], LinkClientError> {
         let link_id = self.id();
-        let future = async {
-            while let Some(event) = self.event_rx.recv().await {
-                let DestinationEvent::InboundPacket { raw, .. } = event else {
-                    continue;
-                };
-                let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-                if header.destination_hash != link_id
-                    || header.flags.packet_type != rns_wire::flags::PacketType::Proof
-                    || !matches!(
-                        header.context,
-                        rns_wire::context::PacketContext::LinkProof
-                            | rns_wire::context::PacketContext::None
-                    )
-                {
-                    continue;
-                }
-                let proof = &raw[offset..];
-                let Some(packet_hash) = proof.get(..32).and_then(|hash| hash.try_into().ok())
-                else {
-                    continue;
-                };
-                if self.link.validate_packet_proof(&packet_hash, proof) {
-                    return Ok(packet_hash);
-                }
+        let expires = Instant::now() + deadline;
+        loop {
+            let event = timeout(time_remaining(expires)?, self.event_rx.recv())
+                .await
+                .map_err(|_| LinkClientError::Timeout("packet delivery proof"))?
+                .ok_or_else(|| {
+                    LinkClientError::HandshakeFailed("destination channel closed".into())
+                })?;
+            let DestinationEvent::InboundPacket { raw, .. } = event else {
+                continue;
+            };
+            let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if header.destination_hash == link_id
+                && header.flags.packet_type == rns_wire::flags::PacketType::Data
+                && header.context == rns_wire::context::PacketContext::None
+            {
+                let packet = self
+                    .link
+                    .decrypt(&raw[offset..])
+                    .map_err(|error| LinkClientError::LinkCrypto(format!("packet: {error:?}")))?;
+                self.pending_packets.push_back(packet);
+                continue;
             }
-            Err(LinkClientError::HandshakeFailed(
-                "destination channel closed".into(),
-            ))
-        };
-        timeout(deadline, future)
-            .await
-            .map_err(|_| LinkClientError::Timeout("packet delivery proof"))?
+            if header.destination_hash != link_id
+                || header.flags.packet_type != rns_wire::flags::PacketType::Proof
+                || !matches!(
+                    header.context,
+                    rns_wire::context::PacketContext::LinkProof
+                        | rns_wire::context::PacketContext::None
+                )
+            {
+                continue;
+            }
+            let proof = &raw[offset..];
+            let Some(packet_hash) = proof.get(..32).and_then(|hash| hash.try_into().ok()) else {
+                continue;
+            };
+            if self.link.validate_packet_proof(&packet_hash, proof) {
+                return Ok(packet_hash);
+            }
+        }
     }
 
     /// Receive the next encrypted application packet on this Link.
     pub async fn recv(&mut self) -> Result<Vec<u8>, LinkClientError> {
+        if let Some(packet) = self.pending_packets.pop_front() {
+            return Ok(packet);
+        }
         while let Some(event) = self.event_rx.recv().await {
             match event {
                 DestinationEvent::LinkClosed { link_id } if link_id == self.id() => {
@@ -1649,7 +1796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_payload_accepts_python_style_packet_proof() {
+    async fn session_worker_sends_payload_with_python_style_packet_proof() {
         let dest_hash = [0xCD; 16];
         let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let responder_pub = responder_key.public_key();
@@ -1664,17 +1811,24 @@ mod tests {
         let link_id = initiator.link_id;
         let (transport_tx, mut transport_rx) = mpsc::channel(4);
         let (event_tx, event_rx) = mpsc::channel(4);
-        let mut session = LinkSession {
+        let session = LinkSession {
             transport_tx,
             identity: Arc::new(Identity::new()),
             link: initiator,
             event_rx,
             channel: None,
             channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
         };
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let handle = LinkSessionHandle {
+            link_id,
+            command_tx,
+        };
+        let worker = tokio::spawn(run_established_link_session(session, command_rx));
 
         let send = async {
-            session
+            handle
                 .send_payload(
                     b"short application payload".to_vec(),
                     true,
@@ -1724,5 +1878,7 @@ mod tests {
                 packet_hash,
             }
         );
+        drop(handle);
+        worker.await.unwrap();
     }
 }
