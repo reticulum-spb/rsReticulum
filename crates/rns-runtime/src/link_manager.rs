@@ -150,7 +150,9 @@ pub enum LinkManagerCommand {
         reason: CloseReason,
         send_teardown: bool,
     },
-    Announce,
+    Announce {
+        app_data: Option<Vec<u8>>,
+    },
     Shutdown,
 }
 
@@ -457,13 +459,14 @@ impl LinkManager {
                 self.close_active_link(link_id, reason, send_teardown);
                 true
             }
-            LinkManagerCommand::Announce => {
+            LinkManagerCommand::Announce { app_data } => {
                 if let Some(handler) = self.announce_handler.as_mut() {
                     handler();
                 } else if let Some(destination) = self.destination.as_ref() {
-                    self.send_destination_announce(AnnounceRequest::normal(
-                        destination.app_name.clone(),
-                    ));
+                    self.send_destination_announce(
+                        AnnounceRequest::normal(destination.app_name.clone()),
+                        app_data.as_deref(),
+                    );
                 }
                 true
             }
@@ -495,17 +498,17 @@ impl LinkManager {
             }
             DestinationEvent::AnnounceRequested(request) => {
                 if request.path_response {
-                    self.send_destination_announce(request);
+                    self.send_destination_announce(request, None);
                 } else if let Some(handler) = self.announce_handler.as_mut() {
                     handler();
                 } else {
-                    self.send_destination_announce(request);
+                    self.send_destination_announce(request, None);
                 }
             }
         }
     }
 
-    fn send_destination_announce(&mut self, request: AnnounceRequest) {
+    fn send_destination_announce(&mut self, request: AnnounceRequest, app_data: Option<&[u8]>) {
         let Some(destination) = self.destination.as_mut() else {
             tracing::debug!(
                 app_name = %request.app_name,
@@ -525,7 +528,7 @@ impl LinkManager {
 
         let raw = match destination.announce_packet(
             identity,
-            None,
+            app_data,
             None,
             request.path_response,
             request.tag.as_deref(),

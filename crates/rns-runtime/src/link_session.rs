@@ -139,8 +139,17 @@ impl LinkListener {
     }
 
     pub async fn announce(&self) -> Result<(), LinkListenerError> {
+        self.announce_with_app_data(None).await
+    }
+
+    pub async fn announce_with_app_data(
+        &self,
+        app_data: Option<&[u8]>,
+    ) -> Result<(), LinkListenerError> {
         self.command_tx
-            .send(LinkManagerCommand::Announce)
+            .send(LinkManagerCommand::Announce {
+                app_data: app_data.map(<[u8]>::to_vec),
+            })
             .await
             .map_err(|_| LinkListenerError::ManagerStopped)
     }
