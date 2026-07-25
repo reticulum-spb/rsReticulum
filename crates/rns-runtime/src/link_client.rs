@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkAction};
 pub use rns_link::{
     constants::{ESTABLISHMENT_TIMEOUT_PER_HOP, KEEPALIVE_DEFAULT},
     link::LinkState,
@@ -112,6 +112,12 @@ enum LinkSessionCommand {
     ReceiveResource {
         deadline: Duration,
         result_tx: oneshot::Sender<Result<ReceivedResource, LinkClientError>>,
+    },
+    SendResource {
+        data: Vec<u8>,
+        auto_compress: bool,
+        deadline: Duration,
+        result_tx: oneshot::Sender<Result<[u8; 32], LinkClientError>>,
     },
     Close {
         result_tx: oneshot::Sender<Result<(), LinkClientError>>,
@@ -268,6 +274,23 @@ impl LinkSessionHandle {
         recv_command_result(result_rx).await
     }
 
+    pub async fn send_resource(
+        &self,
+        data: Vec<u8>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<[u8; 32], LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::SendResource {
+            data,
+            auto_compress,
+            deadline,
+            result_tx,
+        })
+        .await?;
+        recv_command_result(result_rx).await
+    }
+
     pub async fn close(&self) -> Result<(), LinkClientError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.send_command(LinkSessionCommand::Close { result_tx })
@@ -320,6 +343,15 @@ async fn run_established_link_session(
                         result_tx,
                     } => {
                         let _ = result_tx.send(session.recv_resource(deadline).await);
+                    }
+                    LinkSessionCommand::SendResource {
+                        data,
+                        auto_compress,
+                        deadline,
+                        result_tx,
+                    } => {
+                        let _ = result_tx
+                            .send(session.send_resource(data, auto_compress, deadline).await);
                     }
                     LinkSessionCommand::Close { result_tx } => {
                         let result = session.close().await;
@@ -585,7 +617,19 @@ impl LinkSession {
         if let Some(packet) = self.pending_packets.pop_front() {
             return Ok(packet);
         }
-        while let Some(event) = self.event_rx.recv().await {
+        loop {
+            let event = tokio::select! {
+                event = self.event_rx.recv() => event,
+                _ = sleep(Duration::from_secs_f64(
+                    rns_link::constants::WATCHDOG_MAX_SLEEP,
+                )) => {
+                    self.drive_watchdog().await?;
+                    continue;
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 DestinationEvent::LinkClosed { link_id } if link_id == self.id() => {
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
@@ -598,12 +642,17 @@ impl LinkSession {
                     if header.destination_hash != self.id() {
                         continue;
                     }
+                    self.link.record_inbound();
+                    self.link.record_rx(raw.len().saturating_sub(offset));
                     if header.context == rns_wire::context::PacketContext::LinkClose
                         && self.link.receive_teardown(&raw[offset..])
                     {
                         return Err(LinkClientError::HandshakeFailed(
                             "link closed by remote".into(),
                         ));
+                    }
+                    if header.context == rns_wire::context::PacketContext::Keepalive {
+                        continue;
                     }
                     if matches!(
                         header.context,
@@ -620,6 +669,7 @@ impl LinkSession {
                         let packet = self.link.decrypt(&raw[offset..]).map_err(|error| {
                             LinkClientError::LinkCrypto(format!("packet: {error:?}"))
                         })?;
+                        self.link.keepalive.record_data();
                         self.prove_application_packet(&raw, header.flags.header_type)
                             .await?;
                         return Ok(packet);
@@ -631,6 +681,48 @@ impl LinkSession {
         Err(LinkClientError::HandshakeFailed(
             "destination channel closed".into(),
         ))
+    }
+
+    async fn drive_watchdog(&mut self) -> Result<(), LinkClientError> {
+        match self.link.tick() {
+            LinkAction::None => Ok(()),
+            LinkAction::SendKeepalive | LinkAction::TransitionedToStale => {
+                let raw = build_data_packet(
+                    self.id(),
+                    rns_wire::context::PacketContext::Keepalive,
+                    &[rns_link::constants::KEEPALIVE_REQUEST],
+                );
+                send_transport(
+                    &self.transport_tx,
+                    TransportMessage::Outbound(OutboundRequest {
+                        raw,
+                        destination_hash: self.id(),
+                    }),
+                )
+                .await?;
+                self.link.record_tx_keepalive(1);
+                Ok(())
+            }
+            LinkAction::SendTeardownAndClose(data) => {
+                if !data.is_empty() {
+                    let raw = build_data_packet(
+                        self.id(),
+                        rns_wire::context::PacketContext::LinkClose,
+                        &data,
+                    );
+                    send_transport(
+                        &self.transport_tx,
+                        TransportMessage::Outbound(OutboundRequest {
+                            raw,
+                            destination_hash: self.id(),
+                        }),
+                    )
+                    .await?;
+                }
+                Err(LinkClientError::Timeout("link keepalive response"))
+            }
+            LinkAction::Closed(_) => Err(LinkClientError::Timeout("link watchdog")),
+        }
     }
 
     /// Send a request and wait for its response, including Resource responses.
@@ -1913,6 +2005,49 @@ mod tests {
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkClose);
         assert!(responder.receive_teardown(&request.raw[offset..]));
+    }
+
+    #[tokio::test]
+    async fn reusable_session_watchdog_sends_link_keepalive() {
+        let dest_hash = [0xCF; 16];
+        let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let responder_pub = responder_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &responder_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &responder_pub, &responder_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        initiator.keepalive.update_from_rtt(Duration::ZERO);
+        initiator.keepalive.last_inbound =
+            Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
+
+        let link_id = initiator.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(4);
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let mut session = LinkSession {
+            transport_tx,
+            identity: Arc::new(Identity::new()),
+            link: initiator,
+            event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+
+        session.drive_watchdog().await.unwrap();
+        let TransportMessage::Outbound(request) = transport_rx.try_recv().unwrap() else {
+            panic!("expected outbound keepalive");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.destination_hash, link_id);
+        assert_eq!(header.context, rns_wire::context::PacketContext::Keepalive);
+        assert_eq!(
+            &request.raw[offset..],
+            &[rns_link::constants::KEEPALIVE_REQUEST]
+        );
     }
 
     #[tokio::test]
