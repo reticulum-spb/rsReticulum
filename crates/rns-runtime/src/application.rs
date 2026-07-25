@@ -488,6 +488,76 @@ pub async fn send_pre_encrypted_packet(
     Ok(submission)
 }
 
+/// Send an application-prepared encrypted DATA payload and wait for its proof.
+pub async fn send_pre_encrypted_packet_with_receipt(
+    runtime: &ReticulumHandle,
+    destination_hash: [u8; 16],
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<PacketReceipt, ApplicationError> {
+    let (raw, submission) = build_pre_encrypted_packet(destination_hash, payload)?;
+    let listener = Destination::new(None, Direction::In, DestType::Single, "packet.receipt")?;
+    let (tx, mut rx) = mpsc::channel(16);
+    runtime
+        .transport_tx
+        .send(TransportMessage::RegisterDestination {
+            hash: listener.hash,
+            app_name: "packet.receipt".into(),
+            delivery_tx: Some(tx),
+        })
+        .await
+        .map_err(|_| ApplicationError::TransportClosed)?;
+    runtime
+        .transport_tx
+        .send(TransportMessage::RegisterReceipt {
+            truncated_hash: submission.truncated_hash,
+            full_hash: submission.packet_hash,
+            msg_id: hex::encode(submission.packet_hash),
+            timeout: Some(timeout),
+        })
+        .await
+        .map_err(|_| ApplicationError::TransportClosed)?;
+    runtime
+        .transport_tx
+        .send(TransportMessage::Outbound(OutboundRequest {
+            raw,
+            destination_hash,
+        }))
+        .await
+        .map_err(|_| ApplicationError::TransportClosed)?;
+
+    let msg_id = hex::encode(submission.packet_hash);
+    let started = Instant::now();
+    let result = tokio::time::timeout(timeout, async {
+        while let Some(event) = rx.recv().await {
+            if let DestinationEvent::DeliveryProof {
+                msg_id: received,
+                rtt,
+            } = event
+                && received == msg_id
+            {
+                return Some(rtt.unwrap_or_else(|| started.elapsed()));
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    let _ = runtime
+        .transport_tx
+        .send(TransportMessage::DeregisterDestination {
+            hash: listener.hash,
+        })
+        .await;
+    result
+        .map(|rtt| PacketReceipt {
+            packet_hash: submission.packet_hash,
+            rtt,
+        })
+        .ok_or(ApplicationError::Timeout)
+}
+
 /// Non-blocking variant of [`send_pre_encrypted_packet`] for synchronous
 /// application state machines.
 pub fn try_send_pre_encrypted_packet(
