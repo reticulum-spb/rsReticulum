@@ -73,6 +73,7 @@ pub struct LinkSession {
     channel: Option<LinkChannel>,
     channel_packets: Vec<[u8; 32]>,
     pending_packets: VecDeque<Vec<u8>>,
+    pending_resource_packets: VecDeque<Bytes>,
 }
 
 /// An outbound Link whose identifier and handshake packet have been prepared,
@@ -107,6 +108,10 @@ enum LinkSessionCommand {
         auto_compress: bool,
         deadline: Duration,
         result_tx: oneshot::Sender<Result<LinkPayloadSendReceipt, LinkClientError>>,
+    },
+    ReceiveResource {
+        deadline: Duration,
+        result_tx: oneshot::Sender<Result<ReceivedResource, LinkClientError>>,
     },
     Close {
         result_tx: oneshot::Sender<Result<(), LinkClientError>>,
@@ -186,6 +191,7 @@ impl PreparedLinkSession {
             channel: None,
             channel_packets: Vec::new(),
             pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
         })
     }
 
@@ -249,6 +255,19 @@ impl LinkSessionHandle {
             .ok_or_else(|| LinkClientError::HandshakeFailed("Link session task stopped".into()))?
     }
 
+    pub async fn recv_resource(
+        &self,
+        deadline: Duration,
+    ) -> Result<ReceivedResource, LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::ReceiveResource {
+            deadline,
+            result_tx,
+        })
+        .await?;
+        recv_command_result(result_rx).await
+    }
+
     pub async fn close(&self) -> Result<(), LinkClientError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.send_command(LinkSessionCommand::Close { result_tx })
@@ -295,6 +314,12 @@ async fn run_established_link_session(
                     } => {
                         let _ = result_tx
                             .send(session.send_payload(data, auto_compress, deadline).await);
+                    }
+                    LinkSessionCommand::ReceiveResource {
+                        deadline,
+                        result_tx,
+                    } => {
+                        let _ = result_tx.send(session.recv_resource(deadline).await);
                     }
                     LinkSessionCommand::Close { result_tx } => {
                         let result = session.close().await;
@@ -580,6 +605,15 @@ impl LinkSession {
                             "link closed by remote".into(),
                         ));
                     }
+                    if matches!(
+                        header.context,
+                        rns_wire::context::PacketContext::ResourceAdv
+                            | rns_wire::context::PacketContext::Resource
+                            | rns_wire::context::PacketContext::ResourceHmu
+                    ) {
+                        self.pending_resource_packets.push_back(raw);
+                        continue;
+                    }
                     if header.flags.packet_type == rns_wire::flags::PacketType::Data
                         && header.context == rns_wire::context::PacketContext::None
                     {
@@ -746,9 +780,28 @@ impl LinkSession {
             let mut transfers: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
             let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
             let mut multi: Option<MultiSegmentInbound> = None;
-            while let Some(event) = self.event_rx.recv().await {
-                let DestinationEvent::InboundPacket { raw, .. } = event else {
-                    continue;
+            loop {
+                let raw = if let Some(raw) = self.pending_resource_packets.pop_front() {
+                    raw
+                } else {
+                    loop {
+                        match self.event_rx.recv().await {
+                            Some(DestinationEvent::InboundPacket { raw, .. }) => break raw,
+                            Some(DestinationEvent::LinkClosed { link_id })
+                                if link_id == self.id() =>
+                            {
+                                return Err(LinkClientError::HandshakeFailed(
+                                    "link closed during resource".into(),
+                                ));
+                            }
+                            Some(_) => {}
+                            None => {
+                                return Err(LinkClientError::HandshakeFailed(
+                                    "resource channel closed".into(),
+                                ));
+                            }
+                        }
+                    }
                 };
                 let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                     Ok(value) => value,
@@ -759,6 +812,16 @@ impl LinkSession {
                 }
                 let body = &raw[offset..];
                 match header.context {
+                    rns_wire::context::PacketContext::None
+                        if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
+                    {
+                        let packet = self.link.decrypt(body).map_err(|error| {
+                            LinkClientError::LinkCrypto(format!("packet: {error:?}"))
+                        })?;
+                        self.prove_application_packet(&raw, header.flags.header_type)
+                            .await?;
+                        self.pending_packets.push_back(packet);
+                    }
                     rns_wire::context::PacketContext::ResourceAdv => {
                         let plaintext = self.link.decrypt(body).map_err(|error| {
                             LinkClientError::LinkCrypto(format!(
@@ -926,9 +989,6 @@ impl LinkSession {
                     _ => {}
                 }
             }
-            Err(LinkClientError::HandshakeFailed(
-                "resource channel closed".into(),
-            ))
         };
         timeout(deadline, future)
             .await
@@ -1881,6 +1941,7 @@ mod tests {
             channel: None,
             channel_packets: Vec::new(),
             pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
         };
         let (command_tx, command_rx) = mpsc::channel(4);
         let (inbound_tx, inbound_rx) = mpsc::channel(4);
@@ -1939,6 +2000,7 @@ mod tests {
             channel: None,
             channel_packets: Vec::new(),
             pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
         };
         let (command_tx, command_rx) = mpsc::channel(4);
         let (inbound_tx, inbound_rx) = mpsc::channel(4);

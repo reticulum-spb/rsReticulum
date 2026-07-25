@@ -397,7 +397,9 @@ pub enum TransportQuery {
     /// answer "do we already know a public key for this destination hash" —
     /// this was previously only answerable by fetching the entire table via
     /// `GetRecentAnnounces` and filtering client-side.
-    Recall { destination_hash: [u8; 16] },
+    Recall {
+        destination_hash: [u8; 16],
+    },
     GetNextHop {
         dest: [u8; 16],
     },

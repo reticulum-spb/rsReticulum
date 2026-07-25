@@ -152,8 +152,9 @@ pub async fn spawn_kiss_interface(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    let port_cfg = PortConfig::parse(&config.port, config.baud_rate)
-        .map_err(|e| crate::traits::InterfaceError::SendFailed(format!("kiss port parse: {}", e)))?;
+    let port_cfg = PortConfig::parse(&config.port, config.baud_rate).map_err(|e| {
+        crate::traits::InterfaceError::SendFailed(format!("kiss port parse: {}", e))
+    })?;
 
     let port = open_configured_kiss_stream(&config, &port_cfg).await?;
 
@@ -460,7 +461,9 @@ mod tests {
     #[test]
     fn test_kiss_port_config_serial() {
         let cfg = PortConfig::parse("/dev/ttyUSB0", 9600).unwrap();
-        assert!(matches!(cfg, PortConfig::Serial { path, baud } if path == "/dev/ttyUSB0" && baud == 9600));
+        assert!(
+            matches!(cfg, PortConfig::Serial { path, baud } if path == "/dev/ttyUSB0" && baud == 9600)
+        );
     }
 
     /// A TCP KISS interface reconnects instead of dying when the peer
@@ -486,7 +489,9 @@ mod tests {
         });
 
         let (transport_tx, _transport_rx) = mpsc::channel::<TransportMessage>(8);
-        let handle = spawn_kiss_interface(config, 99, transport_tx).await.unwrap();
+        let handle = spawn_kiss_interface(config, 99, transport_tx)
+            .await
+            .unwrap();
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
