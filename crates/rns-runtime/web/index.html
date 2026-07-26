@@ -211,6 +211,7 @@
             <option value="TCPServerInterface">TCP Server</option>
             <option value="UDPInterface">UDP</option>
             <option value="AutoInterface">Auto</option>
+            <option value="BackboneInterface">Backbone</option>
             <option value="SerialInterface">Serial</option>
             <option value="KISSInterface">KISS</option>
             <option value="RNodeInterface">RNode</option>
@@ -327,6 +328,36 @@
           <input id="auto-configured-bitrate" type="number" min="1" step="1"
                  placeholder="10000000">
         </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="backbone-fields" hidden disabled>
+        <legend>Backbone</legend>
+        <label>Role
+          <select id="backbone-role">
+            <option value="listener">Listener</option>
+            <option value="client">Client</option>
+          </select>
+        </label>
+        <label>Port
+          <input id="backbone-port" type="number" min="1" max="65535" required>
+        </label>
+        <label class="wide" id="backbone-target-field" hidden>Target host
+          <input id="backbone-target-host" autocomplete="off">
+        </label>
+        <label class="wide" id="backbone-listen-field">Listen address <span class="optional">optional</span>
+          <input id="backbone-listen-on" autocomplete="off" placeholder="0.0.0.0">
+        </label>
+        <label>Device <span class="optional">optional</span>
+          <input id="backbone-device" autocomplete="off">
+        </label>
+        <label>Connect timeout
+          <input id="backbone-connect-timeout" type="number" min="1" step="1" value="5">
+        </label>
+        <label>Reconnect limit <span class="optional">optional</span>
+          <input id="backbone-reconnect-limit" type="number" min="0" step="1">
+        </label>
+        <label class="check-field"><input id="backbone-prefer-ipv6" type="checkbox"><span>Prefer IPv6</span></label>
+        <label class="check-field"><input id="backbone-i2p-tunneled" type="checkbox"><span>I2P tunneled</span></label>
       </fieldset>
 
       <fieldset class="form-grid" id="serial-fields" hidden disabled>

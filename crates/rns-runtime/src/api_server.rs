@@ -346,6 +346,10 @@ struct InterfaceRequest {
     prefer_ipv6: Option<bool>,
     device: Option<String>,
 
+    // BackboneInterface
+    listen_on: Option<String>,
+    i2p_tunneled: Option<bool>,
+
     // Shared
     kiss_framing: Option<bool>,
     interface_mode: Option<String>,
@@ -458,6 +462,12 @@ impl InterfaceRequest {
         }
         if let Some(ref v) = self.device {
             s.set("device", v);
+        }
+        if let Some(ref v) = self.listen_on {
+            s.set("listen_on", v);
+        }
+        if let Some(v) = self.i2p_tunneled {
+            s.set("i2p_tunneled", if v { "Yes" } else { "No" });
         }
         if let Some(v) = self.kiss_framing {
             s.set("kiss_framing", if v { "Yes" } else { "No" });
@@ -1192,6 +1202,8 @@ fn iface_section_json(section: &ConfigSection) -> Value {
         "forward_port": section.get_uint("forward_port"),
         "prefer_ipv6": section.get_bool("prefer_ipv6"),
         "device": section.get("device"),
+        "listen_on": section.get("listen_on"),
+        "i2p_tunneled": section.get_bool("i2p_tunneled"),
         "kiss_framing": section.get_bool("kiss_framing"),
         "interface_mode": section.get("interface_mode").unwrap_or("Full"),
         "port": section.get("port"),
@@ -1335,6 +1347,18 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "ignored_devices":        c.ignored_devices.join(", "),
             "configured_bitrate":     c.configured_bitrate,
             "interface_mode":         mode_to_str(c.mode),
+        }),
+        InterfaceConfig::Backbone(c) => json!({
+            "type":                  "BackboneInterface",
+            "listen_on":             c.listen_on,
+            "target_host":           c.target_host,
+            "port":                  c.port,
+            "device":                c.device,
+            "prefer_ipv6":           c.prefer_ipv6,
+            "connect_timeout":       c.connect_timeout,
+            "max_reconnect_tries":   c.max_reconnect_tries,
+            "i2p_tunneled":          c.i2p_tunneled,
+            "interface_mode":        mode_to_str(c.mode),
         }),
         #[cfg(feature = "serial")]
         InterfaceConfig::Serial(c) => json!({
@@ -1658,6 +1682,29 @@ mod tests {
         assert_eq!(value["ignored_devices"], "docker0, veth0");
         assert_eq!(value["configured_bitrate"], 20000000);
         assert_eq!(value["interface_mode"], "Full");
+    }
+
+    #[test]
+    fn backbone_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test Backbone",
+            "type": "BackboneInterface",
+            "target_host": "backbone.example",
+            "target_port": 4242,
+            "prefer_ipv6": true,
+            "connect_timeout": 7,
+            "max_reconnect_tries": 4,
+            "i2p_tunneled": true
+        }))
+        .unwrap();
+        let value = iface_config_json(&request.synthesize().unwrap());
+        assert_eq!(value["type"], "BackboneInterface");
+        assert_eq!(value["target_host"], "backbone.example");
+        assert_eq!(value["port"], 4242);
+        assert_eq!(value["prefer_ipv6"], true);
+        assert_eq!(value["connect_timeout"], 7);
+        assert_eq!(value["max_reconnect_tries"], 4);
+        assert_eq!(value["i2p_tunneled"], true);
     }
 
     #[test]

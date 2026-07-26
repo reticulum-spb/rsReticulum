@@ -232,6 +232,10 @@ function interfaceEndpoint(item) {
   if (config.type === "AutoInterface") {
     return config.group_id || "reticulum";
   }
+  if (config.type === "BackboneInterface") {
+    const host = config.target_host || config.listen_on || "0.0.0.0";
+    return `${host}:${config.port ?? "—"}`;
+  }
   if (
     config.type === "SerialInterface"
     || config.type === "KISSInterface"
@@ -293,6 +297,7 @@ function interfaceDetails(item) {
       "TCPServerInterface",
       "UDPInterface",
       "AutoInterface",
+      "BackboneInterface",
       "SerialInterface",
       "KISSInterface",
       "RNodeInterface",
@@ -612,6 +617,7 @@ function setInterfaceType(type) {
   const server = document.querySelector("#tcp-server-fields");
   const udp = document.querySelector("#udp-fields");
   const auto = document.querySelector("#auto-fields");
+  const backbone = document.querySelector("#backbone-fields");
   const serial = document.querySelector("#serial-fields");
   const kissSerial = document.querySelector("#kiss-fields");
   const rnode = document.querySelector("#rnode-fields");
@@ -621,6 +627,7 @@ function setInterfaceType(type) {
   const isServer = type === "TCPServerInterface";
   const isUdp = type === "UDPInterface";
   const isAuto = type === "AutoInterface";
+  const isBackbone = type === "BackboneInterface";
   const isSerial = type === "SerialInterface";
   const isKiss = type === "KISSInterface";
   const isRNode = type === "RNodeInterface";
@@ -633,6 +640,8 @@ function setInterfaceType(type) {
   udp.disabled = !isUdp;
   auto.hidden = !isAuto;
   auto.disabled = !isAuto;
+  backbone.hidden = !isBackbone;
+  backbone.disabled = !isBackbone;
   serial.hidden = !isSerial;
   serial.disabled = !isSerial;
   kissSerial.hidden = !isKiss;
@@ -644,6 +653,13 @@ function setInterfaceType(type) {
   const usesKissFraming = isClient || isServer;
   kiss.hidden = !usesKissFraming;
   document.querySelector("#kiss-framing").disabled = !usesKissFraming;
+}
+
+function setBackboneRole(role) {
+  const client = role === "client";
+  document.querySelector("#backbone-target-field").hidden = !client;
+  document.querySelector("#backbone-listen-field").hidden = client;
+  document.querySelector("#backbone-target-host").required = client;
 }
 
 function setField(selector, value, fallback = "") {
@@ -685,6 +701,19 @@ function openInterfaceDialog(item = null) {
   setField("#auto-devices", config.devices);
   setField("#auto-ignored-devices", config.ignored_devices);
   setField("#auto-configured-bitrate", config.configured_bitrate);
+  const backboneRole = config.target_host ? "client" : "listener";
+  setField("#backbone-role", backboneRole);
+  setField("#backbone-port", config.port);
+  setField("#backbone-target-host", config.target_host);
+  setField("#backbone-listen-on", config.listen_on);
+  setField("#backbone-device", config.device);
+  setField("#backbone-connect-timeout", config.connect_timeout, 5);
+  setField("#backbone-reconnect-limit", config.max_reconnect_tries);
+  document.querySelector("#backbone-prefer-ipv6").checked =
+    Boolean(config.prefer_ipv6);
+  document.querySelector("#backbone-i2p-tunneled").checked =
+    Boolean(config.i2p_tunneled);
+  setBackboneRole(backboneRole);
   setField("#advanced-bitrate", config.bitrate);
   setField("#advanced-announce-cap", config.announce_cap);
   setField("#advanced-rate-target", config.announce_rate_target);
@@ -870,6 +899,25 @@ function interfacePayload() {
     if (configuredBitrate !== undefined) {
       payload.configured_bitrate = configuredBitrate;
     }
+  } else if (type === "BackboneInterface") {
+    payload.target_port = Number(document.querySelector("#backbone-port").value);
+    payload.prefer_ipv6 =
+      document.querySelector("#backbone-prefer-ipv6").checked;
+    payload.i2p_tunneled =
+      document.querySelector("#backbone-i2p-tunneled").checked;
+    if (document.querySelector("#backbone-role").value === "client") {
+      payload.target_host =
+        document.querySelector("#backbone-target-host").value.trim();
+    } else {
+      const listenOn = document.querySelector("#backbone-listen-on").value.trim();
+      if (listenOn) payload.listen_on = listenOn;
+    }
+    const device = document.querySelector("#backbone-device").value.trim();
+    const timeout = optionalInteger("#backbone-connect-timeout");
+    const reconnect = optionalInteger("#backbone-reconnect-limit");
+    if (device) payload.device = device;
+    if (timeout !== undefined) payload.connect_timeout = timeout;
+    if (reconnect !== undefined) payload.max_reconnect_tries = reconnect;
   } else if (type === "SerialInterface") {
     payload.port = document.querySelector("#serial-port").value.trim();
     payload.speed = Number(document.querySelector("#serial-speed").value);
@@ -1087,6 +1135,9 @@ function initialize() {
   document.querySelector("#add-interface").addEventListener("click", () => openInterfaceDialog());
   document.querySelector("#interface-type").addEventListener("change", (event) => {
     setInterfaceType(event.target.value);
+  });
+  document.querySelector("#backbone-role").addEventListener("change", (event) => {
+    setBackboneRole(event.target.value);
   });
   document.querySelector("#open-interface-advanced").addEventListener("click", () => {
     document.querySelector("#interface-advanced-dialog").showModal();

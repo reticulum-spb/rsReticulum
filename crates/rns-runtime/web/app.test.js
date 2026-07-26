@@ -58,6 +58,19 @@ test("formats Auto interface group", () => {
   );
 });
 
+test("formats Backbone endpoint", () => {
+  assert.equal(
+    interfaceEndpoint({
+      config: {
+        type: "BackboneInterface",
+        target_host: "backbone.example",
+        port: 4242,
+      },
+    }),
+    "backbone.example:4242",
+  );
+});
+
 test("formats serial endpoints", () => {
   assert.equal(
     interfaceEndpoint({
