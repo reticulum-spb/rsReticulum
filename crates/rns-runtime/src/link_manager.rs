@@ -26,9 +26,6 @@ use rns_transport::messages::{OutboundRequest, TransportMessage};
 /// between re-checking how much is still in flight.
 const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long a shutdown waits for in-flight outbound transfers to finish.
-const LINK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Beat after teardown so queued close packets reach the wire. These go out
 /// via `try_send`, so without it they are dropped along with the runtime.
 const TEARDOWN_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
@@ -197,6 +194,29 @@ pub enum RequestOutcome {
 type RequestHandler = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send>;
 type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send>;
 type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
+
+/// Splits a handler outcome into the inline response to send, if any, and the
+/// resource transfer to start, if any.
+///
+/// An empty ack accompanying a resource is dropped: the client cannot tell it
+/// apart from a genuine empty response, so sending it makes the client return
+/// zero bytes and never wait for the resource that is the actual answer.
+type FetchSpec = (Vec<u8>, Option<Vec<u8>>, bool);
+fn split_reply_outcome(outcome: RequestOutcome) -> (Option<Vec<u8>>, Option<FetchSpec>) {
+    match outcome {
+        RequestOutcome::Reply(r) => (Some(r), None),
+        RequestOutcome::ReplyWithResource {
+            ack,
+            data,
+            metadata,
+            auto_compress,
+        } => {
+            let ack = if ack.is_empty() { None } else { Some(ack) };
+            (ack, Some((data, metadata, auto_compress)))
+        }
+        RequestOutcome::Drop => (None, None),
+    }
+}
 
 struct ResourceTransferStart {
     data: Vec<u8>,
@@ -396,7 +416,11 @@ impl LinkManager {
     /// that drops the runtime on a signal cuts off any resource transfer
     /// still on the wire: the peer sees the link go silent mid-file and
     /// reports a timeout rather than a clean end.
-    pub async fn run_until_shutdown(mut self, shutdown: crate::lifecycle::ShutdownSignal) {
+    pub async fn run_until_shutdown(
+        mut self,
+        shutdown: crate::lifecycle::ShutdownSignal,
+        drain_grace: std::time::Duration,
+    ) {
         let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
@@ -412,7 +436,7 @@ impl LinkManager {
             }
         }
 
-        self.drain_and_close(LINK_DRAIN_GRACE).await;
+        self.drain_and_close(drain_grace).await;
     }
 
     /// Outbound resource segments still queued or awaiting proof.
@@ -1760,16 +1784,7 @@ impl LinkManager {
                             RequestOutcome::Drop
                         };
 
-                        let (resp_bytes_opt, fetch_spec) = match outcome {
-                            RequestOutcome::Reply(r) => (Some(r), None),
-                            RequestOutcome::ReplyWithResource {
-                                ack,
-                                data,
-                                metadata,
-                                auto_compress,
-                            } => (Some(ack), Some((data, metadata, auto_compress))),
-                            RequestOutcome::Drop => (None, None),
-                        };
+                        let (resp_bytes_opt, fetch_spec) = split_reply_outcome(outcome);
 
                         let mut response_resource = None;
                         if let Some(resp_bytes) = resp_bytes_opt {
@@ -3040,7 +3055,7 @@ mod tests {
         );
         assert_eq!(lm.inflight_outbound_transfers(), 0);
 
-        lm.drain_and_close(LINK_DRAIN_GRACE).await;
+        lm.drain_and_close(std::time::Duration::from_secs(5)).await;
         drop(event_tx);
 
         assert_eq!(lm.active_link_count(), 0, "link left open after shutdown");
@@ -3057,6 +3072,37 @@ mod tests {
             }
         }
         assert!(sent_close, "no LinkClose packet reached the transport");
+    }
+
+    /// An empty ack alongside a resource is indistinguishable from a genuine
+    /// empty response, so the client returned 0 bytes and never waited for
+    /// the resource that was the real answer -- a silent wrong success.
+    #[test]
+    fn reply_with_resource_suppresses_a_meaningless_empty_ack() {
+        let empty = RequestOutcome::ReplyWithResource {
+            ack: Vec::new(),
+            data: vec![1, 2, 3],
+            metadata: None,
+            auto_compress: true,
+        };
+        let (ack, fetch) = split_reply_outcome(empty);
+        assert!(ack.is_none(), "empty ack must not be sent");
+        assert!(fetch.is_some());
+
+        let with_ack = RequestOutcome::ReplyWithResource {
+            ack: vec![0xAA],
+            data: vec![1, 2, 3],
+            metadata: None,
+            auto_compress: true,
+        };
+        let (ack, fetch) = split_reply_outcome(with_ack);
+        assert_eq!(ack.as_deref(), Some(&[0xAA][..]), "real ack must survive");
+        assert!(fetch.is_some());
+
+        // A plain empty Reply is a real answer and must still be delivered.
+        let (ack, fetch) = split_reply_outcome(RequestOutcome::Reply(Vec::new()));
+        assert_eq!(ack.as_deref(), Some(&[][..]));
+        assert!(fetch.is_none());
     }
 
     #[test]
