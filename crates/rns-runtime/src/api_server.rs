@@ -361,8 +361,6 @@ struct InterfaceRequest {
     persistence: Option<u8>,
     slottime: Option<u32>,
     flow_control: Option<bool>,
-    id_interval: Option<u64>,
-    id_callsign: Option<String>,
 
     // RNodeInterface
     frequency: Option<u32>,
@@ -457,14 +455,6 @@ impl InterfaceRequest {
         }
         if let Some(v) = self.flow_control {
             s.set("flow_control", if v { "Yes" } else { "No" });
-        }
-        if self.iface_type == "KISSInterface" {
-            if let Some(v) = self.id_interval {
-                s.set("id_interval", &v.to_string());
-            }
-            if let Some(ref v) = self.id_callsign {
-                s.set("id_callsign", v);
-            }
         }
         if let Some(v) = self.frequency {
             s.set("frequency", &v.to_string());
@@ -1076,8 +1066,6 @@ fn iface_section_json(section: &ConfigSection) -> Value {
         "persistence": section.get_uint("persistence"),
         "slottime": section.get_uint("slottime"),
         "flow_control": section.get_bool("flow_control"),
-        "id_interval": section.get_uint("id_interval"),
-        "id_callsign": section.get("id_callsign"),
         "frequency": section.get_uint("frequency"),
         "bandwidth": section.get_uint("bandwidth"),
         "spreadingfactor": section.get_uint("spreadingfactor")
@@ -1146,8 +1134,6 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "persistence":    c.persistence,
             "slottime":       c.slottime_ms,
             "flow_control":   c.flow_control,
-            "id_interval":    c.id_interval,
-            "id_callsign":    c.id_callsign,
             "interface_mode": mode_to_str(c.mode),
         }),
         #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
@@ -1441,9 +1427,7 @@ mod tests {
             "txtail": 10,
             "persistence": 200,
             "slottime": 30,
-            "flow_control": true,
-            "id_interval": 600,
-            "id_callsign": "N0CALL-1"
+            "flow_control": true
         }))
         .unwrap();
 
@@ -1456,8 +1440,8 @@ mod tests {
         assert_eq!(value["persistence"], 200);
         assert_eq!(value["slottime"], 30);
         assert_eq!(value["flow_control"], true);
-        assert_eq!(value["id_interval"], 600);
-        assert_eq!(value["id_callsign"], "N0CALL-1");
+        assert!(value.get("id_interval").is_none());
+        assert!(value.get("id_callsign").is_none());
     }
 
     #[cfg(feature = "serial")]

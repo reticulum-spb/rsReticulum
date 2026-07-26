@@ -673,8 +673,6 @@ function openInterfaceDialog(item = null) {
   setField("#kiss-txtail", config.txtail, 20);
   setField("#kiss-persistence", config.persistence, 64);
   setField("#kiss-slottime", config.slottime, 20);
-  setField("#kiss-id-interval", config.id_interval);
-  setField("#kiss-id-callsign", config.id_callsign);
   document.querySelector("#kiss-flow-control").checked = Boolean(config.flow_control);
   setField("#rnode-port", config.port);
   setField("#rnode-frequency", config.frequency);
@@ -762,10 +760,6 @@ function interfacePayload() {
     payload.persistence = Number(document.querySelector("#kiss-persistence").value);
     payload.slottime = Number(document.querySelector("#kiss-slottime").value);
     payload.flow_control = document.querySelector("#kiss-flow-control").checked;
-    const idInterval = optionalInteger("#kiss-id-interval");
-    const idCallsign = document.querySelector("#kiss-id-callsign").value.trim();
-    if (idInterval !== undefined) payload.id_interval = idInterval;
-    if (idCallsign) payload.id_callsign = idCallsign;
   } else if (type === "RNodeInterface") {
     payload.port = document.querySelector("#rnode-port").value.trim();
     payload.frequency = Number(document.querySelector("#rnode-frequency").value);
