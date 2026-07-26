@@ -1385,23 +1385,43 @@ impl LinkClient {
         }
     }
 
-    /// Open a Link to `app_name` on `remote_transport_hash`, send one
-    /// request, return the response.
-    pub async fn query(
+    /// Public key from the transport's announce cache, or `None` if this
+    /// destination has never been heard from.
+    ///
+    /// `Recall` is a point lookup into the same cache `GetRecentAnnounces`
+    /// dumps in full — see its docs on [`TransportQuery`].
+    async fn recall_pubkey(&self, dest_hash: [u8; 16]) -> Option<[u8; 64]> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::Recall {
+                    destination_hash: dest_hash,
+                },
+                response_tx: resp_tx,
+            })
+            .await
+            .ok()?;
+        match resp_rx.await.ok()? {
+            TransportQueryResponse::Announce(Some(entry)) => entry.public_key,
+            _ => None,
+        }
+    }
+
+    /// Ask the network for a path and wait for the answering announce to
+    /// carry the destination's public key.
+    ///
+    /// Only reached when the announce cache has no entry: an announce is
+    /// dispatched to the handlers registered *at the moment it arrives*, so
+    /// a query that registers after the answering announce has already been
+    /// dispatched waits out its full timeout for an announce nothing will
+    /// re-send. Consulting the cache first is what keeps back-to-back
+    /// queries to the same destination from alternating success/timeout.
+    async fn discover_pubkey(
         &self,
-        remote_transport_hash: [u8; 16],
         app_name: &str,
-        path: &str,
-        payload: Vec<u8>,
-        hops: u8,
-        overall_timeout: Duration,
-    ) -> Result<Vec<u8>, LinkClientError> {
-        let started = Instant::now();
-        let deadline = started + overall_timeout;
-
-        let dest_hash =
-            Destination::hash_from_name_and_identity(app_name, Some(&remote_transport_hash));
-
+        dest_hash: [u8; 16],
+        deadline: Instant,
+    ) -> Result<[u8; 64], LinkClientError> {
         // Register the handler before the path request so the answering
         // announce (carrying the pubkey) is observed.
         let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
@@ -1423,6 +1443,30 @@ impl LinkClient {
             .try_send(TransportMessage::DeregisterAnnounceHandler {
                 aspect_filter: Some(app_name.to_string()),
             });
+        Ok(pubkey)
+    }
+
+    /// Open a Link to `app_name` on `remote_transport_hash`, send one
+    /// request, return the response.
+    pub async fn query(
+        &self,
+        remote_transport_hash: [u8; 16],
+        app_name: &str,
+        path: &str,
+        payload: Vec<u8>,
+        hops: u8,
+        overall_timeout: Duration,
+    ) -> Result<Vec<u8>, LinkClientError> {
+        let started = Instant::now();
+        let deadline = started + overall_timeout;
+
+        let dest_hash =
+            Destination::hash_from_name_and_identity(app_name, Some(&remote_transport_hash));
+
+        let pubkey = match self.recall_pubkey(dest_hash).await {
+            Some(pubkey) => pubkey,
+            None => self.discover_pubkey(app_name, dest_hash, deadline).await?,
+        };
 
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
         let link_id = link.link_id;
@@ -2042,6 +2086,7 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_transport::messages::AnnounceRpcEntry;
 
     #[test]
     fn build_link_request_packet_has_link_request_type() {
@@ -2088,6 +2133,66 @@ mod tests {
 
         assert_ne!(prepared.id(), [0; 16]);
         assert!(transport_rx.try_recv().is_err());
+    }
+
+    /// An announce is delivered only to the handlers registered when it
+    /// arrives, so a query that waits for a fresh one after the answering
+    /// announce has already been dispatched hangs until its own timeout.
+    /// A destination already in the announce cache must not wait at all.
+    #[tokio::test]
+    async fn query_uses_cached_pubkey_without_waiting_for_an_announce() {
+        let app_name = "nomadnetwork.node";
+        let remote = [0xAB; 16];
+        let dest_hash = Destination::hash_from_name_and_identity(app_name, Some(&remote));
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(32);
+        let transport = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(msg) = transport_rx.recv().await {
+                seen.push(rns_transport::messages::msg_variant_name(&msg));
+                if let TransportMessage::Rpc { response_tx, .. } = msg {
+                    let _ = response_tx.send(TransportQueryResponse::Announce(Some(
+                        AnnounceRpcEntry {
+                            dest_hash,
+                            hops: 1,
+                            app_data: None,
+                            timestamp: 0.0,
+                            public_key: Some([0x11; 64]),
+                            ratchet: None,
+                            name_hash: [0; 10],
+                            is_path_response: false,
+                            retained: false,
+                        },
+                    )));
+                }
+            }
+            seen
+        });
+
+        // Fails at the handshake (nothing answers the link request); the
+        // pubkey stage is what's under test.
+        let _ = LinkClient::new(transport_tx, Identity::new())
+            .query(
+                remote,
+                app_name,
+                "/page/index.mu",
+                Vec::new(),
+                1,
+                Duration::from_millis(250),
+            )
+            .await;
+
+        let seen = transport.await.unwrap();
+        assert!(
+            !seen.contains(&"RegisterAnnounceHandler"),
+            "cached pubkey should skip announce discovery, saw: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&"RequestPath"),
+            "cached pubkey should skip the path request, saw: {seen:?}"
+        );
+        // It got far enough to attempt the link, i.e. it really used the key.
+        assert!(seen.contains(&"RegisterDestination"), "saw: {seen:?}");
     }
 
     #[tokio::test]
