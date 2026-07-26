@@ -208,6 +208,13 @@ function interfaceType(item) {
   return item.config?.type || "Runtime only";
 }
 
+function matchesInterface(item, query) {
+  const normalized = String(query || "").trim().toLocaleLowerCase();
+  if (!normalized) return true;
+  return [item.name, interfaceType(item)]
+    .some((value) => String(value || "").toLocaleLowerCase().includes(normalized));
+}
+
 function interfaceEndpoint(item) {
   const config = item.config;
   if (!config) return "Not stored in config";
@@ -350,10 +357,8 @@ function interfaceRows(items) {
 }
 
 function renderInterfaces() {
-  const query = interfaceState.filter.trim().toLocaleLowerCase();
-  const items = interfaceState.items.filter((item) =>
-    !query || (item.name || "").toLocaleLowerCase().includes(query)
-      || interfaceType(item).toLocaleLowerCase().includes(query));
+  const query = interfaceState.filter.trim();
+  const items = interfaceState.items.filter((item) => matchesInterface(item, query));
   const rows = document.querySelector("#interface-rows");
   const empty = document.querySelector("#interfaces-empty");
   const heading = document.querySelector("#interfaces-empty-heading");
@@ -487,13 +492,16 @@ function pathRows(items) {
   return fragment;
 }
 
+function matchesPath(path, query) {
+  const normalized = String(query || "").trim().toLocaleLowerCase();
+  if (!normalized) return true;
+  return [path.hash, path.via, path.interface]
+    .some((value) => String(value || "").toLocaleLowerCase().includes(normalized));
+}
+
 function renderPaths() {
-  const query = pathState.filter.trim().toLocaleLowerCase();
-  const items = pathState.items.filter((path) => {
-    if (!query) return true;
-    return [path.hash, path.via, path.interface]
-      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
-  });
+  const query = pathState.filter.trim();
+  const items = pathState.items.filter((path) => matchesPath(path, query));
   const rows = document.querySelector("#path-rows");
   const empty = document.querySelector("#paths-empty");
   rows.replaceChildren(pathRows(items));
@@ -800,89 +808,106 @@ async function refresh(button) {
   }
 }
 
-document.querySelectorAll("[data-view]").forEach((button) => {
-  button.addEventListener("click", () => {
-    const target = button.dataset.view;
-    if (window.location.hash === `#${target}`) showView(target, { focus: true });
-    else window.location.hash = target;
+function initialize() {
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.view;
+      if (window.location.hash === `#${target}`) showView(target, { focus: true });
+      else window.location.hash = target;
+    });
   });
-});
 
-document.querySelector("#mobile-menu").addEventListener("click", () => {
-  if (document.querySelector("#sidebar").classList.contains("open")) closeNavigation();
-  else openNavigation();
-});
+  document.querySelector("#mobile-menu").addEventListener("click", () => {
+    if (document.querySelector("#sidebar").classList.contains("open")) closeNavigation();
+    else openNavigation();
+  });
 
-document.querySelector("#dismiss-error").addEventListener("click", clearError);
-document.querySelector("#add-interface").addEventListener("click", () => openInterfaceDialog());
-document.querySelector("#interface-type").addEventListener("change", (event) => {
-  setInterfaceType(event.target.value);
-});
-document.querySelector("#interface-form").addEventListener("submit", saveInterface);
-document.querySelector("#delete-interface-form").addEventListener("submit", deleteInterface);
-document.querySelectorAll("[data-close-interface]").forEach((button) => {
-  button.addEventListener("click", closeInterfaceDialog);
-});
-document.querySelectorAll("[data-close-delete]").forEach((button) => {
-  button.addEventListener("click", closeDeleteDialog);
-});
-document.querySelector("#interface-search").addEventListener("input", (event) => {
-  interfaceState.filter = event.target.value;
-  renderInterfaces();
-});
-document.querySelector("#show-all-interfaces").addEventListener("change", (event) => {
-  interfaceState.showAll = event.target.checked;
-  interfaceState.expanded.clear();
-  interfaceState.loaded = false;
-  if (interfaceRequest) interfaceRequest.finally(() => refreshInterfaces());
-  else refreshInterfaces();
-});
-document.querySelector("#path-search").addEventListener("input", (event) => {
-  pathState.filter = event.target.value;
-  renderPaths();
-});
-document.querySelector("#max-hops").addEventListener("change", (event) => {
-  if (event.target.value && !event.target.checkValidity()) {
-    event.target.reportValidity();
-    return;
-  }
-  pathState.maxHops = event.target.value;
-  pathState.loaded = false;
-  if (pathRequest) pathRequest.finally(() => refreshPaths());
-  else refreshPaths();
-});
+  document.querySelector("#dismiss-error").addEventListener("click", clearError);
+  document.querySelector("#add-interface").addEventListener("click", () => openInterfaceDialog());
+  document.querySelector("#interface-type").addEventListener("change", (event) => {
+    setInterfaceType(event.target.value);
+  });
+  document.querySelector("#interface-form").addEventListener("submit", saveInterface);
+  document.querySelector("#delete-interface-form").addEventListener("submit", deleteInterface);
+  document.querySelectorAll("[data-close-interface]").forEach((button) => {
+    button.addEventListener("click", closeInterfaceDialog);
+  });
+  document.querySelectorAll("[data-close-delete]").forEach((button) => {
+    button.addEventListener("click", closeDeleteDialog);
+  });
+  document.querySelector("#interface-search").addEventListener("input", (event) => {
+    interfaceState.filter = event.target.value;
+    renderInterfaces();
+  });
+  document.querySelector("#show-all-interfaces").addEventListener("change", (event) => {
+    interfaceState.showAll = event.target.checked;
+    interfaceState.expanded.clear();
+    interfaceState.loaded = false;
+    if (interfaceRequest) interfaceRequest.finally(() => refreshInterfaces());
+    else refreshInterfaces();
+  });
+  document.querySelector("#path-search").addEventListener("input", (event) => {
+    pathState.filter = event.target.value;
+    renderPaths();
+  });
+  document.querySelector("#max-hops").addEventListener("change", (event) => {
+    if (event.target.value && !event.target.checkValidity()) {
+      event.target.reportValidity();
+      return;
+    }
+    pathState.maxHops = event.target.value;
+    pathState.loaded = false;
+    if (pathRequest) pathRequest.finally(() => refreshPaths());
+    else refreshPaths();
+  });
 
-document.querySelectorAll("[data-refresh]").forEach((button) => {
-  button.addEventListener("click", () => refresh(button));
-});
+  document.querySelectorAll("[data-refresh]").forEach((button) => {
+    button.addEventListener("click", () => refresh(button));
+  });
 
-window.addEventListener("hashchange", () => showView(currentView(), { focus: true }));
-window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeNavigation();
-});
-window.addEventListener("resize", () => {
-  if (window.innerWidth > 720) closeNavigation();
-});
-window.setInterval(() => {
-  if (currentView() === "dashboard" && !document.hidden) refreshDashboard();
-}, DASHBOARD_REFRESH_MS);
-window.setInterval(() => {
-  if (
-    currentView() === "interfaces"
-    && !document.hidden
-    && Date.now() >= interfaceNextPollAt
-  ) {
-    refreshInterfaces({ background: true });
-  }
-}, INTERFACE_REFRESH_MS);
-window.setInterval(() => {
-  if (
-    currentView() === "paths"
-    && !document.hidden
-    && Date.now() >= pathNextPollAt
-  ) {
-    refreshPaths({ background: true });
-  }
-}, PATH_REFRESH_MS);
+  window.addEventListener("hashchange", () => showView(currentView(), { focus: true }));
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeNavigation();
+  });
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 720) closeNavigation();
+  });
+  window.setInterval(() => {
+    if (currentView() === "dashboard" && !document.hidden) refreshDashboard();
+  }, DASHBOARD_REFRESH_MS);
+  window.setInterval(() => {
+    if (
+      currentView() === "interfaces"
+      && !document.hidden
+      && Date.now() >= interfaceNextPollAt
+    ) {
+      refreshInterfaces({ background: true });
+    }
+  }, INTERFACE_REFRESH_MS);
+  window.setInterval(() => {
+    if (
+      currentView() === "paths"
+      && !document.hidden
+      && Date.now() >= pathNextPollAt
+    ) {
+      refreshPaths({ background: true });
+    }
+  }, PATH_REFRESH_MS);
 
-showView(currentView());
+  showView(currentView());
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    formatBytes,
+    formatDuration,
+    formatFrequency,
+    formatNumber,
+    formatRate,
+    matchesInterface,
+    matchesPath,
+    relativeTimestamp,
+  };
+}
+
+if (typeof document !== "undefined") initialize();

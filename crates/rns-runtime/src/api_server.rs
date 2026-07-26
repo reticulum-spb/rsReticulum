@@ -156,6 +156,7 @@ impl AppState {
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 enum ApiError {
     NotFound,
     BadRequest(String),
@@ -325,6 +326,16 @@ impl InterfaceRequest {
 // Config change + interface restart
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn set_interface_config(config: &mut Config, name: &str, section: ConfigSection) {
+    let interfaces = config.ensure_section("interfaces");
+    interfaces.remove_subsection(name);
+    *interfaces.add_subsection(name.to_string()) = section;
+}
+
+fn remove_interface_config(config: &mut Config, name: &str) -> bool {
+    config.ensure_section("interfaces").remove_subsection(name)
+}
+
 /// Apply interface change:
 /// 1. Write the new section to the config file (or delete it).
 /// 2. Stop the old interface at runtime (if `old_id` is specified).
@@ -340,18 +351,15 @@ async fn apply_interface_change(
 ) -> ApiResult<u64> {
     // ── 1. Конфиг ──────────────────────────────────────────────────────────
     let mut config = s.load_config()?;
-    let interfaces_section = config.ensure_section("interfaces");
 
     match new_section {
         Some(section) => {
             // Replace or add the [[iface_name]] subsection.
-            interfaces_section.remove_subsection(iface_name);
-            let target = interfaces_section.add_subsection(iface_name.to_string());
-            *target = section;
+            set_interface_config(&mut config, iface_name, section);
         }
         None => {
             // Remove
-            if !interfaces_section.remove_subsection(iface_name) {
+            if !remove_interface_config(&mut config, iface_name) {
                 return Err(ApiError::NotFound);
             }
         }
@@ -454,7 +462,7 @@ async fn interfaces(
         .filter(|e| {
             q.filter
                 .as_deref()
-                .map_or(true, |f| e.name.to_lowercase().contains(&f.to_lowercase()))
+                .is_none_or(|f| e.name.to_lowercase().contains(&f.to_lowercase()))
         })
         .map(|e| merge_iface_json(e, configs.get(e.name.as_str())))
         .collect();
@@ -488,7 +496,7 @@ async fn paths(State(s): State<AppState>, Query(q): Query<PathsQuery>) -> ApiRes
     };
     let rows: Vec<_> = entries
         .iter()
-        .filter(|e| q.max_hops.map_or(true, |max| e.hops <= max))
+        .filter(|e| q.max_hops.is_none_or(|max| e.hops <= max))
         .map(path_json)
         .collect();
     Ok(Json(json!({ "paths": rows, "count": rows.len() })))
@@ -564,9 +572,7 @@ async fn update_interface(
     // If the name has changed, delete the old entry from the config.
     if old_name != req.name {
         let mut config = s.load_config()?;
-        config
-            .ensure_section("interfaces")
-            .remove_subsection(&old_name);
+        remove_interface_config(&mut config, &old_name);
         s.save_config(&config)?;
     }
 
@@ -706,11 +712,9 @@ fn load_interface_configs(
     let config = s.load_config()?;
     let mut map = std::collections::HashMap::new();
     for (name, section) in config.subsections("interfaces") {
-        match synthesize_interface(name, section) {
-            Ok(cfg) => {
-                map.insert(name.to_string(), cfg);
-            }
-            Err(_) => {} // disabled or unknown type - just skip
+        // Disabled and unknown interface types are not present at runtime.
+        if let Ok(cfg) = synthesize_interface(name, section) {
+            map.insert(name.to_string(), cfg);
         }
     }
     Ok(map)
@@ -734,4 +738,189 @@ fn visible_by_default(name: &str) -> bool {
         || name.starts_with("AutoInterfacePeer[")
         || name.starts_with("WeaveInterfacePeer[")
         || name.starts_with("I2PInterfacePeer[Connected peer"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    fn web_router() -> Router {
+        Router::new()
+            .route("/", get(index))
+            .route("/app.js", get(app_js))
+            .route("/style.css", get(style_css))
+            .layer(middleware::from_fn(security_headers))
+    }
+
+    #[tokio::test]
+    async fn embedded_web_assets_have_expected_content_types() {
+        let app = web_router();
+        for (path, expected) in [
+            ("/", "text/html; charset=utf-8"),
+            ("/app.js", "text/javascript; charset=utf-8"),
+            ("/style.css", "text/css; charset=utf-8"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn web_router_returns_404_for_unknown_route_with_security_headers() {
+        let response = web_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_errors_are_json_with_status() {
+        let response = ApiError::bad("invalid interface").into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": "invalid interface"})
+        );
+    }
+
+    #[test]
+    fn tcp_client_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test client",
+            "type": "TCPClientInterface",
+            "target_host": "example.test",
+            "target_port": 4242,
+            "connect_timeout": 7,
+            "max_reconnect_tries": 3,
+            "fixed_mtu": 800,
+            "interface_mode": "PointToPoint",
+            "kiss_framing": true
+        }))
+        .unwrap();
+
+        let config = request.synthesize().unwrap();
+        let value = iface_config_json(&config);
+        assert_eq!(value["type"], "TCPClientInterface");
+        assert_eq!(value["target_host"], "example.test");
+        assert_eq!(value["target_port"], 4242);
+        assert_eq!(value["connect_timeout"], 7);
+        assert_eq!(value["max_reconnect_tries"], 3);
+        assert_eq!(value["fixed_mtu"], 800);
+        assert_eq!(value["interface_mode"], "PointToPoint");
+        assert_eq!(value["kiss_framing"], true);
+    }
+
+    #[test]
+    fn tcp_server_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test server",
+            "type": "TCPServerInterface",
+            "listen_ip": "127.0.0.1",
+            "listen_port": 4242,
+            "prefer_ipv6": true,
+            "device": "lo",
+            "interface_mode": "Full",
+            "kiss_framing": false
+        }))
+        .unwrap();
+
+        let config = request.synthesize().unwrap();
+        let value = iface_config_json(&config);
+        assert_eq!(value["type"], "TCPServerInterface");
+        assert_eq!(value["listen_ip"], "127.0.0.1");
+        assert_eq!(value["listen_port"], 4242);
+        assert_eq!(value["prefer_ipv6"], true);
+        assert_eq!(value["device"], "lo");
+        assert_eq!(value["interface_mode"], "Full");
+        assert_eq!(value["kiss_framing"], false);
+    }
+
+    #[test]
+    fn invalid_tcp_request_returns_validation_error() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Broken client",
+            "type": "TCPClientInterface",
+            "target_port": 4242
+        }))
+        .unwrap();
+
+        assert!(matches!(request.synthesize(), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn interface_config_sections_can_be_created_renamed_and_deleted() {
+        let mut config = Config::parse("[interfaces]\n").unwrap();
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "First name",
+            "type": "TCPServerInterface",
+            "listen_ip": "127.0.0.1",
+            "listen_port": 4242
+        }))
+        .unwrap();
+
+        set_interface_config(&mut config, &request.name, request.to_config_section());
+        assert!(
+            config
+                .subsections("interfaces")
+                .iter()
+                .any(|(name, _)| *name == "First name")
+        );
+
+        assert!(remove_interface_config(&mut config, "First name"));
+        set_interface_config(&mut config, "Renamed", request.to_config_section());
+        let serialized = config.to_ini();
+        assert!(serialized.contains("[[Renamed]]"));
+        assert!(!serialized.contains("[[First name]]"));
+
+        assert!(remove_interface_config(&mut config, "Renamed"));
+        assert!(config.subsections("interfaces").is_empty());
+        assert!(!remove_interface_config(&mut config, "Missing"));
+    }
 }

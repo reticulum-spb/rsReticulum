@@ -248,6 +248,13 @@ Then open `http://<host>:8080/`. Binding to `0.0.0.0` is intended temporarily
 for development and testing on trusted networks. The current API has no
 authentication and must not be exposed to the public internet.
 
+Run the Web UI and REST API checks with:
+
+```bash
+node --test crates/rns-runtime/web/app.test.js
+cargo test -p rns-runtime --features api
+```
+
 ## Configuration
 
 `rnsd-rs` reads Reticulum INI config from `<config-dir>/config`. If no config
