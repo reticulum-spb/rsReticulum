@@ -38,7 +38,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -56,6 +56,8 @@ use crate::reticulum::{ReticulumConfig, ReticulumHandle, SharedInstanceType, tea
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLE_CSS: &str = include_str!("../web/style.css");
+pub const RESTART_EXIT_CODE: u8 = 100;
+pub const REBOOT_EXIT_CODE: u8 = 101;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Starting the server
@@ -70,6 +72,7 @@ pub async fn run_api_server(
     let state = AppState {
         transport_tx,
         handle,
+        shutdown: shutdown.clone(),
         config_write_lock: Arc::new(Mutex::new(())),
     };
 
@@ -94,6 +97,8 @@ pub async fn run_api_server(
         .route("/api/v1/paths", get(paths))
         .route("/api/v1/links", get(links))
         .route("/api/v1/settings", get(settings).put(update_settings))
+        .route("/api/v1/system/restart", post(restart_daemon))
+        .route("/api/v1/system/reboot", post(reboot_system))
         .layer(middleware::from_fn(security_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
@@ -129,6 +134,7 @@ struct AppState {
     transport_tx: mpsc::Sender<TransportMessage>,
     handle: ReticulumHandle,
     config_write_lock: Arc<Mutex<()>>,
+    shutdown: ShutdownSignal,
 }
 
 struct LoadedConfig {
@@ -1030,6 +1036,33 @@ async fn update_settings(
         .map_err(|e| ApiError::bad(format!("invalid settings: {e}")))?;
     s.save_config(&loaded.config, &loaded.source)?;
     Ok(Json(json!({ "ok": true, "restart_required": true })))
+}
+
+async fn restart_daemon(State(s): State<AppState>) -> ApiResult<Response> {
+    schedule_exit(s, RESTART_EXIT_CODE, "restart")
+}
+
+async fn reboot_system(State(s): State<AppState>) -> ApiResult<Response> {
+    schedule_exit(s, REBOOT_EXIT_CODE, "reboot")
+}
+
+fn schedule_exit(s: AppState, code: u8, action: &'static str) -> ApiResult<Response> {
+    if !s.shutdown.request_exit(code) {
+        return Err(ApiError::Conflict(
+            "a shutdown action is already scheduled".to_string(),
+        ));
+    }
+    let shutdown = s.shutdown;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        tracing::info!(exit_code = code, action, "Web UI requested shutdown");
+        shutdown.trigger();
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "accepted": true, "action": action, "exit_code": code })),
+    )
+        .into_response())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

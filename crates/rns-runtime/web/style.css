@@ -479,6 +479,8 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
 .dialog-actions-spacer { flex: 1; }
 #settings-form { display: grid; gap: 18px; }
 #settings-form .card { padding: 16px; }
+.system-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.system-actions p { margin: 5px 0 0; }
 .icon-button {
   width: 34px;
   height: 34px;

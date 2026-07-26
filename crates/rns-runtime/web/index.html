@@ -228,6 +228,13 @@
             <label class="check-field"><input id="setting-discovery" type="checkbox"><span>Discover interfaces</span></label>
             <label class="check-field"><input id="setting-logtimestamps" type="checkbox"><span>Log timestamps</span></label>
           </fieldset></section>
+          <section class="card system-actions">
+            <div><strong>System actions</strong><p class="muted">The external launcher handles exit codes 100 and 101.</p></div>
+            <div class="heading-actions">
+              <button class="secondary" id="restart-daemon" type="button">Restart daemon</button>
+              <button class="danger-button" id="reboot-system" type="button">Reboot system</button>
+            </div>
+          </section>
           <p class="form-error" id="settings-error" role="alert"></p>
         </form>
       </section>

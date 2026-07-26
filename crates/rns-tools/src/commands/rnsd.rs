@@ -210,6 +210,10 @@ pub(crate) async fn main() {
 
             shutdown.wait().await;
             tracing::info!("rnsd-rs shutting down");
+            let exit_code = shutdown.exit_code();
+            if exit_code != 0 {
+                std::process::exit(exit_code.into());
+            }
         }
         Err(e) => {
             tracing::error!("failed to start reticulum: {e}");

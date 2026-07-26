@@ -256,8 +256,14 @@ and the previous runtime interface.
 The Interfaces view combines runtime statistics with the configured interface
 list. Disabled or failed interfaces remain visible and can be edited, enabled,
 disabled, or removed even when they do not have a runtime ID. The current forms
-support TCP Client, TCP Server, UDP, Serial, KISS, RNode, and AX.25 KISS
-interfaces.
+support TCP Client, TCP Server, UDP, Auto, Backbone, Serial, KISS, RNode, and
+AX.25 KISS interfaces.
+
+The Settings view can request an externally supervised restart or system
+reboot. After returning HTTP `202 Accepted`, `rnsd-rs` shuts down gracefully
+and exits with code `100` for a daemon restart or `101` for a system reboot.
+The launcher is responsible for interpreting these codes, coordinating
+dependent services, and starting the daemon or rebooting the device.
 
 Run the Web UI and REST API checks with:
 
