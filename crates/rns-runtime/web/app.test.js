@@ -8,6 +8,7 @@ const {
   formatFrequency,
   formatNumber,
   formatRate,
+  interfaceEndpoint,
   matchesInterface,
   matchesPath,
 } = require("./app.js");
@@ -30,6 +31,21 @@ test("filters interfaces by name and type without case sensitivity", () => {
   assert.equal(matchesInterface(item, "BORDER"), true);
   assert.equal(matchesInterface(item, "tcpclient"), true);
   assert.equal(matchesInterface(item, "local server"), false);
+});
+
+test("formats UDP endpoints", () => {
+  assert.equal(
+    interfaceEndpoint({
+      config: {
+        type: "UDPInterface",
+        listen_ip: "0.0.0.0",
+        listen_port: 4242,
+        forward_ip: "255.255.255.255",
+        forward_port: 4242,
+      },
+    }),
+    "0.0.0.0:4242 → 255.255.255.255:4242",
+  );
 });
 
 test("filters paths by destination, next hop, and interface name", () => {

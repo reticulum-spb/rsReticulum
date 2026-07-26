@@ -224,6 +224,11 @@ function interfaceEndpoint(item) {
   if (config.type === "TCPServerInterface") {
     return `${config.listen_ip || "—"}:${config.listen_port ?? "—"}`;
   }
+  if (config.type === "UDPInterface") {
+    const listen = `${config.listen_ip || "0.0.0.0"}:${config.listen_port ?? "—"}`;
+    const forward = `${config.forward_ip || "—"}:${config.forward_port ?? "—"}`;
+    return `${listen} → ${forward}`;
+  }
   return "—";
 }
 
@@ -272,7 +277,11 @@ function interfaceDetails(item) {
   if (item.configured) {
     const actions = document.createElement("div");
     actions.className = "interface-actions";
-    const editable = ["TCPClientInterface", "TCPServerInterface"].includes(item.config?.type);
+    const editable = [
+      "TCPClientInterface",
+      "TCPServerInterface",
+      "UDPInterface",
+    ].includes(item.config?.type);
     if (editable) {
       actions.append(actionButton("Edit configuration", "", () => openInterfaceDialog(item)));
     }
@@ -585,11 +594,19 @@ function refreshPaths({ background = false } = {}) {
 function setInterfaceType(type) {
   const client = document.querySelector("#tcp-client-fields");
   const server = document.querySelector("#tcp-server-fields");
+  const udp = document.querySelector("#udp-fields");
+  const kiss = document.querySelector("#kiss-framing-field");
   const isClient = type === "TCPClientInterface";
+  const isServer = type === "TCPServerInterface";
+  const isUdp = type === "UDPInterface";
   client.hidden = !isClient;
   client.disabled = !isClient;
-  server.hidden = isClient;
-  server.disabled = isClient;
+  server.hidden = !isServer;
+  server.disabled = !isServer;
+  udp.hidden = !isUdp;
+  udp.disabled = !isUdp;
+  kiss.hidden = isUdp;
+  document.querySelector("#kiss-framing").disabled = isUdp;
 }
 
 function setField(selector, value, fallback = "") {
@@ -614,6 +631,11 @@ function openInterfaceDialog(item = null) {
   setField("#listen-ip", config.listen_ip, "0.0.0.0");
   setField("#listen-port", config.listen_port);
   setField("#interface-device", config.device);
+  setField("#udp-listen-ip", config.listen_ip);
+  setField("#udp-listen-port", config.listen_port);
+  setField("#udp-forward-ip", config.forward_ip);
+  setField("#udp-forward-port", config.forward_port);
+  setField("#udp-device", config.device);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
   document.querySelector("#interface-enabled").checked = item ? item.enabled !== false : true;
@@ -643,11 +665,11 @@ function interfacePayload() {
     name: document.querySelector("#interface-name").value.trim(),
     type,
     interface_mode: document.querySelector("#interface-mode").value,
-    kiss_framing: document.querySelector("#kiss-framing").checked,
     enabled: document.querySelector("#interface-enabled").checked,
   };
 
   if (type === "TCPClientInterface") {
+    payload.kiss_framing = document.querySelector("#kiss-framing").checked;
     payload.target_host = document.querySelector("#target-host").value.trim();
     payload.target_port = Number(document.querySelector("#target-port").value);
     const connectTimeout = optionalInteger("#connect-timeout");
@@ -656,11 +678,23 @@ function interfacePayload() {
     if (connectTimeout !== undefined) payload.connect_timeout = connectTimeout;
     if (reconnectTries !== undefined) payload.max_reconnect_tries = reconnectTries;
     if (fixedMtu !== undefined) payload.fixed_mtu = fixedMtu;
-  } else {
+  } else if (type === "TCPServerInterface") {
+    payload.kiss_framing = document.querySelector("#kiss-framing").checked;
     payload.listen_ip = document.querySelector("#listen-ip").value.trim();
     payload.listen_port = Number(document.querySelector("#listen-port").value);
     payload.prefer_ipv6 = document.querySelector("#prefer-ipv6").checked;
     const device = document.querySelector("#interface-device").value.trim();
+    if (device) payload.device = device;
+  } else if (type === "UDPInterface") {
+    const listenIp = document.querySelector("#udp-listen-ip").value.trim();
+    const listenPort = optionalInteger("#udp-listen-port");
+    const forwardIp = document.querySelector("#udp-forward-ip").value.trim();
+    const forwardPort = optionalInteger("#udp-forward-port");
+    const device = document.querySelector("#udp-device").value.trim();
+    if (listenIp) payload.listen_ip = listenIp;
+    if (listenPort !== undefined) payload.listen_port = listenPort;
+    if (forwardIp) payload.forward_ip = forwardIp;
+    if (forwardPort !== undefined) payload.forward_port = forwardPort;
     if (device) payload.device = device;
   }
 
@@ -912,6 +946,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatFrequency,
     formatNumber,
     formatRate,
+    interfaceEndpoint,
     matchesInterface,
     matchesPath,
     relativeTimestamp,

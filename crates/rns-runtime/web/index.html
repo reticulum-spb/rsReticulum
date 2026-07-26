@@ -209,6 +209,7 @@
           <select id="interface-type">
             <option value="TCPClientInterface">TCP Client</option>
             <option value="TCPServerInterface">TCP Server</option>
+            <option value="UDPInterface">UDP</option>
           </select>
         </label>
         <label>Mode
@@ -264,7 +265,26 @@
         </label>
       </fieldset>
 
-      <label class="check-field">
+      <fieldset class="form-grid" id="udp-fields" hidden disabled>
+        <legend>UDP</legend>
+        <label>Listen address <span class="optional">optional</span>
+          <input id="udp-listen-ip" autocomplete="off" placeholder="0.0.0.0">
+        </label>
+        <label>Listen port <span class="optional">optional</span>
+          <input id="udp-listen-port" type="number" min="1" max="65535">
+        </label>
+        <label>Forward address <span class="optional">optional</span>
+          <input id="udp-forward-ip" autocomplete="off" placeholder="255.255.255.255">
+        </label>
+        <label>Forward port <span class="optional">optional</span>
+          <input id="udp-forward-port" type="number" min="1" max="65535">
+        </label>
+        <label class="wide">Device <span class="optional">optional</span>
+          <input id="udp-device" autocomplete="off">
+        </label>
+      </fieldset>
+
+      <label class="check-field" id="kiss-framing-field">
         <input id="kiss-framing" type="checkbox">
         <span>Use KISS framing</span>
       </label>

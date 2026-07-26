@@ -341,6 +341,8 @@ struct InterfaceRequest {
     // TCPServerInterface
     listen_ip: Option<String>,
     listen_port: Option<u16>,
+    forward_ip: Option<String>,
+    forward_port: Option<u16>,
     prefer_ipv6: Option<bool>,
     device: Option<String>,
 
@@ -384,6 +386,12 @@ impl InterfaceRequest {
         }
         if let Some(v) = self.listen_port {
             s.set("listen_port", &v.to_string());
+        }
+        if let Some(ref v) = self.forward_ip {
+            s.set("forward_ip", v);
+        }
+        if let Some(v) = self.forward_port {
+            s.set("forward_port", &v.to_string());
         }
         if let Some(v) = self.prefer_ipv6 {
             s.set("prefer_ipv6", if v { "Yes" } else { "No" });
@@ -970,6 +978,8 @@ fn iface_section_json(section: &ConfigSection) -> Value {
         "fixed_mtu": section.get_uint("fixed_mtu"),
         "listen_ip": section.get("listen_ip"),
         "listen_port": section.get_uint("listen_port"),
+        "forward_ip": section.get("forward_ip"),
+        "forward_port": section.get_uint("forward_port"),
         "prefer_ipv6": section.get_bool("prefer_ipv6"),
         "device": section.get("device"),
         "kiss_framing": section.get_bool("kiss_framing"),
@@ -999,6 +1009,15 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "kiss_framing":   c.kiss_framing,
             "prefer_ipv6":    c.prefer_ipv6,
             "device":         c.device,
+        }),
+        InterfaceConfig::Udp(c) => json!({
+            "type":           "UDPInterface",
+            "listen_ip":      c.listen_ip,
+            "listen_port":    c.listen_port,
+            "forward_ip":     c.forward_ip,
+            "forward_port":   c.forward_port,
+            "device":         c.device,
+            "interface_mode": mode_to_str(c.mode),
         }),
         // The remaining types return only the type - it is expanded by analogy.
         other => json!({ "type": interface_type_name(other) }),
@@ -1211,6 +1230,31 @@ mod tests {
         assert_eq!(value["device"], "lo");
         assert_eq!(value["interface_mode"], "Full");
         assert_eq!(value["kiss_framing"], false);
+    }
+
+    #[test]
+    fn udp_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test UDP",
+            "type": "UDPInterface",
+            "listen_ip": "127.0.0.1",
+            "listen_port": 4242,
+            "forward_ip": "127.0.0.1",
+            "forward_port": 4243,
+            "device": "lo",
+            "interface_mode": "PointToPoint"
+        }))
+        .unwrap();
+
+        let config = request.synthesize().unwrap();
+        let value = iface_config_json(&config);
+        assert_eq!(value["type"], "UDPInterface");
+        assert_eq!(value["listen_ip"], "127.0.0.1");
+        assert_eq!(value["listen_port"], 4242);
+        assert_eq!(value["forward_ip"], "127.0.0.1");
+        assert_eq!(value["forward_port"], 4243);
+        assert_eq!(value["device"], "lo");
+        assert_eq!(value["interface_mode"], "PointToPoint");
     }
 
     #[test]
