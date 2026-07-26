@@ -45,7 +45,7 @@ use rns_transport::messages::{
     TransportQueryResponse,
 };
 
-use crate::config::{Config, ConfigSection};
+use crate::config::{Config, ConfigSection, atomic_write};
 use crate::interface_factory::{InterfaceConfig, synthesize_interface};
 use crate::lifecycle::ShutdownSignal;
 use crate::reticulum::{ReticulumHandle, teardown_interface};
@@ -122,6 +122,51 @@ struct AppState {
     config_write_lock: Arc<Mutex<()>>,
 }
 
+struct LoadedConfig {
+    config: Config,
+    source: Vec<u8>,
+}
+
+fn save_config_snapshot(
+    path: &std::path::Path,
+    config: &Config,
+    expected: &[u8],
+) -> Result<Vec<u8>, ApiError> {
+    let current = std::fs::read(path)
+        .map_err(|e| ApiError::internal(format!("failed to re-read config: {e}")))?;
+    if current != expected {
+        return Err(ApiError::Conflict(
+            "config changed outside the Web UI; reload and retry".to_string(),
+        ));
+    }
+
+    let backup_path = path.with_file_name("config.web-ui.bak");
+    atomic_write(&backup_path, expected)
+        .map_err(|e| ApiError::internal(format!("failed to write config backup: {e}")))?;
+
+    let updated = config.to_ini().into_bytes();
+    atomic_write(path, &updated)
+        .map_err(|e| ApiError::internal(format!("failed to write config: {e}")))?;
+    Ok(updated)
+}
+
+fn rollback_config_snapshot(
+    path: &std::path::Path,
+    applied: &[u8],
+    original: &[u8],
+) -> Result<(), ApiError> {
+    let current = std::fs::read(path)
+        .map_err(|e| ApiError::internal(format!("failed to re-read config for rollback: {e}")))?;
+    if current != applied {
+        return Err(ApiError::Conflict(
+            "config changed externally after the interface restart failed; rollback skipped"
+                .to_string(),
+        ));
+    }
+    atomic_write(path, original)
+        .map_err(|e| ApiError::internal(format!("failed to roll back config: {e}")))
+}
+
 impl AppState {
     async fn query(&self, query: TransportQuery) -> Result<TransportQueryResponse, ApiError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -141,14 +186,26 @@ impl AppState {
     }
 
     fn load_config(&self) -> Result<Config, ApiError> {
-        Config::from_file(&self.config_path())
-            .map_err(|e| ApiError::internal(format!("failed to read config: {e}")))
+        Ok(self.load_config_snapshot()?.config)
     }
 
-    fn save_config(&self, config: &Config) -> Result<(), ApiError> {
-        config
-            .save_to(&self.config_path())
-            .map_err(|e| ApiError::internal(format!("failed to write config: {e}")))
+    fn load_config_snapshot(&self) -> Result<LoadedConfig, ApiError> {
+        let path = self.config_path();
+        let source = std::fs::read(&path)
+            .map_err(|e| ApiError::internal(format!("failed to read config: {e}")))?;
+        let text = std::str::from_utf8(&source)
+            .map_err(|e| ApiError::internal(format!("config is not valid UTF-8: {e}")))?;
+        let config = Config::from_loaded_str(text, &path)
+            .map_err(|e| ApiError::internal(format!("failed to parse config: {e}")))?;
+        Ok(LoadedConfig { config, source })
+    }
+
+    fn save_config(&self, config: &Config, expected: &[u8]) -> Result<Vec<u8>, ApiError> {
+        save_config_snapshot(&self.config_path(), config, expected)
+    }
+
+    fn rollback_config(&self, applied: &[u8], original: &[u8]) -> Result<(), ApiError> {
+        rollback_config_snapshot(&self.config_path(), applied, original)
     }
 }
 
@@ -163,6 +220,18 @@ enum ApiError {
     Conflict(String),
     Transport(String),
     Internal(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::NotFound => f.write_str("not found"),
+            ApiError::BadRequest(message)
+            | ApiError::Conflict(message)
+            | ApiError::Transport(message)
+            | ApiError::Internal(message) => f.write_str(message),
+        }
+    }
 }
 
 impl ApiError {
@@ -348,10 +417,18 @@ async fn apply_interface_change(
     new_section: Option<ConfigSection>, // None = remove from config
     old_id: Option<u64>,                // None = there was no new interface
     new_config: Option<&InterfaceConfig>, // None = deletion only
+    renamed_from: Option<&str>,
+    rollback_interface: Option<&InterfaceConfig>,
 ) -> ApiResult<u64> {
     // ── 1. Конфиг ──────────────────────────────────────────────────────────
-    let mut config = s.load_config()?;
+    let LoadedConfig {
+        mut config,
+        source: original_source,
+    } = s.load_config_snapshot()?;
 
+    if let Some(old_name) = renamed_from {
+        remove_interface_config(&mut config, old_name);
+    }
     match new_section {
         Some(section) => {
             // Replace or add the [[iface_name]] subsection.
@@ -364,7 +441,7 @@ async fn apply_interface_change(
             }
         }
     }
-    s.save_config(&config)?;
+    let applied_source = s.save_config(&config, &original_source)?;
 
     // ── 2. Teardown ─────────────────────────────────────────────────────────
     if let Some(id) = old_id {
@@ -373,7 +450,30 @@ async fn apply_interface_change(
 
     // ── 3. Spawn ─────────────────────────────────────────────────────────────
     let new_id = match new_config {
-        Some(iface_config) => spawn_from_config(s, iface_config).await?,
+        Some(iface_config) => match spawn_from_config(s, iface_config).await {
+            Ok(id) => id,
+            Err(spawn_error) => {
+                let config_rollback = s.rollback_config(&applied_source, &original_source);
+                let runtime_rollback = match rollback_interface {
+                    Some(old_config) => spawn_from_config(s, old_config).await.map(|_| ()),
+                    None => Ok(()),
+                };
+
+                if let Err(error) = config_rollback {
+                    tracing::error!(error = %error, "failed to roll back config");
+                    return Err(ApiError::internal(format!(
+                        "{spawn_error}; config rollback failed: {error}"
+                    )));
+                }
+                if let Err(error) = runtime_rollback {
+                    tracing::error!(error = %error, "failed to restore previous interface");
+                    return Err(ApiError::internal(format!(
+                        "{spawn_error}; runtime rollback failed: {error}"
+                    )));
+                }
+                return Err(spawn_error);
+            }
+        },
         None => 0,
     };
 
@@ -539,8 +639,16 @@ async fn create_interface(
     // to save only what was received (without defaults).
     let section = req.to_config_section();
 
-    let id =
-        apply_interface_change(&s, &req.name, Some(section), None, Some(&iface_config)).await?;
+    let id = apply_interface_change(
+        &s,
+        &req.name,
+        Some(section),
+        None,
+        Some(&iface_config),
+        None,
+        None,
+    )
+    .await?;
 
     let body = Json(json!({ "id": id, "name": req.name }));
     Ok((StatusCode::CREATED, body).into_response())
@@ -565,19 +673,23 @@ async fn update_interface(
         .find(|e| e.id == id)
         .ok_or(ApiError::NotFound)?;
     let old_name = old_entry.name.clone();
+    let old_configs = load_interface_configs(&s)?;
+    let rollback_interface = old_configs.get(&old_name).cloned();
 
     let iface_config = req.synthesize()?;
     let section = req.to_config_section();
 
-    // If the name has changed, delete the old entry from the config.
-    if old_name != req.name {
-        let mut config = s.load_config()?;
-        remove_interface_config(&mut config, &old_name);
-        s.save_config(&config)?;
-    }
-
-    let new_id =
-        apply_interface_change(&s, &req.name, Some(section), Some(id), Some(&iface_config)).await?;
+    let renamed_from = (old_name != req.name).then_some(old_name.as_str());
+    let new_id = apply_interface_change(
+        &s,
+        &req.name,
+        Some(section),
+        Some(id),
+        Some(&iface_config),
+        renamed_from,
+        rollback_interface.as_ref(),
+    )
+    .await?;
 
     Ok(Json(
         json!({ "id": new_id, "name": req.name, "old_id": id }),
@@ -599,7 +711,7 @@ async fn delete_interface(
         .ok_or(ApiError::NotFound)?;
     let name = entry.name.clone();
 
-    apply_interface_change(&s, &name, None, Some(id), None).await?;
+    apply_interface_change(&s, &name, None, Some(id), None, None, None).await?;
 
     Ok(Json(json!({ "deleted": true, "id": id, "name": name })))
 }
@@ -922,5 +1034,50 @@ mod tests {
         assert!(remove_interface_config(&mut config, "Renamed"));
         assert!(config.subsections("interfaces").is_empty());
         assert!(!remove_interface_config(&mut config, "Missing"));
+    }
+
+    #[test]
+    fn config_snapshot_creates_backup_rolls_back_and_detects_external_edits() {
+        let dir = std::env::temp_dir().join(format!(
+            "rns_api_config_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        let original = b"[interfaces]\n# original comment\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+
+        let mut config = Config::parse(std::str::from_utf8(&original).unwrap()).unwrap();
+        let mut section = ConfigSection::new();
+        section.set("type", "TCPServerInterface");
+        section.set("listen_ip", "127.0.0.1");
+        section.set("listen_port", "4242");
+        set_interface_config(&mut config, "Test", section);
+
+        let applied = save_config_snapshot(&path, &config, &original).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("config.web-ui.bak")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), applied);
+
+        rollback_config_snapshot(&path, &applied, &original).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        std::fs::write(&path, b"[interfaces]\n# external edit\n").unwrap();
+        assert!(matches!(
+            save_config_snapshot(&path, &config, &original),
+            Err(ApiError::Conflict(_))
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"[interfaces]\n# external edit\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

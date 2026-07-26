@@ -248,6 +248,11 @@ Then open `http://<host>:8080/`. Binding to `0.0.0.0` is intended temporarily
 for development and testing on trusted networks. The current API has no
 authentication and must not be exposed to the public internet.
 
+Web UI config changes are written atomically. Before every mutation, the
+previous file is saved as `config.web-ui.bak`; external edits are rejected with
+a conflict response, and a failed interface restart restores both the config
+and the previous runtime interface.
+
 Run the Web UI and REST API checks with:
 
 ```bash
