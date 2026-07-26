@@ -1428,22 +1428,29 @@ impl LinkClient {
         self.send_msg(TransportMessage::RegisterAnnounceHandler {
             aspect_filter: Some(app_name.to_string()),
             receive_path_responses: true,
-            callback_tx: ann_tx,
+            callback_tx: ann_tx.clone(),
         })
         .await?;
 
-        self.send_msg(TransportMessage::RequestPath {
-            destination_hash: dest_hash,
-        })
-        .await?;
+        // Every exit past this point must deregister. Returning `?` straight
+        // out of the path request or the wait -- the timeout case, i.e. the
+        // common one -- would leave the registration behind, and the actor
+        // only reaps it once the channel closes.
+        let outcome = async {
+            self.send_msg(TransportMessage::RequestPath {
+                destination_hash: dest_hash,
+            })
+            .await?;
+            wait_for_pubkey(&mut ann_rx, dest_hash, time_remaining(deadline)?).await
+        }
+        .await;
 
-        let pubkey = wait_for_pubkey(&mut ann_rx, dest_hash, time_remaining(deadline)?).await?;
         let _ = self
             .transport_tx
             .try_send(TransportMessage::DeregisterAnnounceHandler {
-                aspect_filter: Some(app_name.to_string()),
+                callback_tx: ann_tx,
             });
-        Ok(pubkey)
+        outcome
     }
 
     /// Open a Link to `app_name` on `remote_transport_hash`, send one
@@ -2193,6 +2200,44 @@ mod tests {
         );
         // It got far enough to attempt the link, i.e. it really used the key.
         assert!(seen.contains(&"RegisterDestination"), "saw: {seen:?}");
+    }
+
+    /// The timeout path is the common one for an unreachable destination,
+    /// and it used to return without deregistering -- leaving a live
+    /// registration the actor only reaps once the channel happens to close.
+    #[tokio::test]
+    async fn query_deregisters_its_announce_handler_when_discovery_times_out() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(32);
+        let transport = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(msg) = transport_rx.recv().await {
+                seen.push(rns_transport::messages::msg_variant_name(&msg));
+                // Never heard of it, and no announce will ever arrive.
+                if let TransportMessage::Rpc { response_tx, .. } = msg {
+                    let _ = response_tx.send(TransportQueryResponse::Announce(None));
+                }
+            }
+            seen
+        });
+
+        let result = LinkClient::new(transport_tx, Identity::new())
+            .query(
+                [0xAB; 16],
+                "nomadnetwork.node",
+                "/page/index.mu",
+                Vec::new(),
+                1,
+                Duration::from_millis(150),
+            )
+            .await;
+
+        assert!(matches!(result, Err(LinkClientError::Timeout(_))));
+        let seen = transport.await.unwrap();
+        assert!(seen.contains(&"RegisterAnnounceHandler"), "saw: {seen:?}");
+        assert!(
+            seen.contains(&"DeregisterAnnounceHandler"),
+            "handler leaked on the timeout path, saw: {seen:?}"
+        );
     }
 
     #[tokio::test]

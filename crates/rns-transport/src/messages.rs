@@ -268,10 +268,14 @@ pub enum TransportMessage {
         receive_path_responses: bool,
         callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
     },
-    /// Remove handler(s) whose `aspect_filter` matches; `None` removes all.
+    /// Remove the one registration made with this exact `callback_tx`.
+    ///
+    /// Identifying by aspect would take down every other subscriber to the
+    /// same aspect, which for a shared aspect like `nomadnetwork.node` means
+    /// one finished query silently unsubscribes all its concurrent peers.
     /// Handlers with closed senders are also reaped on dispatch.
     DeregisterAnnounceHandler {
-        aspect_filter: Option<String>,
+        callback_tx: mpsc::Sender<AnnounceHandlerEvent>,
     },
     /// Ask the actor to satisfy a packet request: replay from its recent-
     /// announce cache when possible, otherwise emit a CacheRequest packet.
@@ -694,10 +698,9 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("RegisterAnnounceHandler")
                 .field("aspect_filter", aspect_filter)
                 .finish(),
-            Self::DeregisterAnnounceHandler { aspect_filter } => f
-                .debug_struct("DeregisterAnnounceHandler")
-                .field("aspect_filter", aspect_filter)
-                .finish(),
+            Self::DeregisterAnnounceHandler { .. } => {
+                f.debug_struct("DeregisterAnnounceHandler").finish()
+            }
             Self::CacheRequest {
                 packet_hash,
                 destination_hash,
