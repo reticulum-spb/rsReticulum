@@ -8,26 +8,201 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main class="shell">
-    <header>
-      <span class="brand-mark">R</span>
-      <div>
-        <span class="eyebrow">Web configurator</span>
-        <h1>rsReticulum</h1>
+  <div class="shell">
+    <header class="topbar">
+      <button class="mobile-menu" id="mobile-menu" type="button"
+              aria-label="Open navigation" aria-expanded="false"
+              aria-controls="sidebar">☰</button>
+      <a class="brand" href="#dashboard" aria-label="rsReticulum dashboard">
+        <span class="brand-mark">R</span>
+        <span>rsReticulum</span>
+      </a>
+      <div class="daemon-pill" id="daemon-pill" data-state="loading"
+           role="status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span id="daemon-label">Connecting…</span>
       </div>
     </header>
 
-    <section class="panel" aria-live="polite">
-      <div class="status">
-        <span class="status-dot"></span>
-        <strong id="status-label">Connecting to rnsd-rs…</strong>
+    <aside class="sidebar" id="sidebar">
+      <nav aria-label="Main navigation">
+        <button class="nav-item active" type="button" data-view="dashboard">
+          <span class="nav-icon" aria-hidden="true">◫</span>
+          <span>Dashboard</span>
+        </button>
+        <button class="nav-item" type="button" data-view="interfaces">
+          <span class="nav-icon" aria-hidden="true">≋</span>
+          <span>Interfaces</span>
+        </button>
+        <button class="nav-item" type="button" data-view="paths">
+          <span class="nav-icon" aria-hidden="true">⌁</span>
+          <span>Paths</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="eyebrow">Shared instance</span>
+        <span class="muted">rnsd-rs control plane</span>
       </div>
-      <p id="status-detail">
-        The embedded Web UI is available. Dashboard and configuration tools
-        will be added in the next implementation block.
-      </p>
-    </section>
-  </main>
+    </aside>
+
+    <main id="main-content" tabindex="-1">
+      <div class="notice error-notice" id="global-error" role="alert" hidden>
+        <span id="global-error-text"></span>
+        <button type="button" id="dismiss-error" aria-label="Dismiss error">×</button>
+      </div>
+
+      <section class="view active" id="view-dashboard" data-view-panel="dashboard">
+        <div class="page-heading">
+          <div>
+            <span class="eyebrow">Shared runtime</span>
+            <h1>Dashboard</h1>
+            <p>Overview of the local Reticulum transport instance.</p>
+          </div>
+          <button class="secondary refresh-button" type="button" data-refresh>
+            <span aria-hidden="true">↻</span> Refresh
+          </button>
+        </div>
+
+        <div class="metric-grid" aria-label="Runtime metrics">
+          <article class="metric">
+            <span>Interfaces</span>
+            <strong id="metric-interfaces">—</strong>
+            <small id="metric-online">Waiting for status</small>
+          </article>
+          <article class="metric">
+            <span>Received</span>
+            <strong id="metric-rx">—</strong>
+            <small>Total traffic</small>
+          </article>
+          <article class="metric">
+            <span>Transmitted</span>
+            <strong id="metric-tx">—</strong>
+            <small>Total traffic</small>
+          </article>
+          <article class="metric">
+            <span>Active links</span>
+            <strong id="metric-links">—</strong>
+            <small>Established sessions</small>
+          </article>
+        </div>
+
+        <section class="card runtime-card">
+          <div>
+            <span class="eyebrow">Runtime status</span>
+            <h2 id="runtime-heading">Connecting to rnsd-rs</h2>
+            <p id="runtime-detail">Checking the embedded REST API.</p>
+          </div>
+          <span class="badge" id="runtime-badge" data-state="loading">Checking</span>
+        </section>
+      </section>
+
+      <section class="view" id="view-interfaces" data-view-panel="interfaces" hidden>
+        <div class="page-heading">
+          <div>
+            <span class="eyebrow">Network adapters</span>
+            <h1>Interfaces</h1>
+            <p>Runtime state and configuration of Reticulum interfaces.</p>
+          </div>
+          <div class="heading-actions">
+            <button class="secondary refresh-button" type="button" data-refresh>
+              <span aria-hidden="true">↻</span> Refresh
+            </button>
+            <button class="primary" id="add-interface" type="button">Add interface</button>
+          </div>
+        </div>
+
+        <section class="table-card">
+          <div class="table-toolbar">
+            <label class="search-field">
+              <span class="sr-only">Search interfaces</span>
+              <input type="search" id="interface-search" placeholder="Search interfaces" disabled>
+            </label>
+            <span class="muted" id="interface-count">Not loaded</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Interface</th>
+                  <th>Status</th>
+                  <th>Mode</th>
+                  <th>Traffic</th>
+                  <th>Rate</th>
+                  <th>MTU</th>
+                </tr>
+              </thead>
+              <tbody id="interface-rows"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="interfaces-empty">
+            <span class="empty-icon" aria-hidden="true">≋</span>
+            <strong>Interface data is not loaded yet</strong>
+            <span>The runtime table will be connected in the next implementation block.</span>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-paths" data-view-panel="paths" hidden>
+        <div class="page-heading">
+          <div>
+            <span class="eyebrow">Transport routing</span>
+            <h1>Paths</h1>
+            <p>Known destinations and their next hops.</p>
+          </div>
+          <button class="secondary refresh-button" type="button" data-refresh>
+            <span aria-hidden="true">↻</span> Refresh
+          </button>
+        </div>
+
+        <section class="table-card">
+          <div class="table-toolbar">
+            <label class="search-field">
+              <span class="sr-only">Search paths</span>
+              <input type="search" id="path-search" placeholder="Search paths" disabled>
+            </label>
+            <span class="muted" id="path-count">Not loaded</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Destination</th>
+                  <th>Hops</th>
+                  <th>Interface</th>
+                  <th>Via</th>
+                  <th>Expires</th>
+                </tr>
+              </thead>
+              <tbody id="path-rows"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="paths-empty">
+            <span class="empty-icon" aria-hidden="true">⌁</span>
+            <strong>Path data is not loaded yet</strong>
+            <span>The route table will be connected in a later implementation block.</span>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="interface-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <span class="eyebrow">Configuration</span>
+          <h2>Add interface</h2>
+        </div>
+        <button class="icon-button" type="submit" value="cancel"
+                aria-label="Close dialog">×</button>
+      </div>
+      <p>TCP interface configuration will be enabled in the CRUD implementation block.</p>
+      <div class="dialog-actions">
+        <button class="secondary" type="submit" value="cancel">Close</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/app.js"></script>
 </body>
