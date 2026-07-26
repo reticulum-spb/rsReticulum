@@ -2,14 +2,18 @@
 
 const REQUEST_TIMEOUT_MS = 8000;
 const DASHBOARD_REFRESH_MS = 5000;
+const INTERFACE_REFRESH_MS = 1000;
+const INTERFACE_ERROR_REFRESH_MS = 5000;
 const views = new Set(["dashboard", "interfaces", "paths"]);
 let dashboardRequest = null;
 let interfaceRequest = null;
+let interfaceNextPollAt = 0;
 const interfaceState = {
   items: [],
   expanded: new Set(),
   filter: "",
   showAll: false,
+  loaded: false,
 };
 
 class ApiError extends Error {
@@ -159,9 +163,9 @@ function refreshDashboard() {
   setDashboardBusy(true);
   setRuntimeState("loading", "Connecting to rnsd-rs", "Checking the embedded REST API.");
   dashboardRequest = Promise.all([
-    apiFetch("/health"),
-    apiFetch("/api/v1/status"),
-    apiFetch("/api/v1/links"),
+    apiFetch("/health", { cache: "no-store" }),
+    apiFetch("/api/v1/status", { cache: "no-store" }),
+    apiFetch("/api/v1/links", { cache: "no-store" }),
   ])
     .then(([health, status, links]) => {
       if (!health?.ok) throw new ApiError("The health endpoint returned an unexpected response");
@@ -370,18 +374,22 @@ function setInterfacesLoading() {
   document.querySelector("#interface-count").textContent = "Loading…";
 }
 
-function refreshInterfaces() {
+function refreshInterfaces({ background = false } = {}) {
   if (interfaceRequest) return interfaceRequest;
 
   const refreshButton = document.querySelector("#view-interfaces [data-refresh]");
   const showAll = document.querySelector("#show-all-interfaces");
-  setBusy(refreshButton, true);
-  showAll.disabled = true;
-  setInterfacesLoading();
+  if (!background) {
+    setBusy(refreshButton, true);
+    showAll.disabled = true;
+  }
+  if (!interfaceState.loaded) setInterfacesLoading();
   const query = interfaceState.showAll ? "?all=true" : "";
-  interfaceRequest = apiFetch(`/api/v1/interfaces${query}`)
+  interfaceRequest = apiFetch(`/api/v1/interfaces${query}`, { cache: "no-store" })
     .then((body) => {
       interfaceState.items = Array.isArray(body.interfaces) ? body.interfaces : [];
+      interfaceState.loaded = true;
+      interfaceNextPollAt = Date.now() + INTERFACE_REFRESH_MS;
       document.querySelector("#interface-search").disabled = false;
       renderInterfaces();
       document.querySelector("#daemon-pill").dataset.state = "online";
@@ -389,19 +397,26 @@ function refreshInterfaces() {
       clearError();
     })
     .catch((error) => {
-      interfaceState.items = [];
-      document.querySelector("#interface-search").disabled = true;
-      document.querySelector("#interfaces-empty-heading").textContent = "Interfaces unavailable";
-      document.querySelector("#interfaces-empty-detail").textContent =
-        "The interface list could not be loaded from rnsd-rs.";
-      document.querySelector("#interface-count").textContent = "Unavailable";
+      interfaceNextPollAt = Date.now() + INTERFACE_ERROR_REFRESH_MS;
+      if (!interfaceState.loaded) {
+        interfaceState.items = [];
+        document.querySelector("#interface-search").disabled = true;
+        document.querySelector("#interfaces-empty-heading").textContent = "Interfaces unavailable";
+        document.querySelector("#interfaces-empty-detail").textContent =
+          "The interface list could not be loaded from rnsd-rs.";
+        document.querySelector("#interface-count").textContent = "Unavailable";
+      } else {
+        document.querySelector("#interface-count").textContent = "Update failed · retrying";
+      }
       document.querySelector("#daemon-pill").dataset.state = "unavailable";
       document.querySelector("#daemon-label").textContent = "Unavailable";
       showError(error);
     })
     .finally(() => {
-      setBusy(refreshButton, false);
-      showAll.disabled = false;
+      if (!background) {
+        setBusy(refreshButton, false);
+        showAll.disabled = false;
+      }
       interfaceRequest = null;
     });
 
@@ -664,7 +679,9 @@ document.querySelector("#interface-search").addEventListener("input", (event) =>
 document.querySelector("#show-all-interfaces").addEventListener("change", (event) => {
   interfaceState.showAll = event.target.checked;
   interfaceState.expanded.clear();
-  refreshInterfaces();
+  interfaceState.loaded = false;
+  if (interfaceRequest) interfaceRequest.finally(() => refreshInterfaces());
+  else refreshInterfaces();
 });
 
 document.querySelectorAll("[data-refresh]").forEach((button) => {
@@ -681,5 +698,14 @@ window.addEventListener("resize", () => {
 window.setInterval(() => {
   if (currentView() === "dashboard" && !document.hidden) refreshDashboard();
 }, DASHBOARD_REFRESH_MS);
+window.setInterval(() => {
+  if (
+    currentView() === "interfaces"
+    && !document.hidden
+    && Date.now() >= interfaceNextPollAt
+  ) {
+    refreshInterfaces({ background: true });
+  }
+}, INTERFACE_REFRESH_MS);
 
 showView(currentView());
