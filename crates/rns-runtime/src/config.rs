@@ -109,6 +109,15 @@ impl ConfigSection {
         self.set_value(key.to_string(), ConfigValue::List(value));
     }
 
+    pub fn remove(&mut self, key: &str) -> bool {
+        if self.values.remove(key).is_some() {
+            self.value_order.retain(|name| name != key);
+            true
+        } else {
+            false
+        }
+    }
+
     fn set_value(&mut self, key: String, value: ConfigValue) {
         if !self.values.contains_key(&key) {
             self.value_order.push(key.clone());

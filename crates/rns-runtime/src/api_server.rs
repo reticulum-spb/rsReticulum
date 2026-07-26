@@ -51,7 +51,7 @@ use rns_transport::messages::{
 use crate::config::{Config, ConfigSection, atomic_write};
 use crate::interface_factory::{InterfaceConfig, synthesize_interface};
 use crate::lifecycle::ShutdownSignal;
-use crate::reticulum::{ReticulumHandle, teardown_interface};
+use crate::reticulum::{ReticulumConfig, ReticulumHandle, SharedInstanceType, teardown_interface};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -93,6 +93,7 @@ pub async fn run_api_server(
         )
         .route("/api/v1/paths", get(paths))
         .route("/api/v1/links", get(links))
+        .route("/api/v1/settings", get(settings).put(update_settings))
         .layer(middleware::from_fn(security_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
@@ -133,6 +134,30 @@ struct AppState {
 struct LoadedConfig {
     config: Config,
     source: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct SettingsRequest {
+    share_instance: bool,
+    instance_name: String,
+    shared_instance_type: String,
+    shared_instance_port: u16,
+    instance_control_port: u16,
+    enable_transport: bool,
+    respond_to_probes: bool,
+    use_implicit_proof: bool,
+    panic_on_interface_error: bool,
+    link_mtu_discovery: bool,
+    force_shared_instance_bitrate: Option<u64>,
+    default_ar_target: Option<u64>,
+    default_ar_grace: Option<u32>,
+    default_ar_penalty: Option<u64>,
+    discover_interfaces: bool,
+    autoconnect_discovered_interfaces: usize,
+    required_discovery_value: u8,
+    api_listen: String,
+    loglevel: i32,
+    logtimestamps: bool,
 }
 
 fn save_config_snapshot(
@@ -901,6 +926,110 @@ async fn links(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         TransportQueryResponse::Error(e) => Err(ApiError::internal(e)),
         other => Err(ApiError::internal(format!("unexpected: {other:?}"))),
     }
+}
+
+async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {
+    let config = s.load_config()?;
+    let parsed = ReticulumConfig::try_from_config(&config)
+        .map_err(|e| ApiError::internal(format!("invalid settings: {e}")))?;
+    Ok(Json(json!({
+        "share_instance": parsed.share_instance,
+        "instance_name": parsed.instance_name,
+        "shared_instance_type": match parsed.shared_instance_type {
+            SharedInstanceType::Tcp => "tcp",
+            SharedInstanceType::Unix => "unix",
+        },
+        "shared_instance_port": parsed.shared_instance_port,
+        "instance_control_port": parsed.control_port,
+        "enable_transport": parsed.enable_transport,
+        "respond_to_probes": parsed.respond_to_probes,
+        "use_implicit_proof": parsed.use_implicit_proof,
+        "panic_on_interface_error": parsed.panic_on_interface_error,
+        "link_mtu_discovery": parsed.link_mtu_discovery,
+        "force_shared_instance_bitrate": parsed.force_shared_instance_bitrate,
+        "default_ar_target": parsed.default_ar_target,
+        "default_ar_grace": parsed.default_ar_grace,
+        "default_ar_penalty": parsed.default_ar_penalty,
+        "discover_interfaces": parsed.discover_interfaces,
+        "autoconnect_discovered_interfaces": parsed.autoconnect_discovered_interfaces,
+        "required_discovery_value": parsed.discover_interfaces_required_value,
+        "api_listen": parsed.api_listen.map(|v| v.to_string()).unwrap_or_default(),
+        "loglevel": parsed.loglevel,
+        "logtimestamps": parsed.log_timestamps,
+        "restart_required": false,
+    })))
+}
+
+async fn update_settings(
+    State(s): State<AppState>,
+    Json(req): Json<SettingsRequest>,
+) -> ApiResult<Json<Value>> {
+    let _guard = s.config_write_lock.lock().await;
+    let mut loaded = s.load_config_snapshot()?;
+    {
+        let section = loaded.config.ensure_section("reticulum");
+        for (key, value) in [
+            ("share_instance", req.share_instance),
+            ("enable_transport", req.enable_transport),
+            ("respond_to_probes", req.respond_to_probes),
+            ("use_implicit_proof", req.use_implicit_proof),
+            ("panic_on_interface_error", req.panic_on_interface_error),
+            ("link_mtu_discovery", req.link_mtu_discovery),
+            ("discover_interfaces", req.discover_interfaces),
+        ] {
+            section.set(key, if value { "Yes" } else { "No" });
+        }
+        section.set("instance_name", req.instance_name.trim());
+        section.set("shared_instance_type", req.shared_instance_type.trim());
+        section.set(
+            "shared_instance_port",
+            &req.shared_instance_port.to_string(),
+        );
+        section.set(
+            "instance_control_port",
+            &req.instance_control_port.to_string(),
+        );
+        section.set(
+            "autoconnect_discovered_interfaces",
+            &req.autoconnect_discovered_interfaces.to_string(),
+        );
+        section.set(
+            "required_discovery_value",
+            &req.required_discovery_value.to_string(),
+        );
+        section.set("api_listen", req.api_listen.trim());
+        for (key, value) in [
+            (
+                "force_shared_instance_bitrate",
+                req.force_shared_instance_bitrate,
+            ),
+            ("default_ar_target", req.default_ar_target),
+            ("default_ar_penalty", req.default_ar_penalty),
+        ] {
+            if let Some(value) = value {
+                section.set(key, &value.to_string());
+            } else {
+                section.remove(key);
+            }
+        }
+        if let Some(value) = req.default_ar_grace {
+            section.set("default_ar_grace", &value.to_string());
+        } else {
+            section.remove("default_ar_grace");
+        }
+    }
+    {
+        let section = loaded.config.ensure_section("logging");
+        section.set("loglevel", &req.loglevel.to_string());
+        section.set(
+            "logtimestamps",
+            if req.logtimestamps { "Yes" } else { "No" },
+        );
+    }
+    ReticulumConfig::try_from_config(&loaded.config)
+        .map_err(|e| ApiError::bad(format!("invalid settings: {e}")))?;
+    s.save_config(&loaded.config, &loaded.source)?;
+    Ok(Json(json!({ "ok": true, "restart_required": true })))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

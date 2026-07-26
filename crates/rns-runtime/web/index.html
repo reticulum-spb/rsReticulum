@@ -38,6 +38,10 @@
           <span class="nav-icon" aria-hidden="true">⌁</span>
           <span>Paths</span>
         </button>
+        <button class="nav-item" type="button" data-view="settings">
+          <span class="nav-icon" aria-hidden="true">⚙</span>
+          <span>Settings</span>
+        </button>
       </nav>
 
       <div class="sidebar-footer">
@@ -184,6 +188,48 @@
             </div>
           </div>
         </section>
+      </section>
+
+      <section class="view" id="view-settings" data-view-panel="settings" hidden>
+        <form id="settings-form">
+          <div class="page-heading">
+            <div class="heading-actions">
+              <button class="secondary" id="reload-settings" type="button">Reload</button>
+              <button class="primary" id="save-settings" type="submit">Save settings</button>
+            </div>
+          </div>
+          <div class="notice" id="settings-restart" hidden>Configuration saved. Restart rnsd-rs to apply these settings.</div>
+          <section class="card"><fieldset class="form-grid">
+            <legend>Shared instance</legend>
+            <label>Instance name<input id="setting-instance-name" required></label>
+            <label>Connection type<select id="setting-shared-type"><option value="unix">Unix</option><option value="tcp">TCP</option></select></label>
+            <label>Shared port<input id="setting-shared-port" type="number" min="1" max="65535" required></label>
+            <label>Control port<input id="setting-control-port" type="number" min="1" max="65535" required></label>
+            <label class="wide">Web API listen address<input id="setting-api-listen" placeholder="0.0.0.0:8080" required></label>
+            <label class="check-field"><input id="setting-share-instance" type="checkbox"><span>Share instance</span></label>
+            <label class="check-field"><input id="setting-enable-transport" type="checkbox"><span>Enable transport</span></label>
+          </fieldset></section>
+          <section class="card"><fieldset class="form-grid">
+            <legend>Protocol</legend>
+            <label>Forced bitrate <span class="optional">optional</span><input id="setting-force-bitrate" type="number" min="1"></label>
+            <label>Default announce target <span class="optional">optional</span><input id="setting-ar-target" type="number" min="1"></label>
+            <label>Announce grace <span class="optional">optional</span><input id="setting-ar-grace" type="number" min="0"></label>
+            <label>Announce penalty <span class="optional">optional</span><input id="setting-ar-penalty" type="number" min="0"></label>
+            <label class="check-field"><input id="setting-probes" type="checkbox"><span>Respond to probes</span></label>
+            <label class="check-field"><input id="setting-implicit-proof" type="checkbox"><span>Implicit proofs</span></label>
+            <label class="check-field"><input id="setting-panic-interface" type="checkbox"><span>Stop on interface error</span></label>
+            <label class="check-field"><input id="setting-mtu-discovery" type="checkbox"><span>Link MTU discovery</span></label>
+          </fieldset></section>
+          <section class="card"><fieldset class="form-grid">
+            <legend>Discovery and logging</legend>
+            <label>Autoconnect limit<input id="setting-autoconnect" type="number" min="0" required></label>
+            <label>Required discovery value<input id="setting-discovery-value" type="number" min="0" max="255" required></label>
+            <label>Log level<select id="setting-loglevel"><option value="0">Critical</option><option value="1">Error</option><option value="2">Warning</option><option value="3">Notice</option><option value="4">Info</option><option value="5">Verbose</option><option value="6">Debug</option><option value="7">Extreme</option></select></label>
+            <label class="check-field"><input id="setting-discovery" type="checkbox"><span>Discover interfaces</span></label>
+            <label class="check-field"><input id="setting-logtimestamps" type="checkbox"><span>Log timestamps</span></label>
+          </fieldset></section>
+          <p class="form-error" id="settings-error" role="alert"></p>
+        </form>
       </section>
     </main>
   </div>

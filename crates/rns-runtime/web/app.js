@@ -6,7 +6,7 @@ const INTERFACE_REFRESH_MS = 1000;
 const INTERFACE_ERROR_REFRESH_MS = 5000;
 const PATH_REFRESH_MS = 5000;
 const PATH_ERROR_REFRESH_MS = 15000;
-const views = new Set(["dashboard", "interfaces", "paths"]);
+const views = new Set(["dashboard", "interfaces", "paths", "settings"]);
 let dashboardRequest = null;
 let interfaceRequest = null;
 let interfaceNextPollAt = 0;
@@ -804,6 +804,81 @@ function optionalInteger(selector) {
   return value === "" ? undefined : Number(value);
 }
 
+async function refreshSettings() {
+  const data = await apiFetch("/api/v1/settings");
+  const fields = {
+    "#setting-instance-name": data.instance_name,
+    "#setting-shared-type": data.shared_instance_type,
+    "#setting-shared-port": data.shared_instance_port,
+    "#setting-control-port": data.instance_control_port,
+    "#setting-api-listen": data.api_listen,
+    "#setting-force-bitrate": data.force_shared_instance_bitrate,
+    "#setting-ar-target": data.default_ar_target,
+    "#setting-ar-grace": data.default_ar_grace,
+    "#setting-ar-penalty": data.default_ar_penalty,
+    "#setting-autoconnect": data.autoconnect_discovered_interfaces,
+    "#setting-discovery-value": data.required_discovery_value,
+    "#setting-loglevel": data.loglevel,
+  };
+  for (const [selector, value] of Object.entries(fields)) setField(selector, value);
+  for (const [selector, key] of [
+    ["#setting-share-instance", "share_instance"],
+    ["#setting-enable-transport", "enable_transport"],
+    ["#setting-probes", "respond_to_probes"],
+    ["#setting-implicit-proof", "use_implicit_proof"],
+    ["#setting-panic-interface", "panic_on_interface_error"],
+    ["#setting-mtu-discovery", "link_mtu_discovery"],
+    ["#setting-discovery", "discover_interfaces"],
+    ["#setting-logtimestamps", "logtimestamps"],
+  ]) document.querySelector(selector).checked = Boolean(data[key]);
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  const number = (id) => Number(document.querySelector(id).value);
+  const optional = (id) => optionalInteger(id);
+  const checked = (id) => document.querySelector(id).checked;
+  const payload = {
+    share_instance: checked("#setting-share-instance"),
+    instance_name: document.querySelector("#setting-instance-name").value.trim(),
+    shared_instance_type: document.querySelector("#setting-shared-type").value,
+    shared_instance_port: number("#setting-shared-port"),
+    instance_control_port: number("#setting-control-port"),
+    api_listen: document.querySelector("#setting-api-listen").value.trim(),
+    enable_transport: checked("#setting-enable-transport"),
+    respond_to_probes: checked("#setting-probes"),
+    use_implicit_proof: checked("#setting-implicit-proof"),
+    panic_on_interface_error: checked("#setting-panic-interface"),
+    link_mtu_discovery: checked("#setting-mtu-discovery"),
+    discover_interfaces: checked("#setting-discovery"),
+    autoconnect_discovered_interfaces: number("#setting-autoconnect"),
+    required_discovery_value: number("#setting-discovery-value"),
+    loglevel: number("#setting-loglevel"),
+    logtimestamps: checked("#setting-logtimestamps"),
+    force_shared_instance_bitrate: optional("#setting-force-bitrate"),
+    default_ar_target: optional("#setting-ar-target"),
+    default_ar_grace: optional("#setting-ar-grace"),
+    default_ar_penalty: optional("#setting-ar-penalty"),
+  };
+  const button = document.querySelector("#save-settings");
+  setBusy(button, true);
+  document.querySelector("#settings-error").textContent = "";
+  try {
+    await apiFetch("/api/v1/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    document.querySelector("#settings-restart").hidden = false;
+  } catch (error) {
+    document.querySelector("#settings-error").textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function addAdvancedOptions(payload) {
   payload.outgoing = document.querySelector("#advanced-outgoing").checked;
   payload.ingress_control =
@@ -1069,6 +1144,7 @@ function showView(name, { focus = false } = {}) {
   if (selected === "dashboard") refreshDashboard();
   if (selected === "interfaces") refreshInterfaces();
   if (selected === "paths") refreshPaths();
+  if (selected === "settings") refreshSettings().catch(showError);
 }
 
 function openNavigation() {
@@ -1143,6 +1219,11 @@ function initialize() {
     document.querySelector("#interface-advanced-dialog").showModal();
   });
   document.querySelector("#interface-form").addEventListener("submit", saveInterface);
+  document.querySelector("#settings-form").addEventListener("submit", saveSettings);
+  document.querySelector("#reload-settings").addEventListener("click", () => {
+    document.querySelector("#settings-restart").hidden = true;
+    refreshSettings().catch(showError);
+  });
   document.querySelector("#delete-interface-form").addEventListener("submit", deleteInterface);
   document.querySelectorAll("[data-close-interface]").forEach((button) => {
     button.addEventListener("click", closeInterfaceDialog);
