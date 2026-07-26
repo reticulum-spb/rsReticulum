@@ -350,6 +350,16 @@ struct InterfaceRequest {
     kiss_framing: Option<bool>,
     interface_mode: Option<String>,
 
+    // AutoInterface
+    group_id: Option<String>,
+    discovery_scope: Option<String>,
+    discovery_port: Option<u16>,
+    data_port: Option<u16>,
+    multicast_address_type: Option<String>,
+    devices: Option<String>,
+    ignored_devices: Option<String>,
+    configured_bitrate: Option<u64>,
+
     // SerialInterface / KISSInterface
     port: Option<String>,
     speed: Option<u32>,
@@ -429,6 +439,30 @@ impl InterfaceRequest {
         }
         if let Some(ref v) = self.interface_mode {
             s.set("interface_mode", v);
+        }
+        if let Some(ref v) = self.group_id {
+            s.set("group_id", v);
+        }
+        if let Some(ref v) = self.discovery_scope {
+            s.set("discovery_scope", v);
+        }
+        if let Some(v) = self.discovery_port {
+            s.set("discovery_port", &v.to_string());
+        }
+        if let Some(v) = self.data_port {
+            s.set("data_port", &v.to_string());
+        }
+        if let Some(ref v) = self.multicast_address_type {
+            s.set("multicast_address_type", v);
+        }
+        if let Some(ref v) = self.devices {
+            s.set("devices", v);
+        }
+        if let Some(ref v) = self.ignored_devices {
+            s.set("ignored_devices", v);
+        }
+        if let Some(v) = self.configured_bitrate {
+            s.set("configured_bitrate", &v.to_string());
         }
         if let Some(ref v) = self.port {
             s.set("port", v);
@@ -1070,7 +1104,7 @@ fn section_enabled(section: &ConfigSection) -> bool {
 }
 
 fn iface_section_json(section: &ConfigSection) -> Value {
-    json!({
+    let mut value = json!({
         "type": section.get("type"),
         "enabled": section_enabled(section),
         "target_host": section.get("target_host"),
@@ -1108,7 +1142,37 @@ fn iface_section_json(section: &ConfigSection) -> Value {
             .or_else(|| section.get_float("lt_alock")),
         "callsign": section.get("callsign"),
         "ssid": section.get_uint("ssid"),
-    })
+    });
+    value.as_object_mut().unwrap().extend([
+        ("group_id".into(), json!(section.get("group_id"))),
+        (
+            "discovery_scope".into(),
+            json!(section.get("discovery_scope")),
+        ),
+        (
+            "discovery_port".into(),
+            json!(section.get_uint("discovery_port")),
+        ),
+        ("data_port".into(), json!(section.get_uint("data_port"))),
+        (
+            "multicast_address_type".into(),
+            json!(section.get("multicast_address_type")),
+        ),
+        ("devices".into(), json!(section.get("devices"))),
+        (
+            "ignored_devices".into(),
+            json!(section.get("ignored_devices")),
+        ),
+        (
+            "configured_bitrate".into(),
+            json!(
+                section
+                    .get_uint("configured_bitrate")
+                    .or_else(|| section.get_uint("bitrate"))
+            ),
+        ),
+    ]);
+    value
 }
 
 /// Serialize `InterfaceConfig` to JSON with full settings.
@@ -1142,6 +1206,18 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "forward_port":   c.forward_port,
             "device":         c.device,
             "interface_mode": mode_to_str(c.mode),
+        }),
+        InterfaceConfig::Auto(c) => json!({
+            "type":                   "AutoInterface",
+            "group_id":               c.group_id,
+            "discovery_scope":        c.discovery_scope.to_string(),
+            "discovery_port":         c.discovery_port,
+            "data_port":              c.data_port,
+            "multicast_address_type": c.multicast_address_type.to_string(),
+            "devices":                c.devices.as_ref().map(|v| v.join(", ")),
+            "ignored_devices":        c.ignored_devices.join(", "),
+            "configured_bitrate":     c.configured_bitrate,
+            "interface_mode":         mode_to_str(c.mode),
         }),
         #[cfg(feature = "serial")]
         InterfaceConfig::Serial(c) => json!({
@@ -1435,6 +1511,36 @@ mod tests {
         assert_eq!(value["forward_port"], 4243);
         assert_eq!(value["device"], "lo");
         assert_eq!(value["interface_mode"], "PointToPoint");
+    }
+
+    #[test]
+    fn auto_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test Auto",
+            "type": "AutoInterface",
+            "group_id": "field-network",
+            "discovery_scope": "site",
+            "discovery_port": 29717,
+            "data_port": 42672,
+            "multicast_address_type": "permanent",
+            "devices": "eth0, wlan0",
+            "ignored_devices": "docker0, veth0",
+            "configured_bitrate": 20000000,
+            "interface_mode": "Full"
+        }))
+        .unwrap();
+
+        let value = iface_config_json(&request.synthesize().unwrap());
+        assert_eq!(value["type"], "AutoInterface");
+        assert_eq!(value["group_id"], "field-network");
+        assert_eq!(value["discovery_scope"], "site");
+        assert_eq!(value["discovery_port"], 29717);
+        assert_eq!(value["data_port"], 42672);
+        assert_eq!(value["multicast_address_type"], "permanent");
+        assert_eq!(value["devices"], "eth0, wlan0");
+        assert_eq!(value["ignored_devices"], "docker0, veth0");
+        assert_eq!(value["configured_bitrate"], 20000000);
+        assert_eq!(value["interface_mode"], "Full");
     }
 
     #[cfg(feature = "serial")]

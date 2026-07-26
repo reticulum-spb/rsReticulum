@@ -49,6 +49,15 @@ test("formats UDP endpoints", () => {
   );
 });
 
+test("formats Auto interface group", () => {
+  assert.equal(
+    interfaceEndpoint({
+      config: { type: "AutoInterface", group_id: "field-network" },
+    }),
+    "field-network",
+  );
+});
+
 test("formats serial endpoints", () => {
   assert.equal(
     interfaceEndpoint({

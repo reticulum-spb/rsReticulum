@@ -210,6 +210,7 @@
             <option value="TCPClientInterface">TCP Client</option>
             <option value="TCPServerInterface">TCP Server</option>
             <option value="UDPInterface">UDP</option>
+            <option value="AutoInterface">Auto</option>
             <option value="SerialInterface">Serial</option>
             <option value="KISSInterface">KISS</option>
             <option value="RNodeInterface">RNode</option>
@@ -285,6 +286,46 @@
         </label>
         <label class="wide">Device <span class="optional">optional</span>
           <input id="udp-device" autocomplete="off">
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="auto-fields" hidden disabled>
+        <legend>Auto</legend>
+        <label class="wide">Group ID
+          <input id="auto-group-id" autocomplete="off" value="reticulum" required>
+        </label>
+        <label>Discovery scope
+          <select id="auto-discovery-scope">
+            <option value="link">Link</option>
+            <option value="admin">Admin</option>
+            <option value="site">Site</option>
+            <option value="organisation">Organisation</option>
+            <option value="global">Global</option>
+          </select>
+        </label>
+        <label>Multicast address
+          <select id="auto-multicast-address-type">
+            <option value="temporary">Temporary</option>
+            <option value="permanent">Permanent</option>
+          </select>
+        </label>
+        <label>Discovery port
+          <input id="auto-discovery-port" type="number" min="1" max="65535"
+                 step="1" value="29716" required>
+        </label>
+        <label>Data port
+          <input id="auto-data-port" type="number" min="1" max="65535"
+                 step="1" value="42671" required>
+        </label>
+        <label class="wide">Devices <span class="optional">optional, comma-separated</span>
+          <input id="auto-devices" autocomplete="off" placeholder="eth0, wlan0">
+        </label>
+        <label class="wide">Ignored devices <span class="optional">optional, comma-separated</span>
+          <input id="auto-ignored-devices" autocomplete="off" placeholder="docker0, veth0">
+        </label>
+        <label class="wide">Configured bitrate, bit/s <span class="optional">optional</span>
+          <input id="auto-configured-bitrate" type="number" min="1" step="1"
+                 placeholder="10000000">
         </label>
       </fieldset>
 

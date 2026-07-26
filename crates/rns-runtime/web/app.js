@@ -229,6 +229,9 @@ function interfaceEndpoint(item) {
     const forward = `${config.forward_ip || "—"}:${config.forward_port ?? "—"}`;
     return `${listen} → ${forward}`;
   }
+  if (config.type === "AutoInterface") {
+    return config.group_id || "reticulum";
+  }
   if (
     config.type === "SerialInterface"
     || config.type === "KISSInterface"
@@ -289,6 +292,7 @@ function interfaceDetails(item) {
       "TCPClientInterface",
       "TCPServerInterface",
       "UDPInterface",
+      "AutoInterface",
       "SerialInterface",
       "KISSInterface",
       "RNodeInterface",
@@ -607,6 +611,7 @@ function setInterfaceType(type) {
   const client = document.querySelector("#tcp-client-fields");
   const server = document.querySelector("#tcp-server-fields");
   const udp = document.querySelector("#udp-fields");
+  const auto = document.querySelector("#auto-fields");
   const serial = document.querySelector("#serial-fields");
   const kissSerial = document.querySelector("#kiss-fields");
   const rnode = document.querySelector("#rnode-fields");
@@ -615,6 +620,7 @@ function setInterfaceType(type) {
   const isClient = type === "TCPClientInterface";
   const isServer = type === "TCPServerInterface";
   const isUdp = type === "UDPInterface";
+  const isAuto = type === "AutoInterface";
   const isSerial = type === "SerialInterface";
   const isKiss = type === "KISSInterface";
   const isRNode = type === "RNodeInterface";
@@ -625,6 +631,8 @@ function setInterfaceType(type) {
   server.disabled = !isServer;
   udp.hidden = !isUdp;
   udp.disabled = !isUdp;
+  auto.hidden = !isAuto;
+  auto.disabled = !isAuto;
   serial.hidden = !isSerial;
   serial.disabled = !isSerial;
   kissSerial.hidden = !isKiss;
@@ -665,6 +673,18 @@ function openInterfaceDialog(item = null) {
   setField("#udp-forward-ip", config.forward_ip);
   setField("#udp-forward-port", config.forward_port);
   setField("#udp-device", config.device);
+  setField("#auto-group-id", config.group_id, "reticulum");
+  setField("#auto-discovery-scope", config.discovery_scope, "link");
+  setField("#auto-discovery-port", config.discovery_port, 29716);
+  setField("#auto-data-port", config.data_port, 42671);
+  setField(
+    "#auto-multicast-address-type",
+    config.multicast_address_type,
+    "temporary",
+  );
+  setField("#auto-devices", config.devices);
+  setField("#auto-ignored-devices", config.ignored_devices);
+  setField("#auto-configured-bitrate", config.configured_bitrate);
   setField("#serial-port", config.port);
   setField("#serial-speed", config.speed, 9600);
   setField("#serial-databits", config.databits, 8);
@@ -761,6 +781,24 @@ function interfacePayload() {
     if (forwardIp) payload.forward_ip = forwardIp;
     if (forwardPort !== undefined) payload.forward_port = forwardPort;
     if (device) payload.device = device;
+  } else if (type === "AutoInterface") {
+    payload.group_id = document.querySelector("#auto-group-id").value.trim();
+    payload.discovery_scope =
+      document.querySelector("#auto-discovery-scope").value;
+    payload.discovery_port =
+      Number(document.querySelector("#auto-discovery-port").value);
+    payload.data_port = Number(document.querySelector("#auto-data-port").value);
+    payload.multicast_address_type =
+      document.querySelector("#auto-multicast-address-type").value;
+    const devices = document.querySelector("#auto-devices").value.trim();
+    const ignoredDevices =
+      document.querySelector("#auto-ignored-devices").value.trim();
+    const configuredBitrate = optionalInteger("#auto-configured-bitrate");
+    if (devices) payload.devices = devices;
+    if (ignoredDevices) payload.ignored_devices = ignoredDevices;
+    if (configuredBitrate !== undefined) {
+      payload.configured_bitrate = configuredBitrate;
+    }
   } else if (type === "SerialInterface") {
     payload.port = document.querySelector("#serial-port").value.trim();
     payload.speed = Number(document.querySelector("#serial-speed").value);
