@@ -103,6 +103,10 @@ enum LinkSessionCommand {
     Identify {
         result_tx: oneshot::Sender<Result<(), LinkClientError>>,
     },
+    SendPacket {
+        data: Vec<u8>,
+        result_tx: oneshot::Sender<Result<(), LinkClientError>>,
+    },
     SendPayload {
         data: Vec<u8>,
         auto_compress: bool,
@@ -235,6 +239,17 @@ impl LinkSessionHandle {
         recv_command_result(result_rx).await
     }
 
+    /// Send one Link packet without waiting for its delivery proof.
+    ///
+    /// This matches Reticulum applications whose protocol provides its own
+    /// acknowledgement, such as RRC's `JOINED` and `PARTED` envelopes.
+    pub async fn send_packet(&self, data: Vec<u8>) -> Result<(), LinkClientError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.send_command(LinkSessionCommand::SendPacket { data, result_tx })
+            .await?;
+        recv_command_result(result_rx).await
+    }
+
     pub async fn send_payload(
         &self,
         data: Vec<u8>,
@@ -328,6 +343,9 @@ async fn run_established_link_session(
                 match command {
                     LinkSessionCommand::Identify { result_tx } => {
                         let _ = result_tx.send(session.identify().await);
+                    }
+                    LinkSessionCommand::SendPacket { data, result_tx } => {
+                        let _ = result_tx.send(session.send(&data).await);
                     }
                     LinkSessionCommand::SendPayload {
                         data,
