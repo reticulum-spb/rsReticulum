@@ -5,7 +5,7 @@
 //!
 //! ```ini
 //! [reticulum]
-//! api_listen = 127.0.0.1:8080
+//! api_listen = 0.0.0.0:8080
 //! ```
 //!
 //! The server runs inside the rnsd process and accesses the transport
@@ -27,15 +27,18 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{delete, get, post, put};
-use serde::{Deserialize, Serialize};
+use axum::http::{HeaderValue, Request, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Json, Response};
+use axum::routing::get;
+use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use rns_transport::messages::{
     InterfaceStatRpcEntry, PathTableRpcEntry, TransportMessage, TransportQuery,
@@ -46,6 +49,10 @@ use crate::config::{Config, ConfigSection};
 use crate::interface_factory::{InterfaceConfig, synthesize_interface};
 use crate::lifecycle::ShutdownSignal;
 use crate::reticulum::{ReticulumHandle, teardown_interface};
+
+const INDEX_HTML: &str = include_str!("../web/index.html");
+const APP_JS: &str = include_str!("../web/app.js");
+const STYLE_CSS: &str = include_str!("../web/style.css");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Starting the server
@@ -60,9 +67,13 @@ pub async fn run_api_server(
     let state = AppState {
         transport_tx,
         handle,
+        config_write_lock: Arc::new(Mutex::new(())),
     };
 
     let app = Router::new()
+        .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/style.css", get(style_css))
         .route("/health", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/interfaces", get(interfaces).post(create_interface))
@@ -74,6 +85,7 @@ pub async fn run_api_server(
         )
         .route("/api/v1/paths", get(paths))
         .route("/api/v1/links", get(links))
+        .layer(middleware::from_fn(security_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
@@ -107,6 +119,7 @@ pub async fn run_api_server(
 struct AppState {
     transport_tx: mpsc::Sender<TransportMessage>,
     handle: ReticulumHandle,
+    config_write_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -177,6 +190,53 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Embedded Web UI
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+async fn app_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_JS,
+    )
+        .into_response()
+}
+
+async fn style_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+        .into_response()
+}
+
+async fn security_headers(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; \
+             style-src 'self'; script-src 'self'; base-uri 'none'; \
+             frame-ancestors 'none'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input JSON for creating/updating the interface
@@ -454,6 +514,8 @@ async fn create_interface(
     State(s): State<AppState>,
     Json(req): Json<InterfaceRequest>,
 ) -> ApiResult<Response> {
+    let _config_guard = s.config_write_lock.lock().await;
+
     // We check whether there is already an interface with this name at runtime.
     if find_running_id(&s, &req.name).await?.is_some() {
         return Err(ApiError::Conflict(format!(
@@ -486,6 +548,8 @@ async fn update_interface(
     Path(id): Path<u64>,
     Json(req): Json<InterfaceRequest>,
 ) -> ApiResult<Json<Value>> {
+    let _config_guard = s.config_write_lock.lock().await;
+
     // Find the old interface by id to know its name for deleting from the config.
     let ifaces = fetch_interfaces(&s).await?;
     let old_entry = ifaces
@@ -519,6 +583,8 @@ async fn delete_interface(
     State(s): State<AppState>,
     Path(id): Path<u64>,
 ) -> ApiResult<Json<Value>> {
+    let _config_guard = s.config_write_lock.lock().await;
+
     // find a name by id
     let ifaces = fetch_interfaces(&s).await?;
     let entry = ifaces

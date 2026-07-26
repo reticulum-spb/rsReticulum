@@ -52,6 +52,7 @@ multi-segment response Resources are reassembled before request decoding.
 - [Build It](#build-it)
 - [Rust Examples](#rust-examples)
 - [Tool Usage](#tool-usage)
+- [Web Configurator](#web-configurator)
 - [Configuration](#configuration)
 - [Interface Support](#interface-support)
 - [Compatibility Notes](#compatibility-notes)
@@ -226,6 +227,26 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -d message.txt.rfe
 Use `--raw -s <file>` only when a workflow intentionally needs the legacy raw
 64-byte signature form. Normal `rnid-rs -s <file>` produces a `.rsg` file that
 embeds the signer metadata needed for 1.3.8 validation.
+
+## Web Configurator
+
+The optional REST API includes an embedded Web UI and is available only from
+the Shared `rnsd-rs` process. Build the daemon with the `api` feature:
+
+```bash
+cargo build --release -p rns-tools --features api
+```
+
+Enable the server in the `[reticulum]` section of the active config:
+
+```ini
+[reticulum]
+api_listen = 0.0.0.0:8080
+```
+
+Then open `http://<host>:8080/`. Binding to `0.0.0.0` is intended temporarily
+for development and testing on trusted networks. The current API has no
+authentication and must not be exposed to the public internet.
 
 ## Configuration
 
