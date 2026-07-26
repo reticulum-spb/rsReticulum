@@ -135,6 +135,13 @@ pub struct ReceivedResource {
     pub resource_hash: [u8; 32],
 }
 
+/// Response payload and optional Resource metadata returned by a Link request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkResponse {
+    pub data: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
+}
+
 /// Proof-backed result of sending an application payload over a Link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkPayloadSendReceipt {
@@ -750,6 +757,31 @@ impl LinkSession {
         data: Option<&[u8]>,
         deadline: Duration,
     ) -> Result<Vec<u8>, LinkClientError> {
+        self.request_with_metadata(path, data, deadline)
+            .await
+            .map(|response| response.data)
+    }
+
+    /// Send a request and retain metadata from a Resource-backed response.
+    pub async fn request_with_metadata(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        deadline: Duration,
+    ) -> Result<LinkResponse, LinkClientError> {
+        self.request_with_metadata_limit(path, data, deadline, usize::MAX)
+            .await
+    }
+
+    /// Send a request while rejecting a response before Resource assembly
+    /// exceeds the application-provided payload limit.
+    pub async fn request_with_metadata_limit(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        deadline: Duration,
+        max_response_bytes: usize,
+    ) -> Result<LinkResponse, LinkClientError> {
         let (encrypted, request_id) = self
             .link
             .request(path, data, deadline)
@@ -779,6 +811,7 @@ impl LinkSession {
             link_id,
             packet_request_id,
             deadline,
+            max_response_bytes,
         )
         .await
     }
@@ -1477,8 +1510,10 @@ impl LinkClient {
             link_id,
             packet_request_id,
             time_remaining(deadline)?,
+            usize::MAX,
         )
-        .await;
+        .await
+        .map(|response| response.data);
 
         // Tear down even on failure so the remote doesn't keep link state.
         let _ = self.send_close(&mut link).await;
@@ -1584,9 +1619,13 @@ async fn wait_for_response(
     link_id: [u8; 16],
     request_id: [u8; 16],
     deadline: Duration,
-) -> Result<Vec<u8>, LinkClientError> {
+    max_response_bytes: usize,
+) -> Result<LinkResponse, LinkClientError> {
     let fut = async {
         let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
+        let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
+        let mut multi: Option<MultiSegmentInbound> = None;
+        let mut advertised_bytes = 0usize;
 
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -1607,7 +1646,15 @@ async fn wait_for_response(
                             match link.handle_response(body) {
                                 Ok((id, response_data)) => {
                                     if id == request_id {
-                                        return Ok(response_data);
+                                        if response_data.len() > max_response_bytes {
+                                            return Err(LinkClientError::UnexpectedResponse(
+                                                "response exceeds application size limit".into(),
+                                            ));
+                                        }
+                                        return Ok(LinkResponse {
+                                            data: response_data,
+                                            metadata: None,
+                                        });
                                     }
                                 }
                                 Err(e) => {
@@ -1633,6 +1680,14 @@ async fn wait_for_response(
                                 || adv.request_id.as_deref() != Some(request_id.as_slice())
                             {
                                 continue;
+                            }
+                            if !inbound_resources.contains_key(&adv.resource_hash) {
+                                advertised_bytes = advertised_bytes.saturating_add(adv.data_size);
+                                if advertised_bytes > max_response_bytes {
+                                    return Err(LinkClientError::UnexpectedResponse(
+                                        "resource response exceeds application size limit".into(),
+                                    ));
+                                }
                             }
 
                             let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
@@ -1667,6 +1722,16 @@ async fn wait_for_response(
                                 )?;
                             }
 
+                            segment_info.insert(
+                                adv.resource_hash,
+                                (adv.original_hash, adv.segment_index, adv.total_segments),
+                            );
+                            if adv.total_segments > 1 && multi.is_none() {
+                                multi = Some(MultiSegmentInbound::new(
+                                    adv.total_segments,
+                                    adv.original_hash,
+                                ));
+                            }
                             inbound_resources.insert(adv.resource_hash, transfer);
                         }
                         rns_wire::context::PacketContext::Resource => {
@@ -1719,7 +1784,7 @@ async fn wait_for_response(
                             }
 
                             if let Some(rh) = completed_rh {
-                                let (assembled, proof) = {
+                                let (assembled, proof, metadata) = {
                                     let transfer =
                                         inbound_resources.get_mut(&rh).ok_or_else(|| {
                                             LinkClientError::UnexpectedResponse(
@@ -1738,19 +1803,54 @@ async fn wait_for_response(
                                             },
                                         )
                                     };
-                                    transfer.complete(Some(&decrypt_fn)).map_err(|e| {
-                                        LinkClientError::UnexpectedResponse(format!(
-                                            "resource assemble: {e:?}"
-                                        ))
-                                    })?
+                                    let (assembled, proof) =
+                                        transfer.complete(Some(&decrypt_fn)).map_err(|e| {
+                                            LinkClientError::UnexpectedResponse(format!(
+                                                "resource assemble: {e:?}"
+                                            ))
+                                        })?;
+                                    (assembled, proof, transfer.resource.metadata.clone())
                                 };
 
                                 send_link_proof(transport_tx, link_id, &proof)?;
                                 inbound_resources.remove(&rh);
-                                match link.handle_response_plaintext(&assembled) {
+                                let (_, segment_index, total_segments) =
+                                    segment_info.remove(&rh).unwrap_or((rh, 1, 1));
+                                let response_payload = if total_segments > 1 {
+                                    let coordinator =
+                                        multi.as_mut().expect("multi-segment coordinator");
+                                    coordinator
+                                        .set_segment_data(segment_index, assembled)
+                                        .map_err(|error| {
+                                            LinkClientError::UnexpectedResponse(format!(
+                                                "resource response segment: {error:?}"
+                                            ))
+                                        })?;
+                                    if let Some(metadata) = metadata.clone() {
+                                        coordinator.set_metadata(metadata);
+                                    }
+                                    if !coordinator.is_complete() {
+                                        continue;
+                                    }
+                                    coordinator.reassemble().map_err(|error| {
+                                        LinkClientError::UnexpectedResponse(format!(
+                                            "resource response reassembly: {error:?}"
+                                        ))
+                                    })?
+                                } else {
+                                    assembled
+                                };
+                                let metadata = multi
+                                    .as_ref()
+                                    .and_then(|coordinator| coordinator.metadata.clone())
+                                    .or(metadata);
+                                match link.handle_response_plaintext(&response_payload) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
-                                            return Ok(response_data);
+                                            return Ok(LinkResponse {
+                                                data: response_data,
+                                                metadata,
+                                            });
                                         }
                                     }
                                     Err(e) => {
