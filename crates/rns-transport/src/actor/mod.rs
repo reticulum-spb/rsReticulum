@@ -490,19 +490,12 @@ impl TransportActor {
                     tx: callback_tx,
                 });
             }
-            TransportMessage::DeregisterAnnounceHandler { aspect_filter } => {
+            TransportMessage::DeregisterAnnounceHandler { callback_tx } => {
                 // Also sweep closed channels here so deregister doubles as
                 // garbage-collection for handlers whose owner dropped
                 // without explicitly unregistering.
                 self.announce_handlers.retain(|registration| {
-                    if registration.tx.is_closed() {
-                        return false;
-                    }
-                    if let Some(ref target) = aspect_filter {
-                        registration.aspect_filter.as_ref() != Some(target)
-                    } else {
-                        true
-                    }
+                    !registration.tx.is_closed() && !registration.tx.same_channel(&callback_tx)
                 });
             }
             TransportMessage::SetTransportEnabled { enabled } => {
@@ -9344,6 +9337,67 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, 3, "None-filter handler must receive all aspects");
+    }
+
+    /// Two concurrent queries subscribe to the same aspect; the first to
+    /// finish must not unsubscribe the second.
+    #[test]
+    fn deregister_announce_handler_only_removes_its_own_subscription() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first_tx, _first_rx) = mpsc::channel(8);
+        let (second_tx, mut second_rx) = mpsc::channel(8);
+        for tx in [first_tx.clone(), second_tx.clone()] {
+            actor.announce_handlers.push(AnnounceHandlerRegistration {
+                aspect_filter: Some("nomadnetwork.node".to_string()),
+                receive_path_responses: true,
+                tx,
+            });
+        }
+
+        actor.handle_message(TransportMessage::DeregisterAnnounceHandler {
+            callback_tx: first_tx,
+        });
+
+        assert_eq!(actor.announce_handlers.len(), 1);
+        assert!(actor.announce_handlers[0].tx.same_channel(&second_tx));
+
+        // The survivor still receives announces.
+        let (entry, _rx) = make_test_interface("test_iface");
+        actor.interfaces.insert(1, entry);
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, _) = make_announce_for(&identity, "nomadnetwork.node", 1);
+        actor.on_inbound(crate::messages::InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(
+            second_rx.try_recv().is_ok(),
+            "surviving handler must still be dispatched to"
+        );
+    }
+
+    /// Registrations must not pile up when a caller deregisters each time --
+    /// a query that returned early used to leave its handler behind forever.
+    #[test]
+    fn announce_handlers_do_not_accumulate_across_repeated_registrations() {
+        let (mut actor, _tx) = TransportActor::new();
+        for _ in 0..16 {
+            let (htx, _hrx) = mpsc::channel(8);
+            actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+                aspect_filter: Some("nomadnetwork.node".to_string()),
+                receive_path_responses: true,
+                callback_tx: htx.clone(),
+            });
+            actor.handle_message(TransportMessage::DeregisterAnnounceHandler { callback_tx: htx });
+        }
+        assert!(
+            actor.announce_handlers.is_empty(),
+            "leaked {} registrations",
+            actor.announce_handlers.len()
+        );
     }
 
     #[test]
