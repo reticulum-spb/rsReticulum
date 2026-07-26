@@ -326,8 +326,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 13px 16px; border-bottom: 1px solid var(--border); text-align: left; }
-th { color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; }
-td { font-size: 13px; }
+th { color: var(--muted); font-size: 12px; font-weight: 650; text-transform: uppercase; }
+td { font-size: 14px; }
 tbody tr:hover { background: var(--panel-2); }
 
 .interface-name {
@@ -479,6 +479,10 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
 .dialog-actions-spacer { flex: 1; }
 #settings-form { display: grid; gap: 18px; }
 #settings-form .card { padding: 16px; }
+#settings-form .form-grid label { font-size: 13px; }
+#settings-form .form-grid input,
+#settings-form .form-grid select { font-size: 14px; }
+#settings-form fieldset.form-grid legend { font-size: 12px; }
 .system-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .log-output {
   height: min(68vh, 760px);
