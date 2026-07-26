@@ -383,16 +383,37 @@
                  step="1" required>
         </label>
         <label>Bandwidth, Hz
-          <input id="rnode-bandwidth" type="number" min="7800" max="1625000"
-                 step="1" value="125000" required>
+          <select id="rnode-bandwidth">
+            <option value="7800">7,800</option>
+            <option value="10400">10,400</option>
+            <option value="15600">15,600</option>
+            <option value="20800">20,800</option>
+            <option value="31250">31,250</option>
+            <option value="41700">41,700</option>
+            <option value="62500">62,500</option>
+            <option value="125000" selected>125,000</option>
+            <option value="250000">250,000</option>
+            <option value="500000">500,000</option>
+            <option value="1625000">1,625,000</option>
+          </select>
         </label>
         <label>Spreading factor
-          <input id="rnode-spreading-factor" type="number" min="5" max="12"
-                 step="1" value="8" required>
+          <select id="rnode-spreading-factor">
+            <option value="7">7</option>
+            <option value="8" selected>8</option>
+            <option value="9">9</option>
+            <option value="10">10</option>
+            <option value="11">11</option>
+            <option value="12">12</option>
+          </select>
         </label>
         <label>Coding rate
-          <input id="rnode-coding-rate" type="number" min="5" max="8"
-                 step="1" value="5" required>
+          <select id="rnode-coding-rate">
+            <option value="5">4:5</option>
+            <option value="6">4:6</option>
+            <option value="7">4:7</option>
+            <option value="8">4:8</option>
+          </select>
         </label>
         <label>TX power, dBm
           <input id="rnode-tx-power" type="number" min="0" max="37"
@@ -405,12 +426,6 @@
         <label>Long airtime limit, % <span class="optional">optional</span>
           <input id="rnode-airtime-long" type="number" min="0" max="100"
                  step="any">
-        </label>
-        <label>ID interval, s <span class="optional">optional</span>
-          <input id="rnode-id-interval" type="number" min="1" step="1">
-        </label>
-        <label>ID callsign <span class="optional">optional</span>
-          <input id="rnode-id-callsign" autocomplete="off">
         </label>
         <label class="check-field wide">
           <input id="rnode-flow-control" type="checkbox">

@@ -684,8 +684,6 @@ function openInterfaceDialog(item = null) {
   setField("#rnode-tx-power", config.txpower, 7);
   setField("#rnode-airtime-short", config.airtime_limit_short);
   setField("#rnode-airtime-long", config.airtime_limit_long);
-  setField("#rnode-id-interval", config.id_interval);
-  setField("#rnode-id-callsign", config.id_callsign);
   document.querySelector("#rnode-flow-control").checked = Boolean(config.flow_control);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
@@ -780,12 +778,8 @@ function interfacePayload() {
     payload.flow_control = document.querySelector("#rnode-flow-control").checked;
     const airtimeShort = optionalInteger("#rnode-airtime-short");
     const airtimeLong = optionalInteger("#rnode-airtime-long");
-    const idInterval = optionalInteger("#rnode-id-interval");
-    const idCallsign = document.querySelector("#rnode-id-callsign").value.trim();
     if (airtimeShort !== undefined) payload.airtime_limit_short = airtimeShort;
     if (airtimeLong !== undefined) payload.airtime_limit_long = airtimeLong;
-    if (idInterval !== undefined) payload.id_interval = idInterval;
-    if (idCallsign) payload.id_callsign = idCallsign;
   }
 
   return payload;

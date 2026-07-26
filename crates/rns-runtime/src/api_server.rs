@@ -458,11 +458,13 @@ impl InterfaceRequest {
         if let Some(v) = self.flow_control {
             s.set("flow_control", if v { "Yes" } else { "No" });
         }
-        if let Some(v) = self.id_interval {
-            s.set("id_interval", &v.to_string());
-        }
-        if let Some(ref v) = self.id_callsign {
-            s.set("id_callsign", v);
+        if self.iface_type == "KISSInterface" {
+            if let Some(v) = self.id_interval {
+                s.set("id_interval", &v.to_string());
+            }
+            if let Some(ref v) = self.id_callsign {
+                s.set("id_callsign", v);
+            }
         }
         if let Some(v) = self.frequency {
             s.set("frequency", &v.to_string());
@@ -1160,8 +1162,6 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "flow_control":        c.flow_control,
             "airtime_limit_short": c.st_alock,
             "airtime_limit_long":  c.lt_alock,
-            "id_interval":         c.id_interval,
-            "id_callsign":         c.id_callsign,
             "interface_mode":      mode_to_str(c.mode),
         }),
         // The remaining types return only the type - it is expanded by analogy.
@@ -1474,9 +1474,7 @@ mod tests {
             "txpower": 7,
             "flow_control": true,
             "airtime_limit_short": 25.0,
-            "airtime_limit_long": 2.5,
-            "id_interval": 600,
-            "id_callsign": "N0CALL-1"
+            "airtime_limit_long": 2.5
         }))
         .unwrap();
 
@@ -1491,8 +1489,8 @@ mod tests {
         assert_eq!(value["flow_control"], true);
         assert_eq!(value["airtime_limit_short"], 25.0);
         assert_eq!(value["airtime_limit_long"], 2.5);
-        assert_eq!(value["id_interval"], 600);
-        assert_eq!(value["id_callsign"], "N0CALL-1");
+        assert!(value.get("id_interval").is_none());
+        assert!(value.get("id_callsign").is_none());
     }
 
     #[test]
