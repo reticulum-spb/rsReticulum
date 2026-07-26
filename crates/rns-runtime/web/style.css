@@ -157,19 +157,12 @@ main {
 .page-heading {
   display: flex;
   align-items: end;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 24px;
-  margin-bottom: 28px;
+  margin-bottom: 14px;
 }
 
-.page-heading h1 {
-  margin: 5px 0 6px;
-  font-size: clamp(30px, 4vw, 44px);
-  letter-spacing: -.045em;
-  line-height: 1;
-}
-
-.page-heading p, .card p, dialog p {
+.card p, dialog p {
   margin: 0;
   color: var(--muted);
   line-height: 1.55;
@@ -400,15 +393,12 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
   }
   .sidebar.open { transform: translateX(0); box-shadow: 20px 0 60px #000a; }
   main { padding: 28px 16px; }
-  .page-heading { align-items: start; }
   .heading-actions { flex-wrap: wrap; justify-content: flex-end; }
 }
 
 @media (max-width: 520px) {
   .daemon-pill { padding: 7px 9px; font-size: 11px; }
   .metric-grid { grid-template-columns: 1fr; }
-  .page-heading { display: grid; }
-  .heading-actions { justify-content: start; }
   .runtime-card { align-items: start; }
   th, td { padding: 12px; }
 }
