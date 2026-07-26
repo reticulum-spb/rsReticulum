@@ -119,7 +119,6 @@
                   <th>Mode</th>
                   <th>Traffic</th>
                   <th>Rate</th>
-                  <th>MTU</th>
                 </tr>
               </thead>
               <tbody id="interface-rows"></tbody>
@@ -140,7 +139,7 @@
           </button>
         </div>
 
-        <section class="table-card">
+        <section class="table-card paths-table-card">
           <div class="table-toolbar">
             <label class="search-field">
               <span class="sr-only">Search paths</span>
@@ -148,7 +147,8 @@
             </label>
             <span class="muted" id="path-count">Not loaded</span>
           </div>
-          <div class="table-scroll">
+          <div class="table-scroll path-table-scroll" tabindex="0"
+               role="region" aria-label="Scrollable path table">
             <table>
               <thead>
                 <tr>
@@ -161,11 +161,11 @@
               </thead>
               <tbody id="path-rows"></tbody>
             </table>
-          </div>
-          <div class="empty" id="paths-empty">
-            <span class="empty-icon" aria-hidden="true">⌁</span>
-            <strong>Path data is not loaded yet</strong>
-            <span>The route table will be connected in a later implementation block.</span>
+            <div class="empty" id="paths-empty">
+              <span class="empty-icon" aria-hidden="true">⌁</span>
+              <strong>Path data is not loaded yet</strong>
+              <span>The route table will be connected in a later implementation block.</span>
+            </div>
           </div>
         </section>
       </section>
