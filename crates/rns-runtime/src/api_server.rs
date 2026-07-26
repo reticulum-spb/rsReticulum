@@ -363,6 +363,15 @@ struct InterfaceRequest {
     flow_control: Option<bool>,
     id_interval: Option<u64>,
     id_callsign: Option<String>,
+
+    // RNodeInterface
+    frequency: Option<u32>,
+    bandwidth: Option<u32>,
+    spreadingfactor: Option<u8>,
+    codingrate: Option<u8>,
+    txpower: Option<i8>,
+    airtime_limit_short: Option<f32>,
+    airtime_limit_long: Option<f32>,
 }
 
 impl InterfaceRequest {
@@ -454,6 +463,27 @@ impl InterfaceRequest {
         }
         if let Some(ref v) = self.id_callsign {
             s.set("id_callsign", v);
+        }
+        if let Some(v) = self.frequency {
+            s.set("frequency", &v.to_string());
+        }
+        if let Some(v) = self.bandwidth {
+            s.set("bandwidth", &v.to_string());
+        }
+        if let Some(v) = self.spreadingfactor {
+            s.set("spreadingfactor", &v.to_string());
+        }
+        if let Some(v) = self.codingrate {
+            s.set("codingrate", &v.to_string());
+        }
+        if let Some(v) = self.txpower {
+            s.set("txpower", &v.to_string());
+        }
+        if let Some(v) = self.airtime_limit_short {
+            s.set("airtime_limit_short", &v.to_string());
+        }
+        if let Some(v) = self.airtime_limit_long {
+            s.set("airtime_limit_long", &v.to_string());
         }
         s
     }
@@ -1046,6 +1076,16 @@ fn iface_section_json(section: &ConfigSection) -> Value {
         "flow_control": section.get_bool("flow_control"),
         "id_interval": section.get_uint("id_interval"),
         "id_callsign": section.get("id_callsign"),
+        "frequency": section.get_uint("frequency"),
+        "bandwidth": section.get_uint("bandwidth"),
+        "spreadingfactor": section.get_uint("spreadingfactor")
+            .or_else(|| section.get_uint("spreading_factor")),
+        "codingrate": section.get_uint("codingrate").or_else(|| section.get_uint("coding_rate")),
+        "txpower": section.get_int("txpower").or_else(|| section.get_int("tx_power")),
+        "airtime_limit_short": section.get_float("airtime_limit_short")
+            .or_else(|| section.get_float("st_alock")),
+        "airtime_limit_long": section.get_float("airtime_limit_long")
+            .or_else(|| section.get_float("lt_alock")),
     })
 }
 
@@ -1107,6 +1147,22 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "id_interval":    c.id_interval,
             "id_callsign":    c.id_callsign,
             "interface_mode": mode_to_str(c.mode),
+        }),
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        InterfaceConfig::RNode(c) => json!({
+            "type":                "RNodeInterface",
+            "port":                c.port,
+            "frequency":           c.frequency,
+            "bandwidth":           c.bandwidth,
+            "spreadingfactor":     c.spreading_factor,
+            "codingrate":          c.coding_rate,
+            "txpower":             c.tx_power,
+            "flow_control":        c.flow_control,
+            "airtime_limit_short": c.st_alock,
+            "airtime_limit_long":  c.lt_alock,
+            "id_interval":         c.id_interval,
+            "id_callsign":         c.id_callsign,
+            "interface_mode":      mode_to_str(c.mode),
         }),
         // The remaining types return only the type - it is expanded by analogy.
         other => json!({ "type": interface_type_name(other) }),
@@ -1400,6 +1456,41 @@ mod tests {
         assert_eq!(value["persistence"], 200);
         assert_eq!(value["slottime"], 30);
         assert_eq!(value["flow_control"], true);
+        assert_eq!(value["id_interval"], 600);
+        assert_eq!(value["id_callsign"], "N0CALL-1");
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn rnode_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test RNode",
+            "type": "RNodeInterface",
+            "port": "/dev/ttyUSB0",
+            "frequency": 867200000,
+            "bandwidth": 125000,
+            "spreadingfactor": 8,
+            "codingrate": 5,
+            "txpower": 7,
+            "flow_control": true,
+            "airtime_limit_short": 25.0,
+            "airtime_limit_long": 2.5,
+            "id_interval": 600,
+            "id_callsign": "N0CALL-1"
+        }))
+        .unwrap();
+
+        let value = iface_config_json(&request.synthesize().unwrap());
+        assert_eq!(value["type"], "RNodeInterface");
+        assert_eq!(value["port"], "/dev/ttyUSB0");
+        assert_eq!(value["frequency"], 867200000);
+        assert_eq!(value["bandwidth"], 125000);
+        assert_eq!(value["spreadingfactor"], 8);
+        assert_eq!(value["codingrate"], 5);
+        assert_eq!(value["txpower"], 7);
+        assert_eq!(value["flow_control"], true);
+        assert_eq!(value["airtime_limit_short"], 25.0);
+        assert_eq!(value["airtime_limit_long"], 2.5);
         assert_eq!(value["id_interval"], 600);
         assert_eq!(value["id_callsign"], "N0CALL-1");
     }

@@ -256,7 +256,7 @@ and the previous runtime interface.
 The Interfaces view combines runtime statistics with the configured interface
 list. Disabled or failed interfaces remain visible and can be edited, enabled,
 disabled, or removed even when they do not have a runtime ID. The current forms
-support TCP Client, TCP Server, UDP, Serial, and KISS interfaces.
+support TCP Client, TCP Server, UDP, Serial, KISS, and RNode interfaces.
 
 Run the Web UI and REST API checks with:
 

@@ -61,6 +61,12 @@ test("formats serial endpoints", () => {
     }),
     "tcp://tnc.local:8001",
   );
+  assert.equal(
+    interfaceEndpoint({
+      config: { type: "RNodeInterface", port: "tcp://rnode.local:7633" },
+    }),
+    "tcp://rnode.local:7633",
+  );
 });
 
 test("filters paths by destination, next hop, and interface name", () => {

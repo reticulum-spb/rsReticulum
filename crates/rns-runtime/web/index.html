@@ -212,6 +212,7 @@
             <option value="UDPInterface">UDP</option>
             <option value="SerialInterface">Serial</option>
             <option value="KISSInterface">KISS</option>
+            <option value="RNodeInterface">RNode</option>
           </select>
         </label>
         <label>Mode
@@ -367,6 +368,52 @@
         </label>
         <label class="check-field wide">
           <input id="kiss-flow-control" type="checkbox">
+          <span>Flow control</span>
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="rnode-fields" hidden disabled>
+        <legend>RNode</legend>
+        <label class="wide">Port
+          <input id="rnode-port" autocomplete="off"
+                 placeholder="/dev/ttyUSB0 or tcp://host:7633" required>
+        </label>
+        <label>Frequency, Hz
+          <input id="rnode-frequency" type="number" min="1" max="4294967295"
+                 step="1" required>
+        </label>
+        <label>Bandwidth, Hz
+          <input id="rnode-bandwidth" type="number" min="7800" max="1625000"
+                 step="1" value="125000" required>
+        </label>
+        <label>Spreading factor
+          <input id="rnode-spreading-factor" type="number" min="5" max="12"
+                 step="1" value="8" required>
+        </label>
+        <label>Coding rate
+          <input id="rnode-coding-rate" type="number" min="5" max="8"
+                 step="1" value="5" required>
+        </label>
+        <label>TX power, dBm
+          <input id="rnode-tx-power" type="number" min="0" max="37"
+                 step="1" value="7" required>
+        </label>
+        <label>Short airtime limit, % <span class="optional">optional</span>
+          <input id="rnode-airtime-short" type="number" min="0" max="100"
+                 step="any">
+        </label>
+        <label>Long airtime limit, % <span class="optional">optional</span>
+          <input id="rnode-airtime-long" type="number" min="0" max="100"
+                 step="any">
+        </label>
+        <label>ID interval, s <span class="optional">optional</span>
+          <input id="rnode-id-interval" type="number" min="1" step="1">
+        </label>
+        <label>ID callsign <span class="optional">optional</span>
+          <input id="rnode-id-callsign" autocomplete="off">
+        </label>
+        <label class="check-field wide">
+          <input id="rnode-flow-control" type="checkbox">
           <span>Flow control</span>
         </label>
       </fieldset>

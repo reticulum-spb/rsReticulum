@@ -229,7 +229,11 @@ function interfaceEndpoint(item) {
     const forward = `${config.forward_ip || "—"}:${config.forward_port ?? "—"}`;
     return `${listen} → ${forward}`;
   }
-  if (config.type === "SerialInterface" || config.type === "KISSInterface") {
+  if (
+    config.type === "SerialInterface"
+    || config.type === "KISSInterface"
+    || config.type === "RNodeInterface"
+  ) {
     return config.port || "—";
   }
   return "—";
@@ -286,6 +290,7 @@ function interfaceDetails(item) {
       "UDPInterface",
       "SerialInterface",
       "KISSInterface",
+      "RNodeInterface",
     ].includes(item.config?.type);
     if (editable) {
       actions.append(actionButton("Edit configuration", "", () => openInterfaceDialog(item)));
@@ -602,12 +607,14 @@ function setInterfaceType(type) {
   const udp = document.querySelector("#udp-fields");
   const serial = document.querySelector("#serial-fields");
   const kissSerial = document.querySelector("#kiss-fields");
+  const rnode = document.querySelector("#rnode-fields");
   const kiss = document.querySelector("#kiss-framing-field");
   const isClient = type === "TCPClientInterface";
   const isServer = type === "TCPServerInterface";
   const isUdp = type === "UDPInterface";
   const isSerial = type === "SerialInterface";
   const isKiss = type === "KISSInterface";
+  const isRNode = type === "RNodeInterface";
   client.hidden = !isClient;
   client.disabled = !isClient;
   server.hidden = !isServer;
@@ -618,6 +625,8 @@ function setInterfaceType(type) {
   serial.disabled = !isSerial;
   kissSerial.hidden = !isKiss;
   kissSerial.disabled = !isKiss;
+  rnode.hidden = !isRNode;
+  rnode.disabled = !isRNode;
   const usesKissFraming = isClient || isServer;
   kiss.hidden = !usesKissFraming;
   document.querySelector("#kiss-framing").disabled = !usesKissFraming;
@@ -667,6 +676,17 @@ function openInterfaceDialog(item = null) {
   setField("#kiss-id-interval", config.id_interval);
   setField("#kiss-id-callsign", config.id_callsign);
   document.querySelector("#kiss-flow-control").checked = Boolean(config.flow_control);
+  setField("#rnode-port", config.port);
+  setField("#rnode-frequency", config.frequency);
+  setField("#rnode-bandwidth", config.bandwidth, 125000);
+  setField("#rnode-spreading-factor", config.spreadingfactor, 8);
+  setField("#rnode-coding-rate", config.codingrate, 5);
+  setField("#rnode-tx-power", config.txpower, 7);
+  setField("#rnode-airtime-short", config.airtime_limit_short);
+  setField("#rnode-airtime-long", config.airtime_limit_long);
+  setField("#rnode-id-interval", config.id_interval);
+  setField("#rnode-id-callsign", config.id_callsign);
+  document.querySelector("#rnode-flow-control").checked = Boolean(config.flow_control);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
   document.querySelector("#interface-enabled").checked = item ? item.enabled !== false : true;
@@ -746,6 +766,24 @@ function interfacePayload() {
     payload.flow_control = document.querySelector("#kiss-flow-control").checked;
     const idInterval = optionalInteger("#kiss-id-interval");
     const idCallsign = document.querySelector("#kiss-id-callsign").value.trim();
+    if (idInterval !== undefined) payload.id_interval = idInterval;
+    if (idCallsign) payload.id_callsign = idCallsign;
+  } else if (type === "RNodeInterface") {
+    payload.port = document.querySelector("#rnode-port").value.trim();
+    payload.frequency = Number(document.querySelector("#rnode-frequency").value);
+    payload.bandwidth = Number(document.querySelector("#rnode-bandwidth").value);
+    payload.spreadingfactor = Number(
+      document.querySelector("#rnode-spreading-factor").value,
+    );
+    payload.codingrate = Number(document.querySelector("#rnode-coding-rate").value);
+    payload.txpower = Number(document.querySelector("#rnode-tx-power").value);
+    payload.flow_control = document.querySelector("#rnode-flow-control").checked;
+    const airtimeShort = optionalInteger("#rnode-airtime-short");
+    const airtimeLong = optionalInteger("#rnode-airtime-long");
+    const idInterval = optionalInteger("#rnode-id-interval");
+    const idCallsign = document.querySelector("#rnode-id-callsign").value.trim();
+    if (airtimeShort !== undefined) payload.airtime_limit_short = airtimeShort;
+    if (airtimeLong !== undefined) payload.airtime_limit_long = airtimeLong;
     if (idInterval !== undefined) payload.id_interval = idInterval;
     if (idCallsign) payload.id_callsign = idCallsign;
   }
