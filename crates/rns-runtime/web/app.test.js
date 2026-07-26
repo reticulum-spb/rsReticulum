@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const test = require("node:test");
 const {
   formatBytes,
@@ -73,6 +74,20 @@ test("formats serial endpoints", () => {
     }),
     "/dev/ttyUSB2",
   );
+});
+
+test("uses standard baud rates in every serial form", () => {
+  const html = fs.readFileSync(require.resolve("./index.html"), "utf8");
+  const expected = [
+    "1200", "2400", "4800", "9600", "19200", "38400",
+    "57600", "115200", "230400", "460800", "921600",
+  ];
+  for (const id of ["serial-speed", "kiss-speed", "ax25-speed"]) {
+    const options = html
+      .match(new RegExp(`id="${id}"[^>]*>([\\s\\S]*?)</select>`))[1]
+      .matchAll(/<option value="(\d+)"/g);
+    assert.deepEqual(Array.from(options, (match) => match[1]), expected);
+  }
 });
 
 test("filters paths by destination, next hop, and interface name", () => {

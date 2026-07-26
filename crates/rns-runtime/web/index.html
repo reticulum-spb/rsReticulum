@@ -294,7 +294,19 @@
           <input id="serial-port" autocomplete="off" placeholder="/dev/ttyUSB0" required>
         </label>
         <label>Speed
-          <input id="serial-speed" type="number" min="1" step="1" value="9600" required>
+          <select id="serial-speed">
+            <option value="1200">1,200</option>
+            <option value="2400">2,400</option>
+            <option value="4800">4,800</option>
+            <option value="9600" selected>9,600</option>
+            <option value="19200">19,200</option>
+            <option value="38400">38,400</option>
+            <option value="57600">57,600</option>
+            <option value="115200">115,200</option>
+            <option value="230400">230,400</option>
+            <option value="460800">460,800</option>
+            <option value="921600">921,600</option>
+          </select>
         </label>
         <label>Data bits
           <select id="serial-databits">
@@ -326,7 +338,19 @@
                  placeholder="/dev/ttyUSB0 or tcp://host:port" required>
         </label>
         <label>Speed
-          <input id="kiss-speed" type="number" min="1" step="1" value="9600" required>
+          <select id="kiss-speed">
+            <option value="1200">1,200</option>
+            <option value="2400">2,400</option>
+            <option value="4800">4,800</option>
+            <option value="9600" selected>9,600</option>
+            <option value="19200">19,200</option>
+            <option value="38400">38,400</option>
+            <option value="57600">57,600</option>
+            <option value="115200">115,200</option>
+            <option value="230400">230,400</option>
+            <option value="460800">460,800</option>
+            <option value="921600">921,600</option>
+          </select>
         </label>
         <label>Data bits
           <select id="kiss-databits">
@@ -443,7 +467,19 @@
                  value="0" required>
         </label>
         <label>Speed
-          <input id="ax25-speed" type="number" min="1" step="1" value="9600" required>
+          <select id="ax25-speed">
+            <option value="1200">1,200</option>
+            <option value="2400">2,400</option>
+            <option value="4800">4,800</option>
+            <option value="9600" selected>9,600</option>
+            <option value="19200">19,200</option>
+            <option value="38400">38,400</option>
+            <option value="57600">57,600</option>
+            <option value="115200">115,200</option>
+            <option value="230400">230,400</option>
+            <option value="460800">460,800</option>
+            <option value="921600">921,600</option>
+          </select>
         </label>
         <label>Data bits
           <select id="ax25-databits">
