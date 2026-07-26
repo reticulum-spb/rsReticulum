@@ -4,6 +4,13 @@ const REQUEST_TIMEOUT_MS = 8000;
 const DASHBOARD_REFRESH_MS = 5000;
 const views = new Set(["dashboard", "interfaces", "paths"]);
 let dashboardRequest = null;
+let interfaceRequest = null;
+const interfaceState = {
+  items: [],
+  expanded: new Set(),
+  filter: "",
+  showAll: false,
+};
 
 class ApiError extends Error {
   constructor(message, status = 0, body = null) {
@@ -103,6 +110,24 @@ function formatBytes(value) {
   return `${scaled.toLocaleString(undefined, { maximumFractionDigits: digits })} ${unit}`;
 }
 
+function formatRate(value) {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate < 0) return "—";
+  return `${formatBytes(rate)}/s`;
+}
+
+function formatNumber(value) {
+  if (value === null || value === undefined) return "—";
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString() : "—";
+}
+
+function formatFrequency(value) {
+  const frequency = Number(value);
+  if (!Number.isFinite(frequency) || frequency < 0) return "—";
+  return `${frequency.toLocaleString(undefined, { maximumFractionDigits: 2 })}/s`;
+}
+
 function resetDashboardMetrics() {
   document.querySelector("#metric-interfaces").textContent = "—";
   document.querySelector("#metric-online").textContent = "Status unavailable";
@@ -165,6 +190,203 @@ function refreshDashboard() {
   return dashboardRequest;
 }
 
+function interfaceType(item) {
+  return item.config?.type || "Runtime only";
+}
+
+function interfaceEndpoint(item) {
+  const config = item.config;
+  if (!config) return "Not stored in config";
+  if (config.type === "TCPClientInterface") {
+    return `${config.target_host || "—"}:${config.target_port ?? "—"}`;
+  }
+  if (config.type === "TCPServerInterface") {
+    return `${config.listen_ip || "—"}:${config.listen_port ?? "—"}`;
+  }
+  return "—";
+}
+
+function detailItem(label, value, className = "") {
+  const wrapper = document.createElement("div");
+  const term = document.createElement("dt");
+  const description = document.createElement("dd");
+  term.textContent = label;
+  description.textContent = value;
+  if (className) description.className = className;
+  wrapper.append(term, description);
+  return wrapper;
+}
+
+function interfaceDetails(item) {
+  const details = document.createElement("dl");
+  details.className = "interface-details";
+  details.append(
+    detailItem("Runtime ID", formatNumber(item.id)),
+    detailItem("Configuration", item.config ? "Configurable" : "Runtime-managed",
+      item.config ? "" : "runtime-only"),
+    detailItem("Type", interfaceType(item)),
+    detailItem("Endpoint", interfaceEndpoint(item)),
+    detailItem("Role", item.role || "—"),
+    detailItem("Bitrate", item.bitrate ? `${formatNumber(item.bitrate)} bit/s` : "—"),
+    detailItem("Clients", formatNumber(item.clients)),
+    detailItem("TX drops", formatNumber(item.tx_drops)),
+    detailItem("IFAC size", item.ifac_size ? `${formatNumber(item.ifac_size)} B` : "None"),
+    detailItem("Announce queue", formatNumber(item.announce_queue)),
+    detailItem("Held announces", formatNumber(item.held_announces)),
+    detailItem("Incoming announces", formatFrequency(item.incoming_announce_frequency)),
+    detailItem("Outgoing announces", formatFrequency(item.outgoing_announce_frequency)),
+  );
+  return details;
+}
+
+function stackedCell(primary, secondary) {
+  const cell = document.createElement("td");
+  const stack = document.createElement("span");
+  const main = document.createElement("span");
+  const small = document.createElement("small");
+  stack.className = "cell-stack";
+  main.textContent = primary;
+  small.textContent = secondary;
+  stack.append(main, small);
+  cell.append(stack);
+  return cell;
+}
+
+function interfaceRows(items) {
+  const fragment = document.createDocumentFragment();
+
+  for (const item of items) {
+    const row = document.createElement("tr");
+    const nameCell = document.createElement("td");
+    const name = document.createElement("span");
+    const nameText = document.createElement("strong");
+    const type = document.createElement("small");
+    const id = document.createElement("code");
+    name.className = "interface-name";
+    nameText.textContent = item.name || "Unnamed interface";
+    type.textContent = interfaceType(item);
+    id.textContent = `#${item.id}`;
+    name.append(nameText, type, id);
+    nameCell.append(name);
+
+    const statusCell = document.createElement("td");
+    const status = document.createElement("span");
+    status.className = `status-chip${item.online ? " online" : ""}`;
+    status.textContent = item.online ? "Online" : "Offline";
+    statusCell.append(status);
+
+    const detailCell = document.createElement("td");
+    const detailButton = document.createElement("button");
+    const expanded = interfaceState.expanded.has(item.id);
+    detailButton.type = "button";
+    detailButton.className = "details-button";
+    detailButton.textContent = expanded ? "−" : "+";
+    detailButton.setAttribute("aria-expanded", String(expanded));
+    detailButton.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} details for ${item.name}`);
+    detailButton.addEventListener("click", () => {
+      if (expanded) interfaceState.expanded.delete(item.id);
+      else interfaceState.expanded.add(item.id);
+      renderInterfaces();
+    });
+    detailCell.append(detailButton);
+
+    row.append(
+      nameCell,
+      statusCell,
+      stackedCell(item.mode || "—", item.role || "—"),
+      stackedCell(`↓ ${formatBytes(item.rx_bytes)}`, `↑ ${formatBytes(item.tx_bytes)}`),
+      stackedCell(`↓ ${formatRate(item.rx_rate)}`, `↑ ${formatRate(item.tx_rate)}`),
+      detailCell,
+    );
+    fragment.append(row);
+
+    if (expanded) {
+      const detailRow = document.createElement("tr");
+      const container = document.createElement("td");
+      detailRow.className = "interface-detail-row";
+      container.colSpan = 6;
+      container.append(interfaceDetails(item));
+      detailRow.append(container);
+      fragment.append(detailRow);
+    }
+  }
+
+  return fragment;
+}
+
+function renderInterfaces() {
+  const query = interfaceState.filter.trim().toLocaleLowerCase();
+  const items = interfaceState.items.filter((item) =>
+    !query || (item.name || "").toLocaleLowerCase().includes(query)
+      || interfaceType(item).toLocaleLowerCase().includes(query));
+  const rows = document.querySelector("#interface-rows");
+  const empty = document.querySelector("#interfaces-empty");
+  const heading = document.querySelector("#interfaces-empty-heading");
+  const detail = document.querySelector("#interfaces-empty-detail");
+
+  rows.replaceChildren(interfaceRows(items));
+  empty.hidden = items.length > 0;
+  if (!items.length) {
+    heading.textContent = query ? "No matching interfaces" : "No interfaces";
+    detail.textContent = query
+      ? "Try a different name or interface type."
+      : "No runtime interfaces were returned by rnsd-rs.";
+  }
+
+  const visible = items.length.toLocaleString();
+  const totalCount = interfaceState.items.length;
+  const total = totalCount.toLocaleString();
+  document.querySelector("#interface-count").textContent =
+    query ? `${visible} of ${total}` : `${total} interface${totalCount === 1 ? "" : "s"}`;
+}
+
+function setInterfacesLoading() {
+  document.querySelector("#interface-rows").replaceChildren();
+  document.querySelector("#interface-search").disabled = true;
+  document.querySelector("#interfaces-empty").hidden = false;
+  document.querySelector("#interfaces-empty-heading").textContent = "Loading interfaces…";
+  document.querySelector("#interfaces-empty-detail").textContent = "Waiting for runtime data.";
+  document.querySelector("#interface-count").textContent = "Loading…";
+}
+
+function refreshInterfaces() {
+  if (interfaceRequest) return interfaceRequest;
+
+  const refreshButton = document.querySelector("#view-interfaces [data-refresh]");
+  const showAll = document.querySelector("#show-all-interfaces");
+  setBusy(refreshButton, true);
+  showAll.disabled = true;
+  setInterfacesLoading();
+  const query = interfaceState.showAll ? "?all=true" : "";
+  interfaceRequest = apiFetch(`/api/v1/interfaces${query}`)
+    .then((body) => {
+      interfaceState.items = Array.isArray(body.interfaces) ? body.interfaces : [];
+      document.querySelector("#interface-search").disabled = false;
+      renderInterfaces();
+      document.querySelector("#daemon-pill").dataset.state = "online";
+      document.querySelector("#daemon-label").textContent = "rnsd-rs online";
+      clearError();
+    })
+    .catch((error) => {
+      interfaceState.items = [];
+      document.querySelector("#interface-search").disabled = true;
+      document.querySelector("#interfaces-empty-heading").textContent = "Interfaces unavailable";
+      document.querySelector("#interfaces-empty-detail").textContent =
+        "The interface list could not be loaded from rnsd-rs.";
+      document.querySelector("#interface-count").textContent = "Unavailable";
+      document.querySelector("#daemon-pill").dataset.state = "unavailable";
+      document.querySelector("#daemon-label").textContent = "Unavailable";
+      showError(error);
+    })
+    .finally(() => {
+      setBusy(refreshButton, false);
+      showAll.disabled = false;
+      interfaceRequest = null;
+    });
+
+  return interfaceRequest;
+}
+
 function currentView() {
   const requested = window.location.hash.replace(/^#/, "");
   return views.has(requested) ? requested : "dashboard";
@@ -190,6 +412,7 @@ function showView(name, { focus = false } = {}) {
   closeNavigation();
   if (focus) document.querySelector("#main-content").focus();
   if (selected === "dashboard") refreshDashboard();
+  if (selected === "interfaces") refreshInterfaces();
 }
 
 function openNavigation() {
@@ -205,6 +428,10 @@ function closeNavigation() {
 async function refresh(button) {
   if (currentView() === "dashboard") {
     await refreshDashboard();
+    return;
+  }
+  if (currentView() === "interfaces") {
+    await refreshInterfaces();
     return;
   }
 
@@ -246,6 +473,15 @@ document.querySelector("#mobile-menu").addEventListener("click", () => {
 document.querySelector("#dismiss-error").addEventListener("click", clearError);
 document.querySelector("#add-interface").addEventListener("click", () => {
   document.querySelector("#interface-dialog").showModal();
+});
+document.querySelector("#interface-search").addEventListener("input", (event) => {
+  interfaceState.filter = event.target.value;
+  renderInterfaces();
+});
+document.querySelector("#show-all-interfaces").addEventListener("change", (event) => {
+  interfaceState.showAll = event.target.checked;
+  interfaceState.expanded.clear();
+  refreshInterfaces();
 });
 
 document.querySelectorAll("[data-refresh]").forEach((button) => {
