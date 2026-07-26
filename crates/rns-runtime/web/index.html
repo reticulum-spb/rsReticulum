@@ -570,9 +570,71 @@
       <p class="form-error" id="interface-form-error" role="alert"></p>
       <p class="form-status" id="interface-form-status" aria-live="polite"></p>
       <div class="dialog-actions">
+        <button class="secondary" id="open-interface-advanced" type="button">Advanced</button>
+        <span class="dialog-actions-spacer"></span>
         <button class="secondary" type="button" data-close-interface>Cancel</button>
         <button class="primary" id="save-interface" type="submit">Add interface</button>
       </div>
+    </form>
+  </dialog>
+
+  <dialog id="interface-advanced-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">Interface</span><h2>Advanced settings</h2></div>
+        <button class="icon-button" value="done" aria-label="Close dialog">×</button>
+      </div>
+      <fieldset class="form-grid">
+        <legend>General</legend>
+        <label>Bitrate, bit/s <span class="optional">optional</span>
+          <input id="advanced-bitrate" type="number" min="1" step="1">
+        </label>
+        <label>Announce cap, % <span class="optional">optional</span>
+          <input id="advanced-announce-cap" type="number" min="0" max="100" step="any">
+        </label>
+        <label>Rate target <span class="optional">optional</span>
+          <input id="advanced-rate-target" type="number" min="0" step="1">
+        </label>
+        <label>Rate grace <span class="optional">optional</span>
+          <input id="advanced-rate-grace" type="number" min="0" step="1">
+        </label>
+        <label>Rate penalty <span class="optional">optional</span>
+          <input id="advanced-rate-penalty" type="number" min="0" step="1">
+        </label>
+        <label class="check-field"><input id="advanced-outgoing" type="checkbox" checked><span>Outgoing</span></label>
+        <label class="check-field"><input id="advanced-recursive-prs" type="checkbox"><span>Recursive path requests</span></label>
+        <label class="check-field"><input id="advanced-announces-internal" type="checkbox" checked><span>Announces from internal</span></label>
+      </fieldset>
+      <fieldset class="form-grid">
+        <legend>IFAC</legend>
+        <label>Network name <span class="optional">optional</span>
+          <input id="advanced-network-name" autocomplete="off">
+        </label>
+        <label>IFAC size, bytes <span class="optional">optional</span>
+          <input id="advanced-ifac-size" type="number" min="1" max="64" step="1">
+        </label>
+        <label class="wide">Passphrase <span class="optional">optional</span>
+          <input id="advanced-passphrase" type="password" autocomplete="new-password">
+        </label>
+      </fieldset>
+      <fieldset class="form-grid">
+        <legend>Ingress control</legend>
+        <label class="check-field wide"><input id="advanced-ingress-control" type="checkbox" checked><span>Ingress control enabled</span></label>
+        <label>New burst frequency<input id="advanced-ic-burst-freq-new" type="number" min="0" step="any"></label>
+        <label>Burst frequency<input id="advanced-ic-burst-freq" type="number" min="0" step="any"></label>
+        <label>New PR burst frequency<input id="advanced-ic-pr-burst-freq-new" type="number" min="0" step="any"></label>
+        <label>PR burst frequency<input id="advanced-ic-pr-burst-freq" type="number" min="0" step="any"></label>
+        <label>New time<input id="advanced-ic-new-time" type="number" min="0" step="any"></label>
+        <label>Burst hold<input id="advanced-ic-burst-hold" type="number" min="0" step="any"></label>
+        <label>Burst penalty<input id="advanced-ic-burst-penalty" type="number" min="0" step="any"></label>
+        <label>Max held announces<input id="advanced-ic-max-held" type="number" min="0" step="1"></label>
+        <label>Held release interval<input id="advanced-ic-held-release" type="number" min="0" step="any"></label>
+        <label>EC PR frequency<input id="advanced-ec-pr-freq" type="number" min="0" step="any"></label>
+        <label>Egress control
+          <select id="advanced-egress-control"><option value="">Default</option><option value="true">Enabled</option><option value="false">Disabled</option></select>
+        </label>
+      </fieldset>
+      <div class="dialog-actions"><button class="primary" value="done">Done</button></div>
     </form>
   </dialog>
 

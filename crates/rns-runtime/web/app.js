@@ -685,6 +685,37 @@ function openInterfaceDialog(item = null) {
   setField("#auto-devices", config.devices);
   setField("#auto-ignored-devices", config.ignored_devices);
   setField("#auto-configured-bitrate", config.configured_bitrate);
+  setField("#advanced-bitrate", config.bitrate);
+  setField("#advanced-announce-cap", config.announce_cap);
+  setField("#advanced-rate-target", config.announce_rate_target);
+  setField("#advanced-rate-grace", config.announce_rate_grace);
+  setField("#advanced-rate-penalty", config.announce_rate_penalty);
+  setField("#advanced-network-name", config.network_name);
+  setField("#advanced-passphrase", config.passphrase);
+  setField("#advanced-ifac-size", config.ifac_size);
+  document.querySelector("#advanced-outgoing").checked = config.outgoing !== false;
+  document.querySelector("#advanced-ingress-control").checked =
+    config.ingress_control !== false;
+  document.querySelector("#advanced-recursive-prs").checked =
+    Boolean(config.recursive_prs);
+  document.querySelector("#advanced-announces-internal").checked =
+    config.announces_from_internal !== false;
+  for (const [id, key] of [
+    ["#advanced-ic-burst-freq-new", "ic_burst_freq_new"],
+    ["#advanced-ic-burst-freq", "ic_burst_freq"],
+    ["#advanced-ic-pr-burst-freq-new", "ic_pr_burst_freq_new"],
+    ["#advanced-ic-pr-burst-freq", "ic_pr_burst_freq"],
+    ["#advanced-ic-new-time", "ic_new_time"],
+    ["#advanced-ic-burst-hold", "ic_burst_hold"],
+    ["#advanced-ic-burst-penalty", "ic_burst_penalty"],
+    ["#advanced-ic-max-held", "ic_max_held_announces"],
+    ["#advanced-ic-held-release", "ic_held_release_interval"],
+    ["#advanced-ec-pr-freq", "ec_pr_freq"],
+  ]) setField(id, config[key]);
+  setField(
+    "#advanced-egress-control",
+    config.egress_control == null ? "" : String(config.egress_control),
+  );
   setField("#serial-port", config.port);
   setField("#serial-speed", config.speed, 9600);
   setField("#serial-databits", config.databits, 8);
@@ -742,6 +773,46 @@ function closeInterfaceDialog() {
 function optionalInteger(selector) {
   const value = document.querySelector(selector).value.trim();
   return value === "" ? undefined : Number(value);
+}
+
+function addAdvancedOptions(payload) {
+  payload.outgoing = document.querySelector("#advanced-outgoing").checked;
+  payload.ingress_control =
+    document.querySelector("#advanced-ingress-control").checked;
+  payload.recursive_prs =
+    document.querySelector("#advanced-recursive-prs").checked;
+  payload.announces_from_internal =
+    document.querySelector("#advanced-announces-internal").checked;
+  for (const [selector, key] of [
+    ["#advanced-bitrate", "bitrate"],
+    ["#advanced-announce-cap", "announce_cap"],
+    ["#advanced-rate-target", "announce_rate_target"],
+    ["#advanced-rate-grace", "announce_rate_grace"],
+    ["#advanced-rate-penalty", "announce_rate_penalty"],
+    ["#advanced-ifac-size", "ifac_size"],
+    ["#advanced-ic-burst-freq-new", "ic_burst_freq_new"],
+    ["#advanced-ic-burst-freq", "ic_burst_freq"],
+    ["#advanced-ic-pr-burst-freq-new", "ic_pr_burst_freq_new"],
+    ["#advanced-ic-pr-burst-freq", "ic_pr_burst_freq"],
+    ["#advanced-ic-new-time", "ic_new_time"],
+    ["#advanced-ic-burst-hold", "ic_burst_hold"],
+    ["#advanced-ic-burst-penalty", "ic_burst_penalty"],
+    ["#advanced-ic-max-held", "ic_max_held_announces"],
+    ["#advanced-ic-held-release", "ic_held_release_interval"],
+    ["#advanced-ec-pr-freq", "ec_pr_freq"],
+  ]) {
+    const value = document.querySelector(selector).value.trim();
+    if (value !== "") payload[key] = Number(value);
+  }
+  for (const [selector, key] of [
+    ["#advanced-network-name", "network_name"],
+    ["#advanced-passphrase", "passphrase"],
+  ]) {
+    const value = document.querySelector(selector).value.trim();
+    if (value) payload[key] = value;
+  }
+  const egress = document.querySelector("#advanced-egress-control").value;
+  if (egress) payload.egress_control = egress === "true";
 }
 
 function interfacePayload() {
@@ -845,6 +916,7 @@ function interfacePayload() {
     payload.flow_control = document.querySelector("#ax25-flow-control").checked;
   }
 
+  addAdvancedOptions(payload);
   return payload;
 }
 
@@ -1015,6 +1087,9 @@ function initialize() {
   document.querySelector("#add-interface").addEventListener("click", () => openInterfaceDialog());
   document.querySelector("#interface-type").addEventListener("change", (event) => {
     setInterfaceType(event.target.value);
+  });
+  document.querySelector("#open-interface-advanced").addEventListener("click", () => {
+    document.querySelector("#interface-advanced-dialog").showModal();
   });
   document.querySelector("#interface-form").addEventListener("submit", saveInterface);
   document.querySelector("#delete-interface-form").addEventListener("submit", deleteInterface);

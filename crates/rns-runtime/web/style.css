@@ -476,6 +476,7 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
 .dialog-heading { display: flex; align-items: start; justify-content: space-between; }
 .dialog-heading h2 { margin: 4px 0 0; font-size: 26px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.dialog-actions-spacer { flex: 1; }
 .icon-button {
   width: 34px;
   height: 34px;

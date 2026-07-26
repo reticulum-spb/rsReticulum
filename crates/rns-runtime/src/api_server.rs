@@ -360,6 +360,31 @@ struct InterfaceRequest {
     ignored_devices: Option<String>,
     configured_bitrate: Option<u64>,
 
+    // Common advanced options
+    outgoing: Option<bool>,
+    bitrate: Option<u64>,
+    announce_cap: Option<f64>,
+    announce_rate_target: Option<u64>,
+    announce_rate_grace: Option<u32>,
+    announce_rate_penalty: Option<u64>,
+    network_name: Option<String>,
+    passphrase: Option<String>,
+    ifac_size: Option<usize>,
+    ingress_control: Option<bool>,
+    ic_burst_freq_new: Option<f64>,
+    ic_burst_freq: Option<f64>,
+    ic_pr_burst_freq_new: Option<f64>,
+    ic_pr_burst_freq: Option<f64>,
+    ic_new_time: Option<f64>,
+    ic_burst_hold: Option<f64>,
+    ic_burst_penalty: Option<f64>,
+    ic_max_held_announces: Option<u64>,
+    ic_held_release_interval: Option<f64>,
+    ec_pr_freq: Option<f64>,
+    egress_control: Option<bool>,
+    recursive_prs: Option<bool>,
+    announces_from_internal: Option<bool>,
+
     // SerialInterface / KISSInterface
     port: Option<String>,
     speed: Option<u32>,
@@ -463,6 +488,55 @@ impl InterfaceRequest {
         }
         if let Some(v) = self.configured_bitrate {
             s.set("configured_bitrate", &v.to_string());
+        }
+        for (key, value) in [
+            ("outgoing", self.outgoing),
+            ("ingress_control", self.ingress_control),
+            ("egress_control", self.egress_control),
+            ("recursive_prs", self.recursive_prs),
+            ("announces_from_internal", self.announces_from_internal),
+        ] {
+            if let Some(value) = value {
+                s.set(key, if value { "Yes" } else { "No" });
+            }
+        }
+        for (key, value) in [
+            ("bitrate", self.bitrate),
+            ("announce_rate_target", self.announce_rate_target),
+            ("announce_rate_penalty", self.announce_rate_penalty),
+            ("ic_max_held_announces", self.ic_max_held_announces),
+        ] {
+            if let Some(value) = value {
+                s.set(key, &value.to_string());
+            }
+        }
+        if let Some(value) = self.announce_rate_grace {
+            s.set("announce_rate_grace", &value.to_string());
+        }
+        for (key, value) in [
+            ("announce_cap", self.announce_cap),
+            ("ic_burst_freq_new", self.ic_burst_freq_new),
+            ("ic_burst_freq", self.ic_burst_freq),
+            ("ic_pr_burst_freq_new", self.ic_pr_burst_freq_new),
+            ("ic_pr_burst_freq", self.ic_pr_burst_freq),
+            ("ic_new_time", self.ic_new_time),
+            ("ic_burst_hold", self.ic_burst_hold),
+            ("ic_burst_penalty", self.ic_burst_penalty),
+            ("ic_held_release_interval", self.ic_held_release_interval),
+            ("ec_pr_freq", self.ec_pr_freq),
+        ] {
+            if let Some(value) = value {
+                s.set(key, &value.to_string());
+            }
+        }
+        if let Some(ref value) = self.network_name {
+            s.set("networkname", value);
+        }
+        if let Some(ref value) = self.passphrase {
+            s.set("passphrase", value);
+        }
+        if let Some(value) = self.ifac_size {
+            s.set("ifac_size", &value.to_string());
         }
         if let Some(ref v) = self.port {
             s.set("port", v);
@@ -1172,6 +1246,49 @@ fn iface_section_json(section: &ConfigSection) -> Value {
             ),
         ),
     ]);
+    let object = value.as_object_mut().unwrap();
+    for key in [
+        "outgoing",
+        "ingress_control",
+        "egress_control",
+        "recursive_prs",
+        "announces_from_internal",
+    ] {
+        object.insert(key.into(), json!(section.get_bool(key)));
+    }
+    for key in [
+        "bitrate",
+        "announce_rate_target",
+        "announce_rate_grace",
+        "announce_rate_penalty",
+        "ifac_size",
+        "ic_max_held_announces",
+    ] {
+        object.insert(key.into(), json!(section.get_uint(key)));
+    }
+    for key in [
+        "announce_cap",
+        "ic_burst_freq_new",
+        "ic_burst_freq",
+        "ic_pr_burst_freq_new",
+        "ic_pr_burst_freq",
+        "ic_new_time",
+        "ic_burst_hold",
+        "ic_burst_penalty",
+        "ic_held_release_interval",
+        "ec_pr_freq",
+    ] {
+        object.insert(key.into(), json!(section.get_float(key)));
+    }
+    object.insert(
+        "network_name".into(),
+        json!(
+            section
+                .get("networkname")
+                .or_else(|| section.get("network_name"))
+        ),
+    );
+    object.insert("passphrase".into(), json!(section.get("passphrase")));
     value
 }
 
@@ -1541,6 +1658,32 @@ mod tests {
         assert_eq!(value["ignored_devices"], "docker0, veth0");
         assert_eq!(value["configured_bitrate"], 20000000);
         assert_eq!(value["interface_mode"], "Full");
+    }
+
+    #[test]
+    fn advanced_interface_options_are_written_to_config() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Advanced",
+            "type": "AutoInterface",
+            "network_name": "private",
+            "passphrase": "secret",
+            "ifac_size": 16,
+            "announce_cap": 2.5,
+            "announce_rate_target": 10,
+            "ingress_control": false,
+            "ic_burst_freq": 3.5,
+            "egress_control": true
+        }))
+        .unwrap();
+        let value = iface_section_json(&request.to_config_section());
+        assert_eq!(value["network_name"], "private");
+        assert_eq!(value["passphrase"], "secret");
+        assert_eq!(value["ifac_size"], 16);
+        assert_eq!(value["announce_cap"], 2.5);
+        assert_eq!(value["announce_rate_target"], 10);
+        assert_eq!(value["ingress_control"], false);
+        assert_eq!(value["ic_burst_freq"], 3.5);
+        assert_eq!(value["egress_control"], true);
     }
 
     #[cfg(feature = "serial")]
