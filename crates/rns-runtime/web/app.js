@@ -824,6 +824,8 @@ async function refreshSettings() {
   for (const [selector, key] of [
     ["#setting-share-instance", "share_instance"],
     ["#setting-enable-transport", "enable_transport"],
+    ["#setting-static-identity", "static_transport_identity"],
+    ["#setting-local-hops-delta", "local_hops_delta"],
     ["#setting-probes", "respond_to_probes"],
     ["#setting-implicit-proof", "use_implicit_proof"],
     ["#setting-panic-interface", "panic_on_interface_error"],
@@ -831,6 +833,17 @@ async function refreshSettings() {
     ["#setting-discovery", "discover_interfaces"],
     ["#setting-logtimestamps", "logtimestamps"],
   ]) document.querySelector(selector).checked = Boolean(data[key]);
+  document.querySelector("#settings-restart").hidden = !data.restart_required;
+  updateBindWarning();
+}
+
+function updateBindWarning() {
+  const value = document.querySelector("#setting-api-listen").value.trim();
+  const host = value.startsWith("[")
+    ? value.slice(1, value.indexOf("]"))
+    : value.split(":")[0];
+  const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
+  document.querySelector("#settings-bind-warning").hidden = !value || loopback;
 }
 
 async function saveSettings(event) {
@@ -848,6 +861,8 @@ async function saveSettings(event) {
     instance_control_port: number("#setting-control-port"),
     api_listen: document.querySelector("#setting-api-listen").value.trim(),
     enable_transport: checked("#setting-enable-transport"),
+    static_transport_identity: checked("#setting-static-identity"),
+    local_hops_delta: checked("#setting-local-hops-delta"),
     respond_to_probes: checked("#setting-probes"),
     use_implicit_proof: checked("#setting-implicit-proof"),
     panic_on_interface_error: checked("#setting-panic-interface"),
@@ -1268,9 +1283,9 @@ function initialize() {
   document.querySelector("#interface-form").addEventListener("submit", saveInterface);
   document.querySelector("#settings-form").addEventListener("submit", saveSettings);
   document.querySelector("#reload-settings").addEventListener("click", () => {
-    document.querySelector("#settings-restart").hidden = true;
     refreshSettings().catch(showError);
   });
+  document.querySelector("#setting-api-listen").addEventListener("input", updateBindWarning);
   document.querySelector("#restart-daemon").addEventListener("click", () => {
     requestSystemAction("restart");
   });

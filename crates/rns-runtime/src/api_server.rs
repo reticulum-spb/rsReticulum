@@ -150,6 +150,8 @@ struct SettingsRequest {
     shared_instance_port: u16,
     instance_control_port: u16,
     enable_transport: bool,
+    static_transport_identity: bool,
+    local_hops_delta: bool,
     respond_to_probes: bool,
     use_implicit_proof: bool,
     panic_on_interface_error: bool,
@@ -938,6 +940,7 @@ async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let config = s.load_config()?;
     let parsed = ReticulumConfig::try_from_config(&config)
         .map_err(|e| ApiError::internal(format!("invalid settings: {e}")))?;
+    let restart_required = settings_differ(&parsed, &s.handle.config);
     Ok(Json(json!({
         "share_instance": parsed.share_instance,
         "instance_name": parsed.instance_name,
@@ -948,6 +951,8 @@ async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         "shared_instance_port": parsed.shared_instance_port,
         "instance_control_port": parsed.control_port,
         "enable_transport": parsed.enable_transport,
+        "static_transport_identity": parsed.static_transport_identity,
+        "local_hops_delta": parsed.local_hops_delta,
         "respond_to_probes": parsed.respond_to_probes,
         "use_implicit_proof": parsed.use_implicit_proof,
         "panic_on_interface_error": parsed.panic_on_interface_error,
@@ -962,8 +967,34 @@ async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         "api_listen": parsed.api_listen.map(|v| v.to_string()).unwrap_or_default(),
         "loglevel": parsed.loglevel,
         "logtimestamps": parsed.log_timestamps,
-        "restart_required": false,
+        "restart_required": restart_required,
+        "apply_mode": "daemon_restart",
     })))
+}
+
+fn settings_differ(a: &ReticulumConfig, b: &ReticulumConfig) -> bool {
+    a.share_instance != b.share_instance
+        || a.instance_name != b.instance_name
+        || a.shared_instance_type != b.shared_instance_type
+        || a.shared_instance_port != b.shared_instance_port
+        || a.control_port != b.control_port
+        || a.enable_transport != b.enable_transport
+        || a.static_transport_identity != b.static_transport_identity
+        || a.local_hops_delta != b.local_hops_delta
+        || a.respond_to_probes != b.respond_to_probes
+        || a.use_implicit_proof != b.use_implicit_proof
+        || a.panic_on_interface_error != b.panic_on_interface_error
+        || a.link_mtu_discovery != b.link_mtu_discovery
+        || a.force_shared_instance_bitrate != b.force_shared_instance_bitrate
+        || a.default_ar_target != b.default_ar_target
+        || a.default_ar_grace != b.default_ar_grace
+        || a.default_ar_penalty != b.default_ar_penalty
+        || a.discover_interfaces != b.discover_interfaces
+        || a.autoconnect_discovered_interfaces != b.autoconnect_discovered_interfaces
+        || a.discover_interfaces_required_value != b.discover_interfaces_required_value
+        || a.api_listen != b.api_listen
+        || a.loglevel != b.loglevel
+        || a.log_timestamps != b.log_timestamps
 }
 
 async fn update_settings(
@@ -977,6 +1008,8 @@ async fn update_settings(
         for (key, value) in [
             ("share_instance", req.share_instance),
             ("enable_transport", req.enable_transport),
+            ("static_transport_identity", req.static_transport_identity),
+            ("local_hops_delta", req.local_hops_delta),
             ("respond_to_probes", req.respond_to_probes),
             ("use_implicit_proof", req.use_implicit_proof),
             ("panic_on_interface_error", req.panic_on_interface_error),
@@ -1893,6 +1926,18 @@ mod tests {
         assert_eq!(value["ingress_control"], false);
         assert_eq!(value["ic_burst_freq"], 3.5);
         assert_eq!(value["egress_control"], true);
+    }
+
+    #[test]
+    fn settings_restart_state_tracks_runtime_difference() {
+        let running = ReticulumConfig::default();
+        let mut stored = running.clone();
+        assert!(!settings_differ(&stored, &running));
+        stored.loglevel += 1;
+        assert!(settings_differ(&stored, &running));
+        stored = running.clone();
+        stored.api_listen = Some("0.0.0.0:8080".parse().unwrap());
+        assert!(settings_differ(&stored, &running));
     }
 
     #[cfg(feature = "serial")]

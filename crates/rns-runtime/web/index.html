@@ -199,6 +199,9 @@
             </div>
           </div>
           <div class="notice" id="settings-restart" hidden>Configuration saved. Restart rnsd-rs to apply these settings.</div>
+          <div class="notice error-notice" id="settings-bind-warning" hidden>
+            The Web API is listening on a non-loopback address. Use only on a trusted network.
+          </div>
           <section class="card"><fieldset class="form-grid">
             <legend>Shared instance</legend>
             <label>Instance name<input id="setting-instance-name" required></label>
@@ -208,6 +211,8 @@
             <label class="wide">Web API listen address<input id="setting-api-listen" placeholder="0.0.0.0:8080" required></label>
             <label class="check-field"><input id="setting-share-instance" type="checkbox"><span>Share instance</span></label>
             <label class="check-field"><input id="setting-enable-transport" type="checkbox"><span>Enable transport</span></label>
+            <label class="check-field"><input id="setting-static-identity" type="checkbox"><span>Static transport identity</span></label>
+            <label class="check-field"><input id="setting-local-hops-delta" type="checkbox"><span>Local hops delta</span></label>
           </fieldset></section>
           <section class="card"><fieldset class="form-grid">
             <legend>Protocol</legend>
