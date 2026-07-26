@@ -879,16 +879,20 @@ async function saveSettings(event) {
   }
 }
 
-async function waitForDaemonRestart(button) {
+async function waitForSystemReturn(button, action) {
   let observedOffline = false;
   for (let attempt = 0; attempt < 120; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
     try {
       const response = await fetch("/health", { cache: "no-store" });
       if (observedOffline && response.ok) {
-        button.textContent = "Restart daemon";
+        button.textContent = action === "reboot" ? "Reboot system" : "Restart daemon";
         setBusy(button, false);
-        await refreshSettings();
+        if (window.location.hash === "#dashboard") {
+          showView("dashboard", { focus: true });
+        } else {
+          window.location.hash = "dashboard";
+        }
         return;
       }
       if (!response.ok) observedOffline = true;
@@ -896,9 +900,9 @@ async function waitForDaemonRestart(button) {
       observedOffline = true;
     }
   }
-  button.textContent = "Restart daemon";
+  button.textContent = action === "reboot" ? "Reboot system" : "Restart daemon";
   setBusy(button, false);
-  showError(new ApiError("Daemon did not return within two minutes"));
+  showError(new ApiError("System did not return within two minutes"));
 }
 
 async function requestSystemAction(action) {
@@ -912,12 +916,9 @@ async function requestSystemAction(action) {
   button.textContent = reboot ? "Rebooting…" : "Restarting…";
   try {
     await apiFetch(`/api/v1/system/${action}`, { method: "POST" });
-    if (reboot) {
-      document.querySelector("#settings-error").textContent =
-        "Reboot accepted. Waiting for the external launcher.";
-    } else {
-      waitForDaemonRestart(button);
-    }
+    document.querySelector("#settings-error").textContent =
+      reboot ? "Reboot accepted. Waiting for the system." : "";
+    waitForSystemReturn(button, action);
   } catch (error) {
     button.textContent = reboot ? "Reboot system" : "Restart daemon";
     setBusy(button, false);
