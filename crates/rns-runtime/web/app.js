@@ -233,6 +233,7 @@ function interfaceEndpoint(item) {
     config.type === "SerialInterface"
     || config.type === "KISSInterface"
     || config.type === "RNodeInterface"
+    || config.type === "AX25KISSInterface"
   ) {
     return config.port || "—";
   }
@@ -291,6 +292,7 @@ function interfaceDetails(item) {
       "SerialInterface",
       "KISSInterface",
       "RNodeInterface",
+      "AX25KISSInterface",
     ].includes(item.config?.type);
     if (editable) {
       actions.append(actionButton("Edit configuration", "", () => openInterfaceDialog(item)));
@@ -608,6 +610,7 @@ function setInterfaceType(type) {
   const serial = document.querySelector("#serial-fields");
   const kissSerial = document.querySelector("#kiss-fields");
   const rnode = document.querySelector("#rnode-fields");
+  const ax25 = document.querySelector("#ax25-fields");
   const kiss = document.querySelector("#kiss-framing-field");
   const isClient = type === "TCPClientInterface";
   const isServer = type === "TCPServerInterface";
@@ -615,6 +618,7 @@ function setInterfaceType(type) {
   const isSerial = type === "SerialInterface";
   const isKiss = type === "KISSInterface";
   const isRNode = type === "RNodeInterface";
+  const isAx25 = type === "AX25KISSInterface";
   client.hidden = !isClient;
   client.disabled = !isClient;
   server.hidden = !isServer;
@@ -627,6 +631,8 @@ function setInterfaceType(type) {
   kissSerial.disabled = !isKiss;
   rnode.hidden = !isRNode;
   rnode.disabled = !isRNode;
+  ax25.hidden = !isAx25;
+  ax25.disabled = !isAx25;
   const usesKissFraming = isClient || isServer;
   kiss.hidden = !usesKissFraming;
   document.querySelector("#kiss-framing").disabled = !usesKissFraming;
@@ -683,6 +689,18 @@ function openInterfaceDialog(item = null) {
   setField("#rnode-airtime-short", config.airtime_limit_short);
   setField("#rnode-airtime-long", config.airtime_limit_long);
   document.querySelector("#rnode-flow-control").checked = Boolean(config.flow_control);
+  setField("#ax25-port", config.port);
+  setField("#ax25-callsign", config.callsign);
+  setField("#ax25-ssid", config.ssid, 0);
+  setField("#ax25-speed", config.speed, 9600);
+  setField("#ax25-databits", config.databits, 8);
+  setField("#ax25-parity", config.parity, "N");
+  setField("#ax25-stopbits", config.stopbits, 1);
+  setField("#ax25-preamble", config.preamble, 350);
+  setField("#ax25-txtail", config.txtail, 20);
+  setField("#ax25-persistence", config.persistence, 64);
+  setField("#ax25-slottime", config.slottime, 20);
+  document.querySelector("#ax25-flow-control").checked = Boolean(config.flow_control);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
   document.querySelector("#interface-enabled").checked = item ? item.enabled !== false : true;
@@ -774,6 +792,19 @@ function interfacePayload() {
     const airtimeLong = optionalInteger("#rnode-airtime-long");
     if (airtimeShort !== undefined) payload.airtime_limit_short = airtimeShort;
     if (airtimeLong !== undefined) payload.airtime_limit_long = airtimeLong;
+  } else if (type === "AX25KISSInterface") {
+    payload.port = document.querySelector("#ax25-port").value.trim();
+    payload.callsign = document.querySelector("#ax25-callsign").value.trim();
+    payload.ssid = Number(document.querySelector("#ax25-ssid").value);
+    payload.speed = Number(document.querySelector("#ax25-speed").value);
+    payload.databits = Number(document.querySelector("#ax25-databits").value);
+    payload.parity = document.querySelector("#ax25-parity").value;
+    payload.stopbits = Number(document.querySelector("#ax25-stopbits").value);
+    payload.preamble = Number(document.querySelector("#ax25-preamble").value);
+    payload.txtail = Number(document.querySelector("#ax25-txtail").value);
+    payload.persistence = Number(document.querySelector("#ax25-persistence").value);
+    payload.slottime = Number(document.querySelector("#ax25-slottime").value);
+    payload.flow_control = document.querySelector("#ax25-flow-control").checked;
   }
 
   return payload;

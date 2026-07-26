@@ -370,6 +370,10 @@ struct InterfaceRequest {
     txpower: Option<i8>,
     airtime_limit_short: Option<f32>,
     airtime_limit_long: Option<f32>,
+
+    // AX25KISSInterface
+    callsign: Option<String>,
+    ssid: Option<u8>,
 }
 
 impl InterfaceRequest {
@@ -477,13 +481,36 @@ impl InterfaceRequest {
         if let Some(v) = self.airtime_limit_long {
             s.set("airtime_limit_long", &v.to_string());
         }
+        if self.iface_type == "AX25KISSInterface" {
+            if let Some(ref v) = self.callsign {
+                s.set("callsign", v);
+            }
+            if let Some(v) = self.ssid {
+                s.set("ssid", &v.to_string());
+            }
+        }
         s
     }
 
     /// Validate and build `InterfaceConfig` via `synthesize_interface`.
     fn synthesize(&self) -> Result<InterfaceConfig, ApiError> {
+        self.validate_fields()?;
         let section = self.to_config_section();
         synthesize_interface(&self.name, &section).map_err(|e| ApiError::bad(format!("{e}")))
+    }
+
+    fn validate_fields(&self) -> Result<(), ApiError> {
+        #[cfg(feature = "serial")]
+        if self.iface_type == "AX25KISSInterface" {
+            let callsign = self
+                .callsign
+                .as_deref()
+                .ok_or_else(|| ApiError::bad("missing callsign"))?;
+            let ssid = self.ssid.ok_or_else(|| ApiError::bad("missing ssid"))?;
+            rns_interface::ax25kiss::parse_callsign_ssid(&format!("{callsign}-{ssid}"))
+                .map_err(ApiError::bad)?;
+        }
+        Ok(())
     }
 
     fn is_enabled(&self) -> bool {
@@ -771,6 +798,7 @@ async fn create_interface(
     Json(req): Json<InterfaceRequest>,
 ) -> ApiResult<Response> {
     let _config_guard = s.config_write_lock.lock().await;
+    req.validate_fields()?;
 
     // Reject both running and config-only duplicates.
     if load_interface_sections(&s)?.contains_key(&req.name)
@@ -822,6 +850,7 @@ async fn update_interface(
     Json(req): Json<InterfaceRequest>,
 ) -> ApiResult<Json<Value>> {
     let _config_guard = s.config_write_lock.lock().await;
+    req.validate_fields()?;
 
     // Find the old interface by id to know its name for deleting from the config.
     let ifaces = fetch_interfaces(&s).await?;
@@ -881,6 +910,7 @@ async fn update_config_interface(
     Json(req): Json<InterfaceRequest>,
 ) -> ApiResult<Json<Value>> {
     let _config_guard = s.config_write_lock.lock().await;
+    req.validate_fields()?;
     let sections = load_interface_sections(&s)?;
     let old_section = sections.get(&old_name).ok_or(ApiError::NotFound)?;
     if old_name != req.name && sections.contains_key(&req.name) {
@@ -1076,6 +1106,8 @@ fn iface_section_json(section: &ConfigSection) -> Value {
             .or_else(|| section.get_float("st_alock")),
         "airtime_limit_long": section.get_float("airtime_limit_long")
             .or_else(|| section.get_float("lt_alock")),
+        "callsign": section.get("callsign"),
+        "ssid": section.get_uint("ssid"),
     })
 }
 
@@ -1149,6 +1181,23 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "airtime_limit_short": c.st_alock,
             "airtime_limit_long":  c.lt_alock,
             "interface_mode":      mode_to_str(c.mode),
+        }),
+        #[cfg(feature = "serial")]
+        InterfaceConfig::AX25KISS(c) => json!({
+            "type":           "AX25KISSInterface",
+            "port":           c.port,
+            "speed":          c.baud_rate,
+            "databits":       c.data_bits,
+            "parity":         c.parity,
+            "stopbits":       c.stop_bits,
+            "callsign":       c.callsign,
+            "ssid":           c.ssid,
+            "preamble":       c.preamble,
+            "txtail":         c.txtail,
+            "persistence":    c.persistence,
+            "slottime":       c.slottime,
+            "flow_control":   c.flow_control,
+            "interface_mode": mode_to_str(c.mode),
         }),
         // The remaining types return only the type - it is expanded by analogy.
         other => json!({ "type": interface_type_name(other) }),
@@ -1475,6 +1524,50 @@ mod tests {
         assert_eq!(value["airtime_limit_long"], 2.5);
         assert!(value.get("id_interval").is_none());
         assert!(value.get("id_callsign").is_none());
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn ax25_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test AX.25",
+            "type": "AX25KISSInterface",
+            "port": "/dev/ttyUSB2",
+            "callsign": "N0CALL",
+            "ssid": 3,
+            "speed": 115200,
+            "databits": 8,
+            "parity": "N",
+            "stopbits": 1,
+            "preamble": 150,
+            "txtail": 10,
+            "persistence": 200,
+            "slottime": 30,
+            "flow_control": true
+        }))
+        .unwrap();
+
+        let value = iface_config_json(&request.synthesize().unwrap());
+        assert_eq!(value["type"], "AX25KISSInterface");
+        assert_eq!(value["port"], "/dev/ttyUSB2");
+        assert_eq!(value["callsign"], "N0CALL");
+        assert_eq!(value["ssid"], 3);
+        assert_eq!(value["speed"], 115200);
+        assert_eq!(value["preamble"], 150);
+        assert_eq!(value["txtail"], 10);
+        assert_eq!(value["persistence"], 200);
+        assert_eq!(value["slottime"], 30);
+        assert_eq!(value["flow_control"], true);
+
+        let invalid: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Invalid AX.25",
+            "type": "AX25KISSInterface",
+            "port": "/dev/ttyUSB2",
+            "callsign": "NO@",
+            "ssid": 0
+        }))
+        .unwrap();
+        assert!(matches!(invalid.synthesize(), Err(ApiError::BadRequest(_))));
     }
 
     #[test]

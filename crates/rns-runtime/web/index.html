@@ -213,6 +213,7 @@
             <option value="SerialInterface">Serial</option>
             <option value="KISSInterface">KISS</option>
             <option value="RNodeInterface">RNode</option>
+            <option value="AX25KISSInterface">AX.25 KISS</option>
           </select>
         </label>
         <label>Mode
@@ -423,6 +424,63 @@
         </label>
         <label class="check-field wide">
           <input id="rnode-flow-control" type="checkbox">
+          <span>Flow control</span>
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="ax25-fields" hidden disabled>
+        <legend>AX.25 KISS</legend>
+        <label class="wide">Port
+          <input id="ax25-port" autocomplete="off" placeholder="/dev/ttyUSB0" required>
+        </label>
+        <label>Callsign
+          <input id="ax25-callsign" autocomplete="off" placeholder="N0CALL"
+                 minlength="3" maxlength="6" pattern="[A-Za-z0-9]{3,6}"
+                 title="3 to 6 ASCII letters or digits" required>
+        </label>
+        <label>SSID
+          <input id="ax25-ssid" type="number" min="0" max="15" step="1"
+                 value="0" required>
+        </label>
+        <label>Speed
+          <input id="ax25-speed" type="number" min="1" step="1" value="9600" required>
+        </label>
+        <label>Data bits
+          <select id="ax25-databits">
+            <option value="8">8</option>
+            <option value="7">7</option>
+            <option value="6">6</option>
+            <option value="5">5</option>
+          </select>
+        </label>
+        <label>Parity
+          <select id="ax25-parity">
+            <option value="N">None</option>
+            <option value="E">Even</option>
+            <option value="O">Odd</option>
+          </select>
+        </label>
+        <label>Stop bits
+          <select id="ax25-stopbits">
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+        </label>
+        <label>Preamble, ms
+          <input id="ax25-preamble" type="number" min="0" step="1" value="350">
+        </label>
+        <label>TX tail, ms
+          <input id="ax25-txtail" type="number" min="0" step="1" value="20">
+        </label>
+        <label>Persistence
+          <input id="ax25-persistence" type="number" min="0" max="255"
+                 step="1" value="64">
+        </label>
+        <label>Slot time, ms
+          <input id="ax25-slottime" type="number" min="0" step="1" value="20">
+        </label>
+        <label class="check-field wide">
+          <input id="ax25-flow-control" type="checkbox">
           <span>Flow control</span>
         </label>
       </fieldset>

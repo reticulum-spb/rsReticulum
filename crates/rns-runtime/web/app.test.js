@@ -67,6 +67,12 @@ test("formats serial endpoints", () => {
     }),
     "tcp://rnode.local:7633",
   );
+  assert.equal(
+    interfaceEndpoint({
+      config: { type: "AX25KISSInterface", port: "/dev/ttyUSB2" },
+    }),
+    "/dev/ttyUSB2",
+  );
 });
 
 test("filters paths by destination, next hop, and interface name", () => {
