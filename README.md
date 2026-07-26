@@ -26,8 +26,26 @@ interoperable. It is not the source-of-truth implementation, do not treat it as 
 Commands are intentionally namespaced for Rust with `*-rs` command names, so
 rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 
+## Application ecosystem
+
+The workspace is also the transport foundation for adjacent Rust applications:
+
+- `rsLXMF` uses identities, announces, packets, Links, Resources, and path
+  discovery for messaging and propagation;
+- `rsRRC-client` uses reusable Link sessions for interactive room clients and
+  bots;
+- `rsRRCD` uses identified inbound Links and Resources for its hub daemon;
+- `rsNomadNet` combines those libraries in a local web client.
+
+The reusable Link session API supports proof-backed payload/Resource delivery
+as well as unconfirmed packet submission for application protocols that carry
+their own acknowledgement. The application packet API also supports
+pre-encrypted payload submission with an optional delivery receipt, which is
+used by LXMF opportunistic delivery.
+
 ## Contents
 
+- [Application ecosystem](#application-ecosystem)
 - [Build It](#build-it)
 - [Rust Examples](#rust-examples)
 - [Tool Usage](#tool-usage)
