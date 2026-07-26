@@ -75,33 +75,51 @@ impl Default for ExitHandler {
     }
 }
 
-/// Install a Ctrl-C (SIGINT) handler that trips `shutdown`. Returned receiver
-/// yields once on signal for await-based callers.
+/// Install SIGINT and SIGTERM handlers that trip `shutdown`. Returned
+/// receiver yields once on signal for await-based callers.
+///
+/// SIGTERM matters as much as SIGINT: it is what systemd, Docker, and
+/// `kill` send, so a daemon that only handles SIGINT dies by default
+/// disposition on every orderly stop — no drain, no exit handlers.
 ///
 /// On unix the OS-level registration happens synchronously in this call — a
 /// handler registered inside a spawned task only takes effect once that task
-/// is first polled, leaving a window where SIGINT kills the process via the
-/// default disposition.
+/// is first polled, leaving a window where the signal kills the process via
+/// the default disposition.
 pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
-    let shutdown_clone = shutdown.clone();
 
     #[cfg(unix)]
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-        Ok(mut sigint) => {
-            tokio::spawn(async move {
-                sigint.recv().await;
-                signal_shutdown(shutdown_clone, tx).await;
-            });
+    {
+        use tokio::signal::unix::SignalKind;
+
+        let mut registered = false;
+        for (name, kind) in [
+            ("SIGINT", SignalKind::interrupt()),
+            ("SIGTERM", SignalKind::terminate()),
+        ] {
+            match tokio::signal::unix::signal(kind) {
+                Ok(mut sig) => {
+                    // One task per signal: a select! over both would drop the
+                    // loser's registration when the first one fires.
+                    let shutdown = shutdown.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        sig.recv().await;
+                        signal_shutdown(shutdown, tx).await;
+                    });
+                    registered = true;
+                }
+                Err(e) => tracing::warn!(signal = name, error = %e, "signal registration failed"),
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "SIGINT registration failed; falling back to ctrl_c");
-            spawn_ctrl_c_handler(shutdown_clone, tx);
+        if !registered {
+            spawn_ctrl_c_handler(shutdown, tx);
         }
     }
 
     #[cfg(not(unix))]
-    spawn_ctrl_c_handler(shutdown_clone, tx);
+    spawn_ctrl_c_handler(shutdown, tx);
 
     rx
 }
@@ -122,6 +140,29 @@ async fn signal_shutdown(shutdown: ShutdownSignal, tx: mpsc::Sender<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends a real SIGTERM to this process. Before SIGTERM was registered
+    /// this did not fail the assertion -- it killed the test binary outright
+    /// via the default disposition, which is exactly the daemon behaviour
+    /// being fixed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_triggers_shutdown_instead_of_killing_the_process() {
+        let shutdown = ShutdownSignal::new();
+        let mut rx = install_signal_handlers(shutdown.clone());
+
+        assert!(std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("kill")
+            .success());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("SIGTERM did not reach the handler")
+            .expect("signal channel closed");
+        assert!(shutdown.is_triggered());
+    }
 
     #[test]
     fn test_shutdown_signal() {
