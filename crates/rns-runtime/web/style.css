@@ -461,12 +461,14 @@ tbody tr:hover { background: var(--panel-2); }
 
 dialog {
   width: min(520px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
   padding: 0;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 14px;
   background: var(--panel);
   box-shadow: 0 24px 80px #000b;
+  overflow-y: auto;
 }
 
 dialog::backdrop { background: #050706cc; backdrop-filter: blur(5px); }

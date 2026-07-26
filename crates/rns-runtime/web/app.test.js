@@ -48,6 +48,21 @@ test("formats UDP endpoints", () => {
   );
 });
 
+test("formats serial endpoints", () => {
+  assert.equal(
+    interfaceEndpoint({
+      config: { type: "SerialInterface", port: "/dev/ttyUSB0" },
+    }),
+    "/dev/ttyUSB0",
+  );
+  assert.equal(
+    interfaceEndpoint({
+      config: { type: "KISSInterface", port: "tcp://tnc.local:8001" },
+    }),
+    "tcp://tnc.local:8001",
+  );
+});
+
 test("filters paths by destination, next hop, and interface name", () => {
   const path = {
     hash: "AABB001122334455",

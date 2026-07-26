@@ -229,6 +229,9 @@ function interfaceEndpoint(item) {
     const forward = `${config.forward_ip || "—"}:${config.forward_port ?? "—"}`;
     return `${listen} → ${forward}`;
   }
+  if (config.type === "SerialInterface" || config.type === "KISSInterface") {
+    return config.port || "—";
+  }
   return "—";
 }
 
@@ -281,6 +284,8 @@ function interfaceDetails(item) {
       "TCPClientInterface",
       "TCPServerInterface",
       "UDPInterface",
+      "SerialInterface",
+      "KISSInterface",
     ].includes(item.config?.type);
     if (editable) {
       actions.append(actionButton("Edit configuration", "", () => openInterfaceDialog(item)));
@@ -595,18 +600,27 @@ function setInterfaceType(type) {
   const client = document.querySelector("#tcp-client-fields");
   const server = document.querySelector("#tcp-server-fields");
   const udp = document.querySelector("#udp-fields");
+  const serial = document.querySelector("#serial-fields");
+  const kissSerial = document.querySelector("#kiss-fields");
   const kiss = document.querySelector("#kiss-framing-field");
   const isClient = type === "TCPClientInterface";
   const isServer = type === "TCPServerInterface";
   const isUdp = type === "UDPInterface";
+  const isSerial = type === "SerialInterface";
+  const isKiss = type === "KISSInterface";
   client.hidden = !isClient;
   client.disabled = !isClient;
   server.hidden = !isServer;
   server.disabled = !isServer;
   udp.hidden = !isUdp;
   udp.disabled = !isUdp;
-  kiss.hidden = isUdp;
-  document.querySelector("#kiss-framing").disabled = isUdp;
+  serial.hidden = !isSerial;
+  serial.disabled = !isSerial;
+  kissSerial.hidden = !isKiss;
+  kissSerial.disabled = !isKiss;
+  const usesKissFraming = isClient || isServer;
+  kiss.hidden = !usesKissFraming;
+  document.querySelector("#kiss-framing").disabled = !usesKissFraming;
 }
 
 function setField(selector, value, fallback = "") {
@@ -636,6 +650,23 @@ function openInterfaceDialog(item = null) {
   setField("#udp-forward-ip", config.forward_ip);
   setField("#udp-forward-port", config.forward_port);
   setField("#udp-device", config.device);
+  setField("#serial-port", config.port);
+  setField("#serial-speed", config.speed, 9600);
+  setField("#serial-databits", config.databits, 8);
+  setField("#serial-parity", config.parity, "N");
+  setField("#serial-stopbits", config.stopbits, 1);
+  setField("#kiss-port", config.port);
+  setField("#kiss-speed", config.speed, 9600);
+  setField("#kiss-databits", config.databits, 8);
+  setField("#kiss-parity", config.parity, "N");
+  setField("#kiss-stopbits", config.stopbits, 1);
+  setField("#kiss-preamble", config.preamble, 350);
+  setField("#kiss-txtail", config.txtail, 20);
+  setField("#kiss-persistence", config.persistence, 64);
+  setField("#kiss-slottime", config.slottime, 20);
+  setField("#kiss-id-interval", config.id_interval);
+  setField("#kiss-id-callsign", config.id_callsign);
+  document.querySelector("#kiss-flow-control").checked = Boolean(config.flow_control);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
   document.querySelector("#interface-enabled").checked = item ? item.enabled !== false : true;
@@ -696,6 +727,27 @@ function interfacePayload() {
     if (forwardIp) payload.forward_ip = forwardIp;
     if (forwardPort !== undefined) payload.forward_port = forwardPort;
     if (device) payload.device = device;
+  } else if (type === "SerialInterface") {
+    payload.port = document.querySelector("#serial-port").value.trim();
+    payload.speed = Number(document.querySelector("#serial-speed").value);
+    payload.databits = Number(document.querySelector("#serial-databits").value);
+    payload.parity = document.querySelector("#serial-parity").value;
+    payload.stopbits = Number(document.querySelector("#serial-stopbits").value);
+  } else if (type === "KISSInterface") {
+    payload.port = document.querySelector("#kiss-port").value.trim();
+    payload.speed = Number(document.querySelector("#kiss-speed").value);
+    payload.databits = Number(document.querySelector("#kiss-databits").value);
+    payload.parity = document.querySelector("#kiss-parity").value;
+    payload.stopbits = Number(document.querySelector("#kiss-stopbits").value);
+    payload.preamble = Number(document.querySelector("#kiss-preamble").value);
+    payload.txtail = Number(document.querySelector("#kiss-txtail").value);
+    payload.persistence = Number(document.querySelector("#kiss-persistence").value);
+    payload.slottime = Number(document.querySelector("#kiss-slottime").value);
+    payload.flow_control = document.querySelector("#kiss-flow-control").checked;
+    const idInterval = optionalInteger("#kiss-id-interval");
+    const idCallsign = document.querySelector("#kiss-id-callsign").value.trim();
+    if (idInterval !== undefined) payload.id_interval = idInterval;
+    if (idCallsign) payload.id_callsign = idCallsign;
   }
 
   return payload;

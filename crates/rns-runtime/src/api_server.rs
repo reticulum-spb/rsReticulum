@@ -349,6 +349,20 @@ struct InterfaceRequest {
     // Shared
     kiss_framing: Option<bool>,
     interface_mode: Option<String>,
+
+    // SerialInterface / KISSInterface
+    port: Option<String>,
+    speed: Option<u32>,
+    databits: Option<u8>,
+    parity: Option<String>,
+    stopbits: Option<u8>,
+    preamble: Option<u32>,
+    txtail: Option<u32>,
+    persistence: Option<u8>,
+    slottime: Option<u32>,
+    flow_control: Option<bool>,
+    id_interval: Option<u64>,
+    id_callsign: Option<String>,
 }
 
 impl InterfaceRequest {
@@ -404,6 +418,42 @@ impl InterfaceRequest {
         }
         if let Some(ref v) = self.interface_mode {
             s.set("interface_mode", v);
+        }
+        if let Some(ref v) = self.port {
+            s.set("port", v);
+        }
+        if let Some(v) = self.speed {
+            s.set("speed", &v.to_string());
+        }
+        if let Some(v) = self.databits {
+            s.set("databits", &v.to_string());
+        }
+        if let Some(ref v) = self.parity {
+            s.set("parity", v);
+        }
+        if let Some(v) = self.stopbits {
+            s.set("stopbits", &v.to_string());
+        }
+        if let Some(v) = self.preamble {
+            s.set("preamble", &v.to_string());
+        }
+        if let Some(v) = self.txtail {
+            s.set("txtail", &v.to_string());
+        }
+        if let Some(v) = self.persistence {
+            s.set("persistence", &v.to_string());
+        }
+        if let Some(v) = self.slottime {
+            s.set("slottime", &v.to_string());
+        }
+        if let Some(v) = self.flow_control {
+            s.set("flow_control", if v { "Yes" } else { "No" });
+        }
+        if let Some(v) = self.id_interval {
+            s.set("id_interval", &v.to_string());
+        }
+        if let Some(ref v) = self.id_callsign {
+            s.set("id_callsign", v);
         }
         s
     }
@@ -984,6 +1034,18 @@ fn iface_section_json(section: &ConfigSection) -> Value {
         "device": section.get("device"),
         "kiss_framing": section.get_bool("kiss_framing"),
         "interface_mode": section.get("interface_mode").unwrap_or("Full"),
+        "port": section.get("port"),
+        "speed": section.get_uint("speed").or_else(|| section.get_uint("baud_rate")),
+        "databits": section.get_uint("databits").or_else(|| section.get_uint("data_bits")),
+        "parity": section.get("parity"),
+        "stopbits": section.get_uint("stopbits").or_else(|| section.get_uint("stop_bits")),
+        "preamble": section.get_uint("preamble"),
+        "txtail": section.get_uint("txtail"),
+        "persistence": section.get_uint("persistence"),
+        "slottime": section.get_uint("slottime"),
+        "flow_control": section.get_bool("flow_control"),
+        "id_interval": section.get_uint("id_interval"),
+        "id_callsign": section.get("id_callsign"),
     })
 }
 
@@ -1017,6 +1079,33 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "forward_ip":     c.forward_ip,
             "forward_port":   c.forward_port,
             "device":         c.device,
+            "interface_mode": mode_to_str(c.mode),
+        }),
+        #[cfg(feature = "serial")]
+        InterfaceConfig::Serial(c) => json!({
+            "type":           "SerialInterface",
+            "port":           c.port,
+            "speed":          c.baud_rate,
+            "databits":       c.data_bits,
+            "parity":         c.parity,
+            "stopbits":       c.stop_bits,
+            "interface_mode": mode_to_str(c.mode),
+        }),
+        #[cfg(feature = "serial")]
+        InterfaceConfig::KissSerial(c) => json!({
+            "type":           "KISSInterface",
+            "port":           c.port,
+            "speed":          c.baud_rate,
+            "databits":       c.data_bits,
+            "parity":         c.parity,
+            "stopbits":       c.stop_bits,
+            "preamble":       c.preamble_ms,
+            "txtail":         c.txtail_ms,
+            "persistence":    c.persistence,
+            "slottime":       c.slottime_ms,
+            "flow_control":   c.flow_control,
+            "id_interval":    c.id_interval,
+            "id_callsign":    c.id_callsign,
             "interface_mode": mode_to_str(c.mode),
         }),
         // The remaining types return only the type - it is expanded by analogy.
@@ -1255,6 +1344,64 @@ mod tests {
         assert_eq!(value["forward_port"], 4243);
         assert_eq!(value["device"], "lo");
         assert_eq!(value["interface_mode"], "PointToPoint");
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn serial_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test serial",
+            "type": "SerialInterface",
+            "port": "/dev/ttyUSB0",
+            "speed": 115200,
+            "databits": 8,
+            "parity": "N",
+            "stopbits": 1,
+            "interface_mode": "Full"
+        }))
+        .unwrap();
+
+        let value = iface_config_json(&request.synthesize().unwrap());
+        assert_eq!(value["type"], "SerialInterface");
+        assert_eq!(value["port"], "/dev/ttyUSB0");
+        assert_eq!(value["speed"], 115200);
+        assert_eq!(value["databits"], 8);
+        assert_eq!(value["parity"], "N");
+        assert_eq!(value["stopbits"], 1);
+    }
+
+    #[cfg(feature = "serial")]
+    #[test]
+    fn kiss_request_validates_and_serializes() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test KISS",
+            "type": "KISSInterface",
+            "port": "tcp://127.0.0.1:8001",
+            "speed": 57600,
+            "databits": 8,
+            "parity": "N",
+            "stopbits": 1,
+            "preamble": 150,
+            "txtail": 10,
+            "persistence": 200,
+            "slottime": 30,
+            "flow_control": true,
+            "id_interval": 600,
+            "id_callsign": "N0CALL-1"
+        }))
+        .unwrap();
+
+        let value = iface_config_json(&request.synthesize().unwrap());
+        assert_eq!(value["type"], "KISSInterface");
+        assert_eq!(value["port"], "tcp://127.0.0.1:8001");
+        assert_eq!(value["speed"], 57600);
+        assert_eq!(value["preamble"], 150);
+        assert_eq!(value["txtail"], 10);
+        assert_eq!(value["persistence"], 200);
+        assert_eq!(value["slottime"], 30);
+        assert_eq!(value["flow_control"], true);
+        assert_eq!(value["id_interval"], 600);
+        assert_eq!(value["id_callsign"], "N0CALL-1");
     }
 
     #[test]
