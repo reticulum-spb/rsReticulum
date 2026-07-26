@@ -1600,6 +1600,24 @@ impl LinkClient {
     }
 }
 
+/// Whether a resource advertised on this link answers our outstanding request.
+///
+/// A response resource names the request it answers and must name ours.
+/// Implementations that reply with a plain application resource instead carry
+/// no correlation id at all -- but the link exists solely for the one request
+/// still outstanding, so such a resource is that request's answer.
+fn resource_answers_request(
+    is_response: bool,
+    adv_request_id: Option<&[u8]>,
+    request_id: &[u8; 16],
+) -> bool {
+    if is_response {
+        adv_request_id == Some(request_id.as_slice())
+    } else {
+        adv_request_id.is_none()
+    }
+}
+
 fn time_remaining(deadline: Instant) -> Result<Duration, LinkClientError> {
     let now = Instant::now();
     if now >= deadline {
@@ -1727,9 +1745,18 @@ async fn wait_for_response(
                                 ))
                             })?;
 
-                            if !adv.flags.is_response
-                                || adv.request_id.as_deref() != Some(request_id.as_slice())
-                            {
+                            // A response resource names the request it answers,
+                            // and must name ours. Implementations that reply
+                            // with a plain application resource instead (no
+                            // response flag, no request id) carry no way to
+                            // correlate -- but this link exists solely for the
+                            // one request still outstanding, so a resource
+                            // arriving on it is that request's answer.
+                            if !resource_answers_request(
+                                adv.flags.is_response,
+                                adv.request_id.as_deref(),
+                                &request_id,
+                            ) {
                                 continue;
                             }
                             if !inbound_resources.contains_key(&adv.resource_hash) {
@@ -1904,10 +1931,17 @@ async fn wait_for_response(
                                             });
                                         }
                                     }
-                                    Err(e) => {
-                                        return Err(LinkClientError::LinkCrypto(format!(
-                                            "resource response decode: {e:?}"
-                                        )));
+                                    // Not the msgpack `[request_id, data]`
+                                    // envelope Python RNS wraps large responses
+                                    // in. Implementations that send the payload
+                                    // raw are answering the same request, so the
+                                    // bytes are the response as they stand --
+                                    // failing here would reject every such peer.
+                                    Err(_) => {
+                                        return Ok(LinkResponse {
+                                            data: response_payload,
+                                            metadata,
+                                        });
                                     }
                                 }
                             }
@@ -2238,6 +2272,26 @@ mod tests {
             seen.contains(&"DeregisterAnnounceHandler"),
             "handler leaked on the timeout path, saw: {seen:?}"
         );
+    }
+
+    /// Peers that answer with a plain application resource (nomad-core does)
+    /// set no response flag and no request id. Requiring both meant the
+    /// advertisement was skipped, no ResourceReq was ever sent, and the link
+    /// sat idle until it was torn down as stale.
+    #[test]
+    fn plain_resource_without_a_request_id_answers_the_outstanding_request() {
+        let ours = [0x11u8; 16];
+        let theirs = [0x22u8; 16];
+
+        // Enveloped response resources still must name our request.
+        assert!(resource_answers_request(true, Some(&ours), &ours));
+        assert!(!resource_answers_request(true, Some(&theirs), &ours));
+        assert!(!resource_answers_request(true, None, &ours));
+
+        // A plain resource carries no id and is taken as the answer.
+        assert!(resource_answers_request(false, None, &ours));
+        // ...but one that names a *different* request is not ours.
+        assert!(!resource_answers_request(false, Some(&theirs), &ours));
     }
 
     #[tokio::test]
