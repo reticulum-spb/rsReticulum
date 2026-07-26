@@ -151,9 +151,16 @@
           <div class="table-toolbar">
             <label class="search-field">
               <span class="sr-only">Search paths</span>
-              <input type="search" id="path-search" placeholder="Search paths" disabled>
+              <input type="search" id="path-search"
+                     placeholder="Search address or interface name" disabled>
             </label>
-            <span class="muted" id="path-count">Not loaded</span>
+            <div class="table-toolbar-meta">
+              <label class="compact-field">Max hops
+                <input id="max-hops" type="number" min="1" max="255"
+                       step="1" placeholder="Any">
+              </label>
+              <span class="muted" id="path-count">Not loaded</span>
+            </div>
           </div>
           <div class="table-scroll path-table-scroll" tabindex="0"
                role="region" aria-label="Scrollable path table">
@@ -164,6 +171,7 @@
                   <th>Hops</th>
                   <th>Interface</th>
                   <th>Via</th>
+                  <th>Learned</th>
                   <th>Expires</th>
                 </tr>
               </thead>

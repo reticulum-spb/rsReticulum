@@ -282,6 +282,23 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .table-toolbar-meta { gap: 18px; }
 .toggle-field { gap: 7px; color: var(--muted); cursor: pointer; white-space: nowrap; }
 .toggle-field input { accent-color: var(--accent); }
+.compact-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.compact-field input {
+  width: 72px;
+  padding: 7px 8px;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: none;
+  background: #090c0b;
+}
+.compact-field input:focus { border-color: var(--accent); }
 .search-field { width: min(320px, 60%); }
 .search-field input {
   width: 100%;
@@ -321,6 +338,12 @@ tbody tr:hover { background: var(--panel-2); }
 .interface-name small, .cell-stack small { color: var(--muted); font-size: 10px; }
 .interface-name code { color: var(--dim); font-size: 10px; }
 .cell-stack { display: grid; gap: 4px; white-space: nowrap; }
+.hash-cell {
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", "Roboto Mono", monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
 .status-chip {
   display: inline-flex;
   align-items: center;

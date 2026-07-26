@@ -4,15 +4,25 @@ const REQUEST_TIMEOUT_MS = 8000;
 const DASHBOARD_REFRESH_MS = 5000;
 const INTERFACE_REFRESH_MS = 1000;
 const INTERFACE_ERROR_REFRESH_MS = 5000;
+const PATH_REFRESH_MS = 5000;
+const PATH_ERROR_REFRESH_MS = 15000;
 const views = new Set(["dashboard", "interfaces", "paths"]);
 let dashboardRequest = null;
 let interfaceRequest = null;
 let interfaceNextPollAt = 0;
+let pathRequest = null;
+let pathNextPollAt = 0;
 const interfaceState = {
   items: [],
   expanded: new Set(),
   filter: "",
   showAll: false,
+  loaded: false,
+};
+const pathState = {
+  items: [],
+  filter: "",
+  maxHops: "",
   loaded: false,
 };
 
@@ -423,6 +433,145 @@ function refreshInterfaces({ background = false } = {}) {
   return interfaceRequest;
 }
 
+function formatTimestamp(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "—";
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+function formatDuration(seconds) {
+  const absolute = Math.max(0, Math.round(Math.abs(seconds)));
+  if (absolute < 60) return `${absolute}s`;
+  if (absolute < 3600) return `${Math.floor(absolute / 60)}m`;
+  if (absolute < 86400) {
+    const hours = Math.floor(absolute / 3600);
+    const minutes = Math.floor((absolute % 3600) / 60);
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  const days = Math.floor(absolute / 86400);
+  const hours = Math.floor((absolute % 86400) / 3600);
+  return hours ? `${days}d ${hours}h` : `${days}d`;
+}
+
+function relativeTimestamp(value, future = false) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "—";
+  const delta = seconds - Date.now() / 1000;
+  if (future) return delta <= 0 ? "Expired" : `in ${formatDuration(delta)}`;
+  return delta >= 0 ? "just now" : `${formatDuration(delta)} ago`;
+}
+
+function pathTextCell(value, className = "") {
+  const cell = document.createElement("td");
+  const text = document.createElement(className === "hash-cell" ? "code" : "span");
+  text.className = className;
+  text.textContent = value || "—";
+  cell.append(text);
+  return cell;
+}
+
+function pathRows(items) {
+  const fragment = document.createDocumentFragment();
+  for (const path of items) {
+    const row = document.createElement("tr");
+    row.append(
+      pathTextCell(path.hash, "hash-cell"),
+      pathTextCell(formatNumber(path.hops)),
+      pathTextCell(path.interface),
+      pathTextCell(path.via, "hash-cell"),
+      stackedCell(formatTimestamp(path.timestamp), relativeTimestamp(path.timestamp)),
+      stackedCell(formatTimestamp(path.expires), relativeTimestamp(path.expires, true)),
+    );
+    fragment.append(row);
+  }
+  return fragment;
+}
+
+function renderPaths() {
+  const query = pathState.filter.trim().toLocaleLowerCase();
+  const items = pathState.items.filter((path) => {
+    if (!query) return true;
+    return [path.hash, path.via, path.interface]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
+  });
+  const rows = document.querySelector("#path-rows");
+  const empty = document.querySelector("#paths-empty");
+  rows.replaceChildren(pathRows(items));
+  empty.hidden = items.length > 0;
+
+  const heading = empty.querySelector("strong");
+  const detail = empty.querySelector("span:last-child");
+  if (!items.length) {
+    heading.textContent = query ? "No matching paths" : "No paths";
+    detail.textContent = query
+      ? "Search matches destination, next-hop address, and interface name."
+      : "No routes were returned by rnsd-rs.";
+  }
+
+  const total = pathState.items.length;
+  document.querySelector("#path-count").textContent = query
+    ? `${items.length.toLocaleString()} of ${total.toLocaleString()}`
+    : `${total.toLocaleString()} path${total === 1 ? "" : "s"}`;
+}
+
+function setPathsLoading() {
+  document.querySelector("#path-rows").replaceChildren();
+  document.querySelector("#path-search").disabled = true;
+  document.querySelector("#paths-empty").hidden = false;
+  document.querySelector("#paths-empty strong").textContent = "Loading paths…";
+  document.querySelector("#paths-empty span:last-child").textContent =
+    "Waiting for transport route data.";
+  document.querySelector("#path-count").textContent = "Loading…";
+}
+
+function refreshPaths({ background = false } = {}) {
+  if (pathRequest) return pathRequest;
+
+  const refreshButton = document.querySelector("#view-paths [data-refresh]");
+  const maxHops = document.querySelector("#max-hops");
+  if (!background) {
+    setBusy(refreshButton, true);
+    maxHops.disabled = true;
+  }
+  if (!pathState.loaded) setPathsLoading();
+  const query = pathState.maxHops ? `?max_hops=${encodeURIComponent(pathState.maxHops)}` : "";
+  pathRequest = apiFetch(`/api/v1/paths${query}`, { cache: "no-store" })
+    .then((body) => {
+      pathState.items = Array.isArray(body.paths) ? body.paths : [];
+      pathState.loaded = true;
+      pathNextPollAt = Date.now() + PATH_REFRESH_MS;
+      document.querySelector("#path-search").disabled = false;
+      renderPaths();
+      document.querySelector("#daemon-pill").dataset.state = "online";
+      document.querySelector("#daemon-label").textContent = "rnsd-rs online";
+      clearError();
+    })
+    .catch((error) => {
+      pathNextPollAt = Date.now() + PATH_ERROR_REFRESH_MS;
+      if (!pathState.loaded) {
+        document.querySelector("#path-search").disabled = true;
+        document.querySelector("#paths-empty strong").textContent = "Paths unavailable";
+        document.querySelector("#paths-empty span:last-child").textContent =
+          "The route table could not be loaded from rnsd-rs.";
+        document.querySelector("#path-count").textContent = "Unavailable";
+      } else {
+        document.querySelector("#path-count").textContent = "Update failed · retrying";
+      }
+      document.querySelector("#daemon-pill").dataset.state = "unavailable";
+      document.querySelector("#daemon-label").textContent = "Unavailable";
+      showError(error);
+    })
+    .finally(() => {
+      if (!background) {
+        setBusy(refreshButton, false);
+        maxHops.disabled = false;
+      }
+      pathRequest = null;
+    });
+
+  return pathRequest;
+}
+
 function setInterfaceType(type) {
   const client = document.querySelector("#tcp-client-fields");
   const server = document.querySelector("#tcp-server-fields");
@@ -602,6 +751,7 @@ function showView(name, { focus = false } = {}) {
   if (focus) document.querySelector("#main-content").focus();
   if (selected === "dashboard") refreshDashboard();
   if (selected === "interfaces") refreshInterfaces();
+  if (selected === "paths") refreshPaths();
 }
 
 function openNavigation() {
@@ -621,6 +771,10 @@ async function refresh(button) {
   }
   if (currentView() === "interfaces") {
     await refreshInterfaces();
+    return;
+  }
+  if (currentView() === "paths") {
+    await refreshPaths();
     return;
   }
 
@@ -683,6 +837,20 @@ document.querySelector("#show-all-interfaces").addEventListener("change", (event
   if (interfaceRequest) interfaceRequest.finally(() => refreshInterfaces());
   else refreshInterfaces();
 });
+document.querySelector("#path-search").addEventListener("input", (event) => {
+  pathState.filter = event.target.value;
+  renderPaths();
+});
+document.querySelector("#max-hops").addEventListener("change", (event) => {
+  if (event.target.value && !event.target.checkValidity()) {
+    event.target.reportValidity();
+    return;
+  }
+  pathState.maxHops = event.target.value;
+  pathState.loaded = false;
+  if (pathRequest) pathRequest.finally(() => refreshPaths());
+  else refreshPaths();
+});
 
 document.querySelectorAll("[data-refresh]").forEach((button) => {
   button.addEventListener("click", () => refresh(button));
@@ -707,5 +875,14 @@ window.setInterval(() => {
     refreshInterfaces({ background: true });
   }
 }, INTERFACE_REFRESH_MS);
+window.setInterval(() => {
+  if (
+    currentView() === "paths"
+    && !document.hidden
+    && Date.now() >= pathNextPollAt
+  ) {
+    refreshPaths({ background: true });
+  }
+}, PATH_REFRESH_MS);
 
 showView(currentView());
