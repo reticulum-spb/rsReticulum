@@ -42,6 +42,9 @@ as well as unconfirmed packet submission for application protocols that carry
 their own acknowledgement. The application packet API also supports
 pre-encrypted payload submission with an optional delivery receipt, which is
 used by LXMF opportunistic delivery.
+Link request responses expose optional Resource metadata and can enforce an
+application-provided size limit before accepting advertised Resource data;
+multi-segment response Resources are reassembled before request decoding.
 
 ## Contents
 
