@@ -253,6 +253,10 @@ previous file is saved as `config.web-ui.bak`; external edits are rejected with
 a conflict response, and a failed interface restart restores both the config
 and the previous runtime interface.
 
+The Interfaces view combines runtime statistics with the configured interface
+list. Disabled or failed interfaces remain visible and can be edited, enabled,
+disabled, or removed even when they do not have a runtime ID.
+
 Run the Web UI and REST API checks with:
 
 ```bash

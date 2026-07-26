@@ -253,9 +253,9 @@ function interfaceDetails(item) {
   const details = document.createElement("dl");
   details.className = "interface-details";
   details.append(
-    detailItem("Runtime ID", formatNumber(item.id)),
-    detailItem("Configuration", item.config ? "Configurable" : "Runtime-managed",
-      item.config ? "" : "runtime-only"),
+    detailItem("Runtime ID", item.id === null ? "Not running" : formatNumber(item.id)),
+    detailItem("Configuration", item.configured ? (item.enabled ? "Enabled" : "Disabled") : "Runtime-managed",
+      item.configured ? "" : "runtime-only"),
     detailItem("Type", interfaceType(item)),
     detailItem("Endpoint", interfaceEndpoint(item)),
     detailItem("Role", item.role || "—"),
@@ -269,13 +269,14 @@ function interfaceDetails(item) {
     detailItem("Outgoing announces", formatFrequency(item.outgoing_announce_frequency)),
   );
   container.append(details);
-  if (item.config) {
+  if (item.configured) {
     const actions = document.createElement("div");
     actions.className = "interface-actions";
-    actions.append(
-      actionButton("Edit configuration", "", () => openInterfaceDialog(item)),
-      actionButton("Delete", "danger", () => openDeleteDialog(item)),
-    );
+    const editable = ["TCPClientInterface", "TCPServerInterface"].includes(item.config?.type);
+    if (editable) {
+      actions.append(actionButton("Edit configuration", "", () => openInterfaceDialog(item)));
+    }
+    actions.append(actionButton("Delete", "danger", () => openDeleteDialog(item)));
     container.append(actions);
   }
   return container;
@@ -307,27 +308,28 @@ function interfaceRows(items) {
     name.className = "interface-name";
     nameText.textContent = item.name || "Unnamed interface";
     type.textContent = interfaceType(item);
-    id.textContent = `#${item.id}`;
+    id.textContent = item.id === null ? "config only" : `#${item.id}`;
     name.append(nameText, type, id);
     nameCell.append(name);
 
     const statusCell = document.createElement("td");
     const status = document.createElement("span");
     status.className = `status-chip${item.online ? " online" : ""}`;
-    status.textContent = item.online ? "Online" : "Offline";
+    status.textContent = !item.enabled ? "Disabled" : item.online ? "Online" : "Offline";
     statusCell.append(status);
 
     const detailCell = document.createElement("td");
     const detailButton = document.createElement("button");
-    const expanded = interfaceState.expanded.has(item.id);
+    const itemKey = item.name;
+    const expanded = interfaceState.expanded.has(itemKey);
     detailButton.type = "button";
     detailButton.className = "details-button";
     detailButton.textContent = expanded ? "−" : "+";
     detailButton.setAttribute("aria-expanded", String(expanded));
     detailButton.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} details for ${item.name}`);
     detailButton.addEventListener("click", () => {
-      if (expanded) interfaceState.expanded.delete(item.id);
-      else interfaceState.expanded.add(item.id);
+      if (expanded) interfaceState.expanded.delete(itemKey);
+      else interfaceState.expanded.add(itemKey);
       renderInterfaces();
     });
     detailCell.append(detailButton);
@@ -600,6 +602,7 @@ function openInterfaceDialog(item = null) {
   const config = item?.config || {};
   form.reset();
   setField("#interface-id", item?.id);
+  setField("#interface-original-name", item?.name);
   setField("#interface-name", item?.name);
   setField("#interface-type", config.type, "TCPClientInterface");
   setField("#interface-mode", config.interface_mode, "Full");
@@ -613,6 +616,7 @@ function openInterfaceDialog(item = null) {
   setField("#interface-device", config.device);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
+  document.querySelector("#interface-enabled").checked = item ? item.enabled !== false : true;
   document.querySelector("#interface-dialog-title").textContent =
     item ? "Edit interface" : "Add interface";
   document.querySelector("#save-interface").textContent =
@@ -640,6 +644,7 @@ function interfacePayload() {
     type,
     interface_mode: document.querySelector("#interface-mode").value,
     kiss_framing: document.querySelector("#kiss-framing").checked,
+    enabled: document.querySelector("#interface-enabled").checked,
   };
 
   if (type === "TCPClientInterface") {
@@ -667,17 +672,20 @@ async function saveInterface(event) {
   const form = event.currentTarget;
   if (!form.reportValidity()) return;
 
-  const id = document.querySelector("#interface-id").value;
+  const originalName = document.querySelector("#interface-original-name").value;
   const button = document.querySelector("#save-interface");
   const errorNode = document.querySelector("#interface-form-error");
   const statusNode = document.querySelector("#interface-form-status");
-  const editing = id !== "";
+  const editing = originalName !== "";
   errorNode.textContent = "";
   statusNode.textContent = editing ? "Restarting interface…" : "Starting interface…";
   setBusy(button, true);
 
   try {
-    await apiFetch(editing ? `/api/v1/interfaces/${id}` : "/api/v1/interfaces", {
+    const endpoint = editing
+      ? `/api/v1/config/interfaces/${encodeURIComponent(originalName)}`
+      : "/api/v1/interfaces";
+    await apiFetch(endpoint, {
       method: editing ? "PUT" : "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(interfacePayload()),
@@ -698,7 +706,7 @@ async function saveInterface(event) {
 
 function openDeleteDialog(item) {
   const dialog = document.querySelector("#delete-interface-dialog");
-  dialog.dataset.interfaceId = item.id;
+  dialog.dataset.interfaceName = item.name;
   document.querySelector("#delete-interface-name").textContent = item.name;
   document.querySelector("#delete-interface-error").textContent = "";
   dialog.showModal();
@@ -708,23 +716,23 @@ function openDeleteDialog(item) {
 function closeDeleteDialog() {
   const dialog = document.querySelector("#delete-interface-dialog");
   dialog.close();
-  delete dialog.dataset.interfaceId;
+  delete dialog.dataset.interfaceName;
 }
 
 async function deleteInterface(event) {
   event.preventDefault();
   const dialog = document.querySelector("#delete-interface-dialog");
-  const id = dialog.dataset.interfaceId;
-  if (!id) return;
+  const name = dialog.dataset.interfaceName;
+  if (!name) return;
 
   const button = document.querySelector("#confirm-delete-interface");
   const errorNode = document.querySelector("#delete-interface-error");
   errorNode.textContent = "";
   setBusy(button, true);
   try {
-    await apiFetch(`/api/v1/interfaces/${id}`, { method: "DELETE" });
+    await apiFetch(`/api/v1/config/interfaces/${encodeURIComponent(name)}`, { method: "DELETE" });
     closeDeleteDialog();
-    interfaceState.expanded.delete(Number(id));
+    interfaceState.expanded.delete(name);
     await Promise.all([refreshInterfaces(), refreshDashboard()]);
   } catch (error) {
     errorNode.textContent = error.message;

@@ -18,11 +18,14 @@
 //! GET /api/v1/status              — summary: counters + interface list
 //! GET /api/v1/interfaces          — list of interfaces (?filter=…&all=true)
 //! GET /api/v1/interfaces/{id}     — one interface by numeric id
+//! GET /api/v1/config/interfaces   — configured interfaces, including disabled
 //! GET /api/v1/paths               — path table (?max_hops=N)
 //! GET /api/v1/links               — number of active links
 //! POST /api/v1/interfaces         — add an interface
 //! PUT /api/v1/interfaces/{id}     — replace the interface configuration
 //! DELETE /api/v1/interfaces/{id}  — delete an interface
+//! PUT /api/v1/config/interfaces/{name}    — replace by stable config name
+//! DELETE /api/v1/config/interfaces/{name} — delete without a runtime ID
 //! ```
 
 use std::net::SocketAddr;
@@ -35,7 +38,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -77,6 +80,11 @@ pub async fn run_api_server(
         .route("/health", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/interfaces", get(interfaces).post(create_interface))
+        .route("/api/v1/config/interfaces", get(config_interfaces))
+        .route(
+            "/api/v1/config/interfaces/{name}",
+            put(update_config_interface).delete(delete_config_interface),
+        )
         .route(
             "/api/v1/interfaces/{id}",
             get(interface_by_id)
@@ -321,6 +329,7 @@ struct InterfaceRequest {
 
     #[serde(rename = "type")]
     iface_type: String,
+    enabled: Option<bool>,
 
     // TCPClientInterface
     target_host: Option<String>,
@@ -346,7 +355,14 @@ impl InterfaceRequest {
     fn to_config_section(&self) -> ConfigSection {
         let mut s = ConfigSection::new();
         s.set("type", &self.iface_type);
-        s.set("enabled", "Yes");
+        s.set(
+            "enabled",
+            if self.enabled.unwrap_or(true) {
+                "Yes"
+            } else {
+                "No"
+            },
+        );
 
         if let Some(ref v) = self.target_host {
             s.set("target_host", v);
@@ -388,6 +404,10 @@ impl InterfaceRequest {
     fn synthesize(&self) -> Result<InterfaceConfig, ApiError> {
         let section = self.to_config_section();
         synthesize_interface(&self.name, &section).map_err(|e| ApiError::bad(format!("{e}")))
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 }
 
@@ -530,7 +550,8 @@ async fn health() -> (StatusCode, Json<Value>) {
 
 async fn status(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let stats = fetch_interfaces(&s).await?;
-    let configs = load_interface_configs(&s)?;
+    let sections = load_interface_sections(&s)?;
+    let configs = load_interface_configs_from_sections(&sections);
     let total_rx: u64 = stats.iter().map(|e| e.rx_bytes).sum();
     let total_tx: u64 = stats.iter().map(|e| e.tx_bytes).sum();
     let online = stats.iter().filter(|e| e.online).count();
@@ -539,7 +560,11 @@ async fn status(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         "interfaces_online": online,
         "rx_bytes_total":    total_rx,
         "tx_bytes_total":    total_tx,
-        "interfaces":        stats.iter().map(|e| merge_iface_json(e, configs.get(e.name.as_str()))).collect::<Vec<_>>(),
+        "interfaces":        stats.iter().map(|e| merge_iface_json(
+            e,
+            configs.get(e.name.as_str()),
+            sections.get(e.name.as_str()),
+        )).collect::<Vec<_>>(),
     })))
 }
 
@@ -554,9 +579,10 @@ async fn interfaces(
     Query(q): Query<InterfacesQuery>,
 ) -> ApiResult<Json<Value>> {
     let stats = fetch_interfaces(&s).await?;
-    let configs = load_interface_configs(&s)?;
+    let config_sections = load_interface_sections(&s)?;
+    let configs = load_interface_configs_from_sections(&config_sections);
     let show_all = q.all.unwrap_or(false);
-    let entries: Vec<_> = stats
+    let mut entries: Vec<_> = stats
         .iter()
         .filter(|e| show_all || visible_by_default(&e.name))
         .filter(|e| {
@@ -564,8 +590,34 @@ async fn interfaces(
                 .as_deref()
                 .is_none_or(|f| e.name.to_lowercase().contains(&f.to_lowercase()))
         })
-        .map(|e| merge_iface_json(e, configs.get(e.name.as_str())))
+        .map(|e| {
+            merge_iface_json(
+                e,
+                configs.get(e.name.as_str()),
+                config_sections.get(e.name.as_str()),
+            )
+        })
         .collect();
+    for (name, section) in &config_sections {
+        if stats.iter().any(|entry| entry.name == *name) {
+            continue;
+        }
+        if q.filter
+            .as_deref()
+            .is_some_and(|filter| !name.to_lowercase().contains(&filter.to_lowercase()))
+        {
+            continue;
+        }
+        entries.push(config_only_iface_json(name, section));
+    }
+    entries.sort_by(|left, right| {
+        let left_name = left["name"].as_str().unwrap_or_default();
+        let right_name = right["name"].as_str().unwrap_or_default();
+        left_name
+            .to_lowercase()
+            .cmp(&right_name.to_lowercase())
+            .then_with(|| left_name.cmp(right_name))
+    });
     Ok(Json(json!({ "interfaces": entries })))
 }
 
@@ -575,8 +627,24 @@ async fn interface_by_id(State(s): State<AppState>, Path(id): Path<u64>) -> ApiR
     stats
         .iter()
         .find(|e| e.id == id)
-        .map(|e| Json(merge_iface_json(e, configs.get(e.name.as_str()))))
+        .map(|e| Json(merge_iface_json(e, configs.get(e.name.as_str()), None)))
         .ok_or(ApiError::NotFound)
+}
+
+async fn config_interfaces(State(s): State<AppState>) -> ApiResult<Json<Value>> {
+    let sections = load_interface_sections(&s)?;
+    let mut entries: Vec<_> = sections
+        .iter()
+        .map(|(name, section)| config_only_iface_json(name, section))
+        .collect();
+    entries.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .cmp(&right["name"].as_str().unwrap_or_default().to_lowercase())
+    });
+    Ok(Json(json!({ "interfaces": entries })))
 }
 
 #[derive(Deserialize)]
@@ -624,16 +692,21 @@ async fn create_interface(
 ) -> ApiResult<Response> {
     let _config_guard = s.config_write_lock.lock().await;
 
-    // We check whether there is already an interface with this name at runtime.
-    if find_running_id(&s, &req.name).await?.is_some() {
+    // Reject both running and config-only duplicates.
+    if load_interface_sections(&s)?.contains_key(&req.name)
+        || find_running_id(&s, &req.name).await?.is_some()
+    {
         return Err(ApiError::Conflict(format!(
             "interface '{}' already exists",
             req.name
         )));
     }
 
-    // Validation via synthesize_interface
-    let iface_config = req.synthesize()?;
+    let iface_config = if req.is_enabled() {
+        Some(req.synthesize()?)
+    } else {
+        None
+    };
 
     // Section for writing to the config — we build from req, not from InterfaceConfig,
     // to save only what was received (without defaults).
@@ -644,13 +717,17 @@ async fn create_interface(
         &req.name,
         Some(section),
         None,
-        Some(&iface_config),
+        iface_config.as_ref(),
         None,
         None,
     )
     .await?;
 
-    let body = Json(json!({ "id": id, "name": req.name }));
+    let body = Json(json!({
+        "id": iface_config.as_ref().map(|_| id),
+        "name": req.name,
+        "enabled": req.is_enabled(),
+    }));
     Ok((StatusCode::CREATED, body).into_response())
 }
 
@@ -716,6 +793,66 @@ async fn delete_interface(
     Ok(Json(json!({ "deleted": true, "id": id, "name": name })))
 }
 
+/// Update an interface by its stable config name. Unlike the numeric runtime
+/// route, this also works for disabled or failed interfaces with no runtime ID.
+async fn update_config_interface(
+    State(s): State<AppState>,
+    Path(old_name): Path<String>,
+    Json(req): Json<InterfaceRequest>,
+) -> ApiResult<Json<Value>> {
+    let _config_guard = s.config_write_lock.lock().await;
+    let sections = load_interface_sections(&s)?;
+    let old_section = sections.get(&old_name).ok_or(ApiError::NotFound)?;
+    if old_name != req.name && sections.contains_key(&req.name) {
+        return Err(ApiError::Conflict(format!(
+            "interface '{}' already exists",
+            req.name
+        )));
+    }
+    let rollback_interface = synthesize_interface(&old_name, old_section).ok();
+    let old_id = find_running_id(&s, &old_name).await?;
+    let new_config = if req.is_enabled() {
+        Some(req.synthesize()?)
+    } else {
+        None
+    };
+    let section = req.to_config_section();
+    let renamed_from = (old_name != req.name).then_some(old_name.as_str());
+
+    let new_id = apply_interface_change(
+        &s,
+        &req.name,
+        Some(section),
+        old_id,
+        new_config.as_ref(),
+        renamed_from,
+        rollback_interface.as_ref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "id": new_config.as_ref().map(|_| new_id),
+        "name": req.name,
+        "old_name": old_name,
+        "enabled": req.is_enabled(),
+    })))
+}
+
+/// Remove a configured interface by name, whether or not it is still running.
+async fn delete_config_interface(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let _config_guard = s.config_write_lock.lock().await;
+    let sections = load_interface_sections(&s)?;
+    if !sections.contains_key(&name) {
+        return Err(ApiError::NotFound);
+    }
+    let old_id = find_running_id(&s, &name).await?;
+    apply_interface_change(&s, &name, None, old_id, None, None, None).await?;
+    Ok(Json(json!({ "deleted": true, "name": name })))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -732,7 +869,11 @@ async fn fetch_interfaces(s: &AppState) -> ApiResult<Vec<InterfaceStatRpcEntry>>
 ///
 /// `config` will be `None` for interfaces that exist at runtime but are missing
 /// in the config (LocalInterface, child TCP clients of servers, etc.).
-fn merge_iface_json(e: &InterfaceStatRpcEntry, config: Option<&InterfaceConfig>) -> Value {
+fn merge_iface_json(
+    e: &InterfaceStatRpcEntry,
+    config: Option<&InterfaceConfig>,
+    section: Option<&ConfigSection>,
+) -> Value {
     let mut v = json!({
         // ── identity ──────────────────────────────────────────────────
         "id":                           e.id,
@@ -770,10 +911,70 @@ fn merge_iface_json(e: &InterfaceStatRpcEntry, config: Option<&InterfaceConfig>)
         "config":                       Value::Null,
     });
 
-    if let Some(cfg) = config {
+    if let Some(section) = section {
+        v["config"] = iface_section_json(section);
+        v["configured"] = json!(true);
+        v["enabled"] = json!(section_enabled(section));
+    } else if let Some(cfg) = config {
         v["config"] = iface_config_json(cfg);
+        v["configured"] = json!(true);
+        v["enabled"] = json!(true);
+    } else {
+        v["configured"] = json!(false);
+        v["enabled"] = json!(true);
     }
     v
+}
+
+fn config_only_iface_json(name: &str, section: &ConfigSection) -> Value {
+    json!({
+        "id": Value::Null,
+        "name": name,
+        "online": false,
+        "mode": section.get("interface_mode"),
+        "role": "configured",
+        "bitrate": Value::Null,
+        "mtu": Value::Null,
+        "ifac_size": Value::Null,
+        "clients": Value::Null,
+        "rx_bytes": 0,
+        "tx_bytes": 0,
+        "rx_rate": 0,
+        "tx_rate": 0,
+        "tx_drops": 0,
+        "announce_queue": 0,
+        "held_announces": 0,
+        "incoming_announce_frequency": 0,
+        "outgoing_announce_frequency": 0,
+        "configured": true,
+        "enabled": section_enabled(section),
+        "config": iface_section_json(section),
+    })
+}
+
+fn section_enabled(section: &ConfigSection) -> bool {
+    section
+        .get_bool("enabled")
+        .or_else(|| section.get_bool("interface_enabled"))
+        .unwrap_or(true)
+}
+
+fn iface_section_json(section: &ConfigSection) -> Value {
+    json!({
+        "type": section.get("type"),
+        "enabled": section_enabled(section),
+        "target_host": section.get("target_host"),
+        "target_port": section.get_uint("target_port"),
+        "connect_timeout": section.get_uint("connect_timeout"),
+        "max_reconnect_tries": section.get_uint("max_reconnect_tries"),
+        "fixed_mtu": section.get_uint("fixed_mtu"),
+        "listen_ip": section.get("listen_ip"),
+        "listen_port": section.get_uint("listen_port"),
+        "prefer_ipv6": section.get_bool("prefer_ipv6"),
+        "device": section.get("device"),
+        "kiss_framing": section.get_bool("kiss_framing"),
+        "interface_mode": section.get("interface_mode").unwrap_or("Full"),
+    })
 }
 
 /// Serialize `InterfaceConfig` to JSON with full settings.
@@ -821,15 +1022,33 @@ fn mode_to_str(mode: rns_interface::traits::InterfaceMode) -> &'static str {
 fn load_interface_configs(
     s: &AppState,
 ) -> ApiResult<std::collections::HashMap<String, InterfaceConfig>> {
+    Ok(load_interface_configs_from_sections(
+        &load_interface_sections(s)?,
+    ))
+}
+
+fn load_interface_sections(
+    s: &AppState,
+) -> ApiResult<std::collections::HashMap<String, ConfigSection>> {
     let config = s.load_config()?;
+    Ok(config
+        .subsections("interfaces")
+        .into_iter()
+        .map(|(name, section)| (name.to_string(), section.clone()))
+        .collect())
+}
+
+fn load_interface_configs_from_sections(
+    sections: &std::collections::HashMap<String, ConfigSection>,
+) -> std::collections::HashMap<String, InterfaceConfig> {
     let mut map = std::collections::HashMap::new();
-    for (name, section) in config.subsections("interfaces") {
+    for (name, section) in sections {
         // Disabled and unknown interface types are not present at runtime.
         if let Ok(cfg) = synthesize_interface(name, section) {
-            map.insert(name.to_string(), cfg);
+            map.insert(name.clone(), cfg);
         }
     }
-    Ok(map)
+    map
 }
 
 fn path_json(e: &PathTableRpcEntry) -> Value {
@@ -1004,6 +1223,30 @@ mod tests {
         .unwrap();
 
         assert!(matches!(request.synthesize(), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn disabled_interface_is_serialized_without_runtime_config() {
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Standby server",
+            "type": "TCPServerInterface",
+            "enabled": false,
+            "listen_ip": "127.0.0.1",
+            "listen_port": 4242
+        }))
+        .unwrap();
+        let section = request.to_config_section();
+
+        assert!(!request.is_enabled());
+        assert!(!section_enabled(&section));
+        assert!(request.synthesize().is_err());
+
+        let value = config_only_iface_json(&request.name, &section);
+        assert_eq!(value["id"], Value::Null);
+        assert_eq!(value["online"], false);
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["config"]["type"], "TCPServerInterface");
+        assert_eq!(value["config"]["listen_port"], 4242);
     }
 
     #[test]
