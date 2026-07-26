@@ -1,7 +1,9 @@
 "use strict";
 
 const REQUEST_TIMEOUT_MS = 8000;
+const DASHBOARD_REFRESH_MS = 5000;
 const views = new Set(["dashboard", "interfaces", "paths"]);
+let dashboardRequest = null;
 
 class ApiError extends Error {
   constructor(message, status = 0, body = null) {
@@ -83,25 +85,84 @@ function setRuntimeState(state, heading, detail) {
   document.querySelector("#runtime-detail").textContent = detail;
 }
 
-async function checkHealth() {
-  setRuntimeState("loading", "Connecting to rnsd-rs", "Checking the embedded REST API.");
-  try {
-    const health = await apiFetch("/health");
-    if (!health?.ok) throw new ApiError("The health endpoint returned an unexpected response");
-    setRuntimeState(
-      "online",
-      "Shared instance is available",
-      "The Web configurator is connected to the rnsd-rs control plane.",
-    );
-    clearError();
-  } catch (error) {
-    setRuntimeState(
-      "unavailable",
-      "Shared instance is unavailable",
-      "The Web UI could not reach the embedded REST API.",
-    );
-    showError(error);
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1000) return `${bytes.toLocaleString()} B`;
+
+  const units = ["kB", "MB", "GB", "TB", "PB"];
+  let scaled = bytes;
+  let unit = "B";
+  for (const candidate of units) {
+    scaled /= 1000;
+    unit = candidate;
+    if (scaled < 1000) break;
   }
+
+  const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+  return `${scaled.toLocaleString(undefined, { maximumFractionDigits: digits })} ${unit}`;
+}
+
+function resetDashboardMetrics() {
+  document.querySelector("#metric-interfaces").textContent = "—";
+  document.querySelector("#metric-online").textContent = "Status unavailable";
+  document.querySelector("#metric-rx").textContent = "—";
+  document.querySelector("#metric-tx").textContent = "—";
+  document.querySelector("#metric-links").textContent = "—";
+}
+
+function renderDashboard(status, links) {
+  const total = Number(status.interfaces_total) || 0;
+  const online = Number(status.interfaces_online) || 0;
+  document.querySelector("#metric-interfaces").textContent = total.toLocaleString();
+  document.querySelector("#metric-online").textContent = `${online.toLocaleString()} online`;
+  document.querySelector("#metric-rx").textContent = formatBytes(status.rx_bytes_total);
+  document.querySelector("#metric-tx").textContent = formatBytes(status.tx_bytes_total);
+  document.querySelector("#metric-links").textContent =
+    (Number(links.link_count) || 0).toLocaleString();
+}
+
+function setDashboardBusy(busy) {
+  document.querySelectorAll("#view-dashboard [data-refresh]").forEach((button) => {
+    setBusy(button, busy);
+  });
+}
+
+function refreshDashboard() {
+  if (dashboardRequest) return dashboardRequest;
+
+  setDashboardBusy(true);
+  setRuntimeState("loading", "Connecting to rnsd-rs", "Checking the embedded REST API.");
+  dashboardRequest = Promise.all([
+    apiFetch("/health"),
+    apiFetch("/api/v1/status"),
+    apiFetch("/api/v1/links"),
+  ])
+    .then(([health, status, links]) => {
+      if (!health?.ok) throw new ApiError("The health endpoint returned an unexpected response");
+      renderDashboard(status, links);
+      setRuntimeState(
+        "online",
+        "Shared instance is available",
+        "Runtime metrics are updating automatically every 5 seconds.",
+      );
+      clearError();
+    })
+    .catch((error) => {
+      resetDashboardMetrics();
+      setRuntimeState(
+        "unavailable",
+        "Shared instance is unavailable",
+        "The Web UI could not load runtime status from the embedded REST API.",
+      );
+      showError(error);
+    })
+    .finally(() => {
+      setDashboardBusy(false);
+      dashboardRequest = null;
+    });
+
+  return dashboardRequest;
 }
 
 function currentView() {
@@ -128,6 +189,7 @@ function showView(name, { focus = false } = {}) {
   document.title = `${selected[0].toUpperCase()}${selected.slice(1)} · rsReticulum`;
   closeNavigation();
   if (focus) document.querySelector("#main-content").focus();
+  if (selected === "dashboard") refreshDashboard();
 }
 
 function openNavigation() {
@@ -141,10 +203,28 @@ function closeNavigation() {
 }
 
 async function refresh(button) {
+  if (currentView() === "dashboard") {
+    await refreshDashboard();
+    return;
+  }
+
   setBusy(button, true);
   clearError();
   try {
-    await checkHealth();
+    const health = await apiFetch("/health");
+    if (!health?.ok) throw new ApiError("The health endpoint returned an unexpected response");
+    setRuntimeState(
+      "online",
+      "Shared instance is available",
+      "The Web configurator is connected to the rnsd-rs control plane.",
+    );
+  } catch (error) {
+    setRuntimeState(
+      "unavailable",
+      "Shared instance is unavailable",
+      "The Web UI could not reach the embedded REST API.",
+    );
+    showError(error);
   } finally {
     setBusy(button, false);
   }
@@ -179,6 +259,8 @@ window.addEventListener("keydown", (event) => {
 window.addEventListener("resize", () => {
   if (window.innerWidth > 720) closeNavigation();
 });
+window.setInterval(() => {
+  if (currentView() === "dashboard" && !document.hidden) refreshDashboard();
+}, DASHBOARD_REFRESH_MS);
 
 showView(currentView());
-checkHealth();
