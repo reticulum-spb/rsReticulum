@@ -22,6 +22,17 @@ use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{OutboundRequest, TransportMessage};
 
+/// Cadence of the housekeeping tick, and the longest the drain loop blocks
+/// between re-checking how much is still in flight.
+const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a shutdown waits for in-flight outbound transfers to finish.
+const LINK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Beat after teardown so queued close packets reach the wire. These go out
+/// via `try_send`, so without it they are dropped along with the runtime.
+const TEARDOWN_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 struct ActiveLink {
     link: Link,
     _interface_id: u64,
@@ -377,6 +388,76 @@ impl LinkManager {
                 }
             }
         }
+    }
+
+    /// Like [`run`](Self::run), but stops on `shutdown` and drains first.
+    ///
+    /// Plain `run` only returns when the event channel closes, so a daemon
+    /// that drops the runtime on a signal cuts off any resource transfer
+    /// still on the wire: the peer sees the link go silent mid-file and
+    /// reports a timeout rather than a clean end.
+    pub async fn run_until_shutdown(mut self, shutdown: crate::lifecycle::ShutdownSignal) {
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(evt) => self.handle_event(evt),
+                        None => break,
+                    }
+                }
+                _ = tick_interval.tick() => self.tick(),
+                _ = shutdown.wait() => break,
+            }
+        }
+
+        self.drain_and_close(LINK_DRAIN_GRACE).await;
+    }
+
+    /// Outbound resource segments still queued or awaiting proof.
+    pub fn inflight_outbound_transfers(&self) -> usize {
+        self.active_links
+            .values()
+            .map(|link| {
+                link.outbound_resources.len()
+                    + link.outbound_split_queues
+                        .values()
+                        .map(VecDeque::len)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Let in-flight transfers finish (up to `grace`), then tear every link
+    /// down with an explicit close so peers don't wait out their timeouts.
+    pub async fn drain_and_close(&mut self, grace: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + grace;
+        while self.inflight_outbound_transfers() > 0 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    inflight = self.inflight_outbound_transfers(),
+                    "drain grace expired with transfers still in flight"
+                );
+                break;
+            }
+            match tokio::time::timeout(remaining.min(TICK), self.event_rx.recv()).await {
+                Ok(Some(event)) => self.handle_event(event),
+                Ok(None) => break,
+                Err(_) => self.tick(),
+            }
+        }
+
+        for link_id in self.active_links.keys().copied().collect::<Vec<_>>() {
+            self.close_active_link(link_id, CloseReason::DestinationClosed, true);
+        }
+
+        // Teardown packets are queued on the transport with try_send; without
+        // a beat for the actor to drain its queue they die with the runtime
+        // and never reach the wire, which is the case this whole path exists
+        // to avoid.
+        tokio::time::sleep(TEARDOWN_FLUSH_GRACE).await;
     }
 
     pub async fn run_with_commands(mut self, mut command_rx: mpsc::Receiver<LinkManagerCommand>) {
@@ -2921,6 +3002,61 @@ mod tests {
         );
 
         let _ = identity_key;
+    }
+
+    /// Dropping the runtime on a signal used to cut links off mid-transfer,
+    /// leaving peers to wait out their own timeouts. Shutdown must close
+    /// them explicitly, and the close packet must actually be handed to the
+    /// transport.
+    #[tokio::test]
+    async fn shutdown_drain_closes_links_with_an_explicit_teardown() {
+        let dest_hash = [0xD1; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = responder.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        assert_eq!(lm.inflight_outbound_transfers(), 0);
+
+        lm.drain_and_close(LINK_DRAIN_GRACE).await;
+        drop(event_tx);
+
+        assert_eq!(lm.active_link_count(), 0, "link left open after shutdown");
+
+        let mut sent_close = false;
+        while let Ok(msg) = transport_rx.try_recv() {
+            if let TransportMessage::Outbound(OutboundRequest { raw, .. }) = msg {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                if header.context == rns_wire::context::PacketContext::LinkClose
+                    && header.destination_hash == link_id
+                {
+                    sent_close = true;
+                }
+            }
+        }
+        assert!(sent_close, "no LinkClose packet reached the transport");
     }
 
     #[test]
