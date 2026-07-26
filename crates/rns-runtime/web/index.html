@@ -181,18 +181,109 @@
   </div>
 
   <dialog id="interface-dialog">
-    <form method="dialog">
+    <form id="interface-form">
       <div class="dialog-heading">
         <div>
           <span class="eyebrow">Configuration</span>
-          <h2>Add interface</h2>
+          <h2 id="interface-dialog-title">Add interface</h2>
         </div>
-        <button class="icon-button" type="submit" value="cancel"
+        <button class="icon-button" type="button" data-close-interface
                 aria-label="Close dialog">×</button>
       </div>
-      <p>TCP interface configuration will be enabled in the CRUD implementation block.</p>
+      <input type="hidden" id="interface-id">
+
+      <div class="form-grid">
+        <label class="wide">Name
+          <input id="interface-name" maxlength="128" autocomplete="off" required>
+        </label>
+        <label>Type
+          <select id="interface-type">
+            <option value="TCPClientInterface">TCP Client</option>
+            <option value="TCPServerInterface">TCP Server</option>
+          </select>
+        </label>
+        <label>Mode
+          <select id="interface-mode">
+            <option value="Full">Full</option>
+            <option value="PointToPoint">Point to point</option>
+            <option value="AccessPoint">Access point</option>
+            <option value="Roaming">Roaming</option>
+            <option value="Boundary">Boundary</option>
+            <option value="Gateway">Gateway</option>
+          </select>
+        </label>
+      </div>
+
+      <fieldset class="form-grid" id="tcp-client-fields">
+        <legend>TCP client</legend>
+        <label class="wide">Target host
+          <input id="target-host" autocomplete="off" required>
+        </label>
+        <label>Target port
+          <input id="target-port" type="number" min="1" max="65535" required>
+        </label>
+        <label>Connect timeout
+          <input id="connect-timeout" type="number" min="1" step="1" placeholder="5">
+        </label>
+        <label>Reconnect limit <span class="optional">optional</span>
+          <input id="max-reconnect-tries" type="number" min="0" step="1"
+                 placeholder="Unlimited">
+        </label>
+        <label>Fixed MTU <span class="optional">optional</span>
+          <input id="fixed-mtu" type="number" min="500" step="1">
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="tcp-server-fields" hidden disabled>
+        <legend>TCP server</legend>
+        <label class="wide">Listen address
+          <input id="listen-ip" autocomplete="off" value="0.0.0.0" required>
+        </label>
+        <label>Listen port
+          <input id="listen-port" type="number" min="1" max="65535" required>
+        </label>
+        <label>Device <span class="optional">optional</span>
+          <input id="interface-device" autocomplete="off">
+        </label>
+        <label class="check-field">
+          <input id="prefer-ipv6" type="checkbox">
+          <span>Prefer IPv6</span>
+        </label>
+      </fieldset>
+
+      <label class="check-field">
+        <input id="kiss-framing" type="checkbox">
+        <span>Use KISS framing</span>
+      </label>
+
+      <p class="form-error" id="interface-form-error" role="alert"></p>
+      <p class="form-status" id="interface-form-status" aria-live="polite"></p>
       <div class="dialog-actions">
-        <button class="secondary" type="submit" value="cancel">Close</button>
+        <button class="secondary" type="button" data-close-interface>Cancel</button>
+        <button class="primary" id="save-interface" type="submit">Add interface</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="delete-interface-dialog">
+    <form id="delete-interface-form">
+      <div class="dialog-heading">
+        <div>
+          <span class="eyebrow danger-text">Destructive action</span>
+          <h2>Delete interface?</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-delete
+                aria-label="Close dialog">×</button>
+      </div>
+      <p>
+        The interface <strong id="delete-interface-name"></strong> will be
+        stopped and removed from the configuration.
+      </p>
+      <p class="form-error" id="delete-interface-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="secondary" type="button" data-close-delete>Cancel</button>
+        <button class="danger-button" id="confirm-delete-interface"
+                type="submit">Delete interface</button>
       </div>
     </form>
   </dialog>

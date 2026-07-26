@@ -217,7 +217,18 @@ function detailItem(label, value, className = "") {
   return wrapper;
 }
 
+function actionButton(label, className, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", handler);
+  return button;
+}
+
 function interfaceDetails(item) {
+  const container = document.createElement("div");
+  container.className = "interface-details-container";
   const details = document.createElement("dl");
   details.className = "interface-details";
   details.append(
@@ -236,7 +247,17 @@ function interfaceDetails(item) {
     detailItem("Incoming announces", formatFrequency(item.incoming_announce_frequency)),
     detailItem("Outgoing announces", formatFrequency(item.outgoing_announce_frequency)),
   );
-  return details;
+  container.append(details);
+  if (item.config) {
+    const actions = document.createElement("div");
+    actions.className = "interface-actions";
+    actions.append(
+      actionButton("Edit configuration", "", () => openInterfaceDialog(item)),
+      actionButton("Delete", "danger", () => openDeleteDialog(item)),
+    );
+    container.append(actions);
+  }
+  return container;
 }
 
 function stackedCell(primary, secondary) {
@@ -387,6 +408,159 @@ function refreshInterfaces() {
   return interfaceRequest;
 }
 
+function setInterfaceType(type) {
+  const client = document.querySelector("#tcp-client-fields");
+  const server = document.querySelector("#tcp-server-fields");
+  const isClient = type === "TCPClientInterface";
+  client.hidden = !isClient;
+  client.disabled = !isClient;
+  server.hidden = isClient;
+  server.disabled = isClient;
+}
+
+function setField(selector, value, fallback = "") {
+  document.querySelector(selector).value = value ?? fallback;
+}
+
+function openInterfaceDialog(item = null) {
+  const dialog = document.querySelector("#interface-dialog");
+  const form = document.querySelector("#interface-form");
+  const config = item?.config || {};
+  form.reset();
+  setField("#interface-id", item?.id);
+  setField("#interface-name", item?.name);
+  setField("#interface-type", config.type, "TCPClientInterface");
+  setField("#interface-mode", config.interface_mode, "Full");
+  setField("#target-host", config.target_host);
+  setField("#target-port", config.target_port);
+  setField("#connect-timeout", config.connect_timeout);
+  setField("#max-reconnect-tries", config.max_reconnect_tries);
+  setField("#fixed-mtu", config.fixed_mtu);
+  setField("#listen-ip", config.listen_ip, "0.0.0.0");
+  setField("#listen-port", config.listen_port);
+  setField("#interface-device", config.device);
+  document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
+  document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
+  document.querySelector("#interface-dialog-title").textContent =
+    item ? "Edit interface" : "Add interface";
+  document.querySelector("#save-interface").textContent =
+    item ? "Save and restart" : "Add interface";
+  document.querySelector("#interface-form-error").textContent = "";
+  document.querySelector("#interface-form-status").textContent = "";
+  setInterfaceType(document.querySelector("#interface-type").value);
+  dialog.showModal();
+  document.querySelector("#interface-name").focus();
+}
+
+function closeInterfaceDialog() {
+  document.querySelector("#interface-dialog").close();
+}
+
+function optionalInteger(selector) {
+  const value = document.querySelector(selector).value.trim();
+  return value === "" ? undefined : Number(value);
+}
+
+function interfacePayload() {
+  const type = document.querySelector("#interface-type").value;
+  const payload = {
+    name: document.querySelector("#interface-name").value.trim(),
+    type,
+    interface_mode: document.querySelector("#interface-mode").value,
+    kiss_framing: document.querySelector("#kiss-framing").checked,
+  };
+
+  if (type === "TCPClientInterface") {
+    payload.target_host = document.querySelector("#target-host").value.trim();
+    payload.target_port = Number(document.querySelector("#target-port").value);
+    const connectTimeout = optionalInteger("#connect-timeout");
+    const reconnectTries = optionalInteger("#max-reconnect-tries");
+    const fixedMtu = optionalInteger("#fixed-mtu");
+    if (connectTimeout !== undefined) payload.connect_timeout = connectTimeout;
+    if (reconnectTries !== undefined) payload.max_reconnect_tries = reconnectTries;
+    if (fixedMtu !== undefined) payload.fixed_mtu = fixedMtu;
+  } else {
+    payload.listen_ip = document.querySelector("#listen-ip").value.trim();
+    payload.listen_port = Number(document.querySelector("#listen-port").value);
+    payload.prefer_ipv6 = document.querySelector("#prefer-ipv6").checked;
+    const device = document.querySelector("#interface-device").value.trim();
+    if (device) payload.device = device;
+  }
+
+  return payload;
+}
+
+async function saveInterface(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+
+  const id = document.querySelector("#interface-id").value;
+  const button = document.querySelector("#save-interface");
+  const errorNode = document.querySelector("#interface-form-error");
+  const statusNode = document.querySelector("#interface-form-status");
+  const editing = id !== "";
+  errorNode.textContent = "";
+  statusNode.textContent = editing ? "Restarting interface…" : "Starting interface…";
+  setBusy(button, true);
+
+  try {
+    await apiFetch(editing ? `/api/v1/interfaces/${id}` : "/api/v1/interfaces", {
+      method: editing ? "PUT" : "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(interfacePayload()),
+    });
+    closeInterfaceDialog();
+    interfaceState.expanded.clear();
+    await Promise.all([refreshInterfaces(), refreshDashboard()]);
+  } catch (error) {
+    errorNode.textContent =
+      error.status === 409 ? `Name conflict: ${error.message}`
+        : error.status === 422 ? `Invalid configuration: ${error.message}`
+          : error.message;
+    statusNode.textContent = "";
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function openDeleteDialog(item) {
+  const dialog = document.querySelector("#delete-interface-dialog");
+  dialog.dataset.interfaceId = item.id;
+  document.querySelector("#delete-interface-name").textContent = item.name;
+  document.querySelector("#delete-interface-error").textContent = "";
+  dialog.showModal();
+  document.querySelector("#confirm-delete-interface").focus();
+}
+
+function closeDeleteDialog() {
+  const dialog = document.querySelector("#delete-interface-dialog");
+  dialog.close();
+  delete dialog.dataset.interfaceId;
+}
+
+async function deleteInterface(event) {
+  event.preventDefault();
+  const dialog = document.querySelector("#delete-interface-dialog");
+  const id = dialog.dataset.interfaceId;
+  if (!id) return;
+
+  const button = document.querySelector("#confirm-delete-interface");
+  const errorNode = document.querySelector("#delete-interface-error");
+  errorNode.textContent = "";
+  setBusy(button, true);
+  try {
+    await apiFetch(`/api/v1/interfaces/${id}`, { method: "DELETE" });
+    closeDeleteDialog();
+    interfaceState.expanded.delete(Number(id));
+    await Promise.all([refreshInterfaces(), refreshDashboard()]);
+  } catch (error) {
+    errorNode.textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function currentView() {
   const requested = window.location.hash.replace(/^#/, "");
   return views.has(requested) ? requested : "dashboard";
@@ -471,8 +645,17 @@ document.querySelector("#mobile-menu").addEventListener("click", () => {
 });
 
 document.querySelector("#dismiss-error").addEventListener("click", clearError);
-document.querySelector("#add-interface").addEventListener("click", () => {
-  document.querySelector("#interface-dialog").showModal();
+document.querySelector("#add-interface").addEventListener("click", () => openInterfaceDialog());
+document.querySelector("#interface-type").addEventListener("change", (event) => {
+  setInterfaceType(event.target.value);
+});
+document.querySelector("#interface-form").addEventListener("submit", saveInterface);
+document.querySelector("#delete-interface-form").addEventListener("submit", deleteInterface);
+document.querySelectorAll("[data-close-interface]").forEach((button) => {
+  button.addEventListener("click", closeInterfaceDialog);
+});
+document.querySelectorAll("[data-close-delete]").forEach((button) => {
+  button.addEventListener("click", closeDeleteDialog);
 });
 document.querySelector("#interface-search").addEventListener("input", (event) => {
   interfaceState.filter = event.target.value;

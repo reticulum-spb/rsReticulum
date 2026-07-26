@@ -192,6 +192,16 @@ main {
   background: var(--accent);
 }
 
+.danger-button {
+  padding: 10px 16px;
+  color: #1a0907;
+  border: 1px solid #ffaaa2;
+  border-radius: 8px;
+  background: var(--danger);
+  font-weight: 700;
+  cursor: pointer;
+}
+.danger-text { color: var(--danger); }
 .secondary {
   color: var(--text);
   border: 1px solid var(--border);
@@ -371,6 +381,22 @@ tbody tr:hover { background: var(--panel-2); }
   font-size: 12px;
 }
 .runtime-only { color: var(--warning); }
+.interface-actions {
+  display: flex;
+  gap: 8px;
+  padding: 0 24px 20px;
+}
+.interface-actions button {
+  padding: 7px 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+.interface-actions button:hover { color: var(--accent); border-color: var(--accent); }
+.interface-actions button.danger:hover { color: var(--danger); border-color: var(--danger); }
 
 .empty {
   display: flex;
@@ -424,7 +450,7 @@ dialog::backdrop { background: #050706cc; backdrop-filter: blur(5px); }
 dialog form { display: grid; gap: 20px; padding: 24px; }
 .dialog-heading { display: flex; align-items: start; justify-content: space-between; }
 .dialog-heading h2 { margin: 4px 0 0; font-size: 26px; }
-.dialog-actions { display: flex; justify-content: flex-end; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .icon-button {
   width: 34px;
   height: 34px;
@@ -436,6 +462,62 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
   font-size: 22px;
   cursor: pointer;
 }
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  min-width: 0;
+}
+fieldset.form-grid {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+fieldset.form-grid legend {
+  padding: 0 6px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.form-grid label, dialog > form > label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+.form-grid label.wide { grid-column: 1 / -1; }
+.form-grid input, .form-grid select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 11px;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: none;
+  background: #090c0b;
+}
+.form-grid input:focus, .form-grid select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #d3ff5810;
+}
+.check-field {
+  display: flex !important;
+  align-items: center;
+  align-self: end;
+  grid-template-columns: auto 1fr;
+  min-height: 38px;
+  cursor: pointer;
+}
+.check-field input { width: auto; accent-color: var(--accent); }
+.optional { color: var(--dim); font-weight: 400; }
+.form-error, .form-status { min-height: 18px; margin: 0; font-size: 12px; }
+.form-error { color: var(--danger); }
+.form-status { color: var(--accent); }
 
 .sr-only {
   position: absolute;
@@ -495,6 +577,8 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
   .runtime-card { align-items: start; }
   th, td { padding: 12px; }
   .interface-details { grid-template-columns: 1fr; }
+  .form-grid { grid-template-columns: 1fr; }
+  .form-grid label.wide { grid-column: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {
