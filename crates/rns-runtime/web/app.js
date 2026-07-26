@@ -6,7 +6,7 @@ const INTERFACE_REFRESH_MS = 1000;
 const INTERFACE_ERROR_REFRESH_MS = 5000;
 const PATH_REFRESH_MS = 5000;
 const PATH_ERROR_REFRESH_MS = 15000;
-const views = new Set(["dashboard", "interfaces", "paths", "settings"]);
+const views = new Set(["dashboard", "interfaces", "paths", "settings", "logs"]);
 let dashboardRequest = null;
 let interfaceRequest = null;
 let interfaceNextPollAt = 0;
@@ -24,6 +24,15 @@ const pathState = {
   filter: "",
   maxHops: "",
   loaded: false,
+};
+const logState = {
+  entries: [],
+  ids: new Set(),
+  source: null,
+  paused: false,
+  filter: "",
+  level: "info",
+  historyLoaded: false,
 };
 
 class ApiError extends Error {
@@ -94,6 +103,9 @@ async function submitLogin(event) {
     });
     document.querySelector("#login-password").value = "";
     document.querySelector("#login-dialog").close();
+    logState.entries = [];
+    logState.ids.clear();
+    logState.historyLoaded = false;
     await refresh();
   } catch (error) {
     document.querySelector("#login-error").textContent = error.message;
@@ -103,9 +115,78 @@ async function submitLogin(event) {
 }
 
 async function logout() {
+  stopLogs();
+  logState.entries = [];
+  logState.ids.clear();
+  logState.historyLoaded = false;
   await apiFetch("/api/v1/auth/logout", { method: "POST" });
   openLoginDialog();
   document.querySelector("#login-user").focus();
+}
+
+function renderLogs() {
+  if (logState.paused) return;
+  const levels = { trace: 0, debug: 1, info: 2, warn: 3, error: 4 };
+  const minimum = levels[logState.level] ?? 2;
+  const query = logState.filter.toLocaleLowerCase();
+  const output = document.querySelector("#log-output");
+  const fragment = document.createDocumentFragment();
+  let count = 0;
+  for (const entry of logState.entries) {
+    if ((levels[entry.level] ?? 2) < minimum) continue;
+    if (query && !`${entry.target} ${entry.message}`.toLocaleLowerCase().includes(query)) continue;
+    const line = document.createElement("div");
+    line.className = "log-line";
+    line.dataset.level = entry.level;
+    const timestamp = new Date(Number(entry.timestamp_ms)).toLocaleTimeString();
+    for (const [className, value] of [
+      ["log-time", timestamp],
+      ["log-level", entry.level],
+      ["log-target", entry.target],
+      ["log-message", entry.message],
+    ]) {
+      const span = document.createElement("span");
+      span.className = className;
+      span.textContent = value;
+      line.append(span);
+    }
+    fragment.append(line);
+    count += 1;
+  }
+  output.replaceChildren(fragment);
+  document.querySelector("#logs-count").textContent = `${count} entries`;
+  if (document.querySelector("#logs-autoscroll").checked) output.scrollTop = output.scrollHeight;
+}
+
+function appendLog(entry) {
+  if (logState.ids.has(entry.id)) return;
+  logState.ids.add(entry.id);
+  logState.entries.push(entry);
+  while (logState.entries.length > 2000) {
+    logState.ids.delete(logState.entries.shift().id);
+  }
+  renderLogs();
+}
+
+async function startLogs() {
+  if (logState.source) return;
+  if (!logState.historyLoaded) {
+    const history = await apiFetch("/api/v1/logs");
+    for (const entry of history.entries || []) appendLog(entry);
+    logState.historyLoaded = true;
+  }
+  const source = new EventSource("/api/v1/logs/stream");
+  source.addEventListener("log", (event) => appendLog(JSON.parse(event.data)));
+  source.onerror = () => {
+    document.querySelector("#logs-count").textContent = "Stream reconnecting…";
+  };
+  logState.source = source;
+  renderLogs();
+}
+
+function stopLogs() {
+  logState.source?.close();
+  logState.source = null;
 }
 
 function setBusy(button, busy) {
@@ -1238,6 +1319,8 @@ function showView(name, { focus = false } = {}) {
   if (selected === "interfaces") refreshInterfaces();
   if (selected === "paths") refreshPaths();
   if (selected === "settings") refreshSettings().catch(showError);
+  if (selected === "logs") startLogs().catch(showError);
+  else stopLogs();
 }
 
 function openNavigation() {
@@ -1261,6 +1344,14 @@ async function refresh(button) {
   }
   if (currentView() === "paths") {
     await refreshPaths();
+    return;
+  }
+  if (currentView() === "settings") {
+    await refreshSettings();
+    return;
+  }
+  if (currentView() === "logs") {
+    await startLogs();
     return;
   }
 
@@ -1325,6 +1416,24 @@ function initialize() {
   });
   document.querySelector("#reboot-system").addEventListener("click", () => {
     requestSystemAction("reboot");
+  });
+  document.querySelector("#logs-pause").addEventListener("click", (event) => {
+    logState.paused = !logState.paused;
+    event.currentTarget.textContent = logState.paused ? "Resume" : "Pause";
+    if (!logState.paused) renderLogs();
+  });
+  document.querySelector("#logs-clear").addEventListener("click", () => {
+    logState.entries = [];
+    logState.ids.clear();
+    renderLogs();
+  });
+  document.querySelector("#logs-search").addEventListener("input", (event) => {
+    logState.filter = event.target.value;
+    renderLogs();
+  });
+  document.querySelector("#logs-level").addEventListener("change", (event) => {
+    logState.level = event.target.value;
+    renderLogs();
   });
   document.querySelector("#delete-interface-form").addEventListener("submit", deleteInterface);
   document.querySelectorAll("[data-close-interface]").forEach((button) => {

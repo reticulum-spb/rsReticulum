@@ -42,6 +42,10 @@
           <span class="nav-icon" aria-hidden="true">⚙</span>
           <span>Settings</span>
         </button>
+        <button class="nav-item" type="button" data-view="logs">
+          <span class="nav-icon" aria-hidden="true">≡</span>
+          <span>Logs</span>
+        </button>
       </nav>
 
       <div class="sidebar-footer">
@@ -244,6 +248,36 @@
           </section>
           <p class="form-error" id="settings-error" role="alert"></p>
         </form>
+      </section>
+
+      <section class="view" id="view-logs" data-view-panel="logs" hidden>
+        <div class="page-heading">
+          <div class="heading-actions">
+            <button class="secondary" id="logs-pause" type="button">Pause</button>
+            <button class="secondary" id="logs-clear" type="button">Clear screen</button>
+          </div>
+        </div>
+        <section class="table-card">
+          <div class="table-toolbar">
+            <label class="search-field"><span class="sr-only">Filter logs</span>
+              <input id="logs-search" type="search" placeholder="Filter logs">
+            </label>
+            <div class="table-toolbar-meta">
+              <label class="compact-field">Level
+                <select id="logs-level">
+                  <option value="trace">Trace</option>
+                  <option value="debug">Debug</option>
+                  <option value="info" selected>Info</option>
+                  <option value="warn">Warning</option>
+                  <option value="error">Error</option>
+                </select>
+              </label>
+              <label class="toggle-field"><input id="logs-autoscroll" type="checkbox" checked><span>Autoscroll</span></label>
+              <span class="muted" id="logs-count">0 entries</span>
+            </div>
+          </div>
+          <div class="log-output" id="log-output" tabindex="0" aria-live="polite"></div>
+        </section>
       </section>
     </main>
   </div>

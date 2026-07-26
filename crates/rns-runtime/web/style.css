@@ -480,6 +480,28 @@ dialog form { display: grid; gap: 20px; padding: 24px; }
 #settings-form { display: grid; gap: 18px; }
 #settings-form .card { padding: 16px; }
 .system-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.log-output {
+  height: min(68vh, 760px);
+  overflow: auto;
+  padding: 10px 0;
+  background: #080b0a;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.log-line {
+  display: grid;
+  grid-template-columns: 94px 54px minmax(120px, 230px) 1fr;
+  gap: 10px;
+  padding: 3px 14px;
+  border-bottom: 1px solid #ffffff08;
+  min-width: 680px;
+}
+.log-line:hover { background: #ffffff07; }
+.log-time, .log-target { color: var(--dim); }
+.log-level { color: var(--muted); font-weight: 750; text-transform: uppercase; }
+.log-line[data-level="error"] .log-level { color: var(--danger); }
+.log-line[data-level="warn"] .log-level { color: var(--warning); }
+.log-line[data-level="info"] .log-level { color: var(--accent); }
+.log-message { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .icon-button {
   width: 34px;
   height: 34px;

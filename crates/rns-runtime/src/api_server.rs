@@ -39,12 +39,15 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use rns_transport::messages::{
     InterfaceStatRpcEntry, PathTableRpcEntry, TransportMessage, TransportQuery,
@@ -102,6 +105,8 @@ pub async fn run_api_server(
         )
         .route("/api/v1/paths", get(paths))
         .route("/api/v1/links", get(links))
+        .route("/api/v1/logs", get(log_history))
+        .route("/api/v1/logs/stream", get(log_stream))
         .route("/api/v1/settings", get(settings).put(update_settings))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/system/restart", post(restart_daemon))
@@ -1080,6 +1085,25 @@ async fn links(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         TransportQueryResponse::Error(e) => Err(ApiError::internal(e)),
         other => Err(ApiError::internal(format!("unexpected: {other:?}"))),
     }
+}
+
+async fn log_history() -> Json<Value> {
+    Json(json!({ "entries": crate::web_logs::history() }))
+}
+
+async fn log_stream()
+-> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let stream = BroadcastStream::new(crate::web_logs::subscribe()).filter_map(|entry| {
+        entry.ok().and_then(|entry| {
+            serde_json::to_string(&entry).ok().map(|data| {
+                Ok(SseEvent::default()
+                    .id(entry.id.to_string())
+                    .event("log")
+                    .data(data))
+            })
+        })
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {

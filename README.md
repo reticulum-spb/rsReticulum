@@ -261,6 +261,10 @@ disabled, or removed even when they do not have a runtime ID. The current forms
 support TCP Client, TCP Server, UDP, Auto, Backbone, Serial, KISS, RNode, and
 AX.25 KISS interfaces.
 
+The Logs view shows the latest 1,000 structured `tracing` events and follows
+new events in real time over an authenticated SSE stream. Sensitive structured
+fields are redacted before entering the Web log buffer.
+
 The Settings view can request an externally supervised restart or system
 reboot. After returning HTTP `202 Accepted`, `rnsd-rs` shuts down gracefully
 and exits with code `100` for a daemon restart or `101` for a system reboot.
