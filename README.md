@@ -237,16 +237,18 @@ the Shared `rnsd-rs` process. Build the daemon with the `api` feature:
 cargo build --release -p rns-tools --features api
 ```
 
-Enable the server in the `[reticulum]` section of the active config:
+Enable the authenticated server in the `[api]` section of the active config:
 
 ```ini
-[reticulum]
-api_listen = 0.0.0.0:8080
+[api]
+port = 8080
+user = admin
+password = change-me
 ```
 
-Then open `http://<host>:8080/`. Binding to `0.0.0.0` is intended temporarily
-for development and testing on trusted networks. The current API has no
-authentication and must not be exposed to the public internet.
+Then open `http://<host>:8080/`. The API listens on all IPv4 interfaces and
+requires a login session. Plain HTTP is intended for trusted local networks;
+use a TLS reverse proxy when traffic crosses an untrusted network.
 
 Web UI config changes are written atomically. Before every mutation, the
 previous file is saved as `config.web-ui.bak`; external edits are rejected with

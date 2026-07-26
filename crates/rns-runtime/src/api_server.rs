@@ -1,11 +1,12 @@
 //! Embedded REST API server for rnsd-rs.
 //!
-//! Activated via `--features api` during build and the `api_listen` key in the
-//! `[reticulum]` section of the config, for example:
+//! Activated via `--features api` and the `[api]` config section:
 //!
 //! ```ini
-//! [reticulum]
-//! api_listen = 0.0.0.0:8080
+//! [api]
+//! port = 8080
+//! user = admin
+//! password = change-me
 //! ```
 //!
 //! The server runs inside the rnsd process and accesses the transport
@@ -28,17 +29,19 @@
 //! DELETE /api/v1/config/interfaces/{name} — delete without a runtime ID
 //! ```
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -69,18 +72,21 @@ pub async fn run_api_server(
     handle: ReticulumHandle,
     shutdown: ShutdownSignal,
 ) {
+    let auth = Arc::new(AuthState {
+        user: handle.config.api_user.clone().unwrap_or_default(),
+        password: handle.config.api_password.clone().unwrap_or_default(),
+        sessions: Mutex::new(HashSet::new()),
+        throttle: Mutex::new(LoginThrottle::default()),
+    });
     let state = AppState {
         transport_tx,
         handle,
         shutdown: shutdown.clone(),
         config_write_lock: Arc::new(Mutex::new(())),
+        auth,
     };
 
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/app.js", get(app_js))
-        .route("/style.css", get(style_css))
-        .route("/health", get(health))
+    let protected = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/interfaces", get(interfaces).post(create_interface))
         .route("/api/v1/config/interfaces", get(config_interfaces))
@@ -97,8 +103,18 @@ pub async fn run_api_server(
         .route("/api/v1/paths", get(paths))
         .route("/api/v1/links", get(links))
         .route("/api/v1/settings", get(settings).put(update_settings))
+        .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/system/restart", post(restart_daemon))
         .route("/api/v1/system/reboot", post(reboot_system))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/style.css", get(style_css))
+        .route("/health", get(health))
+        .route("/api/v1/auth/login", post(login))
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn(security_headers))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
@@ -135,6 +151,20 @@ struct AppState {
     handle: ReticulumHandle,
     config_write_lock: Arc<Mutex<()>>,
     shutdown: ShutdownSignal,
+    auth: Arc<AuthState>,
+}
+
+struct AuthState {
+    user: String,
+    password: String,
+    sessions: Mutex<HashSet<String>>,
+    throttle: Mutex<LoginThrottle>,
+}
+
+#[derive(Default)]
+struct LoginThrottle {
+    failures: u8,
+    blocked_until: Option<std::time::Instant>,
 }
 
 struct LoadedConfig {
@@ -163,7 +193,9 @@ struct SettingsRequest {
     discover_interfaces: bool,
     autoconnect_discovered_interfaces: usize,
     required_discovery_value: u8,
-    api_listen: String,
+    api_port: u16,
+    api_user: String,
+    api_password: Option<String>,
     loglevel: i32,
     logtimestamps: bool,
 }
@@ -806,6 +838,120 @@ async fn health() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct LoginRequest {
+    user: String,
+    password: String,
+}
+
+async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+    let mut throttle = s.auth.throttle.lock().await;
+    if throttle
+        .blocked_until
+        .is_some_and(|until| until > std::time::Instant::now())
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "30")],
+            Json(json!({ "error": "too many failed login attempts" })),
+        )
+            .into_response();
+    }
+    if req.user != s.auth.user || req.password != s.auth.password {
+        throttle.failures = throttle.failures.saturating_add(1);
+        if throttle.failures >= 5 {
+            throttle.failures = 0;
+            throttle.blocked_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        }
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid user or password" })),
+        )
+            .into_response();
+    }
+    throttle.failures = 0;
+    throttle.blocked_until = None;
+    drop(throttle);
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+    s.auth.sessions.lock().await.insert(token.clone());
+    let cookie = format!("rns_session={token}; Path=/; HttpOnly; SameSite=Strict");
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn logout(State(s): State<AppState>, request: Request<Body>) -> Response {
+    if let Some(token) = session_token(request.headers()) {
+        s.auth.sessions.lock().await.remove(token);
+    }
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            "rns_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        )],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn require_auth(State(s): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    if request.method() != axum::http::Method::GET
+        && request.method() != axum::http::Method::HEAD
+        && !same_origin(request.headers())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "cross-origin request rejected" })),
+        )
+            .into_response();
+    }
+    let authorized = match session_token(request.headers()) {
+        Some(token) => s.auth.sessions.lock().await.contains(token),
+        None => false,
+    };
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "authentication required" })),
+        )
+            .into_response()
+    }
+}
+
+fn same_origin(headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Some(host) = headers.get(header::HOST) else {
+        return false;
+    };
+    let (Ok(origin), Ok(host)) = (origin.to_str(), host.to_str()) else {
+        return false;
+    };
+    origin
+        .split_once("://")
+        .is_some_and(|(_, authority)| authority.trim_end_matches('/') == host)
+}
+
+fn session_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|cookie| cookie.strip_prefix("rns_session="))
+}
+
 async fn status(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let stats = fetch_interfaces(&s).await?;
     let sections = load_interface_sections(&s)?;
@@ -964,7 +1110,9 @@ async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         "discover_interfaces": parsed.discover_interfaces,
         "autoconnect_discovered_interfaces": parsed.autoconnect_discovered_interfaces,
         "required_discovery_value": parsed.discover_interfaces_required_value,
-        "api_listen": parsed.api_listen.map(|v| v.to_string()).unwrap_or_default(),
+        "api_port": parsed.api_port,
+        "api_user": parsed.api_user,
+        "password_configured": parsed.api_password.is_some(),
         "loglevel": parsed.loglevel,
         "logtimestamps": parsed.log_timestamps,
         "restart_required": restart_required,
@@ -992,7 +1140,9 @@ fn settings_differ(a: &ReticulumConfig, b: &ReticulumConfig) -> bool {
         || a.discover_interfaces != b.discover_interfaces
         || a.autoconnect_discovered_interfaces != b.autoconnect_discovered_interfaces
         || a.discover_interfaces_required_value != b.discover_interfaces_required_value
-        || a.api_listen != b.api_listen
+        || a.api_port != b.api_port
+        || a.api_user != b.api_user
+        || a.api_password != b.api_password
         || a.loglevel != b.loglevel
         || a.log_timestamps != b.log_timestamps
 }
@@ -1036,7 +1186,6 @@ async fn update_settings(
             "required_discovery_value",
             &req.required_discovery_value.to_string(),
         );
-        section.set("api_listen", req.api_listen.trim());
         for (key, value) in [
             (
                 "force_shared_instance_bitrate",
@@ -1064,6 +1213,14 @@ async fn update_settings(
             "logtimestamps",
             if req.logtimestamps { "Yes" } else { "No" },
         );
+    }
+    {
+        let section = loaded.config.ensure_section("api");
+        section.set("port", &req.api_port.to_string());
+        section.set("user", req.api_user.trim());
+        if let Some(password) = req.api_password.as_deref().filter(|v| !v.is_empty()) {
+            section.set("password", password);
+        }
     }
     ReticulumConfig::try_from_config(&loaded.config)
         .map_err(|e| ApiError::bad(format!("invalid settings: {e}")))?;
@@ -1936,8 +2093,39 @@ mod tests {
         stored.loglevel += 1;
         assert!(settings_differ(&stored, &running));
         stored = running.clone();
-        stored.api_listen = Some("0.0.0.0:8080".parse().unwrap());
+        stored.api_port = Some(8080);
         assert!(settings_differ(&stored, &running));
+    }
+
+    #[test]
+    fn api_section_requires_credentials() {
+        let config = Config::parse(
+            "[reticulum]\nshare_instance = Yes\n[api]\nport = 8080\nuser = admin\npassword = secret\n",
+        )
+        .unwrap();
+        let parsed = ReticulumConfig::try_from_config(&config).unwrap();
+        assert_eq!(parsed.api_port, Some(8080));
+        assert_eq!(parsed.api_user.as_deref(), Some("admin"));
+        assert_eq!(parsed.api_password.as_deref(), Some("secret"));
+
+        let invalid = Config::parse("[api]\nport = 8080\nuser = admin\n").unwrap();
+        assert!(ReticulumConfig::try_from_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn auth_header_helpers_validate_cookie_and_origin() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "other=x; rns_session=abc123".parse().unwrap(),
+        );
+        assert_eq!(session_token(&headers), Some("abc123"));
+        assert!(same_origin(&headers));
+        headers.insert(header::HOST, "device.local:8080".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://device.local:8080".parse().unwrap());
+        assert!(same_origin(&headers));
+        headers.insert(header::ORIGIN, "http://attacker.local".parse().unwrap());
+        assert!(!same_origin(&headers));
     }
 
     #[cfg(feature = "serial")]

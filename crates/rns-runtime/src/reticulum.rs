@@ -637,10 +637,9 @@ pub struct ReticulumConfig {
     /// Bootstrap config files loaded on startup. Python `bootstrap_configs`.
     pub bootstrap_configs: Vec<PathBuf>,
 
-    /// Optional REST API listen address, e.g. `127.0.0.1:8080`.
-    /// Enabled only when compiled with `--features api`.
-    /// Set `api_listen` in `[reticulum]` config section to activate.
-    pub api_listen: Option<std::net::SocketAddr>,
+    pub api_port: Option<u16>,
+    pub api_user: Option<String>,
+    pub api_password: Option<String>,
 }
 
 impl Default for ReticulumConfig {
@@ -678,7 +677,9 @@ impl Default for ReticulumConfig {
                 rns_transport::discovery::blackhole_subscriber::UPDATE_INTERVAL.as_secs_f64(),
             log_timestamps: true,
             bootstrap_configs: Vec::new(),
-            api_listen: None,
+            api_port: None,
+            api_user: None,
+            api_password: None,
         }
     }
 }
@@ -972,18 +973,6 @@ impl ReticulumConfig {
             if let Some(list) = sec.get_list("bootstrap_configs") {
                 rc.bootstrap_configs = list.iter().map(|s| PathBuf::from(s.trim())).collect();
             }
-            if let Some(addr_str) = sec.get("api_listen") {
-                match addr_str.trim().parse::<std::net::SocketAddr>() {
-                    Ok(addr) => rc.api_listen = Some(addr),
-                    Err(e) => {
-                        return Err(ConfigError::InvalidValue {
-                            section: "reticulum".to_string(),
-                            key: "api_listen".to_string(),
-                            message: e.to_string(),
-                        });
-                    }
-                }
-            }
         }
 
         if let Some(sec) = config.section("logging") {
@@ -992,6 +981,22 @@ impl ReticulumConfig {
             }
             if let Some(value) = config_bool("logging", sec, "logtimestamps")? {
                 rc.log_timestamps = value;
+            }
+        }
+        if let Some(sec) = config.section("api") {
+            rc.api_port = config_u16("api", sec, "port")?;
+            rc.api_user = sec.get("user").map(str::to_string);
+            rc.api_password = sec.get("password").map(str::to_string);
+            if rc.api_port.is_some()
+                && (rc.api_user.as_deref().is_none_or(str::is_empty)
+                    || rc.api_password.as_deref().is_none_or(str::is_empty))
+            {
+                return Err(ConfigError::InvalidValue {
+                    section: "api".to_string(),
+                    key: "user/password".to_string(),
+                    message: "non-empty credentials are required when the API is enabled"
+                        .to_string(),
+                });
             }
         }
 
@@ -1517,10 +1522,11 @@ pub async fn init(
         }
     }
 
-    // REST API server — compiled only with --features api, activated by api_listen in config.
+    // REST API server — compiled only with --features api and configured in [api].
     #[cfg(feature = "api")]
     if instance_mode == InstanceMode::Shared {
-        if let Some(listen) = rc.api_listen {
+        if let Some(port) = rc.api_port {
+            let listen = std::net::SocketAddr::from(([0, 0, 0, 0], port));
             let api_tx = transport_tx.clone();
             let api_handle = handle.clone();
             let api_shutdown = shutdown.clone();

@@ -57,6 +57,7 @@ async function apiFetch(path, options = {}) {
 
     if (!response.ok) {
       const message = body?.error || body?.message || `Request failed with HTTP ${response.status}`;
+      if (response.status === 401 && path !== "/api/v1/auth/login") openLoginDialog();
       throw new ApiError(message, response.status, body);
     }
 
@@ -70,6 +71,41 @@ async function apiFetch(path, options = {}) {
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+function openLoginDialog() {
+  const dialog = document.querySelector("#login-dialog");
+  if (!dialog.open) dialog.showModal();
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  const button = document.querySelector("#login-submit");
+  setBusy(button, true);
+  document.querySelector("#login-error").textContent = "";
+  try {
+    await apiFetch("/api/v1/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        user: document.querySelector("#login-user").value,
+        password: document.querySelector("#login-password").value,
+      }),
+    });
+    document.querySelector("#login-password").value = "";
+    document.querySelector("#login-dialog").close();
+    await refresh();
+  } catch (error) {
+    document.querySelector("#login-error").textContent = error.message;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function logout() {
+  await apiFetch("/api/v1/auth/logout", { method: "POST" });
+  openLoginDialog();
+  document.querySelector("#login-user").focus();
 }
 
 function setBusy(button, busy) {
@@ -811,7 +847,8 @@ async function refreshSettings() {
     "#setting-shared-type": data.shared_instance_type,
     "#setting-shared-port": data.shared_instance_port,
     "#setting-control-port": data.instance_control_port,
-    "#setting-api-listen": data.api_listen,
+    "#setting-api-port": data.api_port,
+    "#setting-api-user": data.api_user,
     "#setting-force-bitrate": data.force_shared_instance_bitrate,
     "#setting-ar-target": data.default_ar_target,
     "#setting-ar-grace": data.default_ar_grace,
@@ -834,16 +871,7 @@ async function refreshSettings() {
     ["#setting-logtimestamps", "logtimestamps"],
   ]) document.querySelector(selector).checked = Boolean(data[key]);
   document.querySelector("#settings-restart").hidden = !data.restart_required;
-  updateBindWarning();
-}
-
-function updateBindWarning() {
-  const value = document.querySelector("#setting-api-listen").value.trim();
-  const host = value.startsWith("[")
-    ? value.slice(1, value.indexOf("]"))
-    : value.split(":")[0];
-  const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
-  document.querySelector("#settings-bind-warning").hidden = !value || loopback;
+  setField("#setting-api-password", "");
 }
 
 async function saveSettings(event) {
@@ -859,7 +887,8 @@ async function saveSettings(event) {
     shared_instance_type: document.querySelector("#setting-shared-type").value,
     shared_instance_port: number("#setting-shared-port"),
     instance_control_port: number("#setting-control-port"),
-    api_listen: document.querySelector("#setting-api-listen").value.trim(),
+    api_port: number("#setting-api-port"),
+    api_user: document.querySelector("#setting-api-user").value.trim(),
     enable_transport: checked("#setting-enable-transport"),
     static_transport_identity: checked("#setting-static-identity"),
     local_hops_delta: checked("#setting-local-hops-delta"),
@@ -877,6 +906,8 @@ async function saveSettings(event) {
     default_ar_grace: optional("#setting-ar-grace"),
     default_ar_penalty: optional("#setting-ar-penalty"),
   };
+  const apiPassword = document.querySelector("#setting-api-password").value;
+  if (apiPassword) payload.api_password = apiPassword;
   const button = document.querySelector("#save-settings");
   setBusy(button, true);
   document.querySelector("#settings-error").textContent = "";
@@ -1281,11 +1312,14 @@ function initialize() {
     document.querySelector("#interface-advanced-dialog").showModal();
   });
   document.querySelector("#interface-form").addEventListener("submit", saveInterface);
+  document.querySelector("#login-form").addEventListener("submit", submitLogin);
+  document.querySelector("#logout").addEventListener("click", () => {
+    logout().catch(showError);
+  });
   document.querySelector("#settings-form").addEventListener("submit", saveSettings);
   document.querySelector("#reload-settings").addEventListener("click", () => {
     refreshSettings().catch(showError);
   });
-  document.querySelector("#setting-api-listen").addEventListener("input", updateBindWarning);
   document.querySelector("#restart-daemon").addEventListener("click", () => {
     requestSystemAction("restart");
   });

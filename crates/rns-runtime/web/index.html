@@ -47,6 +47,7 @@
       <div class="sidebar-footer">
         <span class="eyebrow">Shared instance</span>
         <span class="muted">rnsd-rs control plane</span>
+        <button class="secondary" id="logout" type="button">Sign out</button>
       </div>
     </aside>
 
@@ -199,16 +200,17 @@
             </div>
           </div>
           <div class="notice" id="settings-restart" hidden>Configuration saved. Restart rnsd-rs to apply these settings.</div>
-          <div class="notice error-notice" id="settings-bind-warning" hidden>
-            The Web API is listening on a non-loopback address. Use only on a trusted network.
-          </div>
           <section class="card"><fieldset class="form-grid">
             <legend>Shared instance</legend>
             <label>Instance name<input id="setting-instance-name" required></label>
             <label>Connection type<select id="setting-shared-type"><option value="unix">Unix</option><option value="tcp">TCP</option></select></label>
             <label>Shared port<input id="setting-shared-port" type="number" min="1" max="65535" required></label>
             <label>Control port<input id="setting-control-port" type="number" min="1" max="65535" required></label>
-            <label class="wide">Web API listen address<input id="setting-api-listen" placeholder="0.0.0.0:8080" required></label>
+            <label>Web API port<input id="setting-api-port" type="number" min="1" max="65535" required></label>
+            <label>Web API user<input id="setting-api-user" autocomplete="username" required></label>
+            <label class="wide">New Web API password <span class="optional">leave empty to keep current</span>
+              <input id="setting-api-password" type="password" autocomplete="new-password">
+            </label>
             <label class="check-field"><input id="setting-share-instance" type="checkbox"><span>Share instance</span></label>
             <label class="check-field"><input id="setting-enable-transport" type="checkbox"><span>Enable transport</span></label>
             <label class="check-field"><input id="setting-static-identity" type="checkbox"><span>Static transport identity</span></label>
@@ -245,6 +247,18 @@
       </section>
     </main>
   </div>
+
+  <dialog id="login-dialog">
+    <form id="login-form">
+      <div class="dialog-heading"><div><span class="eyebrow">Authentication</span><h2>Sign in</h2></div></div>
+      <div class="form-grid">
+        <label class="wide">User<input id="login-user" autocomplete="username" required autofocus></label>
+        <label class="wide">Password<input id="login-password" type="password" autocomplete="current-password" required></label>
+      </div>
+      <p class="form-error" id="login-error" role="alert"></p>
+      <div class="dialog-actions"><button class="primary" id="login-submit" type="submit">Sign in</button></div>
+    </form>
+  </dialog>
 
   <dialog id="interface-dialog">
     <form id="interface-form">

@@ -1901,6 +1901,7 @@ dependencies = [
  "hmac",
  "md-5",
  "nix 0.29.0",
+ "rand 0.8.5",
  "rmp-serde",
  "rmpv",
  "rns-crypto",
