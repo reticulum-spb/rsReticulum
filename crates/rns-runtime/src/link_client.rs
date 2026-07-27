@@ -1488,83 +1488,90 @@ impl LinkClient {
         })
         .await?;
 
-        let req_pkt = build_link_request_packet(dest_hash, &request_data);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: req_pkt,
-            destination_hash: dest_hash,
-        }))
-        .await?;
+        // The destination is registered above; every exit from here on must
+        // deregister it. Returning `?` straight out of the handshake -- the
+        // timeout path, i.e. what an unreachable or slow node does -- used to
+        // skip the teardown entirely, leaking one registration per attempt.
+        let response = async {
+            let req_pkt = build_link_request_packet(dest_hash, &request_data);
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: req_pkt,
+                destination_hash: dest_hash,
+            }))
+            .await?;
 
-        let proof_data = wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
+            let proof_data = wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
 
-        let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
-            LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
-        })?;
-        let identity_verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("verify key: {e}")))?;
+            let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
+                LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
+            })?;
+            let identity_verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
+                .map_err(|e| LinkClientError::ProofInvalid(format!("verify key: {e}")))?;
 
-        let rtt_data = link
-            .validate_proof(&proof_data, &identity_verify_key, &identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("{e:?}")))?;
+            let rtt_data = link
+                .validate_proof(&proof_data, &identity_verify_key, &identity_ed25519_pub)
+                .map_err(|e| LinkClientError::ProofInvalid(format!("{e:?}")))?;
 
-        let rtt_pkt =
-            build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: rtt_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+            let rtt_pkt =
+                build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: rtt_pkt,
+                destination_hash: link_id,
+            }))
+            .await?;
 
-        let our_pub = self.identity.get_public_key();
-        let our_priv = self
-            .identity
-            .get_signing_key()
-            .ok_or(LinkClientError::NoSigningKey)?;
-        let identify_data = link
-            .identify(&our_pub, &our_priv)
-            .map_err(|e| LinkClientError::LinkCrypto(format!("identify: {e:?}")))?;
-        let identify_pkt = build_data_packet(
-            link_id,
-            rns_wire::context::PacketContext::LinkIdentify,
-            &identify_data,
-        );
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: identify_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+            let our_pub = self.identity.get_public_key();
+            let our_priv = self
+                .identity
+                .get_signing_key()
+                .ok_or(LinkClientError::NoSigningKey)?;
+            let identify_data = link
+                .identify(&our_pub, &our_priv)
+                .map_err(|e| LinkClientError::LinkCrypto(format!("identify: {e:?}")))?;
+            let identify_pkt = build_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::LinkIdentify,
+                &identify_data,
+            );
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: identify_pkt,
+                destination_hash: link_id,
+            }))
+            .await?;
 
-        let req_timeout = Duration::from_secs(5);
-        let (encrypted_req, request_id) = link
-            .request(path, Some(&payload), req_timeout)
-            .map_err(|e| LinkClientError::LinkCrypto(format!("request: {e:?}")))?;
-        let request_pkt = build_data_packet(
-            link_id,
-            rns_wire::context::PacketContext::Request,
-            &encrypted_req,
-        );
-        let packet_request_id = rns_wire::hash::truncated_packet_hash(
-            &request_pkt,
-            rns_wire::flags::HeaderType::Header1,
-        );
-        link.update_pending_request_id(&request_id, packet_request_id);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: request_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+            let req_timeout = Duration::from_secs(5);
+            let (encrypted_req, request_id) = link
+                .request(path, Some(&payload), req_timeout)
+                .map_err(|e| LinkClientError::LinkCrypto(format!("request: {e:?}")))?;
+            let request_pkt = build_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::Request,
+                &encrypted_req,
+            );
+            let packet_request_id = rns_wire::hash::truncated_packet_hash(
+                &request_pkt,
+                rns_wire::flags::HeaderType::Header1,
+            );
+            link.update_pending_request_id(&request_id, packet_request_id);
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: request_pkt,
+                destination_hash: link_id,
+            }))
+            .await?;
 
-        let response = wait_for_response(
-            &self.transport_tx,
-            &mut dest_rx,
-            &mut link,
-            link_id,
-            packet_request_id,
-            time_remaining(deadline)?,
-            usize::MAX,
-        )
-        .await
-        .map(|response| response.data);
+            wait_for_response(
+                &self.transport_tx,
+                &mut dest_rx,
+                &mut link,
+                link_id,
+                packet_request_id,
+                time_remaining(deadline)?,
+                usize::MAX,
+            )
+            .await
+            .map(|response| response.data)
+        }
+        .await;
 
         // Tear down even on failure so the remote doesn't keep link state.
         let _ = self.send_close(&mut link).await;
@@ -2292,6 +2299,68 @@ mod tests {
         assert!(resource_answers_request(false, None, &ours));
         // ...but one that names a *different* request is not ours.
         assert!(!resource_answers_request(false, Some(&theirs), &ours));
+    }
+
+    /// Every failed navigation used to leave a destination registered in the
+    /// transport actor: RegisterDestination happens before the handshake, and
+    /// every `?` between there and the teardown skipped the cleanup. A browser
+    /// doing repeated fetches leaks one per failure.
+    #[tokio::test]
+    async fn failed_query_still_deregisters_its_destination() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(4096);
+        let transport = tokio::spawn(async move {
+            let (mut reg, mut dereg) = (0usize, 0usize);
+            while let Some(msg) = transport_rx.recv().await {
+                match msg {
+                    TransportMessage::RegisterDestination { .. } => reg += 1,
+                    TransportMessage::DeregisterDestination { .. } => dereg += 1,
+                    TransportMessage::Rpc { response_tx, .. } => {
+                        // Known peer, so discovery is skipped and the query
+                        // proceeds straight to the handshake, which nothing
+                        // answers -- the common slow/unreachable-node path.
+                        let _ = response_tx.send(TransportQueryResponse::Announce(Some(
+                            AnnounceRpcEntry {
+                                dest_hash: [0; 16],
+                                hops: 1,
+                                app_data: None,
+                                timestamp: 0.0,
+                                public_key: Some([0x11; 64]),
+                                ratchet: None,
+                                name_hash: [0; 10],
+                                is_path_response: false,
+                                retained: false,
+                            },
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            (reg, dereg)
+        });
+
+        let client = LinkClient::new(transport_tx, Identity::new());
+        const NAVIGATIONS: usize = 30;
+        for _ in 0..NAVIGATIONS {
+            let _ = client
+                .query(
+                    [0xAB; 16],
+                    "nomadnetwork.node",
+                    "/page/index.mu",
+                    Vec::new(),
+                    1,
+                    Duration::from_millis(20),
+                )
+                .await;
+        }
+        drop(client);
+
+        let (reg, dereg) = transport.await.unwrap();
+        assert_eq!(reg, NAVIGATIONS, "expected one registration per navigation");
+        assert_eq!(
+            dereg, reg,
+            "leaked {} destination registrations over {NAVIGATIONS} failed navigations",
+            reg - dereg
+        );
     }
 
     #[tokio::test]

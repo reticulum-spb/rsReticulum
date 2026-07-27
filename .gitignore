@@ -7,3 +7,4 @@ __pycache__/
 /rust_artifacts/
 proptest-regressions/
 /tools/*
+target/
