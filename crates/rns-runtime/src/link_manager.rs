@@ -2666,6 +2666,8 @@ impl LinkManager {
                 auto_compress,
                 request_id: None,
                 is_response: false,
+                // Unsolicited, unlike the reply paths: nothing has proved
+                // the link works yet, so wait for it to go Active.
                 allow_handshake: false,
             },
         )
@@ -2685,7 +2687,11 @@ impl LinkManager {
                 auto_compress: false,
                 request_id: Some(request_id.to_vec()),
                 is_response: true,
-                allow_handshake: false,
+                // As with the plain-resource reply it sits beside: the
+                // request itself proves the link carries traffic, and the
+                // responder may not have processed LRRTT yet. Requiring
+                // Active here dropped the answer with no packet sent.
+                allow_handshake: true,
             },
         )
     }
@@ -3491,6 +3497,48 @@ mod tests {
         assert_eq!(link.state, LinkState::Active);
         assert_eq!(link.expected_hops, Some(4));
         assert_eq!(initiator.expected_hops, Some(2));
+    }
+
+    /// The two branches that answer an inbound Request sit next to each other
+    /// and act on the same link at the same moment, so they must agree on
+    /// whether the link has to be Active yet. An oversized inline reply goes
+    /// out as a response resource, and if that path alone refuses to start
+    /// during the handshake the answer is dropped with no packet and no
+    /// warning -- the caller just waits out its timeout.
+    #[test]
+    fn response_resource_can_also_start_before_responder_lrrtt_activation() {
+        let dest_hash = [0x37; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let (_initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, _proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let link_id = responder.link_id;
+        assert_eq!(responder.state, LinkState::Handshake);
+
+        let (transport_tx, _transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let packed = rns_link::link::Link::pack_response(&[0xAB; 16], &vec![0u8; 4096]).unwrap();
+        assert!(
+            lm.start_response_resource(&link_id, packed, [0xAB; 16])
+                .is_some(),
+            "response resource was refused during handshake, so the reply is \
+             silently dropped and the requester times out"
+        );
     }
 
     #[test]
