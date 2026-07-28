@@ -218,6 +218,44 @@ fn split_reply_outcome(outcome: RequestOutcome) -> (Option<Vec<u8>>, Option<Fetc
     }
 }
 
+/// Builds the transfer start for a `fetch_spec` (a `ReplyWithResource`'s
+/// resource half), matching Python `RNS.Link.handle_request`.
+///
+/// Any resource that answers a request carries `is_response=true` and the
+/// request id on its own advertisement -- without that, a compliant client's
+/// default `resource_strategy` (`ACCEPT_NONE`) drops the resource before ever
+/// trying to read it, regardless of what the payload contains.
+///
+/// Whether the payload itself needs the msgpack `[request_id, data]` envelope
+/// is decided by the same signal a Python client dispatches on when the
+/// resource arrives: whether metadata is attached
+/// (`resource.has_metadata` in `Link.response_resource_concluded`). A file
+/// response carries metadata and is sent raw -- `Node.py`'s `serve_file`
+/// returns an open file handle, which `Link.handle_request` forwards via
+/// `Resource(file_handle, ...)` with no packing. Anything else (`serve_page`'s
+/// return value) goes through the plain branch, which always packs
+/// `umsgpack.packb([request_id, response])` first.
+fn fetch_spec_transfer_start(
+    request_id: [u8; 16],
+    data: Vec<u8>,
+    metadata: Option<Vec<u8>>,
+    auto_compress: bool,
+) -> ResourceTransferStart {
+    let data = if metadata.is_some() {
+        data
+    } else {
+        rns_link::link::Link::pack_response(&request_id, &data).unwrap_or(data)
+    };
+    ResourceTransferStart {
+        data,
+        metadata,
+        auto_compress,
+        request_id: Some(request_id.to_vec()),
+        is_response: true,
+        allow_handshake: true,
+    }
+}
+
 struct ResourceTransferStart {
     data: Vec<u8>,
     metadata: Option<Vec<u8>>,
@@ -1848,20 +1886,13 @@ impl LinkManager {
                         }
 
                         if let Some((data, metadata, auto_compress)) = fetch_spec {
-                            if self
-                                .start_resource_transfer_inner(
-                                    &link_id,
-                                    ResourceTransferStart {
-                                        data,
-                                        metadata,
-                                        auto_compress,
-                                        request_id: None,
-                                        is_response: false,
-                                        allow_handshake: true,
-                                    },
-                                )
-                                .is_none()
-                            {
+                            let start = fetch_spec_transfer_start(
+                                request_id,
+                                data,
+                                metadata,
+                                auto_compress,
+                            );
+                            if self.start_resource_transfer_inner(&link_id, start).is_none() {
                                 tracing::warn!(
                                     link_id = hex::encode(link_id),
                                     "link request resource response could not be started"
@@ -3109,6 +3140,65 @@ mod tests {
         let (ack, fetch) = split_reply_outcome(RequestOutcome::Reply(Vec::new()));
         assert_eq!(ack.as_deref(), Some(&[][..]));
         assert!(fetch.is_none());
+    }
+
+    /// A response resource must carry `is_response=true` and the request id
+    /// on its advertisement, matching Python `RNS.Link.handle_request` --
+    /// confirmed against a real NomadNet node on the live network, whose
+    /// oversized-page ResourceAdv carried `is_response=true` and its own
+    /// `request_id`. Without it, a compliant client's default
+    /// `resource_strategy` (`ACCEPT_NONE`) drops the resource before ever
+    /// reading it, which is why other NomadNet clients could not receive
+    /// pages or files served this way.
+    #[test]
+    fn fetch_spec_transfer_always_carries_response_id_and_flag() {
+        let request_id = [0x42; 16];
+        let start = fetch_spec_transfer_start(request_id, b"hello".to_vec(), None, false);
+        assert!(start.is_response);
+        assert_eq!(start.request_id.as_deref(), Some(request_id.as_slice()));
+    }
+
+    /// A page response (no metadata) must be wrapped in the msgpack
+    /// `[request_id, data]` envelope: real Python clients dispatch on
+    /// `resource.has_metadata` when a response resource completes, and
+    /// unconditionally `umsgpack.unpackb()` the payload when it's absent
+    /// (`Link.response_resource_concluded`). Sending raw bytes there fails to
+    /// unpack on a real client even after the is_response/request_id fix.
+    #[test]
+    fn page_response_without_metadata_is_enveloped() {
+        let request_id = [0x11; 16];
+        let start = fetch_spec_transfer_start(request_id, b"page bytes".to_vec(), None, false);
+
+        assert_ne!(
+            start.data,
+            b"page bytes",
+            "page response must not be sent raw"
+        );
+        let mut link = Link::new_responder(
+            &Link::new_initiator([0x99; 16], 1).1,
+            &Ed25519PrivateKey::generate(),
+            [0x99; 16],
+            1,
+        )
+        .unwrap()
+        .0;
+        let (id, data) = link.handle_response_plaintext(&start.data).unwrap();
+        assert_eq!(id, request_id);
+        assert_eq!(data, b"page bytes");
+    }
+
+    /// A file response (metadata present) must stay raw: `Node.py`'s
+    /// `serve_file` hands `Link.handle_request` an open file handle, which it
+    /// wraps directly in a `Resource` with no packing at all -- and a real
+    /// client passes `resource.data` straight through when metadata is
+    /// present, without ever attempting to unpack it.
+    #[test]
+    fn file_response_with_metadata_stays_raw() {
+        let request_id = [0x22; 16];
+        let metadata = Some(b"{\"name\":\"x.bin\"}".to_vec());
+        let start =
+            fetch_spec_transfer_start(request_id, b"raw file bytes".to_vec(), metadata, true);
+        assert_eq!(start.data, b"raw file bytes");
     }
 
     #[test]
