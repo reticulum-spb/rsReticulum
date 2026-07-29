@@ -1360,7 +1360,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 
                 if let Some(rh) = completed_rh {
                     let (payload, proof, metadata, resource_hash) = match transfers.get_mut(&rh) {
-                        Some(t) => match t.complete(Some(&decrypt_fn)) {
+                        // `transfer_flags.has_metadata` above is already
+                        // cleared for segment_index > 1, so the resource's
+                        // own flag already reflects whether to strip here.
+                        Some(t) => match t.complete(Some(&decrypt_fn), true) {
                             Ok((payload, proof)) => (
                                 payload,
                                 proof,

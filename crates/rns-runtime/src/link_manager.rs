@@ -1336,9 +1336,18 @@ impl LinkManager {
                                 })
                             };
 
+                            // Looked up before completing: metadata is only
+                            // embedded in segment 1's payload, so `complete()`
+                            // needs to know whether this is that segment
+                            // before deciding whether to strip it.
+                            let is_first_segment = active
+                                .segment_routing
+                                .get(&rh)
+                                .map(|route| route.segment_index == 1)
+                                .unwrap_or(true);
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 if let Ok((assembled_data, proof)) =
-                                    transfer.complete(Some(&decrypt_fn))
+                                    transfer.complete(Some(&decrypt_fn), is_first_segment)
                                 {
                                     // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
                                     // (Packet.py:195-197). Each split segment still needs its
@@ -2860,8 +2869,13 @@ impl LinkManager {
         resource_hash: &[u8; 32],
     ) -> Option<(Vec<u8>, Vec<u8>)> {
         let active = self.active_links.get_mut(link_id)?;
+        let is_first_segment = active
+            .segment_routing
+            .get(resource_hash)
+            .map(|route| route.segment_index == 1)
+            .unwrap_or(true);
         let transfer = active.inbound_resources.get_mut(resource_hash)?;
-        match transfer.complete(None) {
+        match transfer.complete(None, is_first_segment) {
             Ok((data, proof)) => {
                 active.link.untrack_resource(resource_hash);
                 active.inbound_resources.remove(resource_hash);

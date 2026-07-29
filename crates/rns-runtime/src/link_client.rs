@@ -1052,17 +1052,24 @@ impl LinkSession {
                                     rns_protocol::resource::ResourceError::DecryptFailed
                                 })
                             };
-                            let (data, proof) =
-                                transfer.complete(Some(&decrypt)).map_err(|error| {
+                            // Looked up before completing: metadata is only
+                            // physically embedded in segment 1's payload, so
+                            // `complete()` must know whether this is that
+                            // segment before it decides whether to strip it.
+                            let (original_hash, segment_index, total_segments) = segment_info
+                                .get(&resource_hash)
+                                .copied()
+                                .unwrap_or((resource_hash, 1, 1));
+                            let (data, proof) = transfer
+                                .complete(Some(&decrypt), segment_index == 1)
+                                .map_err(|error| {
                                     LinkClientError::UnexpectedResponse(format!(
                                         "resource completion: {error:?}"
                                     ))
                                 })?;
                             let metadata = transfer.resource.metadata.clone();
                             send_link_proof(&self.transport_tx, link_id, &proof)?;
-                            let (original_hash, segment_index, total_segments) = segment_info
-                                .remove(&resource_hash)
-                                .unwrap_or((resource_hash, 1, 1));
+                            segment_info.remove(&resource_hash);
                             transfers.remove(&resource_hash);
                             if total_segments > 1 {
                                 let coordinator =
@@ -1869,6 +1876,15 @@ async fn wait_for_response(
                             }
 
                             if let Some(rh) = completed_rh {
+                                // Looked up before completing, same reason as
+                                // the other resource-response path above:
+                                // metadata is only embedded in segment 1's
+                                // payload, so `complete()` needs to know
+                                // whether this is that segment first.
+                                let is_first_segment = segment_info
+                                    .get(&rh)
+                                    .map(|&(_, segment_index, _)| segment_index == 1)
+                                    .unwrap_or(true);
                                 let (assembled, proof, metadata) = {
                                     let transfer =
                                         inbound_resources.get_mut(&rh).ok_or_else(|| {
@@ -1888,8 +1904,9 @@ async fn wait_for_response(
                                             },
                                         )
                                     };
-                                    let (assembled, proof) =
-                                        transfer.complete(Some(&decrypt_fn)).map_err(|e| {
+                                    let (assembled, proof) = transfer
+                                        .complete(Some(&decrypt_fn), is_first_segment)
+                                        .map_err(|e| {
                                             LinkClientError::UnexpectedResponse(format!(
                                                 "resource assemble: {e:?}"
                                             ))
