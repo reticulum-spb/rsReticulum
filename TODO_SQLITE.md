@@ -25,17 +25,20 @@
 
 ## 1. Аудит публичного API
 
-- [ ] Составить список публичных типов `rns-transport`.
-- [ ] Составить список публичных типов `rns-runtime`.
-- [ ] Зафиксировать `TransportMessage`, `TransportQuery` и responses.
-- [ ] Найти публичные поля routing tables.
-- [ ] Найти методы, возвращающие `&T`, `&mut T` и reference iterators.
-- [ ] Проверить использование API в `rns-runtime`, `rns-tools` и examples.
-- [ ] Проверить API, используемый внешними приложениями.
-- [ ] Определить обязательную compatibility surface.
+- [x] Составить список публичных типов `rns-transport`.
+- [x] Составить список публичных типов `rns-runtime`.
+- [x] Зафиксировать `TransportMessage`, `TransportQuery` и responses.
+- [x] Найти публичные поля routing tables.
+- [x] Найти методы, возвращающие `&T`, `&mut T` и reference iterators.
+- [x] Проверить использование API в `rns-runtime`, `rns-tools` и examples.
+- [x] Проверить API, используемый внешними приложениями.
+- [x] Определить обязательную compatibility surface.
 - [ ] Добавить API regression/compile tests.
-- [ ] Спроектировать совместимый wrapper для `PathTable`.
+- [x] Спроектировать границы совместимого wrapper для `PathTable`.
+- [ ] Реализовать совместимый wrapper для `PathTable`.
 - [ ] Добавить новый постраничный API, не удаляя старый full-list API.
+
+Результаты аудита: `doc/api.md`.
 
 ## 2. Storage abstraction
 
