@@ -812,6 +812,7 @@ impl LinkSession {
             packet_request_id,
             deadline,
             max_response_bytes,
+            None,
         )
         .await
     }
@@ -1471,6 +1472,55 @@ impl LinkClient {
         hops: u8,
         overall_timeout: Duration,
     ) -> Result<Vec<u8>, LinkClientError> {
+        self.query_inner(
+            remote_transport_hash,
+            app_name,
+            path,
+            payload,
+            hops,
+            overall_timeout,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::query`], but sends `(bytes_received, total_bytes)` on
+    /// `progress` as resource segments arrive. `total_bytes` is only known
+    /// once the reply's `ResourceAdv` advertisement is seen, so a small
+    /// (inline, non-resource) response never sends anything at all.
+    pub async fn query_with_progress(
+        &self,
+        remote_transport_hash: [u8; 16],
+        app_name: &str,
+        path: &str,
+        payload: Vec<u8>,
+        hops: u8,
+        overall_timeout: Duration,
+        progress: mpsc::UnboundedSender<(usize, usize)>,
+    ) -> Result<Vec<u8>, LinkClientError> {
+        self.query_inner(
+            remote_transport_hash,
+            app_name,
+            path,
+            payload,
+            hops,
+            overall_timeout,
+            Some(progress),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn query_inner(
+        &self,
+        remote_transport_hash: [u8; 16],
+        app_name: &str,
+        path: &str,
+        payload: Vec<u8>,
+        hops: u8,
+        overall_timeout: Duration,
+        progress: Option<mpsc::UnboundedSender<(usize, usize)>>,
+    ) -> Result<Vec<u8>, LinkClientError> {
         let started = Instant::now();
         let deadline = started + overall_timeout;
 
@@ -1574,6 +1624,7 @@ impl LinkClient {
                 packet_request_id,
                 time_remaining(deadline)?,
                 usize::MAX,
+                progress.as_ref(),
             )
             .await
             .map(|response| response.data)
@@ -1695,6 +1746,7 @@ async fn wait_for_proof(
         .map_err(|_| LinkClientError::Timeout("link proof"))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_response(
     transport_tx: &mpsc::Sender<TransportMessage>,
     rx: &mut mpsc::Receiver<DestinationEvent>,
@@ -1703,7 +1755,14 @@ async fn wait_for_response(
     request_id: [u8; 16],
     deadline: Duration,
     max_response_bytes: usize,
+    progress: Option<&mpsc::UnboundedSender<(usize, usize)>>,
 ) -> Result<LinkResponse, LinkClientError> {
+    // Throttled so a multi-thousand-packet transfer doesn't flood the
+    // receiver with one update per wire packet (each ~350-500 bytes).
+    const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(150);
+    let mut bytes_received = 0usize;
+    let mut last_progress_emit: Option<Instant> = None;
+
     let fut = async {
         let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
         let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
@@ -1855,6 +1914,24 @@ async fn wait_for_response(
                                 }
                             }
 
+                            // Approximate, not exact: counts the wire packet
+                            // once per arrival rather than crediting whichever
+                            // candidate transfer actually consumed it, which is
+                            // indistinguishable from here without changing
+                            // InboundTransfer's return type. Close enough for a
+                            // progress bar; a query has one outstanding
+                            // resource in the overwhelming majority of cases.
+                            if let Some(tx) = progress {
+                                bytes_received = bytes_received.saturating_add(body.len());
+                                let now = Instant::now();
+                                let due = last_progress_emit
+                                    .is_none_or(|last| now - last >= PROGRESS_MIN_INTERVAL);
+                                if due && advertised_bytes > 0 {
+                                    last_progress_emit = Some(now);
+                                    let _ = tx.send((bytes_received.min(advertised_bytes), advertised_bytes));
+                                }
+                            }
+
                             if let Some(action) = action_to_send {
                                 let (context, payload) = match action {
                                     TransferAction::SendHmu(hmu) => {
@@ -1949,6 +2026,9 @@ async fn wait_for_response(
                                 match link.handle_response_plaintext(&response_payload) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
+                                            if let Some(tx) = progress {
+                                                let _ = tx.send((advertised_bytes, advertised_bytes));
+                                            }
                                             return Ok(LinkResponse {
                                                 data: response_data,
                                                 metadata,
@@ -1962,6 +2042,9 @@ async fn wait_for_response(
                                     // bytes are the response as they stand --
                                     // failing here would reject every such peer.
                                     Err(_) => {
+                                        if let Some(tx) = progress {
+                                            let _ = tx.send((advertised_bytes, advertised_bytes));
+                                        }
                                         return Ok(LinkResponse {
                                             data: response_payload,
                                             metadata,
