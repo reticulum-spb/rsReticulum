@@ -2500,7 +2500,10 @@ mod tests {
             assert!(inbound.receive_part(part.clone()));
         }
         assert!(inbound.is_complete());
-        assert_eq!(inbound.assemble(None, inbound.flags.has_metadata).unwrap(), data);
+        assert_eq!(
+            inbound.assemble(None, inbound.flags.has_metadata).unwrap(),
+            data
+        );
     }
 
     #[test]
@@ -3731,9 +3734,7 @@ mod tests {
                 let _ = inbound.receive_part(part.clone());
             }
             assert!(inbound.resource.is_complete());
-            let (payload, proof) = inbound
-                .complete(None, segment.segment_index == 1)
-                .unwrap();
+            let (payload, proof) = inbound.complete(None, segment.segment_index == 1).unwrap();
             assert!(segment.validate_proof(&proof));
             if let Some(meta) = inbound.resource.metadata.clone() {
                 multi_in.set_metadata(meta);
@@ -3786,9 +3787,7 @@ mod tests {
             }
             // Every segment's own advertisement says has_metadata=true now.
             assert!(inbound.resource.flags.has_metadata);
-            let (payload, _proof) = inbound
-                .complete(None, segment.segment_index == 1)
-                .unwrap();
+            let (payload, _proof) = inbound.complete(None, segment.segment_index == 1).unwrap();
             multi_in
                 .set_segment_data(segment.segment_index, payload)
                 .unwrap();
@@ -4582,7 +4581,10 @@ mod tests {
         }
 
         assert!(inbound.resource.is_complete());
-        let assembled = inbound.resource.assemble(None, inbound.resource.flags.has_metadata).unwrap();
+        let assembled = inbound
+            .resource
+            .assemble(None, inbound.resource.flags.has_metadata)
+            .unwrap();
         assert_eq!(assembled, data);
     }
 

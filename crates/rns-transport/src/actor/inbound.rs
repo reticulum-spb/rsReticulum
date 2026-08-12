@@ -561,6 +561,8 @@ impl TransportActor {
         // `hash_from_name_and_identity(filter, identity_hash) == destination_hash`.
         // Without a validated identity, filtered handlers are skipped.
         if !self.announce_handlers.is_empty() {
+            self.announce_handlers
+                .retain(|registration| !registration.tx.is_closed());
             let handler_app_data = app_data_for_handlers;
             let is_path_response = header.context == rns_wire::context::PacketContext::PathResponse;
             let announce_packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);

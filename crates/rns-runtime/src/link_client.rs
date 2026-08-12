@@ -96,8 +96,11 @@ pub struct PreparedLinkSession {
 pub struct LinkSessionHandle {
     link_id: [u8; 16],
     command_tx: mpsc::Sender<LinkSessionCommand>,
-    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, LinkClientError>>>>,
+    inbound_rx: SharedInboundReceiver,
 }
+
+type SharedInboundReceiver =
+    Arc<tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, LinkClientError>>>>;
 
 enum LinkSessionCommand {
     Identify {
@@ -173,33 +176,47 @@ impl PreparedLinkSession {
             },
         )
         .await?;
-        send_transport(
-            &self.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: build_link_request_packet(self.destination_hash, &self.request_data),
-                destination_hash: self.destination_hash,
-            }),
-        )
-        .await?;
+        let establishment = async {
+            send_transport(
+                &self.transport_tx,
+                TransportMessage::Outbound(OutboundRequest {
+                    raw: build_link_request_packet(self.destination_hash, &self.request_data),
+                    destination_hash: self.destination_hash,
+                }),
+            )
+            .await?;
 
-        let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
-        let ed25519_bytes: [u8; 32] = self.public_key[32..]
-            .try_into()
-            .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
-        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
-        let rtt_data = self
-            .link
-            .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
-        send_transport(
-            &self.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data),
-                destination_hash: link_id,
-            }),
-        )
-        .await?;
+            let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
+            let ed25519_bytes: [u8; 32] = self.public_key[32..]
+                .try_into()
+                .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
+            let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
+            let rtt_data = self
+                .link
+                .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
+                .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
+            send_transport(
+                &self.transport_tx,
+                TransportMessage::Outbound(OutboundRequest {
+                    raw: build_data_packet(
+                        link_id,
+                        rns_wire::context::PacketContext::Lrrtt,
+                        &rtt_data,
+                    ),
+                    destination_hash: link_id,
+                }),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = establishment {
+            let _ = self
+                .transport_tx
+                .send(TransportMessage::DeregisterDestination { hash: link_id })
+                .await;
+            return Err(error);
+        }
         Ok(LinkSession {
             transport_tx: self.transport_tx,
             identity: Arc::new(self.identity),
@@ -813,6 +830,7 @@ impl LinkSession {
             deadline,
             max_response_bytes,
             None,
+            false,
         )
         .await
     }
@@ -1271,10 +1289,10 @@ impl LinkSession {
                             }
                         }
                     }
-                    rns_wire::context::PacketContext::ResourcePrf => {
-                        if transfer.handle_proof(body) {
-                            return Ok(resource_hash);
-                        }
+                    rns_wire::context::PacketContext::ResourcePrf
+                        if transfer.handle_proof(body) =>
+                    {
+                        return Ok(resource_hash);
                     }
                     rns_wire::context::PacketContext::ResourceRcl => {
                         return Err(LinkClientError::Resource(
@@ -1455,9 +1473,10 @@ impl LinkClient {
 
         let _ = self
             .transport_tx
-            .try_send(TransportMessage::DeregisterAnnounceHandler {
+            .send(TransportMessage::DeregisterAnnounceHandler {
                 callback_tx: ann_tx,
-            });
+            })
+            .await;
         outcome
     }
 
@@ -1488,6 +1507,7 @@ impl LinkClient {
     /// `progress` as resource segments arrive. `total_bytes` is only known
     /// once the reply's `ResourceAdv` advertisement is seen, so a small
     /// (inline, non-resource) response never sends anything at all.
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_with_progress(
         &self,
         remote_transport_hash: [u8; 16],
@@ -1557,7 +1577,8 @@ impl LinkClient {
             }))
             .await?;
 
-            let proof_data = wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
+            let proof_data =
+                wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
 
             let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
                 LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
@@ -1625,6 +1646,7 @@ impl LinkClient {
                 time_remaining(deadline)?,
                 usize::MAX,
                 progress.as_ref(),
+                true,
             )
             .await
             .map(|response| response.data)
@@ -1635,7 +1657,8 @@ impl LinkClient {
         let _ = self.send_close(&mut link).await;
         let _ = self
             .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+            .send(TransportMessage::DeregisterDestination { hash: link_id })
+            .await;
 
         response
     }
@@ -1675,11 +1698,12 @@ fn resource_answers_request(
     is_response: bool,
     adv_request_id: Option<&[u8]>,
     request_id: &[u8; 16],
+    accept_plain_resource: bool,
 ) -> bool {
     if is_response {
         adv_request_id == Some(request_id.as_slice())
     } else {
-        adv_request_id.is_none()
+        accept_plain_resource && adv_request_id.is_none()
     }
 }
 
@@ -1756,6 +1780,7 @@ async fn wait_for_response(
     deadline: Duration,
     max_response_bytes: usize,
     progress: Option<&mpsc::UnboundedSender<(usize, usize)>>,
+    accept_plain_resource: bool,
 ) -> Result<LinkResponse, LinkClientError> {
     // Throttled so a multi-thousand-packet transfer doesn't flood the
     // receiver with one update per wire packet (each ~350-500 bytes).
@@ -1829,6 +1854,7 @@ async fn wait_for_response(
                                 adv.flags.is_response,
                                 adv.request_id.as_deref(),
                                 &request_id,
+                                accept_plain_resource,
                             ) {
                                 continue;
                             }
@@ -1928,7 +1954,10 @@ async fn wait_for_response(
                                     .is_none_or(|last| now - last >= PROGRESS_MIN_INTERVAL);
                                 if due && advertised_bytes > 0 {
                                     last_progress_emit = Some(now);
-                                    let _ = tx.send((bytes_received.min(advertised_bytes), advertised_bytes));
+                                    let _ = tx.send((
+                                        bytes_received.min(advertised_bytes),
+                                        advertised_bytes,
+                                    ));
                                 }
                             }
 
@@ -2027,7 +2056,8 @@ async fn wait_for_response(
                                     Ok((id, response_data)) => {
                                         if id == request_id {
                                             if let Some(tx) = progress {
-                                                let _ = tx.send((advertised_bytes, advertised_bytes));
+                                                let _ =
+                                                    tx.send((advertised_bytes, advertised_bytes));
                                             }
                                             return Ok(LinkResponse {
                                                 data: response_data,
@@ -2268,6 +2298,40 @@ mod tests {
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkProof);
     }
 
+    #[tokio::test]
+    async fn failed_session_establishment_deregisters_destination() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let prepared = LinkSession::prepare_on_transport(
+            transport_tx,
+            Identity::new(),
+            [0x44; 16],
+            [0x55; 64],
+            1,
+        );
+        let link_id = prepared.id();
+        let observer = tokio::spawn(async move {
+            let mut registered = 0;
+            let mut deregistered = 0;
+            while let Some(message) = transport_rx.recv().await {
+                match message {
+                    TransportMessage::RegisterDestination { hash, .. } if hash == link_id => {
+                        registered += 1;
+                    }
+                    TransportMessage::DeregisterDestination { hash } if hash == link_id => {
+                        deregistered += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (registered, deregistered)
+        });
+
+        let result = prepared.establish(Duration::from_millis(20)).await;
+        assert!(result.is_err());
+        assert_eq!(observer.await.unwrap(), (1, 1));
+    }
+
     #[test]
     fn prepared_session_exposes_link_id_without_transport_io() {
         let (transport_tx, mut transport_rx) = mpsc::channel(1);
@@ -2391,14 +2455,16 @@ mod tests {
         let theirs = [0x22u8; 16];
 
         // Enveloped response resources still must name our request.
-        assert!(resource_answers_request(true, Some(&ours), &ours));
-        assert!(!resource_answers_request(true, Some(&theirs), &ours));
-        assert!(!resource_answers_request(true, None, &ours));
+        assert!(resource_answers_request(true, Some(&ours), &ours, true));
+        assert!(!resource_answers_request(true, Some(&theirs), &ours, true));
+        assert!(!resource_answers_request(true, None, &ours, true));
 
-        // A plain resource carries no id and is taken as the answer.
-        assert!(resource_answers_request(false, None, &ours));
+        // A plain resource carries no id and is taken as the answer only by
+        // the one-shot query path, which closes its Link immediately after.
+        assert!(resource_answers_request(false, None, &ours, true));
+        assert!(!resource_answers_request(false, None, &ours, false));
         // ...but one that names a *different* request is not ours.
-        assert!(!resource_answers_request(false, Some(&theirs), &ours));
+        assert!(!resource_answers_request(false, Some(&theirs), &ours, true));
     }
 
     /// Every failed navigation used to leave a destination registered in the
@@ -2457,7 +2523,8 @@ mod tests {
         let (reg, dereg) = transport.await.unwrap();
         assert_eq!(reg, NAVIGATIONS, "expected one registration per navigation");
         assert_eq!(
-            dereg, reg,
+            dereg,
+            reg,
             "leaked {} destination registrations over {NAVIGATIONS} failed navigations",
             reg - dereg
         );

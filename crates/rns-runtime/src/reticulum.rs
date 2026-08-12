@@ -2742,8 +2742,10 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
         send_announce_try(&announce_tx, &announce_identity, app_name, None);
     });
 
+    let shutdown = handle.shutdown.clone();
     tokio::spawn(async move {
-        lm.run().await;
+        lm.run_until_shutdown(shutdown, std::time::Duration::from_secs(5))
+            .await;
     });
 
     send_announce_try(&handle.transport_tx, &identity, app_name, None);

@@ -173,7 +173,7 @@ impl ConfigSection {
     pub(crate) fn write_ini(&self, name: &str, depth: usize, out: &mut String) {
         let brackets = "[".repeat(depth);
         let close = "]".repeat(depth);
-        let needs_quote = name.contains(|c: char| c == '#' || c == '[' || c == ']');
+        let needs_quote = name.contains(['#', '[', ']']);
         if needs_quote {
             out.push_str(&format!("{}\"{}\"{}\n", brackets, name, close));
         } else {
@@ -429,7 +429,7 @@ impl Config {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                let needs_quote = section_name.contains(|c: char| c == '#' || c == '[' || c == ']');
+                let needs_quote = section_name.contains(['#', '[', ']']);
                 if needs_quote {
                     out.push_str(&format!("[\"{}\"]\n", section_name));
                 } else {

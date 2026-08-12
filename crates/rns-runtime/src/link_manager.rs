@@ -20,15 +20,11 @@ use rns_protocol::resource::{
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
-use rns_transport::messages::{OutboundRequest, TransportMessage};
+use rns_transport::messages::{OutboundRequest, TransportMessage, TransportQuery};
 
 /// Cadence of the housekeeping tick, and the longest the drain loop blocks
 /// between re-checking how much is still in flight.
 const TICK: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Beat after teardown so queued close packets reach the wire. These go out
-/// via `try_send`, so without it they are dropped along with the runtime.
-const TEARDOWN_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 struct ActiveLink {
     link: Link,
@@ -483,7 +479,8 @@ impl LinkManager {
             .values()
             .map(|link| {
                 link.outbound_resources.len()
-                    + link.outbound_split_queues
+                    + link
+                        .outbound_split_queues
                         .values()
                         .map(VecDeque::len)
                         .sum::<usize>()
@@ -491,35 +488,92 @@ impl LinkManager {
             .sum()
     }
 
+    /// All accepted Resource transfers that still need protocol traffic.
+    pub fn inflight_transfers(&self) -> usize {
+        self.inflight_outbound_transfers()
+            + self
+                .active_links
+                .values()
+                .map(|link| link.inbound_resources.len())
+                .sum::<usize>()
+    }
+
     /// Let in-flight transfers finish (up to `grace`), then tear every link
     /// down with an explicit close so peers don't wait out their timeouts.
     pub async fn drain_and_close(&mut self, grace: std::time::Duration) {
         let deadline = tokio::time::Instant::now() + grace;
-        while self.inflight_outbound_transfers() > 0 {
+        let mut tick_interval = tokio::time::interval(TICK);
+        // Consume interval's immediate first tick; subsequent ticks are paced.
+        tick_interval.tick().await;
+        while self.inflight_transfers() > 0 {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 tracing::warn!(
-                    inflight = self.inflight_outbound_transfers(),
+                    inflight = self.inflight_transfers(),
                     "drain grace expired with transfers still in flight"
                 );
                 break;
             }
-            match tokio::time::timeout(remaining.min(TICK), self.event_rx.recv()).await {
-                Ok(Some(event)) => self.handle_event(event),
-                Ok(None) => break,
-                Err(_) => self.tick(),
+            tokio::select! {
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(event) => self.handle_event(event),
+                        None => break,
+                    }
+                }
+                _ = tick_interval.tick() => self.tick(),
+                _ = tokio::time::sleep(remaining) => break,
             }
         }
 
         for link_id in self.active_links.keys().copied().collect::<Vec<_>>() {
-            self.close_active_link(link_id, CloseReason::DestinationClosed, true);
+            self.close_active_link_for_shutdown(link_id).await;
         }
 
-        // Teardown packets are queued on the transport with try_send; without
-        // a beat for the actor to drain its queue they die with the runtime
-        // and never reach the wire, which is the case this whole path exists
-        // to avoid.
-        tokio::time::sleep(TEARDOWN_FLUSH_GRACE).await;
+        // This RPC is a FIFO barrier on the transport actor's command queue:
+        // receiving its response proves that all preceding LinkClose and
+        // deregistration messages were processed by the actor.
+        let (barrier_tx, barrier_rx) = oneshot::channel();
+        if self
+            .transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::GetLinkCount,
+                response_tx: barrier_tx,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(TICK, barrier_rx).await;
+        }
+    }
+
+    async fn close_active_link_for_shutdown(&mut self, link_id: [u8; 16]) {
+        let Some(mut active) = self.active_links.remove(&link_id) else {
+            return;
+        };
+        if let Some(teardown_data) = active.link.teardown(CloseReason::DestinationClosed) {
+            let _ = self
+                .transport_tx
+                .send(TransportMessage::Outbound(OutboundRequest {
+                    raw: Self::build_link_close_packet(&link_id, &teardown_data),
+                    destination_hash: link_id,
+                }))
+                .await;
+        }
+        if let Some(ref callback) = active.link.link_closed_callback {
+            callback(&active.link);
+        }
+        self.backchannel_links.retain(|_, id| *id != link_id);
+        if let Ok(mut identities) = self.link_identities.lock() {
+            identities.remove(&link_id);
+        }
+        let _ = self
+            .transport_tx
+            .send(TransportMessage::DeregisterDestination { hash: link_id })
+            .await;
+        if let Some(ref tx) = self.link_closed_tx {
+            let _ = tx.try_send(link_id);
+        }
     }
 
     pub async fn run_with_commands(mut self, mut command_rx: mpsc::Receiver<LinkManagerCommand>) {
@@ -544,6 +598,40 @@ impl LinkManager {
 
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Run the event and command loops until shutdown, then finish accepted
+    /// Resource transfers up to `drain_grace` and explicitly close every Link.
+    pub async fn run_with_commands_until_shutdown(
+        mut self,
+        mut command_rx: mpsc::Receiver<LinkManagerCommand>,
+        shutdown: crate::lifecycle::ShutdownSignal,
+        drain_grace: std::time::Duration,
+    ) {
+        let mut tick_interval = tokio::time::interval(TICK);
+        loop {
+            tokio::select! {
+                command = command_rx.recv() => {
+                    match command {
+                        Some(command) => {
+                            if !self.handle_command(command) {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(event) => self.handle_event(event),
+                        None => return,
+                    }
+                }
+                _ = tick_interval.tick() => self.tick(),
+                _ = shutdown.wait() => break,
+            }
+        }
+        self.drain_and_close(drain_grace).await;
     }
 
     fn handle_command(&mut self, command: LinkManagerCommand) -> bool {
@@ -1901,7 +1989,10 @@ impl LinkManager {
                                 metadata,
                                 auto_compress,
                             );
-                            if self.start_resource_transfer_inner(&link_id, start).is_none() {
+                            if self
+                                .start_resource_transfer_inner(&link_id, start)
+                                .is_none()
+                            {
                                 tracing::warn!(
                                     link_id = hex::encode(link_id),
                                     "link request resource response could not be started"
@@ -2245,6 +2336,14 @@ impl LinkManager {
         link_id: &[u8; 16],
         teardown_data: &[u8],
     ) {
+        let raw = Self::build_link_close_packet(link_id, teardown_data);
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw,
+            destination_hash: *link_id,
+        }));
+    }
+
+    fn build_link_close_packet(link_id: &[u8; 16], teardown_data: &[u8]) -> Bytes {
         let td_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
                 header_type: rns_wire::flags::HeaderType::Header1,
@@ -2260,10 +2359,7 @@ impl LinkManager {
         };
         let mut td_raw = td_header.pack();
         td_raw.extend_from_slice(teardown_data);
-        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(td_raw),
-            destination_hash: *link_id,
-        }));
+        Bytes::from(td_raw)
     }
 
     fn send_keepalive_packet(transport_tx: &mpsc::Sender<TransportMessage>, link_id: &[u8; 16]) {
@@ -3184,8 +3280,7 @@ mod tests {
         let start = fetch_spec_transfer_start(request_id, b"page bytes".to_vec(), None, false);
 
         assert_ne!(
-            start.data,
-            b"page bytes",
+            start.data, b"page bytes",
             "page response must not be sent raw"
         );
         let mut link = Link::new_responder(

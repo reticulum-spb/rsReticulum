@@ -32,10 +32,20 @@ impl ShutdownSignal {
     }
 
     pub async fn wait(&self) {
-        if self.is_triggered() {
-            return;
+        loop {
+            // Register before observing the flag. If trigger() runs between
+            // these two operations, this Notified is already a waiter; if it
+            // ran earlier, the flag makes us return without awaiting it.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if self.is_triggered() {
+                return;
+            }
+            notified.await;
+            if self.is_triggered() {
+                return;
+            }
         }
-        self.notify.notified().await;
     }
 }
 
@@ -93,7 +103,7 @@ pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
     {
         use tokio::signal::unix::SignalKind;
 
-        let mut registered = false;
+        let mut sigint_registered = false;
         for (name, kind) in [
             ("SIGINT", SignalKind::interrupt()),
             ("SIGTERM", SignalKind::terminate()),
@@ -108,12 +118,14 @@ pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
                         sig.recv().await;
                         signal_shutdown(shutdown, tx).await;
                     });
-                    registered = true;
+                    if name == "SIGINT" {
+                        sigint_registered = true;
+                    }
                 }
                 Err(e) => tracing::warn!(signal = name, error = %e, "signal registration failed"),
             }
         }
-        if !registered {
+        if !sigint_registered {
             spawn_ctrl_c_handler(shutdown, tx);
         }
     }
@@ -151,11 +163,13 @@ mod tests {
         let shutdown = ShutdownSignal::new();
         let mut rx = install_signal_handlers(shutdown.clone());
 
-        assert!(std::process::Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
-            .expect("kill")
-            .success());
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &std::process::id().to_string()])
+                .status()
+                .expect("kill")
+                .success()
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
@@ -211,5 +225,14 @@ mod tests {
 
         signal.wait().await;
         assert!(signal.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_returns_when_triggered_before_registration() {
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        tokio::time::timeout(std::time::Duration::from_millis(100), signal.wait())
+            .await
+            .expect("pre-triggered shutdown must be retained");
     }
 }
