@@ -25,6 +25,7 @@ pub fn init_tracing<W>(level: tracing::Level, timestamps: bool, ansi: bool, writ
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
+    #[cfg_attr(not(feature = "api"), allow(unused_imports))]
     use tracing_subscriber::prelude::*;
 
     let builder = tracing_subscriber::fmt()
