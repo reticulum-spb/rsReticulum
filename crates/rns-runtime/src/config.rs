@@ -4,6 +4,7 @@
 //! `True`/`Yes`/`On`/`1`.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 
@@ -106,6 +107,15 @@ impl ConfigSection {
 
     pub fn set_list(&mut self, key: &str, value: Vec<String>) {
         self.set_value(key.to_string(), ConfigValue::List(value));
+    }
+
+    pub fn remove(&mut self, key: &str) -> bool {
+        if self.values.remove(key).is_some() {
+            self.value_order.retain(|name| name != key);
+            true
+        } else {
+            false
+        }
     }
 
     fn set_value(&mut self, key: String, value: ConfigValue) {
@@ -238,7 +248,11 @@ impl Config {
     /// following. Security policy for config paths must be enforced by callers.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let mut config = Self::parse(&content)?;
+        Self::from_loaded_str(&content, path)
+    }
+
+    pub(crate) fn from_loaded_str(input: &str, path: &Path) -> Result<Self, ConfigError> {
+        let mut config = Self::parse(input)?;
         config.prepare_loaded_reticulum_config(path)?;
         Ok(config)
     }
@@ -465,8 +479,7 @@ impl Config {
     /// Write the config back to a file.
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         let content = self.to_ini();
-        std::fs::write(path, content)?;
-        Ok(())
+        atomic_write(path, content.as_bytes())
     }
 
     fn prepare_loaded_reticulum_config(&mut self, _config_path: &Path) -> Result<(), ConfigError> {
@@ -488,6 +501,78 @@ impl Config {
         }
         self.sections.get_mut("").unwrap()
     }
+}
+
+/// Replace a file atomically by writing and syncing a temporary file in the
+/// same directory before renaming it over the destination.
+///
+/// Direct symlinks are resolved first so saving a config preserves the symlink
+/// instead of replacing it.
+pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no parent directory",
+        )
+    })?;
+    let file_name = target.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no file name",
+        )
+    })?;
+
+    let original_permissions = std::fs::metadata(&target)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let mut last_collision = None;
+
+    for attempt in 0..32_u8 {
+        let temporary = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            attempt
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let result = (|| -> Result<(), std::io::Error> {
+            if let Some(permissions) = original_permissions.clone() {
+                file.set_permissions(permissions)?;
+            }
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &target)?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        return result.map_err(ConfigError::from);
+    }
+
+    Err(last_collision
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "temporary file"))
+        .into())
 }
 
 fn section_for_path_mut<'a>(
@@ -1045,13 +1130,54 @@ type = UDPInterface
         std::fs::write(&target, "[reticulum]\nshare_instance = No\n").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let config = Config::from_file(&link).unwrap();
+        let mut config = Config::from_file(&link).unwrap();
         assert_eq!(
             config
                 .section("reticulum")
                 .and_then(|section| section.get_bool("share_instance")),
             Some(false)
         );
+
+        config
+            .section_mut("reticulum")
+            .unwrap()
+            .set("share_instance", "Yes");
+        config.save_to(&link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("share_instance = Yes")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_save_to_atomically_replaces_config_without_temp_files() {
+        let dir = unique_test_dir("atomic-save");
+        let path = dir.join("config");
+        std::fs::write(&path, "[reticulum]\nshare_instance = No\n").unwrap();
+        let mut config = Config::from_file(&path).unwrap();
+        config
+            .section_mut("reticulum")
+            .unwrap()
+            .set("share_instance", "Yes");
+
+        config.save_to(&path).unwrap();
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("share_instance = Yes")
+        );
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(entries.len(), 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

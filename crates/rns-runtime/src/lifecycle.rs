@@ -2,7 +2,7 @@
 //! allowing them to detach interfaces and flush state cleanly before exit.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct ShutdownSignal {
     flag: Arc<AtomicBool>,
+    exit_code: Arc<AtomicU8>,
     notify: Arc<tokio::sync::Notify>,
 }
 
@@ -17,6 +18,7 @@ impl ShutdownSignal {
     pub fn new() -> Self {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
+            exit_code: Arc::new(AtomicU8::new(0)),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -26,6 +28,16 @@ impl ShutdownSignal {
             tracing::debug!("shutdown triggered, notifying waiters");
         }
         self.notify.notify_waiters();
+    }
+
+    pub fn request_exit(&self, code: u8) -> bool {
+        self.exit_code
+            .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        self.exit_code.load(Ordering::SeqCst)
     }
 
     pub fn is_triggered(&self) -> bool {
@@ -297,6 +309,16 @@ mod tests {
         let clone = signal.clone();
         signal.trigger();
         assert!(clone.is_triggered());
+    }
+
+    #[test]
+    fn exit_request_is_shared_and_only_accepted_once() {
+        let signal = ShutdownSignal::new();
+        let clone = signal.clone();
+        assert!(signal.request_exit(100));
+        assert!(!clone.request_exit(101));
+        assert_eq!(clone.exit_code(), 100);
+        assert!(!signal.is_triggered());
     }
 
     #[test]

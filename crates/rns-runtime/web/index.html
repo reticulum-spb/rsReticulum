@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>rsReticulum</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <button class="mobile-menu" id="mobile-menu" type="button"
+              aria-label="Open navigation" aria-expanded="false"
+              aria-controls="sidebar">☰</button>
+      <a class="brand" href="#dashboard" aria-label="rsReticulum dashboard">
+        <span class="brand-mark">R</span>
+        <span>rsReticulum</span>
+      </a>
+      <div class="daemon-pill" id="daemon-pill" data-state="loading"
+           role="status" aria-live="polite">
+        <span class="status-dot"></span>
+        <span id="daemon-label">Connecting…</span>
+      </div>
+    </header>
+
+    <aside class="sidebar" id="sidebar">
+      <nav aria-label="Main navigation">
+        <button class="nav-item active" type="button" data-view="dashboard">
+          <span class="nav-icon" aria-hidden="true">◫</span>
+          <span>Dashboard</span>
+        </button>
+        <button class="nav-item" type="button" data-view="interfaces">
+          <span class="nav-icon" aria-hidden="true">≋</span>
+          <span>Interfaces</span>
+        </button>
+        <button class="nav-item" type="button" data-view="paths">
+          <span class="nav-icon" aria-hidden="true">⌁</span>
+          <span>Paths</span>
+        </button>
+        <button class="nav-item" type="button" data-view="settings">
+          <span class="nav-icon" aria-hidden="true">⚙</span>
+          <span>Settings</span>
+        </button>
+        <button class="nav-item" type="button" data-view="logs">
+          <span class="nav-icon" aria-hidden="true">≡</span>
+          <span>Logs</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="eyebrow">Shared instance</span>
+        <span class="muted">rnsd-rs control plane</span>
+        <button class="secondary" id="logout" type="button">Sign out</button>
+      </div>
+    </aside>
+
+    <main id="main-content" tabindex="-1">
+      <div class="notice error-notice" id="global-error" role="alert" hidden>
+        <span id="global-error-text"></span>
+        <button type="button" id="dismiss-error" aria-label="Dismiss error">×</button>
+      </div>
+
+      <section class="view active" id="view-dashboard" data-view-panel="dashboard">
+        <div class="page-heading">
+          <button class="secondary refresh-button" type="button" data-refresh>
+            <span aria-hidden="true">↻</span> Refresh
+          </button>
+        </div>
+
+        <div class="metric-grid" aria-label="Runtime metrics" aria-live="polite">
+          <article class="metric">
+            <span>Interfaces</span>
+            <strong id="metric-interfaces">—</strong>
+            <small id="metric-online">Waiting for status</small>
+          </article>
+          <article class="metric">
+            <span>Received</span>
+            <strong id="metric-rx">—</strong>
+            <small>Total traffic</small>
+          </article>
+          <article class="metric">
+            <span>Transmitted</span>
+            <strong id="metric-tx">—</strong>
+            <small>Total traffic</small>
+          </article>
+          <article class="metric">
+            <span>Active links</span>
+            <strong id="metric-links">—</strong>
+            <small>Established sessions</small>
+          </article>
+        </div>
+
+        <section class="card runtime-card">
+          <div>
+            <span class="eyebrow">Runtime status</span>
+            <h2 id="runtime-heading">Connecting to rnsd-rs</h2>
+            <p id="runtime-detail">Checking the embedded REST API.</p>
+          </div>
+          <span class="badge" id="runtime-badge" data-state="loading">Checking</span>
+        </section>
+      </section>
+
+      <section class="view" id="view-interfaces" data-view-panel="interfaces" hidden>
+        <div class="page-heading">
+          <div class="heading-actions">
+            <button class="secondary refresh-button" type="button" data-refresh>
+              <span aria-hidden="true">↻</span> Refresh
+            </button>
+            <button class="primary" id="add-interface" type="button">Add interface</button>
+          </div>
+        </div>
+
+        <section class="table-card">
+          <div class="table-toolbar">
+            <label class="search-field">
+              <span class="sr-only">Search interfaces</span>
+              <input type="search" id="interface-search" placeholder="Search interfaces" disabled>
+            </label>
+            <div class="table-toolbar-meta">
+              <label class="toggle-field">
+                <input type="checkbox" id="show-all-interfaces">
+                <span>Show internal</span>
+              </label>
+              <span class="muted" id="interface-count">Not loaded</span>
+            </div>
+          </div>
+          <div class="table-scroll" tabindex="0" role="region"
+               aria-label="Scrollable interface table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Interface</th>
+                  <th>Status</th>
+                  <th>Mode / role</th>
+                  <th>Traffic</th>
+                  <th>Rate</th>
+                  <th><span class="sr-only">Details</span></th>
+                </tr>
+              </thead>
+              <tbody id="interface-rows"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="interfaces-empty">
+            <span class="empty-icon" aria-hidden="true">≋</span>
+            <strong id="interfaces-empty-heading">Loading interfaces…</strong>
+            <span id="interfaces-empty-detail">Waiting for runtime data.</span>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-paths" data-view-panel="paths" hidden>
+        <div class="page-heading">
+          <button class="secondary refresh-button" type="button" data-refresh>
+            <span aria-hidden="true">↻</span> Refresh
+          </button>
+        </div>
+
+        <section class="table-card paths-table-card">
+          <div class="table-toolbar">
+            <label class="search-field">
+              <span class="sr-only">Search paths</span>
+              <input type="search" id="path-search"
+                     placeholder="Search address or interface name" disabled>
+            </label>
+            <div class="table-toolbar-meta">
+              <label class="compact-field">Max hops
+                <input id="max-hops" type="number" min="1" max="255"
+                       step="1" placeholder="Any">
+              </label>
+              <span class="muted" id="path-count">Not loaded</span>
+            </div>
+          </div>
+          <div class="table-scroll path-table-scroll" tabindex="0"
+               role="region" aria-label="Scrollable path table">
+            <table>
+              <thead>
+                <tr>
+                  <th>Destination</th>
+                  <th>Hops</th>
+                  <th>Interface</th>
+                  <th>Via</th>
+                  <th>Learned</th>
+                  <th>Expires</th>
+                </tr>
+              </thead>
+              <tbody id="path-rows"></tbody>
+            </table>
+            <div class="empty" id="paths-empty">
+              <span class="empty-icon" aria-hidden="true">⌁</span>
+              <strong>Path data is not loaded yet</strong>
+              <span>The route table will be connected in a later implementation block.</span>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-settings" data-view-panel="settings" hidden>
+        <form id="settings-form">
+          <div class="page-heading">
+            <div class="heading-actions">
+              <button class="secondary" id="reload-settings" type="button">Reload</button>
+              <button class="primary" id="save-settings" type="submit">Save settings</button>
+            </div>
+          </div>
+          <div class="notice" id="settings-restart" hidden>Configuration saved. Restart rnsd-rs to apply these settings.</div>
+          <section class="card"><fieldset class="form-grid">
+            <legend>Shared instance</legend>
+            <label>Instance name<input id="setting-instance-name" required></label>
+            <label>Connection type<select id="setting-shared-type"><option value="unix">Unix</option><option value="tcp">TCP</option></select></label>
+            <label>Shared port<input id="setting-shared-port" type="number" min="1" max="65535" required></label>
+            <label>Control port<input id="setting-control-port" type="number" min="1" max="65535" required></label>
+            <label>Web API port<input id="setting-api-port" type="number" min="1" max="65535" required></label>
+            <label>Web API user<input id="setting-api-user" autocomplete="username" required></label>
+            <label class="wide">New Web API password <span class="optional">leave empty to keep current</span>
+              <input id="setting-api-password" type="password" autocomplete="new-password">
+            </label>
+            <label class="check-field"><input id="setting-share-instance" type="checkbox"><span>Share instance</span></label>
+            <label class="check-field"><input id="setting-enable-transport" type="checkbox"><span>Enable transport</span></label>
+            <label class="check-field"><input id="setting-static-identity" type="checkbox"><span>Static transport identity</span></label>
+            <label class="check-field"><input id="setting-local-hops-delta" type="checkbox"><span>Local hops delta</span></label>
+          </fieldset></section>
+          <section class="card"><fieldset class="form-grid">
+            <legend>Protocol</legend>
+            <label>Forced bitrate <span class="optional">optional</span><input id="setting-force-bitrate" type="number" min="1"></label>
+            <label>Default announce target <span class="optional">optional</span><input id="setting-ar-target" type="number" min="1"></label>
+            <label>Announce grace <span class="optional">optional</span><input id="setting-ar-grace" type="number" min="0"></label>
+            <label>Announce penalty <span class="optional">optional</span><input id="setting-ar-penalty" type="number" min="0"></label>
+            <label class="check-field"><input id="setting-probes" type="checkbox"><span>Respond to probes</span></label>
+            <label class="check-field"><input id="setting-implicit-proof" type="checkbox"><span>Implicit proofs</span></label>
+            <label class="check-field"><input id="setting-panic-interface" type="checkbox"><span>Stop on interface error</span></label>
+            <label class="check-field"><input id="setting-mtu-discovery" type="checkbox"><span>Link MTU discovery</span></label>
+          </fieldset></section>
+          <section class="card"><fieldset class="form-grid">
+            <legend>Discovery and logging</legend>
+            <label>Autoconnect limit<input id="setting-autoconnect" type="number" min="0" required></label>
+            <label>Required discovery value<input id="setting-discovery-value" type="number" min="0" max="255" required></label>
+            <label>Log level<select id="setting-loglevel"><option value="0">Critical</option><option value="1">Error</option><option value="2">Warning</option><option value="3">Notice</option><option value="4">Info</option><option value="5">Verbose</option><option value="6">Debug</option><option value="7">Extreme</option></select></label>
+            <label class="check-field"><input id="setting-discovery" type="checkbox"><span>Discover interfaces</span></label>
+            <label class="check-field"><input id="setting-logtimestamps" type="checkbox"><span>Log timestamps</span></label>
+          </fieldset></section>
+          <section class="card system-actions">
+            <strong>System actions</strong>
+            <div class="heading-actions">
+              <button class="secondary" id="restart-daemon" type="button">Restart daemon</button>
+              <button class="danger-button" id="reboot-system" type="button">Reboot system</button>
+            </div>
+          </section>
+          <p class="form-error" id="settings-error" role="alert"></p>
+        </form>
+      </section>
+
+      <section class="view" id="view-logs" data-view-panel="logs" hidden>
+        <div class="page-heading">
+          <div class="heading-actions">
+            <button class="secondary" id="logs-pause" type="button">Pause</button>
+            <button class="secondary" id="logs-clear" type="button">Clear screen</button>
+          </div>
+        </div>
+        <section class="table-card">
+          <div class="table-toolbar">
+            <label class="search-field"><span class="sr-only">Filter logs</span>
+              <input id="logs-search" type="search" placeholder="Filter logs">
+            </label>
+            <div class="table-toolbar-meta">
+              <label class="compact-field">Level
+                <select id="logs-level">
+                  <option value="trace">Trace</option>
+                  <option value="debug">Debug</option>
+                  <option value="info" selected>Info</option>
+                  <option value="warn">Warning</option>
+                  <option value="error">Error</option>
+                </select>
+              </label>
+              <label class="toggle-field"><input id="logs-autoscroll" type="checkbox" checked><span>Autoscroll</span></label>
+              <span class="muted" id="logs-count">0 entries</span>
+            </div>
+          </div>
+          <div class="log-output" id="log-output" tabindex="0" aria-live="polite"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="login-dialog">
+    <form id="login-form">
+      <div class="dialog-heading"><div><span class="eyebrow">Authentication</span><h2>Sign in</h2></div></div>
+      <div class="form-grid">
+        <label class="wide">User<input id="login-user" autocomplete="username" required autofocus></label>
+        <label class="wide">Password<input id="login-password" type="password" autocomplete="current-password" required></label>
+      </div>
+      <p class="form-error" id="login-error" role="alert"></p>
+      <div class="dialog-actions"><button class="primary" id="login-submit" type="submit">Sign in</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="interface-dialog">
+    <form id="interface-form">
+      <div class="dialog-heading">
+        <div>
+          <span class="eyebrow">Configuration</span>
+          <h2 id="interface-dialog-title">Add interface</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-interface
+                aria-label="Close dialog">×</button>
+      </div>
+      <input type="hidden" id="interface-id">
+      <input type="hidden" id="interface-original-name">
+
+      <div class="form-grid">
+        <label class="wide">Name
+          <input id="interface-name" maxlength="128" autocomplete="off" required>
+        </label>
+        <label>Type
+          <select id="interface-type">
+            <option value="TCPClientInterface">TCP Client</option>
+            <option value="TCPServerInterface">TCP Server</option>
+            <option value="UDPInterface">UDP</option>
+            <option value="AutoInterface">Auto</option>
+            <option value="BackboneInterface">Backbone</option>
+            <option value="SerialInterface">Serial</option>
+            <option value="KISSInterface">KISS</option>
+            <option value="RNodeInterface">RNode</option>
+            <option value="AX25KISSInterface">AX.25 KISS</option>
+          </select>
+        </label>
+        <label>Mode
+          <select id="interface-mode">
+            <option value="Full">Full</option>
+            <option value="PointToPoint">Point to point</option>
+            <option value="AccessPoint">Access point</option>
+            <option value="Roaming">Roaming</option>
+            <option value="Boundary">Boundary</option>
+            <option value="Gateway">Gateway</option>
+          </select>
+        </label>
+        <label class="check-field wide">
+          <input type="checkbox" id="interface-enabled" checked>
+          <span>Enabled</span>
+        </label>
+      </div>
+
+      <fieldset class="form-grid" id="tcp-client-fields">
+        <legend>TCP client</legend>
+        <label class="wide">Target host
+          <input id="target-host" autocomplete="off" required>
+        </label>
+        <label>Target port
+          <input id="target-port" type="number" min="1" max="65535" required>
+        </label>
+        <label>Connect timeout
+          <input id="connect-timeout" type="number" min="1" step="1" placeholder="5">
+        </label>
+        <label>Reconnect limit <span class="optional">optional</span>
+          <input id="max-reconnect-tries" type="number" min="0" step="1"
+                 placeholder="Unlimited">
+        </label>
+        <label>Fixed MTU <span class="optional">optional</span>
+          <input id="fixed-mtu" type="number" min="500" step="1">
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="tcp-server-fields" hidden disabled>
+        <legend>TCP server</legend>
+        <label class="wide">Listen address
+          <input id="listen-ip" autocomplete="off" value="0.0.0.0" required>
+        </label>
+        <label>Listen port
+          <input id="listen-port" type="number" min="1" max="65535" required>
+        </label>
+        <label>Device <span class="optional">optional</span>
+          <input id="interface-device" autocomplete="off">
+        </label>
+        <label class="check-field">
+          <input id="prefer-ipv6" type="checkbox">
+          <span>Prefer IPv6</span>
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="udp-fields" hidden disabled>
+        <legend>UDP</legend>
+        <label>Listen address <span class="optional">optional</span>
+          <input id="udp-listen-ip" autocomplete="off" placeholder="0.0.0.0">
+        </label>
+        <label>Listen port <span class="optional">optional</span>
+          <input id="udp-listen-port" type="number" min="1" max="65535">
+        </label>
+        <label>Forward address <span class="optional">optional</span>
+          <input id="udp-forward-ip" autocomplete="off" placeholder="255.255.255.255">
+        </label>
+        <label>Forward port <span class="optional">optional</span>
+          <input id="udp-forward-port" type="number" min="1" max="65535">
+        </label>
+        <label class="wide">Device <span class="optional">optional</span>
+          <input id="udp-device" autocomplete="off">
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="auto-fields" hidden disabled>
+        <legend>Auto</legend>
+        <label class="wide">Group ID
+          <input id="auto-group-id" autocomplete="off" value="reticulum" required>
+        </label>
+        <label>Discovery scope
+          <select id="auto-discovery-scope">
+            <option value="link">Link</option>
+            <option value="admin">Admin</option>
+            <option value="site">Site</option>
+            <option value="organisation">Organisation</option>
+            <option value="global">Global</option>
+          </select>
+        </label>
+        <label>Multicast address
+          <select id="auto-multicast-address-type">
+            <option value="temporary">Temporary</option>
+            <option value="permanent">Permanent</option>
+          </select>
+        </label>
+        <label>Discovery port
+          <input id="auto-discovery-port" type="number" min="1" max="65535"
+                 step="1" value="29716" required>
+        </label>
+        <label>Data port
+          <input id="auto-data-port" type="number" min="1" max="65535"
+                 step="1" value="42671" required>
+        </label>
+        <label class="wide">Devices <span class="optional">optional, comma-separated</span>
+          <input id="auto-devices" autocomplete="off" placeholder="eth0, wlan0">
+        </label>
+        <label class="wide">Ignored devices <span class="optional">optional, comma-separated</span>
+          <input id="auto-ignored-devices" autocomplete="off" placeholder="docker0, veth0">
+        </label>
+        <label class="wide">Configured bitrate, bit/s <span class="optional">optional</span>
+          <input id="auto-configured-bitrate" type="number" min="1" step="1"
+                 placeholder="10000000">
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="backbone-fields" hidden disabled>
+        <legend>Backbone</legend>
+        <label>Role
+          <select id="backbone-role">
+            <option value="listener">Listener</option>
+            <option value="client">Client</option>
+          </select>
+        </label>
+        <label>Port
+          <input id="backbone-port" type="number" min="1" max="65535" required>
+        </label>
+        <label class="wide" id="backbone-target-field" hidden>Target host
+          <input id="backbone-target-host" autocomplete="off">
+        </label>
+        <label class="wide" id="backbone-listen-field">Listen address <span class="optional">optional</span>
+          <input id="backbone-listen-on" autocomplete="off" placeholder="0.0.0.0">
+        </label>
+        <label>Device <span class="optional">optional</span>
+          <input id="backbone-device" autocomplete="off">
+        </label>
+        <label>Connect timeout
+          <input id="backbone-connect-timeout" type="number" min="1" step="1" value="5">
+        </label>
+        <label>Reconnect limit <span class="optional">optional</span>
+          <input id="backbone-reconnect-limit" type="number" min="0" step="1">
+        </label>
+        <label class="check-field"><input id="backbone-prefer-ipv6" type="checkbox"><span>Prefer IPv6</span></label>
+        <label class="check-field"><input id="backbone-i2p-tunneled" type="checkbox"><span>I2P tunneled</span></label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="serial-fields" hidden disabled>
+        <legend>Serial</legend>
+        <label class="wide">Port
+          <input id="serial-port" autocomplete="off" placeholder="/dev/ttyUSB0" required>
+        </label>
+        <label>Speed
+          <select id="serial-speed">
+            <option value="1200">1,200</option>
+            <option value="2400">2,400</option>
+            <option value="4800">4,800</option>
+            <option value="9600" selected>9,600</option>
+            <option value="19200">19,200</option>
+            <option value="38400">38,400</option>
+            <option value="57600">57,600</option>
+            <option value="115200">115,200</option>
+            <option value="230400">230,400</option>
+            <option value="460800">460,800</option>
+            <option value="921600">921,600</option>
+          </select>
+        </label>
+        <label>Data bits
+          <select id="serial-databits">
+            <option value="8">8</option>
+            <option value="7">7</option>
+            <option value="6">6</option>
+            <option value="5">5</option>
+          </select>
+        </label>
+        <label>Parity
+          <select id="serial-parity">
+            <option value="N">None</option>
+            <option value="E">Even</option>
+            <option value="O">Odd</option>
+          </select>
+        </label>
+        <label>Stop bits
+          <select id="serial-stopbits">
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="kiss-fields" hidden disabled>
+        <legend>KISS</legend>
+        <label class="wide">Port
+          <input id="kiss-port" autocomplete="off"
+                 placeholder="/dev/ttyUSB0 or tcp://host:port" required>
+        </label>
+        <label>Speed
+          <select id="kiss-speed">
+            <option value="1200">1,200</option>
+            <option value="2400">2,400</option>
+            <option value="4800">4,800</option>
+            <option value="9600" selected>9,600</option>
+            <option value="19200">19,200</option>
+            <option value="38400">38,400</option>
+            <option value="57600">57,600</option>
+            <option value="115200">115,200</option>
+            <option value="230400">230,400</option>
+            <option value="460800">460,800</option>
+            <option value="921600">921,600</option>
+          </select>
+        </label>
+        <label>Data bits
+          <select id="kiss-databits">
+            <option value="8">8</option>
+            <option value="7">7</option>
+            <option value="6">6</option>
+            <option value="5">5</option>
+          </select>
+        </label>
+        <label>Parity
+          <select id="kiss-parity">
+            <option value="N">None</option>
+            <option value="E">Even</option>
+            <option value="O">Odd</option>
+          </select>
+        </label>
+        <label>Stop bits
+          <select id="kiss-stopbits">
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+        </label>
+        <label>Preamble, ms
+          <input id="kiss-preamble" type="number" min="0" step="1" value="350">
+        </label>
+        <label>TX tail, ms
+          <input id="kiss-txtail" type="number" min="0" step="1" value="20">
+        </label>
+        <label>Persistence
+          <input id="kiss-persistence" type="number" min="0" max="255" step="1" value="64">
+        </label>
+        <label>Slot time, ms
+          <input id="kiss-slottime" type="number" min="0" step="1" value="20">
+        </label>
+        <label class="check-field wide">
+          <input id="kiss-flow-control" type="checkbox">
+          <span>Flow control</span>
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="rnode-fields" hidden disabled>
+        <legend>RNode</legend>
+        <label class="wide">Port
+          <input id="rnode-port" autocomplete="off"
+                 placeholder="/dev/ttyUSB0 or tcp://host:7633" required>
+        </label>
+        <label>Frequency, Hz
+          <input id="rnode-frequency" type="number" min="1" max="4294967295"
+                 step="1" required>
+        </label>
+        <label>Bandwidth, Hz
+          <select id="rnode-bandwidth">
+            <option value="7800">7,800</option>
+            <option value="10400">10,400</option>
+            <option value="15600">15,600</option>
+            <option value="20800">20,800</option>
+            <option value="31250">31,250</option>
+            <option value="41700">41,700</option>
+            <option value="62500">62,500</option>
+            <option value="125000" selected>125,000</option>
+            <option value="250000">250,000</option>
+            <option value="500000">500,000</option>
+            <option value="1625000">1,625,000</option>
+          </select>
+        </label>
+        <label>Spreading factor
+          <select id="rnode-spreading-factor">
+            <option value="7">7</option>
+            <option value="8" selected>8</option>
+            <option value="9">9</option>
+            <option value="10">10</option>
+            <option value="11">11</option>
+            <option value="12">12</option>
+          </select>
+        </label>
+        <label>Coding rate
+          <select id="rnode-coding-rate">
+            <option value="5">4:5</option>
+            <option value="6">4:6</option>
+            <option value="7">4:7</option>
+            <option value="8">4:8</option>
+          </select>
+        </label>
+        <label>TX power, dBm
+          <input id="rnode-tx-power" type="number" min="0" max="37"
+                 step="1" value="7" required>
+        </label>
+        <label>Short airtime limit, % <span class="optional">optional</span>
+          <input id="rnode-airtime-short" type="number" min="0" max="100"
+                 step="any">
+        </label>
+        <label>Long airtime limit, % <span class="optional">optional</span>
+          <input id="rnode-airtime-long" type="number" min="0" max="100"
+                 step="any">
+        </label>
+        <label class="check-field wide">
+          <input id="rnode-flow-control" type="checkbox">
+          <span>Flow control</span>
+        </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="ax25-fields" hidden disabled>
+        <legend>AX.25 KISS</legend>
+        <label class="wide">Port
+          <input id="ax25-port" autocomplete="off" placeholder="/dev/ttyUSB0" required>
+        </label>
+        <label>Callsign
+          <input id="ax25-callsign" autocomplete="off" placeholder="N0CALL"
+                 minlength="3" maxlength="6" pattern="[A-Za-z0-9]{3,6}"
+                 title="3 to 6 ASCII letters or digits" required>
+        </label>
+        <label>SSID
+          <input id="ax25-ssid" type="number" min="0" max="15" step="1"
+                 value="0" required>
+        </label>
+        <label>Speed
+          <select id="ax25-speed">
+            <option value="1200">1,200</option>
+            <option value="2400">2,400</option>
+            <option value="4800">4,800</option>
+            <option value="9600" selected>9,600</option>
+            <option value="19200">19,200</option>
+            <option value="38400">38,400</option>
+            <option value="57600">57,600</option>
+            <option value="115200">115,200</option>
+            <option value="230400">230,400</option>
+            <option value="460800">460,800</option>
+            <option value="921600">921,600</option>
+          </select>
+        </label>
+        <label>Data bits
+          <select id="ax25-databits">
+            <option value="8">8</option>
+            <option value="7">7</option>
+            <option value="6">6</option>
+            <option value="5">5</option>
+          </select>
+        </label>
+        <label>Parity
+          <select id="ax25-parity">
+            <option value="N">None</option>
+            <option value="E">Even</option>
+            <option value="O">Odd</option>
+          </select>
+        </label>
+        <label>Stop bits
+          <select id="ax25-stopbits">
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+        </label>
+        <label>Preamble, ms
+          <input id="ax25-preamble" type="number" min="0" step="1" value="350">
+        </label>
+        <label>TX tail, ms
+          <input id="ax25-txtail" type="number" min="0" step="1" value="20">
+        </label>
+        <label>Persistence
+          <input id="ax25-persistence" type="number" min="0" max="255"
+                 step="1" value="64">
+        </label>
+        <label>Slot time, ms
+          <input id="ax25-slottime" type="number" min="0" step="1" value="20">
+        </label>
+        <label class="check-field wide">
+          <input id="ax25-flow-control" type="checkbox">
+          <span>Flow control</span>
+        </label>
+      </fieldset>
+
+      <label class="check-field" id="kiss-framing-field">
+        <input id="kiss-framing" type="checkbox">
+        <span>Use KISS framing</span>
+      </label>
+
+      <p class="form-error" id="interface-form-error" role="alert"></p>
+      <p class="form-status" id="interface-form-status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button class="secondary" id="open-interface-advanced" type="button">Advanced</button>
+        <span class="dialog-actions-spacer"></span>
+        <button class="secondary" type="button" data-close-interface>Cancel</button>
+        <button class="primary" id="save-interface" type="submit">Add interface</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="interface-advanced-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">Interface</span><h2>Advanced settings</h2></div>
+        <button class="icon-button" value="done" aria-label="Close dialog">×</button>
+      </div>
+      <fieldset class="form-grid">
+        <legend>General</legend>
+        <label>Bitrate, bit/s <span class="optional">optional</span>
+          <input id="advanced-bitrate" type="number" min="1" step="1">
+        </label>
+        <label>Announce cap, % <span class="optional">optional</span>
+          <input id="advanced-announce-cap" type="number" min="0" max="100" step="any">
+        </label>
+        <label>Rate target <span class="optional">optional</span>
+          <input id="advanced-rate-target" type="number" min="0" step="1">
+        </label>
+        <label>Rate grace <span class="optional">optional</span>
+          <input id="advanced-rate-grace" type="number" min="0" step="1">
+        </label>
+        <label>Rate penalty <span class="optional">optional</span>
+          <input id="advanced-rate-penalty" type="number" min="0" step="1">
+        </label>
+        <label class="check-field"><input id="advanced-outgoing" type="checkbox" checked><span>Outgoing</span></label>
+        <label class="check-field"><input id="advanced-recursive-prs" type="checkbox"><span>Recursive path requests</span></label>
+        <label class="check-field"><input id="advanced-announces-internal" type="checkbox" checked><span>Announces from internal</span></label>
+      </fieldset>
+      <fieldset class="form-grid">
+        <legend>IFAC</legend>
+        <label>Network name <span class="optional">optional</span>
+          <input id="advanced-network-name" autocomplete="off">
+        </label>
+        <label>IFAC size, bytes <span class="optional">optional</span>
+          <input id="advanced-ifac-size" type="number" min="1" max="64" step="1">
+        </label>
+        <label class="wide">Passphrase <span class="optional">optional</span>
+          <input id="advanced-passphrase" type="password" autocomplete="new-password">
+        </label>
+      </fieldset>
+      <fieldset class="form-grid">
+        <legend>Ingress control</legend>
+        <label class="check-field wide"><input id="advanced-ingress-control" type="checkbox" checked><span>Ingress control enabled</span></label>
+        <label>New burst frequency<input id="advanced-ic-burst-freq-new" type="number" min="0" step="any"></label>
+        <label>Burst frequency<input id="advanced-ic-burst-freq" type="number" min="0" step="any"></label>
+        <label>New PR burst frequency<input id="advanced-ic-pr-burst-freq-new" type="number" min="0" step="any"></label>
+        <label>PR burst frequency<input id="advanced-ic-pr-burst-freq" type="number" min="0" step="any"></label>
+        <label>New time<input id="advanced-ic-new-time" type="number" min="0" step="any"></label>
+        <label>Burst hold<input id="advanced-ic-burst-hold" type="number" min="0" step="any"></label>
+        <label>Burst penalty<input id="advanced-ic-burst-penalty" type="number" min="0" step="any"></label>
+        <label>Max held announces<input id="advanced-ic-max-held" type="number" min="0" step="1"></label>
+        <label>Held release interval<input id="advanced-ic-held-release" type="number" min="0" step="any"></label>
+        <label>EC PR frequency<input id="advanced-ec-pr-freq" type="number" min="0" step="any"></label>
+        <label>Egress control
+          <select id="advanced-egress-control"><option value="">Default</option><option value="true">Enabled</option><option value="false">Disabled</option></select>
+        </label>
+      </fieldset>
+      <div class="dialog-actions"><button class="primary" value="done">Done</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="delete-interface-dialog">
+    <form id="delete-interface-form">
+      <div class="dialog-heading">
+        <div>
+          <span class="eyebrow danger-text">Destructive action</span>
+          <h2>Delete interface?</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-delete
+                aria-label="Close dialog">×</button>
+      </div>
+      <p>
+        The interface <strong id="delete-interface-name"></strong> will be
+        stopped and removed from the configuration.
+      </p>
+      <p class="form-error" id="delete-interface-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="secondary" type="button" data-close-delete>Cancel</button>
+        <button class="danger-button" id="confirm-delete-interface"
+                type="submit">Delete interface</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

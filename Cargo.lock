@@ -1901,6 +1901,7 @@ dependencies = [
  "hmac",
  "md-5",
  "nix 0.29.0",
+ "rand 0.8.5",
  "rmp-serde",
  "rmpv",
  "rns-crypto",
@@ -1916,8 +1917,11 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

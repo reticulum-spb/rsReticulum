@@ -52,6 +52,7 @@ multi-segment response Resources are reassembled before request decoding.
 - [Build It](#build-it)
 - [Rust Examples](#rust-examples)
 - [Tool Usage](#tool-usage)
+- [Web Configurator](#web-configurator)
 - [Configuration](#configuration)
 - [Interface Support](#interface-support)
 - [Compatibility Notes](#compatibility-notes)
@@ -226,6 +227,56 @@ rnid-rs -i ~/.rsReticulum/identities/mgmt -d message.txt.rfe
 Use `--raw -s <file>` only when a workflow intentionally needs the legacy raw
 64-byte signature form. Normal `rnid-rs -s <file>` produces a `.rsg` file that
 embeds the signer metadata needed for 1.3.8 validation.
+
+## Web Configurator
+
+The optional REST API includes an embedded Web UI and is available only from
+the Shared `rnsd-rs` process. Build the daemon with the `api` feature:
+
+```bash
+cargo build --release -p rns-tools --features api
+```
+
+Enable the authenticated server in the `[api]` section of the active config:
+
+```ini
+[api]
+port = 8080
+user = admin
+password = change-me
+```
+
+Then open `http://<host>:8080/`. The API listens on all IPv4 interfaces and
+requires a login session. Plain HTTP is intended for trusted local networks;
+use a TLS reverse proxy when traffic crosses an untrusted network.
+
+Web UI config changes are written atomically. Before every mutation, the
+previous file is saved as `config.web-ui.bak`; external edits are rejected with
+a conflict response, and a failed interface restart restores both the config
+and the previous runtime interface.
+
+The Interfaces view combines runtime statistics with the configured interface
+list. Disabled or failed interfaces remain visible and can be edited, enabled,
+disabled, or removed even when they do not have a runtime ID. The current forms
+support TCP Client, TCP Server, UDP, Auto, Backbone, Serial, KISS, RNode, and
+AX.25 KISS interfaces.
+
+The Logs view shows the latest 1,000 structured `tracing` events and follows
+new events in real time over an authenticated SSE stream. Sensitive structured
+fields are redacted before entering the Web log buffer.
+
+The Settings view can request an externally supervised restart or system
+reboot. After returning HTTP `202 Accepted`, `rnsd-rs` shuts down gracefully
+and exits with code `100` for a daemon restart or `101` for a system reboot.
+The launcher is responsible for interpreting these codes, coordinating
+dependent services, and starting the daemon or rebooting the device.
+
+Run the Web UI and REST API checks with:
+
+```bash
+node --test crates/rns-runtime/web/app.test.js
+cargo test -p rns-runtime --features api
+```
 
 ## Configuration
 

@@ -25,13 +25,28 @@ pub fn init_tracing<W>(level: tracing::Level, timestamps: bool, ansi: bool, writ
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
+    use tracing_subscriber::prelude::*;
+
     let builder = tracing_subscriber::fmt()
         .with_max_level(level)
         .with_ansi(ansi)
         .with_writer(writer);
     if timestamps {
+        #[cfg(feature = "api")]
+        let _ = builder
+            .finish()
+            .with(rns_runtime::web_logs::WebLogLayer)
+            .try_init();
+        #[cfg(not(feature = "api"))]
         let _ = builder.try_init();
     } else {
+        #[cfg(feature = "api")]
+        let _ = builder
+            .without_time()
+            .finish()
+            .with(rns_runtime::web_logs::WebLogLayer)
+            .try_init();
+        #[cfg(not(feature = "api"))]
         let _ = builder.without_time().try_init();
     }
 }

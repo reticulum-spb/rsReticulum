@@ -22,3 +22,5 @@ pub mod rpc_server;
 
 #[cfg(feature = "api")]
 pub mod api_server;
+#[cfg(feature = "api")]
+pub mod web_logs;
