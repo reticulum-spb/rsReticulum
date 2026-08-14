@@ -53,6 +53,18 @@ pub enum LinkClientError {
     Channel(#[from] ChannelError),
     #[error("resource: {0}")]
     Resource(String),
+    /// The peer answered with a plain (unenveloped, no request id) Resource
+    /// on a request path that doesn't accept one -- see
+    /// [`LinkSession::request`]'s doc comment for why. Distinct from
+    /// [`Timeout`](Self::Timeout) on purpose: this is a real, observed
+    /// reply, not silence, so a caller can tell "peer answered in a way
+    /// this API can't use" from "peer never answered at all".
+    #[error(
+        "peer answered with a plain (unenveloped) resource, which this \
+         reusable-session request path does not accept for response \
+         correlation safety"
+    )]
+    PlainResourceNotAccepted,
 }
 
 #[derive(Clone)]
@@ -768,6 +780,20 @@ impl LinkSession {
     }
 
     /// Send a request and wait for its response, including Resource responses.
+    ///
+    /// Does not accept a plain (unenveloped, no request id) Resource as the
+    /// answer -- only `LinkClient::query`'s one-shot path does, since it
+    /// closes its Link immediately after and so has no later request that
+    /// reusing the correlation could misattribute to. A reusable session
+    /// has no such guarantee: without a request id there is nothing to stop
+    /// a stale or unrelated resource from being mistaken for the answer to
+    /// whatever request happens to be outstanding when it arrives (see
+    /// `resource_answers_request`). A peer that answers this way (some
+    /// NomadNet-style nodes; see `af5aecd` in this repo's history) is a
+    /// real, valid reply this call cannot use -- it returns
+    /// [`LinkClientError::PlainResourceNotAccepted`] rather than the
+    /// generic [`LinkClientError::Timeout`] a genuinely unreachable peer
+    /// would produce, so a caller can distinguish the two.
     pub async fn request(
         &mut self,
         path: &str,
@@ -780,6 +806,9 @@ impl LinkSession {
     }
 
     /// Send a request and retain metadata from a Resource-backed response.
+    ///
+    /// See [`Self::request`]'s doc comment for the plain-resource caveat --
+    /// applies here identically.
     pub async fn request_with_metadata(
         &mut self,
         path: &str,
@@ -792,6 +821,9 @@ impl LinkSession {
 
     /// Send a request while rejecting a response before Resource assembly
     /// exceeds the application-provided payload limit.
+    ///
+    /// See [`Self::request`]'s doc comment for the plain-resource caveat --
+    /// applies here identically.
     pub async fn request_with_metadata_limit(
         &mut self,
         path: &str,
@@ -1289,10 +1321,16 @@ impl LinkSession {
                             }
                         }
                     }
-                    rns_wire::context::PacketContext::ResourcePrf
-                        if transfer.handle_proof(body) =>
-                    {
-                        return Ok(resource_hash);
+                    rns_wire::context::PacketContext::ResourcePrf => {
+                        // `handle_proof` mutates `transfer` (records the
+                        // verified state), so it belongs in the arm body,
+                        // not match-guard position: a guard that evaluates
+                        // `false` still falls through having already caused
+                        // that side effect, which is a correctness footgun
+                        // for whichever arm ends up matching next.
+                        if transfer.handle_proof(body) {
+                            return Ok(resource_hash);
+                        }
                     }
                     rns_wire::context::PacketContext::ResourceRcl => {
                         return Err(LinkClientError::Resource(
@@ -1856,6 +1894,20 @@ async fn wait_for_response(
                                 &request_id,
                                 accept_plain_resource,
                             ) {
+                                // A plain resource that would have answered
+                                // this request under `accept_plain_resource:
+                                // true` is a real, observed reply on a link
+                                // dedicated to this one outstanding request --
+                                // not silence to keep waiting out. Surface it
+                                // now instead of falling through to the
+                                // generic timeout, so callers on this path
+                                // can tell the two apart.
+                                if !accept_plain_resource
+                                    && !adv.flags.is_response
+                                    && adv.request_id.is_none()
+                                {
+                                    return Err(LinkClientError::PlainResourceNotAccepted);
+                                }
                                 continue;
                             }
                             if !inbound_resources.contains_key(&adv.resource_hash) {
@@ -2784,5 +2836,87 @@ mod tests {
 
         drop(handle);
         worker.await.unwrap();
+    }
+
+    /// `LinkSession::request` (via `request_with_metadata_limit`'s
+    /// `accept_plain_resource: false`) must surface a peer's plain-resource
+    /// reply as `PlainResourceNotAccepted`, not silently keep waiting until
+    /// the deadline produces a generic `Timeout` indistinguishable from an
+    /// unreachable peer. This drives the real path end to end: a genuine
+    /// `OutboundResource` advertisement (no request id, no response flag --
+    /// exactly what nomad-core-style peers send), encrypted and delivered
+    /// as the peer would, through `LinkSession::request` itself.
+    #[tokio::test]
+    async fn session_request_reports_plain_resource_reply_distinctly_from_timeout() {
+        let dest_hash = [0xC7; 16];
+        let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let responder_pub = responder_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &responder_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &responder_pub, &responder_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = initiator.link_id;
+
+        let (transport_tx, _transport_rx) = mpsc::channel(4);
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let mut session = LinkSession {
+            transport_tx,
+            identity: Arc::new(Identity::new()),
+            link: initiator,
+            event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+
+        // A plain resource: no request id, no response flag -- the shape
+        // `OutboundResource::new` produces by construction, matching what a
+        // peer answering with a raw application resource (not Python RNS's
+        // enveloped [request_id, data] response) sends on the wire.
+        let resource = OutboundResource::new(b"peer answered anyway".to_vec(), false, None)
+            .expect("plain resource");
+        let mut transfer = OutboundTransfer::from_prebuilt(resource, Duration::from_millis(500));
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            panic!("expected a fresh outbound resource to advertise first");
+        };
+        let encrypted = responder
+            .encrypt(&advertisement)
+            .expect("responder encrypts as the peer would");
+        let raw = build_data_packet(
+            link_id,
+            rns_wire::context::PacketContext::ResourceAdv,
+            &encrypted,
+        );
+        event_tx
+            .send(DestinationEvent::InboundPacket {
+                raw,
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        // Deadline is deliberately generous relative to how fast this must
+        // resolve: a false pass from an accidentally-fast Timeout is exactly
+        // what distinguishing the two error variants guards against.
+        let result = session
+            .request("test/plain-resource", None, Duration::from_secs(2))
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(LinkClientError::PlainResourceNotAccepted)),
+            "expected PlainResourceNotAccepted, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must be detected immediately on arrival, not discovered only near the \
+             2s deadline (which would make it indistinguishable from Timeout in \
+             practice even though the variant differs); took {elapsed:?}"
+        );
     }
 }

@@ -72,6 +72,13 @@ pub struct ReticulumHandle {
     /// Mobile builds throttle tick rates when the app is backgrounded.
     pub is_foreground: Arc<AtomicBool>,
     pub shutdown: ShutdownSignal,
+    /// Shared with the runtime's own transport-actor teardown task: every
+    /// shutdown-aware `LinkManager` owner should hold a `DrainGuard` (via
+    /// `drain_coordinator.register()`) for the lifetime of its
+    /// `run_until_shutdown` / `run_with_commands_until_shutdown` task, so
+    /// the transport actor doesn't tear down interface sockets while a
+    /// `LinkClose` is still in flight to them.
+    pub drain_coordinator: crate::lifecycle::DrainCoordinator,
     /// Wire-facing transport identity (Python `Transport.identity`): on
     /// non-transport nodes this is a fresh per-boot identity unless
     /// `static_transport_identity` is set (Transport.py:234-238); RPC-key
@@ -1060,6 +1067,12 @@ pub async fn init(
 
     let shutdown_tx = transport_tx.clone();
     let shutdown_clone = shutdown.clone();
+    // Every shutdown-aware LinkManager owner (rncp, rnsh, remote management,
+    // the blackhole publisher, LinkListener, ...) registers a `DrainGuard`
+    // here for as long as its own drain is running, so the transport-actor
+    // teardown below can wait for their `LinkClose` traffic to actually be
+    // handed off before the sockets carrying it disappear.
+    let drain_coordinator = crate::lifecycle::DrainCoordinator::new();
     tokio::spawn(async move {
         actor.run().await;
     });
@@ -1455,6 +1468,7 @@ pub async fn init(
         config: rc.clone(),
         is_foreground,
         shutdown: shutdown.clone(),
+        drain_coordinator: drain_coordinator.clone(),
         transport_identity: wire_transport_identity,
         network_identity: network_identity.clone(),
         discovery: discovery_runtime,
@@ -1472,6 +1486,15 @@ pub async fn init(
 
     tokio::spawn(async move {
         shutdown_clone.wait().await;
+        // Give every registered LinkManager owner (rncp, rnsh, remote
+        // management, the blackhole publisher, LinkListener, ...) a chance
+        // to finish its own bounded drain -- build and send its LinkClose,
+        // wait out INTERFACE_FLUSH_GRACE -- before the interfaces carrying
+        // that traffic are torn down. Bounded on top of each owner's own
+        // bound, so a genuinely unreachable peer still can't hang shutdown.
+        drain_coordinator
+            .wait_for_drain(crate::lifecycle::TRANSPORT_SHUTDOWN_DRAIN_TIMEOUT)
+            .await;
         let _ = shutdown_tx.send(TransportMessage::Shutdown).await;
     });
 
@@ -1567,6 +1590,8 @@ pub async fn init(
             transport_tx.clone(),
             &mgmt_identity,
             allowed,
+            shutdown.clone(),
+            handle.drain_coordinator.clone(),
         )
         .await
         {
@@ -2743,9 +2768,11 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
     });
 
     let shutdown = handle.shutdown.clone();
+    let drain_guard = handle.drain_coordinator.register();
     tokio::spawn(async move {
         lm.run_until_shutdown(shutdown, std::time::Duration::from_secs(5))
             .await;
+        drop(drain_guard);
     });
 
     send_announce_try(&handle.transport_tx, &identity, app_name, None);
@@ -4350,10 +4377,103 @@ loglevel = 7
             config: ReticulumConfig::default(),
             is_foreground: Arc::new(AtomicBool::new(true)),
             shutdown: ShutdownSignal::new(),
+            drain_coordinator: crate::lifecycle::DrainCoordinator::new(),
             transport_identity: Arc::new(Identity::new()),
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
         }
+    }
+
+    /// This is deliberately NOT a pure unit test on `DrainCoordinator` alone
+    /// (see `lifecycle.rs`'s own coverage for that) -- the actual bug this
+    /// proves fixed is a race between two independently-scheduled tasks
+    /// racing the same `ShutdownSignal` through a REAL `TransportActor`'s
+    /// message loop, which only a test that spins up the real actor and
+    /// races real tasks against it can reproduce. Mirrors the exact shape
+    /// of `reticulum.rs`'s own transport-actor-teardown task and a
+    /// generic drain-aware owner (rncp/rnsh/remote management/etc. all
+    /// follow this same register-guard-around-the-spawn pattern).
+    ///
+    /// Verified by deletion: temporarily removing the `wait_for_drain` call
+    /// below (restoring the pre-fix `shutdown.wait().await; send(Shutdown)`
+    /// body) makes this test fail -- `wire_rx.recv()` times out because the
+    /// actor processes `Shutdown` and drops its receiver before the owner's
+    /// slower `Outbound` send ever arrives, exactly reproducing the live
+    /// SIGTERM finding (zero `TCP write` lines after the shutdown signal).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_actor_teardown_waits_for_registered_drains_before_shutdown() {
+        let (actor, transport_tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+
+        // Fake interface: outbound bytes land in `wire_rx`, exactly like a
+        // real driver's write task would forward them to the wire.
+        let (iface_tx, mut wire_rx) = mpsc::channel::<Bytes>(16);
+        let entry = rns_transport::messages::InterfaceEntry::new(
+            "test-interface".to_string(),
+            rns_transport::constants::InterfaceMode::Full,
+            rns_transport::constants::InterfaceDirection::bidirectional(),
+            10_000_000,
+            1500,
+            iface_tx,
+        );
+        transport_tx
+            .send(TransportMessage::RegisterInterface { id: 1, entry })
+            .await
+            .unwrap();
+
+        let shutdown = ShutdownSignal::new();
+        let drain_coordinator = crate::lifecycle::DrainCoordinator::new();
+        // `on_outbound` parses `raw` as a real wire packet and silently
+        // drops anything that doesn't unpack as one -- reuse the same
+        // helper other tests in this module use to build a genuine packet,
+        // not arbitrary bytes.
+        let sentinel = make_plain_data_packet([0x42; 16], b"drain-owner-linkclose-sentinel");
+
+        // Mimics a real LinkManager owner's drain-aware run: registers a
+        // guard, waits for shutdown, does real async work simulating the
+        // multi-hop drain latency (inflight check, build+send LinkClose, RPC
+        // barrier, INTERFACE_FLUSH_GRACE) before its outbound traffic
+        // reaches `transport_tx`, then drops the guard -- exactly matching
+        // each owner's `let guard = coordinator.register(); spawn(async {
+        // run_until_shutdown(...).await; drop(guard); })` wrapper.
+        let owner_shutdown = shutdown.clone();
+        let owner_tx = transport_tx.clone();
+        let owner_guard = drain_coordinator.register();
+        let owner_sentinel = sentinel.clone();
+        tokio::spawn(async move {
+            owner_shutdown.wait().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = owner_tx
+                .send(TransportMessage::Outbound(OutboundRequest {
+                    raw: owner_sentinel,
+                    destination_hash: [0x42; 16],
+                }))
+                .await;
+            drop(owner_guard);
+        });
+
+        // Exact copy of reticulum.rs's own transport-actor teardown task.
+        let kill_shutdown = shutdown.clone();
+        let kill_tx = transport_tx.clone();
+        let kill_coordinator = drain_coordinator.clone();
+        tokio::spawn(async move {
+            kill_shutdown.wait().await;
+            kill_coordinator
+                .wait_for_drain(crate::lifecycle::TRANSPORT_SHUTDOWN_DRAIN_TIMEOUT)
+                .await;
+            let _ = kill_tx.send(TransportMessage::Shutdown).await;
+        });
+
+        shutdown.trigger();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("the owner's LinkClose must reach the wire before the actor tears down")
+            .expect("interface channel must not be dropped before the message arrives");
+        assert_eq!(
+            received, sentinel,
+            "transport-actor teardown must wait for the registered drain before sending Shutdown"
+        );
     }
 
     struct StaticStamper;

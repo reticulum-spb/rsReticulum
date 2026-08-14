@@ -634,6 +634,7 @@ async fn run_listen(args: Args) -> ! {
         allow_fetch: args.allow_fetch,
         fetch_jail,
         fetch_auto_compress: !args.no_compress,
+        drain_coordinator: handle.drain_coordinator.clone(),
     };
     let listener = match spawn_rncp_listener(handle.transport_tx.clone(), cfg, event_tx).await {
         Ok(h) => h,

@@ -26,6 +26,25 @@ use rns_transport::messages::{OutboundRequest, TransportMessage, TransportQuery}
 /// between re-checking how much is still in flight.
 const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Best-effort beat after the `GetLinkCount` shutdown barrier, giving each
+/// interface driver's own outbound queue a chance to write the just-closed
+/// Links' teardown packets to the wire. The barrier proves the transport
+/// actor's single command queue processed every preceding `LinkClose`/
+/// deregister send (see `drain_and_close`'s doc comment on that RPC) --
+/// it does NOT prove the packets reached the wire: `send_to_interface`
+/// (`rns-transport/src/actor/mod.rs`) hands each packet to a SECOND queue,
+/// `InterfaceEntry::tx: mpsc::Sender<Bytes>`, consumed independently by
+/// whichever driver task owns that interface (TCP, serial, BLE, ...). That
+/// hop has no acknowledgment path back to here -- `try_send` on a full
+/// queue drops silently (see `tx_drops`) -- so this sleep cannot be turned
+/// into a real guarantee without adding delivery acknowledgment to every
+/// interface driver, a much larger change than this shutdown-races fix.
+/// Under normal (non-full-queue) conditions the second hop is a local
+/// channel send plus a socket/serial write, both far faster than this
+/// window; a genuinely stuck or saturated driver still loses the packet,
+/// exactly as it already could mid-session outside of shutdown.
+const INTERFACE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 struct ActiveLink {
     link: Link,
     _interface_id: u64,
@@ -532,7 +551,10 @@ impl LinkManager {
 
         // This RPC is a FIFO barrier on the transport actor's command queue:
         // receiving its response proves that all preceding LinkClose and
-        // deregistration messages were processed by the actor.
+        // deregistration messages were processed by the actor -- i.e. handed
+        // off to `send_to_interface`. It does not prove the wire has them;
+        // see `INTERFACE_FLUSH_GRACE`'s doc comment for why that's a
+        // separate, deliberately best-effort step below.
         let (barrier_tx, barrier_rx) = oneshot::channel();
         if self
             .transport_tx
@@ -545,6 +567,8 @@ impl LinkManager {
         {
             let _ = tokio::time::timeout(TICK, barrier_rx).await;
         }
+
+        tokio::time::sleep(INTERFACE_FLUSH_GRACE).await;
     }
 
     async fn close_active_link_for_shutdown(&mut self, link_id: [u8; 16]) {
@@ -602,6 +626,14 @@ impl LinkManager {
 
     /// Run the event and command loops until shutdown, then finish accepted
     /// Resource transfers up to `drain_grace` and explicitly close every Link.
+    ///
+    /// Every exit drains, not just the `shutdown` signal: `LinkManagerCommand`
+    /// telling the loop to stop (`handle_command` returning `false`), the
+    /// command channel closing, and the event channel closing are all real
+    /// ways this manager's caller-facing loop ends, and a Link left open on
+    /// any of them is exactly the "peer sees the link go silent mid-file"
+    /// failure [`run_until_shutdown`](Self::run_until_shutdown) exists to
+    /// avoid -- that guarantee shouldn't depend on which exit fired.
     pub async fn run_with_commands_until_shutdown(
         mut self,
         mut command_rx: mpsc::Receiver<LinkManagerCommand>,
@@ -615,16 +647,16 @@ impl LinkManager {
                     match command {
                         Some(command) => {
                             if !self.handle_command(command) {
-                                return;
+                                break;
                             }
                         }
-                        None => return,
+                        None => break,
                     }
                 }
                 event = self.event_rx.recv() => {
                     match event {
                         Some(event) => self.handle_event(event),
-                        None => return,
+                        None => break,
                     }
                 }
                 _ = tick_interval.tick() => self.tick(),
@@ -3219,6 +3251,123 @@ mod tests {
             }
         }
         assert!(sent_close, "no LinkClose packet reached the transport");
+    }
+
+    /// `run_with_commands_until_shutdown` had four exits and only one --
+    /// `shutdown.wait()` -- drained; a `LinkManagerCommand::Shutdown` sent
+    /// through the command channel (what every one of rncp/rnsh's own
+    /// command-loop shutdowns actually does) hit `handle_command`'s
+    /// `Shutdown => false` and returned immediately, skipping
+    /// `drain_and_close` entirely. This drives that exact exit and proves it
+    /// now drains too: an active Link gets an explicit LinkClose on the
+    /// wire, not silence.
+    #[tokio::test]
+    async fn run_with_commands_until_shutdown_drains_on_command_exit_not_just_signal() {
+        let dest_hash = [0xD2; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = responder.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let (command_tx, command_rx) = mpsc::channel(4);
+        // Never triggered: this test's whole point is proving the *other*
+        // three exits drain too, not just this one (already covered by
+        // `shutdown_drain_closes_links_with_an_explicit_teardown` via
+        // `drain_and_close` directly).
+        let shutdown = crate::lifecycle::ShutdownSignal::new();
+
+        command_tx.send(LinkManagerCommand::Shutdown).await.unwrap();
+        lm.run_with_commands_until_shutdown(
+            command_rx,
+            shutdown,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let mut sent_close = false;
+        while let Ok(msg) = transport_rx.try_recv() {
+            if let TransportMessage::Outbound(OutboundRequest { raw, .. }) = msg {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                if header.context == rns_wire::context::PacketContext::LinkClose
+                    && header.destination_hash == link_id
+                {
+                    sent_close = true;
+                }
+            }
+        }
+        assert!(
+            sent_close,
+            "LinkManagerCommand::Shutdown must drain before returning, same as the \
+             shutdown-signal exit -- no LinkClose packet reached the transport"
+        );
+    }
+
+    /// `INTERFACE_FLUSH_GRACE` is a real, timed wait, not just a comment.
+    /// This is the honest limit of what's testable here per its own doc
+    /// comment: the second `mpsc` hop it's covering for
+    /// (`send_to_interface`'s `InterfaceEntry::tx`) has no driver task in
+    /// this unit test to observe delivery through, and no acknowledgment
+    /// path even in production -- that's the whole reason it's a fixed
+    /// sleep and not a real barrier. What *is* provable: the sleep executes
+    /// and actually elapses. A fake transport task answers the
+    /// `GetLinkCount` barrier RPC immediately, so with nothing else in
+    /// flight, any measured time beyond a tiny epsilon is directly
+    /// attributable to this sleep, not incidental delay elsewhere in
+    /// `drain_and_close`.
+    #[tokio::test]
+    async fn drain_and_close_waits_out_the_interface_flush_grace() {
+        let dest_hash = [0xD3; 16];
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+
+        tokio::spawn(async move {
+            while let Some(msg) = transport_rx.recv().await {
+                if let TransportMessage::Rpc {
+                    query: TransportQuery::GetLinkCount,
+                    response_tx,
+                } = msg
+                {
+                    let _ = response_tx.send(
+                        rns_transport::messages::TransportQueryResponse::IntResult(0),
+                    );
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        lm.drain_and_close(std::time::Duration::from_secs(5)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= INTERFACE_FLUSH_GRACE,
+            "drain_and_close must wait out INTERFACE_FLUSH_GRACE ({INTERFACE_FLUSH_GRACE:?}) \
+             even when nothing is in flight and the barrier resolves instantly; \
+             only waited {elapsed:?}"
+        );
     }
 
     /// An empty ack alongside a resource is indistinguishable from a genuine

@@ -2,7 +2,8 @@
 //! allowing them to detach interfaces and flush state cleanly before exit.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -52,6 +53,110 @@ impl ShutdownSignal {
 impl Default for ShutdownSignal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Upper bound on how long the runtime's `TransportActor` teardown will wait
+/// for outstanding [`DrainGuard`]s before proceeding anyway. Every current
+/// owner bounds its own drain to 5s (`drain_grace`) plus a 300ms
+/// `INTERFACE_FLUSH_GRACE` best-effort wait; this sits comfortably above
+/// that combined worst case so it only ever fires as a last-resort safety
+/// net, not as the normal path.
+pub const TRANSPORT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// The runtime's `TransportActor` teardown (`reticulum.rs`'s dedicated
+/// shutdown task) and every shutdown-aware `LinkManager` owner (rncp, rnsh,
+/// remote management, the blackhole publisher, `LinkListener`, ...) all
+/// react to the *same* [`ShutdownSignal`], but the actor teardown has far
+/// less work to do before it can act on it -- it just forwards one message.
+/// A `LinkManager`'s own drain needs several more `.await` hops (check
+/// in-flight transfers, build and send an explicit `LinkClose`, an RPC
+/// barrier, a flush grace) before its outbound traffic is even handed to the
+/// transport actor. Left uncoordinated, the actor teardown routinely wins
+/// that race and drops the interface sockets before `LinkClose` reaches the
+/// wire -- confirmed live over real TCP with real process-level SIGTERM
+/// (see the shutdown-race live-testing report). `DrainCoordinator` closes
+/// that gap: every owner holds a [`DrainGuard`] for exactly as long as its
+/// drain-aware run loop is alive, and the actor teardown task waits for the
+/// outstanding count to hit zero -- bounded by `max_wait`, so a genuinely
+/// unreachable peer (whose drain runs out its own grace but never gets
+/// acked) still can't hang shutdown forever.
+#[derive(Clone)]
+pub struct DrainCoordinator {
+    count: Arc<AtomicUsize>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl DrainCoordinator {
+    pub fn new() -> Self {
+        Self {
+            count: Arc::new(AtomicUsize::new(0)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Register one in-flight drain. Hold the returned guard for exactly as
+    /// long as the owner's `run_until_shutdown` / `run_with_commands_until_shutdown`
+    /// task is alive -- drop it (letting the task's natural end run the
+    /// `Drop` impl) once that call returns, meaning this owner's own bounded
+    /// drain has already finished (successfully or by timing out on its own
+    /// grace) and its close/deregister traffic has been handed to the
+    /// transport actor.
+    pub fn register(&self) -> DrainGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        DrainGuard {
+            coordinator: self.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn outstanding(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Wait until every registered guard has been released, or `max_wait`
+    /// elapses, whichever comes first. Always returns -- never hangs
+    /// indefinitely, even if a guard is leaked or an owner's own drain logic
+    /// has a bug that keeps it from ever finishing.
+    pub async fn wait_for_drain(&self, max_wait: Duration) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            // Register before observing the count, same lost-wakeup-safe
+            // pattern as `ShutdownSignal::wait`: if the last guard drops
+            // between the count check and the await below, this `Notified`
+            // is already a registered waiter and still fires.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    outstanding = self.count.load(Ordering::SeqCst),
+                    "drain coordinator wait expired with owners still draining"
+                );
+                return;
+            }
+            let _ = tokio::time::timeout(remaining, notified).await;
+        }
+    }
+}
+
+impl Default for DrainCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct DrainGuard {
+    coordinator: DrainCoordinator,
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.coordinator.count.fetch_sub(1, Ordering::SeqCst);
+        self.coordinator.notify.notify_waiters();
     }
 }
 
@@ -234,5 +339,77 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), signal.wait())
             .await
             .expect("pre-triggered shutdown must be retained");
+    }
+
+    #[tokio::test]
+    async fn drain_coordinator_waits_for_every_outstanding_guard() {
+        let coordinator = DrainCoordinator::new();
+        let guard_a = coordinator.register();
+        let guard_b = coordinator.register();
+        assert_eq!(coordinator.outstanding(), 2);
+
+        let waiter = coordinator.clone();
+        let waited = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            waiter.wait_for_drain(Duration::from_secs(5)).await;
+            started.elapsed()
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !waited.is_finished(),
+            "must still be waiting while guards are outstanding"
+        );
+
+        drop(guard_a);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waited.is_finished(),
+            "must still be waiting on the second guard"
+        );
+
+        drop(guard_b);
+        let elapsed = tokio::time::timeout(Duration::from_secs(1), waited)
+            .await
+            .expect("wait_for_drain must return promptly once the last guard drops")
+            .expect("task panicked");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "should return as soon as the last guard drops, not wait out the full timeout: {elapsed:?}"
+        );
+        assert_eq!(coordinator.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_coordinator_bounds_the_wait_when_a_guard_is_never_released() {
+        let coordinator = DrainCoordinator::new();
+        let guard = coordinator.register();
+
+        let started = std::time::Instant::now();
+        coordinator.wait_for_drain(Duration::from_millis(100)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "must wait out the full bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not hang indefinitely past the bound: {elapsed:?}"
+        );
+        // The leaked guard still reports outstanding work; only dropping it
+        // (never happening here, by construction) would clear the count.
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn drain_coordinator_returns_immediately_with_nothing_registered() {
+        let coordinator = DrainCoordinator::new();
+        let started = std::time::Instant::now();
+        coordinator.wait_for_drain(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "an idle coordinator must not add any shutdown latency"
+        );
     }
 }

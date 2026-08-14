@@ -28,10 +28,23 @@ const PATH_PATH: &str = "/path";
 /// `identity` must be stable across restarts so clients can cache the dest
 /// hash. Empty `allowed_identities` denies all peers, matching Python's
 /// `Destination.ALLOW_LIST` semantics.
+///
+/// `shutdown` drives the spawned `LinkManager` via `run_until_shutdown` (5s
+/// drain grace, matching `link_session.rs`/the blackhole publisher in this
+/// crate) so triggering it closes every active management Link explicitly
+/// instead of leaving the task to run forever, detached from anything that
+/// could observe or await its completion.
+///
+/// `drain_coordinator` is held for the lifetime of that drain (see
+/// [`crate::lifecycle::DrainCoordinator`]) so the runtime's transport-actor
+/// teardown waits for this Link's close traffic to be handed off before the
+/// interface carrying it can be torn down.
 pub async fn start_remote_management(
     transport_tx: mpsc::Sender<TransportMessage>,
     identity: &Identity,
     allowed_identities: Vec<[u8; 16]>,
+    shutdown: crate::lifecycle::ShutdownSignal,
+    drain_coordinator: crate::lifecycle::DrainCoordinator,
 ) -> Result<[u8; 16], String> {
     let signing_key = identity
         .get_signing_key()
@@ -96,8 +109,11 @@ pub async fn start_remote_management(
 
     let dest_hash = lm.destination_hash;
 
+    let drain_guard = drain_coordinator.register();
     tokio::spawn(async move {
-        lm.run().await;
+        lm.run_until_shutdown(shutdown, std::time::Duration::from_secs(5))
+            .await;
+        drop(drain_guard);
     });
 
     tracing::info!(
@@ -306,6 +322,148 @@ fn mode_from_debug_string(s: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_link::link::Link;
+    use rns_transport::link_messages::DestinationEvent;
+
+    /// `start_remote_management` used to fire-and-forget `lm.run()` with no
+    /// `JoinHandle` and no signal -- shutting down the runtime left it
+    /// running detached forever, draining nothing. This drives a real Link
+    /// through the actual spawned task (LinkRequest -> Proof -> LRRTT, the
+    /// same three-packet handshake a genuine peer performs) to reach
+    /// `LinkState::Active`, triggers `shutdown`, and proves an explicit
+    /// LinkClose reaches the transport rather than the link being silently
+    /// abandoned mid-session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_drains_an_active_link_instead_of_abandoning_it() {
+        let identity = Identity::new();
+        let app_name = "rnstransport.remote.management";
+        let dest_hash = Destination::hash_from_name_and_identity(app_name, Some(&identity.hash));
+        let identity_pub = identity.get_public_key();
+        let ed25519_bytes: [u8; 32] = identity_pub[32..64].try_into().unwrap();
+        let verify_key = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&ed25519_bytes).unwrap();
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let shutdown = crate::lifecycle::ShutdownSignal::new();
+
+        let dest_hash_result = start_remote_management(
+            transport_tx,
+            &identity,
+            Vec::new(),
+            shutdown.clone(),
+            crate::lifecycle::DrainCoordinator::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dest_hash_result, dest_hash);
+
+        let Some(TransportMessage::RegisterDestination {
+            delivery_tx: Some(dest_tx),
+            ..
+        }) = transport_rx.recv().await
+        else {
+            panic!("expected RegisterDestination with a delivery channel");
+        };
+
+        // Peer side of the handshake, entirely local to this test -- the
+        // spawned task only ever sees packets, exactly as it would over the
+        // wire.
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let link_id = initiator.link_id;
+
+        let req_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::LinkRequest,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut req_raw = req_header.pack();
+        req_raw.extend_from_slice(&request_data);
+        dest_tx
+            .send(DestinationEvent::LinkRequest {
+                raw: req_raw.into(),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let Some(TransportMessage::Outbound(proof_msg)) = transport_rx.recv().await else {
+            panic!("expected an outbound LINKPROOF after the LinkRequest");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof_msg.raw).unwrap();
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::Lrproof
+        );
+        let rtt_data = initiator
+            .validate_proof(&proof_msg.raw[proof_offset..], &verify_key, &ed25519_bytes)
+            .unwrap();
+
+        let rtt_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrrtt,
+        };
+        let mut rtt_raw = rtt_header.pack();
+        rtt_raw.extend_from_slice(&rtt_data);
+        dest_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: rtt_raw.into(),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        // Let the spawned task actually process the LRRTT before shutdown
+        // races it -- `send` only guarantees delivery to the channel, not
+        // that `handle_event` has run yet.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        shutdown.trigger();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut sent_close = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), transport_rx.recv())
+                .await
+            {
+                Ok(Some(TransportMessage::Outbound(msg))) => {
+                    if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&msg.raw) {
+                        if header.context == rns_wire::context::PacketContext::LinkClose
+                            && header.destination_hash == link_id
+                        {
+                            sent_close = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert!(
+            sent_close,
+            "shutdown must drain the active Link with an explicit LinkClose, not \
+             leave it running detached with no drain"
+        );
+    }
 
     #[test]
     fn remote_management_allow_list_denies_empty() {
