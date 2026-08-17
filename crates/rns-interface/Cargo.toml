@@ -6,14 +6,20 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
-serial = ["dep:serialport"]
-rnode-tcp = []
-ble = ["dep:btleplug", "dep:futures", "dep:uuid", "dep:bluer"]
+default = ["full"]
+# Local/TCP are the only interface implementations required by a process
+# attaching to an existing shared Reticulum instance.
+shared-client = []
+# All software/network/radio interface implementations available before the
+# feature split. Kept as the default for source compatibility.
+full = ["shared-client", "dep:rand", "dep:serde", "dep:serde_json", "dep:hex"]
+serial = ["full", "dep:serialport"]
+rnode-tcp = ["full"]
+ble = ["full", "dep:btleplug", "dep:futures", "dep:uuid", "dep:bluer"]
 # See rns-transport's mobile-throttle. When enabled, auto-interface beacons
 # and reverse-peering probes slow down in the background; BLE peer scan
 # cadence adjusts to `is_foreground`. Disabled on desktop builds.
-mobile-throttle = ["rns-transport/mobile-throttle"]
+mobile-throttle = ["full", "rns-transport/mobile-throttle"]
 
 [dependencies]
 rns-crypto = { workspace = true, features = ["std"] }
@@ -30,10 +36,10 @@ serialport = { workspace = true, optional = true }
 btleplug = { version = "0.11", optional = true }
 futures = { version = "0.3", optional = true }
 uuid = { version = "1", optional = true }
-rand = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-hex = { workspace = true }
+rand = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 
 # Apple BLE Peripheral (CoreBluetooth GATT server, iOS + macOS).
 # Version pinned to match btleplug's internal objc2 version so the shared

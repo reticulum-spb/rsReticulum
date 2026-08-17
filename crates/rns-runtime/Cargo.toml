@@ -6,11 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
-serial = ["rns-interface/serial"]
-rnode-tcp = ["rns-interface/rnode-tcp"]
-ble = ["rns-interface/ble"]
-api = ["dep:axum", "dep:tower-http", "dep:serde_json", "dep:rand", "dep:tracing-subscriber", "dep:tokio-stream"]
+default = ["full"]
+# Application runtime that can only attach to an already-running shared
+# Reticulum instance. It never owns hardware interfaces or starts a shared
+# server itself.
+client = ["rns-interface/shared-client"]
+# Preserve the pre-feature-split API and behaviour for existing dependants.
+full = ["client", "rns-interface/full"]
+serial = ["full", "rns-interface/serial"]
+rnode-tcp = ["full", "rns-interface/rnode-tcp"]
+ble = ["full", "rns-interface/ble"]
+api = ["full", "dep:axum", "dep:tower-http", "dep:serde_json", "dep:rand", "dep:tracing-subscriber", "dep:tokio-stream"]
 
 [dependencies]
 rns-crypto = { workspace = true, features = ["std"] }
@@ -19,7 +25,7 @@ rns-identity = { workspace = true }
 rns-transport = { workspace = true }
 rns-link = { workspace = true }
 rns-protocol = { workspace = true }
-rns-interface = { workspace = true }
+rns-interface = { workspace = true, default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }

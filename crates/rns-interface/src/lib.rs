@@ -3,10 +3,13 @@
 //! concrete transport; [`traits::InterfaceHandle`] is the common handle the
 //! runtime registers with the transport actor.
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "full", target_os = "android"))]
 pub mod android_usb;
+#[cfg(feature = "full")]
 pub mod auto;
+#[cfg(feature = "full")]
 pub mod ax25kiss;
+#[cfg(feature = "full")]
 pub mod backbone;
 #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]
 pub mod ble_central_apple;
@@ -21,13 +24,17 @@ pub mod ble_peer_lifecycle;
 #[cfg(feature = "ble")]
 pub mod ble_rnode;
 pub mod hdlc;
+#[cfg(feature = "full")]
 pub mod i2p;
 pub mod kiss;
 #[cfg(feature = "serial")]
 pub mod kiss_iface;
 pub mod local;
+#[cfg(feature = "full")]
 pub mod pipe;
+#[cfg(feature = "full")]
 pub mod rnode;
+#[cfg(feature = "full")]
 pub mod rnode_admin;
 #[cfg(feature = "serial")]
 pub mod rnode_multi;
@@ -40,5 +47,7 @@ pub mod serial_tcp_stream;
 pub mod socket_tuning;
 pub mod tcp;
 pub mod traits;
+#[cfg(feature = "full")]
 pub mod udp;
+#[cfg(feature = "full")]
 pub mod weave;
