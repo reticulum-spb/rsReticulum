@@ -73,11 +73,10 @@ pub struct ReticulumHandle {
     pub is_foreground: Arc<AtomicBool>,
     pub shutdown: ShutdownSignal,
     /// Shared with the runtime's own transport-actor teardown task: every
-    /// shutdown-aware `LinkManager` owner should hold a `DrainGuard` (via
-    /// `drain_coordinator.register()`) for the lifetime of its
-    /// `run_until_shutdown` / `run_with_commands_until_shutdown` task, so
-    /// the transport actor doesn't tear down interface sockets while a
-    /// `LinkClose` is still in flight to them.
+    /// shutdown-aware `LinkManager` owner should wrap its run future with
+    /// `drain_coordinator.run_registered(...)`, so the transport actor
+    /// doesn't tear down interface sockets while a `LinkClose` is still in
+    /// flight to them.
     pub drain_coordinator: crate::lifecycle::DrainCoordinator,
     /// Wire-facing transport identity (Python `Transport.identity`): on
     /// non-transport nodes this is a fresh per-boot identity unless
@@ -2774,12 +2773,10 @@ async fn start_blackhole_publisher(handle: &ReticulumHandle) -> Result<[u8; 16],
     });
 
     let shutdown = handle.shutdown.clone();
-    let drain_guard = handle.drain_coordinator.register();
-    tokio::spawn(async move {
-        lm.run_until_shutdown(shutdown, std::time::Duration::from_secs(5))
-            .await;
-        drop(drain_guard);
-    });
+    let drain_coordinator = handle.drain_coordinator.clone();
+    tokio::spawn(drain_coordinator.run_registered(
+        lm.run_until_shutdown(shutdown, crate::lifecycle::LINK_MANAGER_DRAIN_GRACE),
+    ));
 
     send_announce_try(&handle.transport_tx, &identity, app_name, None);
     Ok(dest_hash)

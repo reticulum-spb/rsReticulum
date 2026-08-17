@@ -218,17 +218,16 @@ async fn run_rnsh_listener_inner(
     // caller passed one in.
     let manager_shutdown = ShutdownSignal::new();
     let manager_shutdown_for_task = manager_shutdown.clone();
-    let drain_guard = drain_coordinator.map(|coordinator| coordinator.register());
-    let manager_task = tokio::spawn(async move {
-        link_mgr
-            .run_with_commands_until_shutdown(
-                command_rx,
-                manager_shutdown_for_task,
-                Duration::from_secs(5),
-            )
-            .await;
-        drop(drain_guard);
-    });
+    let run = link_mgr.run_with_commands_until_shutdown(
+        command_rx,
+        manager_shutdown_for_task,
+        crate::lifecycle::LINK_MANAGER_DRAIN_GRACE,
+    );
+    let manager_task = if let Some(coordinator) = drain_coordinator {
+        tokio::spawn(coordinator.run_registered(run))
+    } else {
+        tokio::spawn(run)
+    };
 
     if cfg.announce_period.is_some() {
         send_announce(&transport_tx, &cfg.identity, RNSH_APP_NAME).await?;

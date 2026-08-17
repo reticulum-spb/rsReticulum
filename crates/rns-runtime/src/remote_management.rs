@@ -109,12 +109,9 @@ pub async fn start_remote_management(
 
     let dest_hash = lm.destination_hash;
 
-    let drain_guard = drain_coordinator.register();
-    tokio::spawn(async move {
-        lm.run_until_shutdown(shutdown, std::time::Duration::from_secs(5))
-            .await;
-        drop(drain_guard);
-    });
+    tokio::spawn(drain_coordinator.run_registered(
+        lm.run_until_shutdown(shutdown, crate::lifecycle::LINK_MANAGER_DRAIN_GRACE),
+    ));
 
     tracing::info!(
         dest = %hex::encode(dest_hash),

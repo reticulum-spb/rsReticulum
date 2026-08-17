@@ -68,9 +68,15 @@ impl Default for ShutdownSignal {
     }
 }
 
+/// Grace period shared by every shutdown-aware `LinkManager` owner.
+///
+/// Keeping this next to [`TRANSPORT_SHUTDOWN_DRAIN_TIMEOUT`] makes the ordering
+/// between the per-manager drain and the transport's safety net explicit.
+pub const LINK_MANAGER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 /// Upper bound on how long the runtime's `TransportActor` teardown will wait
 /// for outstanding [`DrainGuard`]s before proceeding anyway. Every current
-/// owner bounds its own drain to 5s (`drain_grace`) plus a 300ms
+/// owner bounds its own drain to [`LINK_MANAGER_DRAIN_GRACE`] plus a 300ms
 /// `INTERFACE_FLUSH_GRACE` best-effort wait; this sits comfortably above
 /// that combined worst case so it only ever fires as a last-resort safety
 /// net, not as the normal path.
@@ -113,11 +119,32 @@ impl DrainCoordinator {
     /// `Drop` impl) once that call returns, meaning this owner's own bounded
     /// drain has already finished (successfully or by timing out on its own
     /// grace) and its close/deregister traffic has been handed to the
-    /// transport actor.
+    /// transport actor. Prefer [`run_registered`](Self::run_registered) for
+    /// drain-aware futures so cancellation cannot accidentally leak a guard.
     pub fn register(&self) -> DrainGuard {
         self.count.fetch_add(1, Ordering::SeqCst);
         DrainGuard {
             coordinator: self.clone(),
+        }
+    }
+
+    /// Run an owner's drain-aware future while keeping it registered.
+    ///
+    /// The guard is released both on normal completion and when the future is
+    /// cancelled or panics. Prefer this over manually pairing [`register`](Self::register)
+    /// with `drop`, which makes it easy for a new early return to leak the
+    /// coordinator registration until transport shutdown times out.
+    pub fn run_registered<F>(self, future: F) -> impl std::future::Future<Output = F::Output>
+    where
+        F: std::future::Future,
+    {
+        // Register before returning the future, rather than inside its first
+        // poll. Transport shutdown can start immediately after the caller
+        // spawns an owner, and must already see that owner at that point.
+        let guard = self.register();
+        async move {
+            let _guard = guard;
+            future.await
         }
     }
 
@@ -433,5 +460,24 @@ mod tests {
             started.elapsed() < Duration::from_millis(50),
             "an idle coordinator must not add any shutdown latency"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_future_releases_guard_when_cancelled() {
+        let coordinator = DrainCoordinator::new();
+        let runner = coordinator.clone();
+        let registered = runner.run_registered(std::future::pending::<()>());
+        assert_eq!(coordinator.outstanding(), 1);
+        let task = tokio::spawn(registered);
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            coordinator.wait_for_drain(Duration::from_secs(1)),
+        )
+        .await
+        .expect("cancelling a registered future must release its drain guard");
+        assert_eq!(coordinator.outstanding(), 0);
     }
 }

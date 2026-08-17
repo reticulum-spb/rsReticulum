@@ -351,13 +351,9 @@ pub async fn spawn_rncp_listener(
     let loop_shutdown = shutdown.clone();
 
     let task = tokio::spawn(async move {
-        let drain_guard = drain_coordinator.register();
-        let lm_task = tokio::spawn(async move {
-            link_mgr
-                .run_until_shutdown(lm_shutdown, Duration::from_secs(5))
-                .await;
-            drop(drain_guard);
-        });
+        let lm_task = tokio::spawn(drain_coordinator.run_registered(
+            link_mgr.run_until_shutdown(lm_shutdown, crate::lifecycle::LINK_MANAGER_DRAIN_GRACE),
+        ));
 
         let mut denied_links: std::collections::HashSet<[u8; 16]> = Default::default();
 
