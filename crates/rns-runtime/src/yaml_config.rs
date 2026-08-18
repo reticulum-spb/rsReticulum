@@ -113,7 +113,9 @@ impl Config {
     }
 
     pub fn to_yaml(&self) -> Result<String, YamlConfigError> {
-        serde_saphyr::to_string(self).map_err(|error| YamlConfigError::Serialize(error.to_string()))
+        let compact = compact_value(self)?;
+        serde_saphyr::to_string(&compact)
+            .map_err(|error| YamlConfigError::Serialize(error.to_string()))
     }
 
     pub fn validate(&self) -> Result<(), YamlConfigError> {
@@ -1240,6 +1242,113 @@ pub enum OpaqueValue {
     Mapping(BTreeMap<String, OpaqueValue>),
 }
 
+fn compact_value(config: &Config) -> Result<serde_json::Value, YamlConfigError> {
+    let mut value = serde_json::to_value(config)
+        .map_err(|error| YamlConfigError::Serialize(error.to_string()))?;
+    let defaults = Config {
+        interfaces: Vec::new(),
+        ..Config::default()
+    };
+    let default_value = serde_json::to_value(defaults)
+        .map_err(|error| YamlConfigError::Serialize(error.to_string()))?;
+
+    let serde_json::Value::Object(root) = &mut value else {
+        return Ok(value);
+    };
+    if let serde_json::Value::Object(default_root) = default_value {
+        prune_object(root, &default_root, &[]);
+    }
+
+    if let Some(serde_json::Value::Array(interfaces)) = root.get_mut("interfaces") {
+        for (item, interface) in interfaces.iter_mut().zip(&config.interfaces) {
+            let baseline = serde_json::to_value(default_interface(interface))
+                .map_err(|error| YamlConfigError::Serialize(error.to_string()))?;
+            if let (serde_json::Value::Object(item), serde_json::Value::Object(baseline)) =
+                (item, baseline)
+            {
+                prune_object(item, &baseline, &["type", "name"]);
+                if matches!(interface, InterfaceConfig::RnodeMulti(_))
+                    && let Some(serde_json::Value::Array(subinterfaces)) =
+                        item.get_mut("subinterfaces")
+                {
+                    let sub_default = serde_json::to_value(RnodeSubInterfaceConfig::default())
+                        .map_err(|error| YamlConfigError::Serialize(error.to_string()))?;
+                    if let serde_json::Value::Object(sub_default) = sub_default {
+                        for subinterface in subinterfaces {
+                            if let serde_json::Value::Object(subinterface) = subinterface {
+                                prune_object(subinterface, &sub_default, &["name"]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if root
+        .get("interfaces")
+        .is_some_and(|value| matches!(value, serde_json::Value::Array(items) if items.is_empty()))
+    {
+        root.remove("interfaces");
+    }
+    Ok(value)
+}
+
+fn prune_object(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    defaults: &serde_json::Map<String, serde_json::Value>,
+    preserve: &[&str],
+) {
+    let keys: Vec<String> = value.keys().cloned().collect();
+    for key in keys {
+        if preserve.contains(&key.as_str()) {
+            continue;
+        }
+        let Some(default) = defaults.get(&key) else {
+            continue;
+        };
+        let remove = match (value.get_mut(&key), default) {
+            (Some(serde_json::Value::Object(current)), serde_json::Value::Object(default)) => {
+                prune_object(current, default, &[]);
+                current.is_empty()
+            }
+            (Some(current), default) => current == default,
+            (None, _) => false,
+        };
+        if remove {
+            value.remove(&key);
+        }
+    }
+}
+
+fn default_interface(interface: &InterfaceConfig) -> InterfaceConfig {
+    match interface {
+        InterfaceConfig::Auto(_) => InterfaceConfig::Auto(AutoInterfaceConfig::default()),
+        InterfaceConfig::TcpClient(_) => {
+            InterfaceConfig::TcpClient(TcpClientInterfaceConfig::default())
+        }
+        InterfaceConfig::TcpServer(_) => {
+            InterfaceConfig::TcpServer(TcpServerInterfaceConfig::default())
+        }
+        InterfaceConfig::Udp(_) => InterfaceConfig::Udp(UdpInterfaceConfig::default()),
+        InterfaceConfig::Local(_) => InterfaceConfig::Local(LocalInterfaceConfig::default()),
+        InterfaceConfig::I2p(_) => InterfaceConfig::I2p(I2pInterfaceConfig::default()),
+        InterfaceConfig::Pipe(_) => InterfaceConfig::Pipe(PipeInterfaceConfig::default()),
+        InterfaceConfig::Backbone(_) => {
+            InterfaceConfig::Backbone(BackboneInterfaceConfig::default())
+        }
+        InterfaceConfig::Serial(_) => InterfaceConfig::Serial(SerialInterfaceConfig::default()),
+        InterfaceConfig::Kiss(_) => InterfaceConfig::Kiss(KissInterfaceConfig::default()),
+        InterfaceConfig::Rnode(_) => InterfaceConfig::Rnode(RnodeInterfaceConfig::default()),
+        InterfaceConfig::RnodeMulti(_) => {
+            InterfaceConfig::RnodeMulti(RnodeMultiInterfaceConfig::default())
+        }
+        InterfaceConfig::Ax25Kiss(_) => {
+            InterfaceConfig::Ax25Kiss(Ax25KissInterfaceConfig::default())
+        }
+        InterfaceConfig::Plugin(_) => InterfaceConfig::Plugin(PluginInterfaceConfig::default()),
+    }
+}
+
 fn set_bool(section: &mut crate::normalized_config::NormalizedSection, key: &str, value: bool) {
     section.set(key, if value { "Yes" } else { "No" });
 }
@@ -1765,6 +1874,29 @@ mod tests {
         let config = Config::default();
         let yaml = config.to_yaml().unwrap();
         assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+    }
+
+    #[test]
+    fn serialization_omits_default_values_but_preserves_required_fields() {
+        let config = Config::default();
+        let yaml = config.to_yaml().unwrap();
+        assert!(yaml.contains("type: auto"));
+        assert!(yaml.contains("name: Default Interface"));
+        assert!(!yaml.contains("share_instance:"));
+        assert!(!yaml.contains("enabled:"));
+        assert!(!yaml.contains("discovery_port:"));
+        assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+
+        let mut changed = config;
+        changed.reticulum.enable_transport = true;
+        let InterfaceConfig::Auto(interface) = &mut changed.interfaces[0] else {
+            unreachable!()
+        };
+        interface.common.outgoing = false;
+        let yaml = changed.to_yaml().unwrap();
+        assert!(yaml.contains("enable_transport: true"));
+        assert!(yaml.contains("outgoing: false"));
+        assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), changed);
     }
 
     #[test]

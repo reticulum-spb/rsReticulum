@@ -15,6 +15,11 @@ are case-sensitive and use `snake_case`. Ports are integers in `1..=65535`
 unless a field is explicitly optional. Interface names must be non-empty and
 unique, including disabled interfaces.
 
+When rsReticulum or the Web UI writes the file, fields equal to their documented
+defaults are omitted. Required identity and discriminator fields such as
+interface `type` and `name` are always retained. Reading the compact form
+restores all omitted values from the same defaults listed below.
+
 Validate a file without starting Reticulum:
 
 ```bash
