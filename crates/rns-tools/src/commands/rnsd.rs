@@ -45,6 +45,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     check: Option<PathBuf>,
 
+    /// List interface plugins from /usr/lib/reticulum-rs and exit.
+    #[arg(long)]
+    list_plugin: bool,
+
     /// Print version and exit.
     #[arg(long)]
     version: bool,
@@ -61,6 +65,11 @@ pub(crate) async fn main() {
 
     if args.exampleconfig {
         print!("{}", rns_runtime::config::EXAMPLE_CONFIG);
+        return;
+    }
+
+    if args.list_plugin {
+        list_plugins_and_exit();
         return;
     }
 
@@ -141,6 +150,29 @@ pub(crate) async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn list_plugins_and_exit() {
+    #[cfg(target_os = "linux")]
+    match rns_interface::plugin::list_available_plugins() {
+        Ok(entries) => {
+            for entry in entries {
+                match entry.result {
+                    Ok(info) => println!(
+                        "{}\t{}\t{}\t{}",
+                        entry.filename, info.name, info.version, info.description
+                    ),
+                    Err(error) => println!("{}\tERROR\t{}", entry.filename, error),
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("rnsd-rs: cannot list /usr/lib/reticulum-rs: {error}");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("rnsd-rs: interface plugins are supported only on Linux");
 }
 
 async fn run_interactive_shell(handle: rns_runtime::reticulum::ReticulumHandle) {
