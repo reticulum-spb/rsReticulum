@@ -77,12 +77,12 @@ pub fn resolve_config_dir(configdir: Option<&str>) -> PathBuf {
             let platform = Platform::current();
             if !matches!(platform, Platform::Windows | Platform::Android) {
                 let etc = PathBuf::from("/etc/rsReticulum");
-                if etc.join(crate::yaml_config::CONFIG_FILE_NAME).is_file() {
+                if etc.join(crate::config::CONFIG_FILE_NAME).is_file() {
                     return etc;
                 }
                 if let Ok(home) = std::env::var("HOME") {
                     let xdg = PathBuf::from(home).join(".config/rsReticulum");
-                    if xdg.join(crate::yaml_config::CONFIG_FILE_NAME).is_file() {
+                    if xdg.join(crate::config::CONFIG_FILE_NAME).is_file() {
                         return xdg;
                     }
                 }

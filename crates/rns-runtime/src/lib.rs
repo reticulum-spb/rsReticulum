@@ -4,8 +4,13 @@
 #[cfg(not(any(feature = "client", feature = "full")))]
 compile_error!("rns-runtime requires either the `client` or `full` feature");
 
+#[cfg(feature = "api")]
+pub mod api_server;
 pub mod application;
+#[path = "yaml_config.rs"]
 pub mod config;
+#[path = "config.rs"]
+pub(crate) mod config_compat;
 pub mod constants;
 #[cfg(feature = "full")]
 pub mod interface_factory;
@@ -34,9 +39,5 @@ pub mod rnsh;
 pub mod rpc;
 #[cfg(feature = "full")]
 pub mod rpc_server;
-pub mod yaml_config;
-
-#[cfg(feature = "api")]
-pub mod api_server;
 #[cfg(feature = "api")]
 pub mod web_logs;

@@ -13,12 +13,10 @@ pub const RETICULUM_COMPAT_VERSION: &str = "1.3.8";
 /// RNS/__init__.py:85 default True): whether log lines carry a timestamp
 /// prefix. Read pre-init from the config file, like the loglevel.
 pub fn config_log_timestamps(config_dir: &std::path::Path) -> bool {
-    rns_runtime::yaml_config::Config::from_file(
-        config_dir.join(rns_runtime::yaml_config::CONFIG_FILE_NAME),
-    )
-    .ok()
-    .map(|config| config.logging.timestamps)
-    .unwrap_or(true)
+    rns_runtime::config::Config::from_file(config_dir.join(rns_runtime::config::CONFIG_FILE_NAME))
+        .ok()
+        .map(|config| config.logging.timestamps)
+        .unwrap_or(true)
 }
 
 /// Shared tracing-subscriber setup for the CLI binaries; omits the timestamp

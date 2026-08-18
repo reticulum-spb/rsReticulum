@@ -60,12 +60,12 @@ pub(crate) async fn main() {
     }
 
     if args.exampleconfig {
-        print!("{}", rns_runtime::yaml_config::EXAMPLE_CONFIG);
+        print!("{}", rns_runtime::config::EXAMPLE_CONFIG);
         return;
     }
 
     if let Some(path) = &args.check {
-        match rns_runtime::yaml_config::Config::from_file(path) {
+        match rns_runtime::config::Config::from_file(path) {
             Ok(_) => {
                 println!("configuration is valid: {}", path.display());
                 return;
@@ -297,11 +297,9 @@ fn parse_string_literal(value: &str) -> Option<String> {
 }
 
 fn read_config_loglevel(config_dir: &Path) -> Option<i32> {
-    rns_runtime::yaml_config::Config::from_file(
-        config_dir.join(rns_runtime::yaml_config::CONFIG_FILE_NAME),
-    )
-    .ok()
-    .map(|config| config.logging.level)
+    rns_runtime::config::Config::from_file(config_dir.join(rns_runtime::config::CONFIG_FILE_NAME))
+        .ok()
+        .map(|config| config.logging.level)
 }
 
 fn tracing_level(verbosity: i32) -> tracing::Level {

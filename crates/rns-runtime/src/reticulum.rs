@@ -14,7 +14,7 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, ConfigError, ConfigSection};
+use crate::config_compat::{Config, ConfigError, ConfigSection};
 use crate::constants::*;
 use crate::interface_factory;
 use crate::jobs::{Job, JobScheduler};
@@ -1033,7 +1033,7 @@ pub async fn init(
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
 
-    let config_path = config_dir.join(crate::yaml_config::CONFIG_FILE_NAME);
+    let config_path = config_dir.join(crate::config::CONFIG_FILE_NAME);
     let (config, config_created) = load_or_create_config(&config_path)?;
     if config_created {
         tracing::info!(
@@ -2016,7 +2016,7 @@ fn get_post_init_for_config(
         return interface_factory::InterfacePostInit::from_section(section)
             .with_default_ifac_size(default_ifac_size);
     }
-    interface_factory::InterfacePostInit::from_section(&crate::config::ConfigSection::new())
+    interface_factory::InterfacePostInit::from_section(&crate::config_compat::ConfigSection::new())
         .with_default_ifac_size(default_ifac_size)
 }
 
@@ -3575,11 +3575,10 @@ pub async fn spawn_interface_from_config(
 
     // Load post_init from the on-disk config so IFAC, announce-rate, etc.
     // are honoured for newly added interfaces too.
-    let disk_config = crate::yaml_config::Config::from_file(
-        handle.config_dir.join(crate::yaml_config::CONFIG_FILE_NAME),
-    )
-    .and_then(|config| config.to_runtime_compat_config())
-    .unwrap_or_default();
+    let disk_config =
+        crate::config::Config::from_file(handle.config_dir.join(crate::config::CONFIG_FILE_NAME))
+            .and_then(|config| config.to_runtime_compat_config())
+            .unwrap_or_default();
     let mut post_init = get_post_init_for_config(&disk_config, iface_config);
     finalize_post_init(&mut post_init, &handle.config);
 
@@ -3894,12 +3893,12 @@ pub fn get_instance() -> Option<&'static ReticulumHandle> {
 
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
     if path.exists() {
-        crate::yaml_config::Config::from_file(path)
+        crate::config::Config::from_file(path)
             .and_then(|config| config.to_runtime_compat_config())
             .map(|config| (config, false))
             .map_err(ReticulumError::YamlConfig)
     } else {
-        let config = crate::yaml_config::Config::default();
+        let config = crate::config::Config::default();
         let content = config.to_yaml().map_err(ReticulumError::YamlConfig)?;
         std::fs::write(path, content).map_err(ReticulumError::Io)?;
         config
@@ -4042,7 +4041,7 @@ pub enum ReticulumError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
     #[error("{0}")]
-    YamlConfig(#[from] crate::yaml_config::YamlConfigError),
+    YamlConfig(#[from] crate::config::YamlConfigError),
     #[error("I/O error: {0}")]
     Io(std::io::Error),
     #[error("already initialized")]

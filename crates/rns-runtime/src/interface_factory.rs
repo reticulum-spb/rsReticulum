@@ -1,7 +1,7 @@
 //! Mirrors `Reticulum._synthesize_interface` in the Python reference but
 //! rejects external-program interfaces.
 
-use crate::config::ConfigSection;
+use crate::config_compat::ConfigSection;
 use rns_interface::tcp::{TcpClientConfig, TcpServerConfig};
 use rns_interface::traits::InterfaceMode;
 use rns_interface::udp::UdpInterfaceConfig;
@@ -1276,8 +1276,8 @@ fn mode_to_str(mode: InterfaceMode) -> &'static str {
 /// writing into the `[interfaces]` block of the Reticulum config file.
 pub fn tcp_client_to_section(
     c: &rns_interface::tcp::TcpClientConfig,
-) -> crate::config::ConfigSection {
-    let mut s = crate::config::ConfigSection::new();
+) -> crate::config_compat::ConfigSection {
+    let mut s = crate::config_compat::ConfigSection::new();
     s.set("type", "TCPClientInterface");
     s.set("enabled", "Yes");
     s.set("target_host", &c.target_host);
@@ -1303,8 +1303,8 @@ pub fn tcp_client_to_section(
 /// Convert a [`TcpServerConfig`] back into a [`ConfigSection`].
 pub fn tcp_server_to_section(
     c: &rns_interface::tcp::TcpServerConfig,
-) -> crate::config::ConfigSection {
-    let mut s = crate::config::ConfigSection::new();
+) -> crate::config_compat::ConfigSection {
+    let mut s = crate::config_compat::ConfigSection::new();
     s.set("type", "TCPServerInterface");
     s.set("enabled", "Yes");
     s.set("listen_ip", &c.listen_ip);

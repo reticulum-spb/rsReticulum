@@ -154,8 +154,10 @@ impl Config {
     /// changed from `ConfigSection` to the typed model. Input is always typed
     /// YAML; this does not parse or accept the legacy file format.
     #[doc(hidden)]
-    pub fn to_runtime_compat_config(&self) -> Result<crate::config::Config, YamlConfigError> {
-        let mut output = crate::config::Config::new();
+    pub fn to_runtime_compat_config(
+        &self,
+    ) -> Result<crate::config_compat::Config, YamlConfigError> {
+        let mut output = crate::config_compat::Config::new();
         {
             let section = output.ensure_section("reticulum");
             set_bool(section, "share_instance", self.reticulum.share_instance);
@@ -295,7 +297,7 @@ impl Config {
         {
             let interfaces = output.ensure_section("interfaces");
             for interface in &self.interfaces {
-                let mut section = crate::config::ConfigSection::new();
+                let mut section = crate::config_compat::ConfigSection::new();
                 interface.write_compat_section(&mut section)?;
                 *interfaces.add_subsection(interface.common().name.clone()) = section;
             }
@@ -584,7 +586,7 @@ impl InterfaceConfig {
 
     fn write_compat_section(
         &self,
-        section: &mut crate::config::ConfigSection,
+        section: &mut crate::config_compat::ConfigSection,
     ) -> Result<(), YamlConfigError> {
         write_common(section, self.common());
         match self {
@@ -1208,22 +1210,22 @@ pub enum OpaqueValue {
     Mapping(BTreeMap<String, OpaqueValue>),
 }
 
-fn set_bool(section: &mut crate::config::ConfigSection, key: &str, value: bool) {
+fn set_bool(section: &mut crate::config_compat::ConfigSection, key: &str, value: bool) {
     section.set(key, if value { "Yes" } else { "No" });
 }
 
-fn set_num(section: &mut crate::config::ConfigSection, key: &str, value: impl ToString) {
+fn set_num(section: &mut crate::config_compat::ConfigSection, key: &str, value: impl ToString) {
     section.set(key, &value.to_string());
 }
 
-fn set_opt(section: &mut crate::config::ConfigSection, key: &str, value: Option<&str>) {
+fn set_opt(section: &mut crate::config_compat::ConfigSection, key: &str, value: Option<&str>) {
     if let Some(value) = value {
         section.set(key, value);
     }
 }
 
 fn set_opt_num<T: ToString + Copy>(
-    section: &mut crate::config::ConfigSection,
+    section: &mut crate::config_compat::ConfigSection,
     key: &str,
     value: Option<T>,
 ) {
@@ -1244,7 +1246,7 @@ fn mode_name(mode: InterfaceMode) -> &'static str {
     }
 }
 
-fn write_common(section: &mut crate::config::ConfigSection, common: &InterfaceCommonConfig) {
+fn write_common(section: &mut crate::config_compat::ConfigSection, common: &InterfaceCommonConfig) {
     set_bool(section, "enabled", common.enabled);
     section.set("mode", mode_name(common.mode));
     set_bool(section, "outgoing", common.outgoing);
@@ -1270,7 +1272,7 @@ fn write_common(section: &mut crate::config::ConfigSection, common: &InterfaceCo
     );
 }
 
-fn write_ingress(section: &mut crate::config::ConfigSection, ingress: &IngressConfig) {
+fn write_ingress(section: &mut crate::config_compat::ConfigSection, ingress: &IngressConfig) {
     set_opt_num(section, "ic_burst_freq_new", ingress.burst_freq_new);
     set_opt_num(section, "ic_burst_freq", ingress.burst_freq);
     set_opt_num(
@@ -1294,7 +1296,7 @@ fn write_ingress(section: &mut crate::config::ConfigSection, ingress: &IngressCo
     }
 }
 
-fn write_serial(section: &mut crate::config::ConfigSection, serial: &SerialInterfaceConfig) {
+fn write_serial(section: &mut crate::config_compat::ConfigSection, serial: &SerialInterfaceConfig) {
     write_serial_fields(
         section,
         &serial.port,
@@ -1306,7 +1308,7 @@ fn write_serial(section: &mut crate::config::ConfigSection, serial: &SerialInter
 }
 
 fn write_serial_fields(
-    section: &mut crate::config::ConfigSection,
+    section: &mut crate::config_compat::ConfigSection,
     port: &str,
     baud_rate: u32,
     data_bits: u8,
@@ -1321,7 +1323,7 @@ fn write_serial_fields(
 }
 
 fn write_kiss(
-    section: &mut crate::config::ConfigSection,
+    section: &mut crate::config_compat::ConfigSection,
     preamble_ms: u32,
     tx_tail_ms: u32,
     persistence: u8,
@@ -1335,7 +1337,7 @@ fn write_kiss(
     set_bool(section, "flow_control", flow_control);
 }
 
-fn write_radio(section: &mut crate::config::ConfigSection, radio: &RadioConfig) {
+fn write_radio(section: &mut crate::config_compat::ConfigSection, radio: &RadioConfig) {
     set_num(section, "frequency", radio.frequency);
     set_num(section, "bandwidth", radio.bandwidth);
     set_num(section, "spreading_factor", radio.spreading_factor);
@@ -1351,7 +1353,7 @@ fn write_radio(section: &mut crate::config::ConfigSection, radio: &RadioConfig) 
 #[cfg(feature = "api")]
 pub fn interface_from_compat_section(
     name: &str,
-    section: &crate::config::ConfigSection,
+    section: &crate::config_compat::ConfigSection,
 ) -> Result<InterfaceConfig, YamlConfigError> {
     let mut enabled_section = section.clone();
     enabled_section.set("enabled", "Yes");
@@ -1541,7 +1543,10 @@ pub fn interface_from_compat_section(
 }
 
 #[cfg(feature = "api")]
-fn common_from_compat(name: &str, section: &crate::config::ConfigSection) -> InterfaceCommonConfig {
+fn common_from_compat(
+    name: &str,
+    section: &crate::config_compat::ConfigSection,
+) -> InterfaceCommonConfig {
     InterfaceCommonConfig {
         name: name.to_string(),
         enabled: section.get_bool("enabled").unwrap_or(true),

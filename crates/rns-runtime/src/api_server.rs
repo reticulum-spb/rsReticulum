@@ -54,7 +54,7 @@ use rns_transport::messages::{
     TransportQueryResponse,
 };
 
-use crate::config::{Config, ConfigSection, atomic_write};
+use crate::config_compat::{Config, ConfigSection, atomic_write};
 use crate::interface_factory::{InterfaceConfig, synthesize_interface};
 use crate::lifecycle::ShutdownSignal;
 use crate::reticulum::{ReticulumConfig, ReticulumHandle, SharedInstanceType, teardown_interface};
@@ -174,7 +174,7 @@ struct LoginThrottle {
 
 struct LoadedConfig {
     config: Config,
-    typed: crate::yaml_config::Config,
+    typed: crate::config::Config,
     source: Vec<u8>,
 }
 
@@ -208,7 +208,7 @@ struct SettingsRequest {
 
 fn save_config_snapshot(
     path: &std::path::Path,
-    config: &crate::yaml_config::Config,
+    config: &crate::config::Config,
     expected: &[u8],
 ) -> Result<Vec<u8>, ApiError> {
     let current = std::fs::read(path)
@@ -267,9 +267,7 @@ impl AppState {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.handle
-            .config_dir
-            .join(crate::yaml_config::CONFIG_FILE_NAME)
+        self.handle.config_dir.join(crate::config::CONFIG_FILE_NAME)
     }
 
     fn load_config(&self) -> Result<Config, ApiError> {
@@ -282,7 +280,7 @@ impl AppState {
             .map_err(|e| ApiError::internal(format!("failed to read config: {e}")))?;
         let text = std::str::from_utf8(&source)
             .map_err(|e| ApiError::internal(format!("config is not valid UTF-8: {e}")))?;
-        let typed = crate::yaml_config::Config::parse(text, &path)
+        let typed = crate::config::Config::parse(text, &path)
             .map_err(|e| ApiError::internal(format!("failed to parse config: {e}")))?;
         let config = typed
             .to_runtime_compat_config()
@@ -296,7 +294,7 @@ impl AppState {
 
     fn save_config(
         &self,
-        config: &crate::yaml_config::Config,
+        config: &crate::config::Config,
         expected: &[u8],
     ) -> Result<Vec<u8>, ApiError> {
         save_config_snapshot(&self.config_path(), config, expected)
@@ -707,9 +705,9 @@ impl InterfaceRequest {
         synthesize_interface(&self.name, &section).map_err(|e| ApiError::bad(format!("{e}")))
     }
 
-    fn to_yaml_config(&self) -> Result<crate::yaml_config::InterfaceConfig, ApiError> {
+    fn to_yaml_config(&self) -> Result<crate::config::InterfaceConfig, ApiError> {
         self.validate_fields()?;
-        crate::yaml_config::interface_from_compat_section(&self.name, &self.to_config_section())
+        crate::config::interface_from_compat_section(&self.name, &self.to_config_section())
             .map_err(|error| ApiError::bad(error.to_string()))
     }
 
@@ -737,8 +735,8 @@ impl InterfaceRequest {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn set_interface_config(
-    config: &mut crate::yaml_config::Config,
-    interface: crate::yaml_config::InterfaceConfig,
+    config: &mut crate::config::Config,
+    interface: crate::config::InterfaceConfig,
 ) {
     let name = interface.common().name.as_str();
     config
@@ -747,7 +745,7 @@ fn set_interface_config(
     config.interfaces.push(interface);
 }
 
-fn remove_interface_config(config: &mut crate::yaml_config::Config, name: &str) -> bool {
+fn remove_interface_config(config: &mut crate::config::Config, name: &str) -> bool {
     let before = config.interfaces.len();
     config
         .interfaces
@@ -764,9 +762,9 @@ fn remove_interface_config(config: &mut crate::yaml_config::Config, name: &str) 
 async fn apply_interface_change(
     s: &AppState,
     iface_name: &str,
-    new_yaml_config: Option<crate::yaml_config::InterfaceConfig>, // None = remove
-    old_id: Option<u64>,                  // None = there was no new interface
-    new_config: Option<&InterfaceConfig>, // None = deletion only
+    new_yaml_config: Option<crate::config::InterfaceConfig>, // None = remove
+    old_id: Option<u64>,                                     // None = there was no new interface
+    new_config: Option<&InterfaceConfig>,                    // None = deletion only
     renamed_from: Option<&str>,
     rollback_interface: Option<&InterfaceConfig>,
 ) -> ApiResult<u64> {
@@ -1288,8 +1286,8 @@ async fn update_settings(
         .to_ascii_lowercase()
         .as_str()
     {
-        "tcp" => crate::yaml_config::SharedInstanceType::Tcp,
-        "unix" => crate::yaml_config::SharedInstanceType::Unix,
+        "tcp" => crate::config::SharedInstanceType::Tcp,
+        "unix" => crate::config::SharedInstanceType::Unix,
         _ => {
             return Err(ApiError::bad("shared_instance_type must be tcp or unix"));
         }
@@ -2395,7 +2393,7 @@ mod tests {
 
     #[test]
     fn interface_config_sections_can_be_created_renamed_and_deleted() {
-        let mut config = crate::yaml_config::Config {
+        let mut config = crate::config::Config {
             interfaces: Vec::new(),
             ..Default::default()
         };
@@ -2449,8 +2447,7 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
 
         let mut config =
-            crate::yaml_config::Config::parse(std::str::from_utf8(&original).unwrap(), &path)
-                .unwrap();
+            crate::config::Config::parse(std::str::from_utf8(&original).unwrap(), &path).unwrap();
         let request: InterfaceRequest = serde_json::from_value(json!({
             "name": "Test",
             "type": "TCPServerInterface",

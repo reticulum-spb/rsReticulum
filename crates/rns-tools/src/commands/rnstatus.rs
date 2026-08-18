@@ -195,8 +195,8 @@ async fn run_local(args: Args) -> ExitCode {
 
 async fn run_local_once(args: &Args) -> ExitCode {
     let config_dir = resolve_config_dir(args.config.as_deref());
-    let config_path = config_dir.join(rns_runtime::yaml_config::CONFIG_FILE_NAME);
-    let config = match rns_runtime::yaml_config::Config::from_file(&config_path)
+    let config_path = config_dir.join(rns_runtime::config::CONFIG_FILE_NAME);
+    let config = match rns_runtime::config::Config::from_file(&config_path)
         .and_then(|config| config.to_runtime_compat_config())
     {
         Ok(c) => c,
@@ -301,7 +301,7 @@ fn local_rpc_failure_message(
     err: &rns_runtime::rpc::RpcError,
 ) -> String {
     let endpoint = endpoint.display();
-    let config_path = config_dir.join(rns_runtime::yaml_config::CONFIG_FILE_NAME);
+    let config_path = config_dir.join(rns_runtime::config::CONFIG_FILE_NAME);
     let transport_identity_path = rns_runtime::platform::StoragePaths::from_config_dir(config_dir)
         .storage_dir
         .join("transport_identity");

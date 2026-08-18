@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ConfigError};
+use crate::config_compat::{Config, ConfigError};
 use crate::constants::{
     ANNOUNCE_CAP, DEFAULT_INSTANCE_NAME, LOCAL_CONTROL_PORT, LOCAL_INTERFACE_PORT,
 };
@@ -304,11 +304,11 @@ pub async fn connect_shared(
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
-    let config_path = config_dir.join(crate::yaml_config::CONFIG_FILE_NAME);
+    let config_path = config_dir.join(crate::config::CONFIG_FILE_NAME);
     let config = if config_path.exists() {
-        crate::yaml_config::Config::from_file(&config_path)?.to_runtime_compat_config()?
+        crate::config::Config::from_file(&config_path)?.to_runtime_compat_config()?
     } else {
-        let typed = crate::yaml_config::Config::default();
+        let typed = crate::config::Config::default();
         std::fs::write(&config_path, typed.to_yaml()?).map_err(ReticulumError::Io)?;
         typed.to_runtime_compat_config()?
     };
@@ -499,7 +499,7 @@ pub enum ReticulumError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
     #[error("{0}")]
-    YamlConfig(#[from] crate::yaml_config::YamlConfigError),
+    YamlConfig(#[from] crate::config::YamlConfigError),
     #[error("I/O error: {0}")]
     Io(std::io::Error),
     #[error("already initialized")]
