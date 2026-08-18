@@ -5256,11 +5256,11 @@ enabled = yes
         std::fs::create_dir_all(&dir_c).unwrap();
         let rpc_key_hex = "4242424242424242424242424242424242424242424242424242424242424242";
         let cfg = format!(
-            "[reticulum]\nshare_instance = Yes\nshared_instance_type = tcp\nshared_instance_port = {port}\ninstance_control_port = {control_port}\nrpc_key = {rpc_key_hex}\nenable_transport = No\n\n[interfaces]\n"
+            "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control_port}\n  rpc_key: {rpc_key_hex}\n  enable_transport: false\ninterfaces: []\n"
         );
-        std::fs::write(dir_a.join("config"), &cfg).unwrap();
-        std::fs::write(dir_b.join("config"), &cfg).unwrap();
-        std::fs::write(dir_c.join("config"), &cfg).unwrap();
+        std::fs::write(dir_a.join("config.yaml"), &cfg).unwrap();
+        std::fs::write(dir_b.join("config.yaml"), &cfg).unwrap();
+        std::fs::write(dir_c.join("config.yaml"), &cfg).unwrap();
 
         let shutdown_a = ShutdownSignal::new();
         let shutdown_b = ShutdownSignal::new();
@@ -5495,9 +5495,9 @@ enabled = yes
 
         let rpc_key_hex = "5353535353535353535353535353535353535353535353535353535353535353";
         let cfg = format!(
-            "[reticulum]\nshare_instance = Yes\nshared_instance_type = tcp\nshared_instance_port = {port}\ninstance_control_port = {control_port}\nrpc_key = {rpc_key_hex}\nenable_transport = Yes\n\n[interfaces]\n"
+            "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control_port}\n  rpc_key: {rpc_key_hex}\n  enable_transport: true\ninterfaces: []\n"
         );
-        std::fs::write(dir.join("config"), &cfg).unwrap();
+        std::fs::write(dir.join("config.yaml"), &cfg).unwrap();
 
         let shutdown = ShutdownSignal::new();
         let foreground = Arc::new(AtomicBool::new(true));
@@ -5563,9 +5563,9 @@ enabled = yes
         let dir = std::env::temp_dir().join(format!("reticulum_rs_live_tcp_testnet_{nonce}"));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = format!(
-            "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n\n[[Public TCP]]\ntype = TCPClientInterface\nenabled = Yes\ntarget_host = {host}\ntarget_port = {port}\n"
+            "reticulum:\n  share_instance: false\n  enable_transport: false\ninterfaces:\n  - type: tcp_client\n    name: Public TCP\n    enabled: true\n    target_host: {host}\n    target_port: {port}\n"
         );
-        std::fs::write(dir.join("config"), &cfg).unwrap();
+        std::fs::write(dir.join("config.yaml"), &cfg).unwrap();
 
         let shutdown = ShutdownSignal::new();
         let foreground = Arc::new(AtomicBool::new(true));

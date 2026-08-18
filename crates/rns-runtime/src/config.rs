@@ -1,10 +1,18 @@
+//! Internal compatibility section tree used while runtime consumers migrate
+//! to the typed YAML model.
+//!
+//! The legacy ConfigObj parser is compiled only for historical unit tests; no
+//! production entry point can read or write the old format.
+//!
 //! INI parser compatible with the ConfigObj subset used by Python Reticulum:
 //! nested sections, quoted keys/sections/values, ConfigObj list values,
 //! multiline values, `#` comments outside quotes, and boolean variants
 //! `True`/`Yes`/`On`/`1`.
 
 use std::collections::HashMap;
+#[cfg(any(test, feature = "api"))]
 use std::io::Write;
+#[cfg(any(test, feature = "api"))]
 use std::path::Path;
 use thiserror::Error;
 
@@ -125,6 +133,7 @@ impl ConfigSection {
         self.values.insert(key, value);
     }
 
+    #[cfg(test)]
     fn insert_value(
         &mut self,
         key: String,
@@ -142,6 +151,7 @@ impl ConfigSection {
         Ok(())
     }
 
+    #[cfg(test)]
     fn insert_subsection(
         &mut self,
         name: String,
@@ -180,6 +190,7 @@ impl ConfigSection {
 
     /// Serialize this section at `depth` bracket-levels into `out`.
     /// `depth=2` → `[[name]]`, `depth=3` → `[[[name]]]`, etc.
+    #[cfg(test)]
     pub(crate) fn write_ini(&self, name: &str, depth: usize, out: &mut String) {
         let brackets = "[".repeat(depth);
         let close = "]".repeat(depth);
@@ -246,17 +257,20 @@ impl Config {
 
     /// Mirrors Python ConfigObj file loading, including normal OS symlink
     /// following. Security policy for config paths must be enforced by callers.
+    #[cfg(test)]
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         Self::from_loaded_str(&content, path)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_loaded_str(input: &str, path: &Path) -> Result<Self, ConfigError> {
         let mut config = Self::parse(input)?;
         config.prepare_loaded_reticulum_config(path)?;
         Ok(config)
     }
 
+    #[cfg(test)]
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         let mut config = Config::new();
         let mut current_section: Option<String> = None;
@@ -405,10 +419,12 @@ impl Config {
         }
     }
 
+    #[cfg(test)]
     pub fn default_config() -> &'static str {
         DEFAULT_CONFIG
     }
 
+    #[cfg(test)]
     pub fn write_default(path: &Path) -> Result<(), ConfigError> {
         std::fs::write(path, DEFAULT_CONFIG)?;
         Ok(())
@@ -426,6 +442,7 @@ impl Config {
 
     /// Serialize the entire config back to INI text.
     /// Preserves insertion order of sections, keys, and subsections.
+    #[cfg(test)]
     pub fn to_ini(&self) -> String {
         let mut out = String::new();
         for section_name in &self.section_order {
@@ -477,11 +494,13 @@ impl Config {
     }
 
     /// Write the config back to a file.
+    #[cfg(test)]
     pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
         let content = self.to_ini();
         atomic_write(path, content.as_bytes())
     }
 
+    #[cfg(test)]
     fn prepare_loaded_reticulum_config(&mut self, _config_path: &Path) -> Result<(), ConfigError> {
         let Some(section) = self.section_mut("reticulum") else {
             return Ok(());
@@ -494,6 +513,7 @@ impl Config {
         Ok(())
     }
 
+    #[cfg(test)]
     fn root_section_mut(&mut self) -> &mut ConfigSection {
         if !self.sections.contains_key("") {
             self.section_order.push(String::new());
@@ -508,6 +528,7 @@ impl Config {
 ///
 /// Direct symlinks are resolved first so saving a config preserves the symlink
 /// instead of replacing it.
+#[cfg(any(test, feature = "api"))]
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(path)?,
@@ -575,6 +596,7 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ConfigErro
         .into())
 }
 
+#[cfg(test)]
 fn section_for_path_mut<'a>(
     mut section: &'a mut ConfigSection,
     path: &[String],
@@ -588,6 +610,7 @@ fn section_for_path_mut<'a>(
     section
 }
 
+#[cfg(test)]
 fn unquote_token(value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -606,6 +629,7 @@ fn unquote_token(value: &str) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
 fn parse_config_value(
     raw: &str,
     lines: &[&str],
@@ -623,6 +647,7 @@ fn parse_config_value(
         })
 }
 
+#[cfg(test)]
 fn parse_multiline_value(
     raw: &str,
     lines: &[&str],
@@ -653,6 +678,7 @@ fn parse_multiline_value(
     })
 }
 
+#[cfg(test)]
 fn parse_single_line_value(raw: &str) -> Result<ConfigValue, String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -681,6 +707,7 @@ fn parse_single_line_value(raw: &str) -> Result<ConfigValue, String> {
     Ok(ConfigValue::Scalar(unquote_token(value)?))
 }
 
+#[cfg(test)]
 fn split_value_parts(value: &str) -> Result<(Vec<String>, bool), String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -743,6 +770,7 @@ fn split_value_parts(value: &str) -> Result<(Vec<String>, bool), String> {
 }
 
 /// Truncate at the first `#` outside a quoted string.
+#[cfg(test)]
 fn strip_comment(line: &str) -> &str {
     let mut in_quote = false;
     let mut quote_char = ' ';
@@ -769,6 +797,7 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 fn validate_identity_hash_list(section: &ConfigSection, key: &str) -> Result<(), ConfigError> {
     let Some(values) = section.get_list(key) else {
         return Ok(());
@@ -807,6 +836,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+#[cfg(test)]
 const DEFAULT_CONFIG: &str = r#"# This is the default Reticulum config file.
 
 [reticulum]

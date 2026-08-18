@@ -44,8 +44,8 @@ impl Drop for TempDir {
 #[cfg(unix)]
 fn write_config(tmp: &TempDir) {
     fs::write(
-        tmp.path().join("config"),
-        "[reticulum]\nshare_instance = No\nenable_transport = No\n\n[interfaces]\n",
+        tmp.path().join("config.yaml"),
+        "reticulum:\n  share_instance: false\n  enable_transport: false\ninterfaces: []\n",
     )
     .expect("write config");
 }

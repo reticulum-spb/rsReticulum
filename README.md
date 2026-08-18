@@ -251,7 +251,7 @@ requires a login session. Plain HTTP is intended for trusted local networks;
 use a TLS reverse proxy when traffic crosses an untrusted network.
 
 Web UI config changes are written atomically. Before every mutation, the
-previous file is saved as `config.web-ui.bak`; external edits are rejected with
+previous file is saved as `config.yaml.web-ui.bak`; external edits are rejected with
 a conflict response, and a failed interface restart restores both the config
 and the previous runtime interface.
 
@@ -280,13 +280,15 @@ cargo test -p rns-runtime --features api
 
 ## Configuration
 
-`rnsd-rs` reads Reticulum INI config from `<config-dir>/config`. If no config
+`rnsd-rs` reads typed YAML from `<config-dir>/config.yaml`. The legacy
+ConfigObj/INI file named `config` is not read and there is no automatic
+fallback or conversion. If no config
 directory is supplied, the default is:
 
 | Platform | Default config file |
 | --- | --- |
-| Linux/macOS | `/etc/rsReticulum/config`, then `~/.config/rsReticulum/config`, then `~/.rsReticulum/config` |
-| Windows | `%APPDATA%\rsReticulum\config` |
+| Linux/macOS | `/etc/rsReticulum/config.yaml`, then `~/.config/rsReticulum/config.yaml`, then `~/.rsReticulum/config.yaml` |
+| Windows | `%APPDATA%\rsReticulum\config.yaml` |
 
 Generate the annotated starter file:
 
@@ -294,35 +296,46 @@ Generate the annotated starter file:
 rnsd-rs --exampleconfig
 ```
 
-Minimal TCP client example:
+Validate a file without starting Reticulum:
 
-```ini
-[reticulum]
-share_instance = yes
-instance_control_socket = yes
-enable_transport = no
-
-[interfaces]
-
-  [[Default TCP]]
-    type = TCPClientInterface
-    enabled = yes
-    target_host = rns.ratspeak.org
-    target_port = 4242
+```bash
+rnsd-rs --check /path/to/config.yaml
 ```
 
-Existing Python Reticulum configs should work if every requested interface
-is implemented here. Unknown or not-yet-wired interfaces should be removed or
-disabled until support lands.
+Minimal TCP client example:
+
+```yaml
+reticulum:
+  share_instance: true
+  enable_transport: false
+
+interfaces:
+  - type: tcp_client
+    name: Default TCP
+    enabled: true
+    target_host: rns.ratspeak.org
+    target_port: 4242
+```
+
+This is a breaking configuration-format change. Existing Python Reticulum
+configs must be rewritten as YAML; rsReticulum intentionally does not parse
+the old format.
+
+Configuration is deserialized with `serde-saphyr` into strict Serde structs.
+It was selected because it is actively maintained, reports source locations,
+supports both reading and Web UI serialization, and does not require a native
+libyaml dependency. The archived and deprecated `serde_yaml` crate is not used.
+Unknown fields are errors for core and built-in interfaces; only the nested
+`config` value of a future `type: plugin` interface is opaque to core.
 
 The default shared-instance data/control ports are `37428`/`37429`. Ratspeak
 uses app-private `37430`/`37431` ports. If you run two daemons at the same
 time, give one config a distinct port pair to avoid confliction, like:
 
-```ini
-[reticulum]
-shared_instance_port = 37432
-instance_control_port = 37433
+```yaml
+reticulum:
+  shared_instance_port: 37432
+  instance_control_port: 37433
 ```
 
 ## Interface Support

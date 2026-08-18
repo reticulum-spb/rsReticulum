@@ -701,9 +701,10 @@ impl InterfaceConfig {
                     v.flow_control,
                 );
             }
+            Self::Plugin(v) if !v.common.enabled => section.set("type", "PluginInterface"),
             Self::Plugin(v) => {
                 return Err(YamlConfigError::Validation(format!(
-                    "interface {:?}: plugin interfaces cannot run before the plugin ABI is implemented",
+                    "interface {:?}: enabled plugin interfaces require the future plugin ABI",
                     v.common.name
                 )));
             }

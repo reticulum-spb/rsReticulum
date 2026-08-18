@@ -212,20 +212,9 @@ fn rnsd_rnstatus_cli_survives_stale_python_destination_table() {
     let (shared_port, control_port) = free_tcp_port_pair();
     let rpc_key_hex = "5353535353535353535353535353535353535353535353535353535353535353";
     let config = format!(
-        "[reticulum]\n\
-         share_instance = Yes\n\
-         shared_instance_type = tcp\n\
-         shared_instance_port = {shared_port}\n\
-         instance_control_port = {control_port}\n\
-         rpc_key = {rpc_key_hex}\n\
-         enable_transport = Yes\n\
-         \n\
-         [logging]\n\
-         loglevel = 1\n\
-         \n\
-         [interfaces]\n"
+        "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {shared_port}\n  instance_control_port: {control_port}\n  rpc_key: {rpc_key_hex}\n  enable_transport: true\nlogging:\n  level: 1\ninterfaces: []\n"
     );
-    fs::write(tmp.join("config"), config).expect("write config");
+    fs::write(tmp.join("config.yaml"), config).expect("write config");
     write_stale_python_destination_table(&tmp.join("storage"), 512);
 
     let mut daemon = ChildGuard::spawn(
@@ -261,26 +250,9 @@ fn rnsd_rnstatus_cli_public_tcp_testnet_smoke() {
         .unwrap_or(4242);
     let rpc_key_hex = "5353535353535353535353535353535353535353535353535353535353535353";
     let config = format!(
-        "[reticulum]\n\
-         share_instance = Yes\n\
-         shared_instance_type = tcp\n\
-         shared_instance_port = {shared_port}\n\
-         instance_control_port = {control_port}\n\
-         rpc_key = {rpc_key_hex}\n\
-         enable_transport = No\n\
-         \n\
-         [logging]\n\
-         loglevel = 1\n\
-         \n\
-         [interfaces]\n\
-         \n\
-         [[Public TCP]]\n\
-         type = TCPClientInterface\n\
-         enabled = Yes\n\
-         target_host = {host}\n\
-         target_port = {port}\n"
+        "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {shared_port}\n  instance_control_port: {control_port}\n  rpc_key: {rpc_key_hex}\n  enable_transport: false\nlogging:\n  level: 1\ninterfaces:\n  - type: tcp_client\n    name: Public TCP\n    enabled: true\n    target_host: {host}\n    target_port: {port}\n"
     );
-    fs::write(tmp.join("config"), config).expect("write config");
+    fs::write(tmp.join("config.yaml"), config).expect("write config");
 
     let mut daemon = ChildGuard::spawn(
         env!("CARGO_BIN_EXE_rnsd-rs"),

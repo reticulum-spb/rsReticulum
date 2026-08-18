@@ -105,51 +105,16 @@ fn free_tcp_ports(count: usize) -> Vec<u16> {
 
 fn write_responder_config(tmp: &TempDir, shared_port: u16, control_port: u16, link_port: u16) {
     let config = format!(
-        "[reticulum]\n\
-         share_instance = Yes\n\
-         shared_instance_type = tcp\n\
-         shared_instance_port = {shared_port}\n\
-         instance_control_port = {control_port}\n\
-         rpc_key = 5151515151515151515151515151515151515151515151515151515151515151\n\
-         enable_transport = No\n\
-         respond_to_probes = Yes\n\
-         \n\
-         [logging]\n\
-         loglevel = 1\n\
-         \n\
-         [interfaces]\n\
-         \n\
-         [[Matrix TCP Server]]\n\
-         type = TCPServerInterface\n\
-         enabled = Yes\n\
-         listen_ip = 127.0.0.1\n\
-         listen_port = {link_port}\n"
+        "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {shared_port}\n  instance_control_port: {control_port}\n  rpc_key: 5151515151515151515151515151515151515151515151515151515151515151\n  enable_transport: false\n  respond_to_probes: true\nlogging:\n  level: 1\ninterfaces:\n  - type: tcp_server\n    name: Matrix TCP Server\n    enabled: true\n    listen_ip: 127.0.0.1\n    listen_port: {link_port}\n"
     );
-    fs::write(tmp.join("config"), config).expect("write responder config");
+    fs::write(tmp.join("config.yaml"), config).expect("write responder config");
 }
 
 fn write_origin_config(tmp: &TempDir, shared_port: u16, control_port: u16, link_port: u16) {
     let config = format!(
-        "[reticulum]\n\
-         share_instance = Yes\n\
-         shared_instance_type = tcp\n\
-         shared_instance_port = {shared_port}\n\
-         instance_control_port = {control_port}\n\
-         rpc_key = 5252525252525252525252525252525252525252525252525252525252525252\n\
-         enable_transport = No\n\
-         \n\
-         [logging]\n\
-         loglevel = 1\n\
-         \n\
-         [interfaces]\n\
-         \n\
-         [[Matrix TCP Client]]\n\
-         type = TCPClientInterface\n\
-         enabled = Yes\n\
-         target_host = 127.0.0.1\n\
-         target_port = {link_port}\n"
+        "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {shared_port}\n  instance_control_port: {control_port}\n  rpc_key: 5252525252525252525252525252525252525252525252525252525252525252\n  enable_transport: false\nlogging:\n  level: 1\ninterfaces:\n  - type: tcp_client\n    name: Matrix TCP Client\n    enabled: true\n    target_host: 127.0.0.1\n    target_port: {link_port}\n"
     );
-    fs::write(tmp.join("config"), config).expect("write origin config");
+    fs::write(tmp.join("config.yaml"), config).expect("write origin config");
 }
 
 fn output_text(output: &Output) -> (String, String) {
