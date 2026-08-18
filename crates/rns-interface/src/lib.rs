@@ -32,6 +32,8 @@ pub mod kiss_iface;
 pub mod local;
 #[cfg(feature = "full")]
 pub mod pipe;
+#[cfg(all(feature = "full", target_os = "linux"))]
+pub mod plugin;
 #[cfg(feature = "full")]
 pub mod rnode;
 #[cfg(feature = "full")]

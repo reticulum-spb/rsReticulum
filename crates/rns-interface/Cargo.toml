@@ -12,7 +12,15 @@ default = ["full"]
 shared-client = []
 # All software/network/radio interface implementations available before the
 # feature split. Kept as the default for source compatibility.
-full = ["shared-client", "dep:rand", "dep:serde", "dep:serde_json", "dep:hex"]
+full = [
+    "shared-client",
+    "dep:rand",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:hex",
+    "dep:rns-plugin",
+    "dep:libloading",
+]
 serial = ["full", "dep:serialport"]
 rnode-tcp = ["full"]
 ble = ["full", "dep:btleplug", "dep:futures", "dep:uuid", "dep:bluer"]
@@ -40,6 +48,7 @@ rand = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+rns-plugin = { workspace = true, optional = true }
 
 # Apple BLE Peripheral (CoreBluetooth GATT server, iOS + macOS).
 # Version pinned to match btleplug's internal objc2 version so the shared
@@ -68,6 +77,7 @@ jni = "0.19"
 # linux_peripheral module is gated by both `ble` feature and target_os.
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"], optional = true }
+libloading = { workspace = true, optional = true }
 
 # Windows BLE Peripheral via WinRT GattServiceProvider (MSIX-packaged apps).
 # Windows-only target dep so cross-platform builds don't pull in WinRT
