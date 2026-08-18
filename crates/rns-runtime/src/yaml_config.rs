@@ -117,6 +117,19 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), YamlConfigError> {
+        if self.reticulum.shared_instance_port == 0 || self.reticulum.instance_control_port == 0 {
+            return Err(YamlConfigError::Validation(
+                "reticulum shared_instance_port and instance_control_port must be in 1..=65535"
+                    .into(),
+            ));
+        }
+        if let Some(key) = &self.reticulum.rpc_key
+            && (key.is_empty() || key.len() % 2 != 0 || hex::decode(key).is_err())
+        {
+            return Err(YamlConfigError::Validation(
+                "reticulum.rpc_key must be a non-empty, even-length hexadecimal string".into(),
+            ));
+        }
         let mut names = HashSet::new();
         for interface in &self.interfaces {
             let name = interface.common().name.trim();
@@ -150,14 +163,12 @@ impl Config {
         Ok(())
     }
 
-    /// Transitional adapter for runtime components that have not yet been
-    /// changed from `ConfigSection` to the typed model. Input is always typed
-    /// YAML; this does not parse or accept the legacy file format.
+    /// Normalize the validated typed configuration for runtime consumers.
     #[doc(hidden)]
-    pub fn to_runtime_compat_config(
+    pub fn to_runtime_config(
         &self,
-    ) -> Result<crate::config_compat::Config, YamlConfigError> {
-        let mut output = crate::config_compat::Config::new();
+    ) -> Result<crate::normalized_config::NormalizedConfig, YamlConfigError> {
+        let mut output = crate::normalized_config::NormalizedConfig::new();
         {
             let section = output.ensure_section("reticulum");
             set_bool(section, "share_instance", self.reticulum.share_instance);
@@ -297,8 +308,8 @@ impl Config {
         {
             let interfaces = output.ensure_section("interfaces");
             for interface in &self.interfaces {
-                let mut section = crate::config_compat::ConfigSection::new();
-                interface.write_compat_section(&mut section)?;
+                let mut section = crate::normalized_config::NormalizedSection::new();
+                interface.write_normalized_section(&mut section)?;
                 *interfaces.add_subsection(interface.common().name.clone()) = section;
             }
         }
@@ -411,6 +422,11 @@ pub struct ApiConfig {
 
 impl ApiConfig {
     fn validate(&self) -> Result<(), YamlConfigError> {
+        if self.port == Some(0) {
+            return Err(YamlConfigError::Validation(
+                "api.port must be in 1..=65535".into(),
+            ));
+        }
         if self.port.is_some()
             && (self.user.as_deref().is_none_or(str::is_empty)
                 || self.password.as_deref().is_none_or(str::is_empty))
@@ -479,6 +495,14 @@ impl InterfaceConfig {
     }
 
     fn validate(&self) -> Result<(), YamlConfigError> {
+        if let Some(cap) = self.common().announce_cap
+            && (!cap.is_finite() || !(0.0 < cap && cap <= 100.0))
+        {
+            return Err(YamlConfigError::Validation(format!(
+                "interface {:?}: announce_cap must be in (0, 100]",
+                self.common().name
+            )));
+        }
         if let Some(size) = self.common().ifac_size
             && !(1..=64).contains(&size)
         {
@@ -557,6 +581,12 @@ impl InterfaceConfig {
             Self::RnodeMulti(v) => {
                 let mut ports = HashSet::new();
                 for sub in &v.subinterfaces {
+                    if sub.name.trim().is_empty() {
+                        return Err(YamlConfigError::Validation(format!(
+                            "interface {:?}: RNode subinterface name must not be empty",
+                            v.common.name
+                        )));
+                    }
                     if !ports.insert(sub.vport) {
                         return Err(YamlConfigError::Validation(format!(
                             "interface {:?}: duplicate RNode vport {}",
@@ -584,9 +614,9 @@ impl InterfaceConfig {
         }
     }
 
-    fn write_compat_section(
+    fn write_normalized_section(
         &self,
-        section: &mut crate::config_compat::ConfigSection,
+        section: &mut crate::normalized_config::NormalizedSection,
     ) -> Result<(), YamlConfigError> {
         write_common(section, self.common());
         match self {
@@ -1210,22 +1240,30 @@ pub enum OpaqueValue {
     Mapping(BTreeMap<String, OpaqueValue>),
 }
 
-fn set_bool(section: &mut crate::config_compat::ConfigSection, key: &str, value: bool) {
+fn set_bool(section: &mut crate::normalized_config::NormalizedSection, key: &str, value: bool) {
     section.set(key, if value { "Yes" } else { "No" });
 }
 
-fn set_num(section: &mut crate::config_compat::ConfigSection, key: &str, value: impl ToString) {
+fn set_num(
+    section: &mut crate::normalized_config::NormalizedSection,
+    key: &str,
+    value: impl ToString,
+) {
     section.set(key, &value.to_string());
 }
 
-fn set_opt(section: &mut crate::config_compat::ConfigSection, key: &str, value: Option<&str>) {
+fn set_opt(
+    section: &mut crate::normalized_config::NormalizedSection,
+    key: &str,
+    value: Option<&str>,
+) {
     if let Some(value) = value {
         section.set(key, value);
     }
 }
 
 fn set_opt_num<T: ToString + Copy>(
-    section: &mut crate::config_compat::ConfigSection,
+    section: &mut crate::normalized_config::NormalizedSection,
     key: &str,
     value: Option<T>,
 ) {
@@ -1246,7 +1284,10 @@ fn mode_name(mode: InterfaceMode) -> &'static str {
     }
 }
 
-fn write_common(section: &mut crate::config_compat::ConfigSection, common: &InterfaceCommonConfig) {
+fn write_common(
+    section: &mut crate::normalized_config::NormalizedSection,
+    common: &InterfaceCommonConfig,
+) {
     set_bool(section, "enabled", common.enabled);
     section.set("mode", mode_name(common.mode));
     set_bool(section, "outgoing", common.outgoing);
@@ -1272,7 +1313,10 @@ fn write_common(section: &mut crate::config_compat::ConfigSection, common: &Inte
     );
 }
 
-fn write_ingress(section: &mut crate::config_compat::ConfigSection, ingress: &IngressConfig) {
+fn write_ingress(
+    section: &mut crate::normalized_config::NormalizedSection,
+    ingress: &IngressConfig,
+) {
     set_opt_num(section, "ic_burst_freq_new", ingress.burst_freq_new);
     set_opt_num(section, "ic_burst_freq", ingress.burst_freq);
     set_opt_num(
@@ -1296,7 +1340,10 @@ fn write_ingress(section: &mut crate::config_compat::ConfigSection, ingress: &In
     }
 }
 
-fn write_serial(section: &mut crate::config_compat::ConfigSection, serial: &SerialInterfaceConfig) {
+fn write_serial(
+    section: &mut crate::normalized_config::NormalizedSection,
+    serial: &SerialInterfaceConfig,
+) {
     write_serial_fields(
         section,
         &serial.port,
@@ -1308,7 +1355,7 @@ fn write_serial(section: &mut crate::config_compat::ConfigSection, serial: &Seri
 }
 
 fn write_serial_fields(
-    section: &mut crate::config_compat::ConfigSection,
+    section: &mut crate::normalized_config::NormalizedSection,
     port: &str,
     baud_rate: u32,
     data_bits: u8,
@@ -1323,7 +1370,7 @@ fn write_serial_fields(
 }
 
 fn write_kiss(
-    section: &mut crate::config_compat::ConfigSection,
+    section: &mut crate::normalized_config::NormalizedSection,
     preamble_ms: u32,
     tx_tail_ms: u32,
     persistence: u8,
@@ -1337,7 +1384,7 @@ fn write_kiss(
     set_bool(section, "flow_control", flow_control);
 }
 
-fn write_radio(section: &mut crate::config_compat::ConfigSection, radio: &RadioConfig) {
+fn write_radio(section: &mut crate::normalized_config::NormalizedSection, radio: &RadioConfig) {
     set_num(section, "frequency", radio.frequency);
     set_num(section, "bandwidth", radio.bandwidth);
     set_num(section, "spreading_factor", radio.spreading_factor);
@@ -1347,19 +1394,19 @@ fn write_radio(section: &mut crate::config_compat::ConfigSection, radio: &RadioC
     set_opt_num(section, "airtime_limit_long", radio.airtime_limit_long);
 }
 
-/// Convert a Web/API compatibility section into the typed YAML variant. This
+/// Convert a runtime-normalized section into the typed YAML variant. This
 /// is deliberately kept at the configuration boundary; runtime code never
 /// receives parser values.
 #[cfg(feature = "api")]
-pub fn interface_from_compat_section(
+pub fn interface_from_normalized_section(
     name: &str,
-    section: &crate::config_compat::ConfigSection,
+    section: &crate::normalized_config::NormalizedSection,
 ) -> Result<InterfaceConfig, YamlConfigError> {
     let mut enabled_section = section.clone();
     enabled_section.set("enabled", "Yes");
     let runtime = crate::interface_factory::synthesize_interface(name, &enabled_section)
         .map_err(|error| YamlConfigError::Validation(error.to_string()))?;
-    let common = common_from_compat(name, section);
+    let common = common_from_normalized(name, section);
     use crate::interface_factory::InterfaceConfig as Runtime;
     Ok(match runtime {
         Runtime::Auto(v) => InterfaceConfig::Auto(AutoInterfaceConfig {
@@ -1543,9 +1590,9 @@ pub fn interface_from_compat_section(
 }
 
 #[cfg(feature = "api")]
-fn common_from_compat(
+fn common_from_normalized(
     name: &str,
-    section: &crate::config_compat::ConfigSection,
+    section: &crate::normalized_config::NormalizedSection,
 ) -> InterfaceCommonConfig {
     InterfaceCommonConfig {
         name: name.to_string(),
@@ -1696,6 +1743,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_out_of_range_ports_caps_and_invalid_rpc_keys() {
+        for yaml in [
+            "reticulum:\n  shared_instance_port: 0\n",
+            "api:\n  port: 0\n",
+            "reticulum:\n  rpc_key: xyz\n",
+            "interfaces:\n  - type: auto\n    name: LAN\n    announce_cap: 0\n",
+        ] {
+            assert!(Config::parse(yaml, "config.yaml").is_err(), "{yaml}");
+        }
+    }
+
+    #[test]
     fn plugin_config_is_opaque_to_core() {
         let yaml = "interfaces:\n  - type: plugin\n    name: LoRa\n    plugin: sx1262\n    config:\n      reset_pin: 12\n      modulation:\n        spreading_factor: 9\n";
         Config::parse(yaml, "config.yaml").unwrap();
@@ -1753,7 +1812,7 @@ interfaces:
 "#;
         let config = Config::parse(yaml, "all-interfaces.yaml").unwrap();
         assert_eq!(config.interfaces.len(), 14);
-        config.to_runtime_compat_config().unwrap();
+        config.to_runtime_config().unwrap();
     }
 
     #[test]

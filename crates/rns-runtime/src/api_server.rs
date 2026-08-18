@@ -54,9 +54,9 @@ use rns_transport::messages::{
     TransportQueryResponse,
 };
 
-use crate::config_compat::{Config, ConfigSection, atomic_write};
 use crate::interface_factory::{InterfaceConfig, synthesize_interface};
 use crate::lifecycle::ShutdownSignal;
+use crate::normalized_config::{NormalizedConfig as Config, NormalizedSection, atomic_write};
 use crate::reticulum::{ReticulumConfig, ReticulumHandle, SharedInstanceType, teardown_interface};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -283,7 +283,7 @@ impl AppState {
         let typed = crate::config::Config::parse(text, &path)
             .map_err(|e| ApiError::internal(format!("failed to parse config: {e}")))?;
         let config = typed
-            .to_runtime_compat_config()
+            .to_runtime_config()
             .map_err(|e| ApiError::internal(format!("failed to normalize config: {e}")))?;
         Ok(LoadedConfig {
             config,
@@ -412,7 +412,7 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 /// `type` defines the variant; the remaining fields are by type.
 #[derive(Debug, Deserialize)]
 struct InterfaceRequest {
-    /// The interface name is the key in the `[interfaces]` section.
+    /// The interface name identifies its item in the `interfaces` sequence.
     name: String,
 
     #[serde(rename = "type")]
@@ -504,10 +504,10 @@ struct InterfaceRequest {
 }
 
 impl InterfaceRequest {
-    /// Build `ConfigSection` from the request body to run through
+    /// Build `NormalizedSection` from the request body to run through
     /// `synthesize_interface` with the same validation as during regular parsing.
-    fn to_config_section(&self) -> ConfigSection {
-        let mut s = ConfigSection::new();
+    fn to_config_section(&self) -> NormalizedSection {
+        let mut s = NormalizedSection::new();
         s.set("type", &self.iface_type);
         s.set(
             "enabled",
@@ -707,7 +707,7 @@ impl InterfaceRequest {
 
     fn to_yaml_config(&self) -> Result<crate::config::InterfaceConfig, ApiError> {
         self.validate_fields()?;
-        crate::config::interface_from_compat_section(&self.name, &self.to_config_section())
+        crate::config::interface_from_normalized_section(&self.name, &self.to_config_section())
             .map_err(|error| ApiError::bad(error.to_string()))
     }
 
@@ -1546,7 +1546,7 @@ async fn fetch_interfaces(s: &AppState) -> ApiResult<Vec<InterfaceStatRpcEntry>>
 fn merge_iface_json(
     e: &InterfaceStatRpcEntry,
     config: Option<&InterfaceConfig>,
-    section: Option<&ConfigSection>,
+    section: Option<&NormalizedSection>,
 ) -> Value {
     let mut v = json!({
         // ── identity ──────────────────────────────────────────────────
@@ -1600,7 +1600,7 @@ fn merge_iface_json(
     v
 }
 
-fn config_only_iface_json(name: &str, section: &ConfigSection) -> Value {
+fn config_only_iface_json(name: &str, section: &NormalizedSection) -> Value {
     json!({
         "id": Value::Null,
         "name": name,
@@ -1626,14 +1626,14 @@ fn config_only_iface_json(name: &str, section: &ConfigSection) -> Value {
     })
 }
 
-fn section_enabled(section: &ConfigSection) -> bool {
+fn section_enabled(section: &NormalizedSection) -> bool {
     section
         .get_bool("enabled")
         .or_else(|| section.get_bool("interface_enabled"))
         .unwrap_or(true)
 }
 
-fn iface_section_json(section: &ConfigSection) -> Value {
+fn iface_section_json(section: &NormalizedSection) -> Value {
     let mut value = json!({
         "type": section.get("type"),
         "enabled": section_enabled(section),
@@ -1891,7 +1891,7 @@ fn load_interface_configs(
 
 fn load_interface_sections(
     s: &AppState,
-) -> ApiResult<std::collections::HashMap<String, ConfigSection>> {
+) -> ApiResult<std::collections::HashMap<String, NormalizedSection>> {
     let config = s.load_config()?;
     Ok(config
         .subsections("interfaces")
@@ -1901,7 +1901,7 @@ fn load_interface_sections(
 }
 
 fn load_interface_configs_from_sections(
-    sections: &std::collections::HashMap<String, ConfigSection>,
+    sections: &std::collections::HashMap<String, NormalizedSection>,
 ) -> std::collections::HashMap<String, InterfaceConfig> {
     let mut map = std::collections::HashMap::new();
     for (name, section) in sections {
@@ -2193,17 +2193,22 @@ mod tests {
 
     #[test]
     fn api_section_requires_credentials() {
-        let config = Config::parse(
-            "[reticulum]\nshare_instance = Yes\n[api]\nport = 8080\nuser = admin\npassword = secret\n",
+        let config = crate::config::Config::parse(
+            "reticulum:\n  share_instance: true\napi:\n  port: 8080\n  user: admin\n  password: secret\n",
+            "config.yaml",
         )
+        .unwrap()
+        .to_runtime_config()
         .unwrap();
         let parsed = ReticulumConfig::try_from_config(&config).unwrap();
         assert_eq!(parsed.api_port, Some(8080));
         assert_eq!(parsed.api_user.as_deref(), Some("admin"));
         assert_eq!(parsed.api_password.as_deref(), Some("secret"));
 
-        let invalid = Config::parse("[api]\nport = 8080\nuser = admin\n").unwrap();
-        assert!(ReticulumConfig::try_from_config(&invalid).is_err());
+        assert!(
+            crate::config::Config::parse("api:\n  port: 8080\n  user: admin\n", "config.yaml")
+                .is_err()
+        );
     }
 
     #[test]

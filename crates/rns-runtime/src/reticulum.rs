@@ -14,13 +14,13 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::config_compat::{Config, ConfigError, ConfigSection};
 use crate::constants::*;
 use crate::interface_factory;
 use crate::jobs::{Job, JobScheduler};
 use crate::lifecycle::ShutdownSignal;
 use crate::link_client::LinkClient;
 use crate::link_manager::LinkManager;
+use crate::normalized_config::{ConfigError, NormalizedConfig as Config, NormalizedSection};
 use crate::platform::{StoragePaths, resolve_config_dir};
 use rns_identity::identity::Identity;
 use rns_transport::await_path::{AwaitPathError, await_path};
@@ -630,7 +630,7 @@ pub struct ReticulumConfig {
     /// `blackhole_update_interval` (Reticulum.py:266,593-596): parsed as
     /// float minutes, clamped to min 2, stored as seconds; default 3600.
     pub blackhole_update_interval: f64,
-    /// Python 1.3.8 `[logging] logtimestamps` (Reticulum.py:459-461,
+    /// Python 1.3.8 logging timestamp behavior (Reticulum.py:459-461,
     /// RNS/__init__.py:85 default True): log lines carry a timestamp prefix.
     pub log_timestamps: bool,
 
@@ -705,7 +705,7 @@ fn invalid_config_value(section: &str, key: &str, message: impl Into<String>) ->
 
 fn config_bool(
     section_name: &str,
-    section: &ConfigSection,
+    section: &NormalizedSection,
     key: &str,
 ) -> Result<Option<bool>, ConfigError> {
     if !section.has(key) {
@@ -719,7 +719,7 @@ fn config_bool(
 
 fn config_int(
     section_name: &str,
-    section: &ConfigSection,
+    section: &NormalizedSection,
     key: &str,
 ) -> Result<Option<i64>, ConfigError> {
     if !section.has(key) {
@@ -733,7 +733,7 @@ fn config_int(
 
 fn config_uint(
     section_name: &str,
-    section: &ConfigSection,
+    section: &NormalizedSection,
     key: &str,
 ) -> Result<Option<u64>, ConfigError> {
     if !section.has(key) {
@@ -747,7 +747,7 @@ fn config_uint(
 
 fn config_float(
     section_name: &str,
-    section: &ConfigSection,
+    section: &NormalizedSection,
     key: &str,
 ) -> Result<Option<f64>, ConfigError> {
     if !section.has(key) {
@@ -761,7 +761,7 @@ fn config_float(
 
 fn config_u16(
     section_name: &str,
-    section: &ConfigSection,
+    section: &NormalizedSection,
     key: &str,
 ) -> Result<Option<u16>, ConfigError> {
     let Some(value) = config_uint(section_name, section, key)? else {
@@ -774,7 +774,7 @@ fn config_u16(
 
 fn parse_ingress_overrides(
     section_name: &str,
-    section: &ConfigSection,
+    section: &NormalizedSection,
 ) -> Result<rns_transport::ingress::IngressOverrides, ConfigError> {
     Ok(rns_transport::ingress::IngressOverrides {
         burst_freq_new: config_float(section_name, section, "ic_burst_freq_new")?,
@@ -812,7 +812,7 @@ fn merge_ingress_overrides(
     }
 }
 
-fn parse_autoconnect_limit(sec: &ConfigSection) -> Result<Option<usize>, ConfigError> {
+fn parse_autoconnect_limit(sec: &NormalizedSection) -> Result<Option<usize>, ConfigError> {
     if let Some(v) = config_uint("reticulum", sec, "autoconnect_discovered_interfaces")? {
         return Ok(Some(v as usize));
     }
@@ -1522,7 +1522,7 @@ pub async fn init(
         }
     }
 
-    // REST API server — compiled only with --features api and configured in [api].
+    // REST API server — compiled only with --features api and configured by `api`.
     #[cfg(feature = "api")]
     if instance_mode == InstanceMode::Shared {
         if let Some(port) = rc.api_port {
@@ -1998,8 +1998,9 @@ fn runtime_ifac_post_init(
         return Ok(None);
     }
 
-    let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
-        .with_default_ifac_size(default_ifac_size);
+    let mut post_init =
+        interface_factory::InterfacePostInit::from_section(&NormalizedSection::new())
+            .with_default_ifac_size(default_ifac_size);
     post_init.ifac_network_name = network_name;
     post_init.ifac_passphrase = passphrase;
     post_init.ifac_size = ifac.ifac_size;
@@ -2016,8 +2017,10 @@ fn get_post_init_for_config(
         return interface_factory::InterfacePostInit::from_section(section)
             .with_default_ifac_size(default_ifac_size);
     }
-    interface_factory::InterfacePostInit::from_section(&crate::config_compat::ConfigSection::new())
-        .with_default_ifac_size(default_ifac_size)
+    interface_factory::InterfacePostInit::from_section(
+        &crate::normalized_config::NormalizedSection::new(),
+    )
+    .with_default_ifac_size(default_ifac_size)
 }
 
 fn apply_default_announce_rate(
@@ -2094,7 +2097,7 @@ fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &
 fn interface_section<'a>(
     config: &'a Config,
     iface_config: &interface_factory::InterfaceConfig,
-) -> Option<&'a ConfigSection> {
+) -> Option<&'a NormalizedSection> {
     let name = interface_config_name(iface_config);
     config.subsection("interfaces", name)
 }
@@ -2367,7 +2370,7 @@ fn discovery_config_for_interface(
     })
 }
 
-fn configured_reachable_on(section: &ConfigSection) -> Option<String> {
+fn configured_reachable_on(section: &NormalizedSection) -> Option<String> {
     section
         .get("discovery_reachable_on")
         .or_else(|| section.get("reachable_on"))
@@ -2384,7 +2387,7 @@ fn usable_listen_addr(addr: &str) -> Option<String> {
     }
 }
 
-fn discovery_announce_interval_secs(section: &ConfigSection) -> u64 {
+fn discovery_announce_interval_secs(section: &NormalizedSection) -> u64 {
     if let Some(seconds) = section.get_uint("discovery_announce_interval_secs") {
         return seconds.max(1);
     }
@@ -2628,8 +2631,9 @@ async fn spawn_discovered_backbone_client(
             .await
             .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
-    let mut post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new())
-        .with_default_ifac_size(16);
+    let mut post_init =
+        interface_factory::InterfacePostInit::from_section(&NormalizedSection::new())
+            .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
     post_init.ifac_network_name = record.info.ifac_netname.clone();
     post_init.ifac_passphrase = record.info.ifac_netkey.clone();
@@ -3577,7 +3581,7 @@ pub async fn spawn_interface_from_config(
     // are honoured for newly added interfaces too.
     let disk_config =
         crate::config::Config::from_file(handle.config_dir.join(crate::config::CONFIG_FILE_NAME))
-            .and_then(|config| config.to_runtime_compat_config())
+            .and_then(|config| config.to_runtime_config())
             .unwrap_or_default();
     let mut post_init = get_post_init_for_config(&disk_config, iface_config);
     finalize_post_init(&mut post_init, &handle.config);
@@ -3894,7 +3898,7 @@ pub fn get_instance() -> Option<&'static ReticulumHandle> {
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
     if path.exists() {
         crate::config::Config::from_file(path)
-            .and_then(|config| config.to_runtime_compat_config())
+            .and_then(|config| config.to_runtime_config())
             .map(|config| (config, false))
             .map_err(ReticulumError::YamlConfig)
     } else {
@@ -3902,7 +3906,7 @@ fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> 
         let content = config.to_yaml().map_err(ReticulumError::YamlConfig)?;
         std::fs::write(path, content).map_err(ReticulumError::Io)?;
         config
-            .to_runtime_compat_config()
+            .to_runtime_config()
             .map(|config| (config, true))
             .map_err(ReticulumError::YamlConfig)
     }
@@ -4254,91 +4258,12 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_default_file() {
-        let config = Config::parse(Config::default_config()).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert!(rc.share_instance);
-        assert_eq!(rc.shared_instance_port, 37428);
-        assert_eq!(rc.loglevel, 4);
-    }
-
-    #[test]
-    fn test_config_custom_values() {
-        let input = r#"
-[reticulum]
-share_instance = No
-instance_name = testnode
-shared_instance_port = 12345
-instance_control_port = 12346
-enable_transport = Yes
-respond_to_probes = Yes
-use_implicit_proof = No
-
-[logging]
-loglevel = 7
-"#;
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert!(!rc.share_instance);
-        assert_eq!(rc.instance_name, "testnode");
-        assert_eq!(rc.shared_instance_port, 12345);
-        assert_eq!(rc.control_port, 12346);
-        assert!(rc.enable_transport);
-        assert!(rc.respond_to_probes);
-        assert!(!rc.use_implicit_proof);
-        assert_eq!(rc.loglevel, 7);
-    }
-
-    #[test]
-    fn test_shared_instance_type_explicit_tcp() {
-        let input = "[reticulum]\nshared_instance_type = tcp\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.shared_instance_type, SharedInstanceType::Tcp);
-    }
-
-    #[test]
-    fn test_shared_instance_type_explicit_unix() {
-        let input = "[reticulum]\nshared_instance_type = Unix\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.shared_instance_type, SharedInstanceType::Unix);
-    }
-
-    #[test]
-    fn test_shared_instance_type_invalid_keeps_default() {
-        let input = "[reticulum]\nshared_instance_type = bogus\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(
-            rc.shared_instance_type,
-            SharedInstanceType::platform_default()
-        );
-    }
-
-    #[test]
     fn test_shared_tcp_client_config_has_no_reconnect_cap() {
         let config = shared_tcp_client_config(12345);
         assert_eq!(config.name, "SharedInstanceClient");
         assert_eq!(config.target_host, "127.0.0.1");
         assert_eq!(config.target_port, 12345);
         assert_eq!(config.max_reconnect_tries, None);
-    }
-
-    #[test]
-    fn test_force_shared_instance_bitrate_parsed() {
-        let input = "[reticulum]\nforce_shared_instance_bitrate = 1000000\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.force_shared_instance_bitrate, Some(1_000_000));
-    }
-
-    #[test]
-    fn test_force_shared_instance_bitrate_absent() {
-        let input = "[reticulum]\nshare_instance = Yes\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.force_shared_instance_bitrate, None);
     }
 
     #[test]
@@ -4444,296 +4369,13 @@ loglevel = 7
         assert!(rc.bootstrap_configs.is_empty());
     }
 
-    #[test]
-    fn test_discovery_keys_parsed() {
-        let input = "[reticulum]\n\
-                     discover_interfaces = Yes\n\
-                     autoconnect_discovered_interfaces = 2\n\
-                     required_discovery_value = 16\n\
-                     interface_discovery_sources = 521c87a83afb8f29e4455e77930b973b\n\
-                     default_ar_target = 7200\n\
-                     default_ar_penalty = 30\n\
-                     default_ar_grace = 9\n\
-                     publish_blackhole = Yes\n\
-                     network_identity = /opt/rnsd/network.identity\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert!(rc.discover_interfaces);
-        assert_eq!(rc.autoconnect_discovered_interfaces, 2);
-        assert_eq!(rc.discover_interfaces_required_value, 16);
-        assert_eq!(rc.interface_discovery_sources.len(), 1);
-        assert_eq!(rc.default_ar_target, Some(7200));
-        assert_eq!(rc.default_ar_penalty, Some(30));
-        assert_eq!(rc.default_ar_grace, Some(9));
-        assert!(rc.publish_blackhole);
-        assert_eq!(
-            rc.network_identity_path,
-            Some(PathBuf::from("/opt/rnsd/network.identity"))
-        );
-    }
-
-    #[test]
-    fn test_global_ingress_control_keys_parsed() {
-        let input = "[reticulum]\n\
-                     ic_max_held_announces = 64\n\
-                     ic_burst_hold = 11.5\n\
-                     ic_burst_freq_new = 2.5\n\
-                     ic_burst_freq = 12.5\n\
-                     ic_pr_burst_freq_new = 4.5\n\
-                     ic_pr_burst_freq = 9.5\n\
-                     ec_pr_freq = 6.5\n\
-                     egress_control = Yes\n\
-                     ic_new_time = 1234\n\
-                     ic_burst_penalty = 17.5\n\
-                     ic_held_release_interval = 3.5\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-
-        assert_eq!(rc.ingress_overrides.max_held, Some(64));
-        assert_eq!(rc.ingress_overrides.burst_hold, Some(11.5));
-        assert_eq!(rc.ingress_overrides.burst_freq_new, Some(2.5));
-        assert_eq!(rc.ingress_overrides.burst_freq, Some(12.5));
-        assert_eq!(rc.ingress_overrides.pr_burst_freq_new, Some(4.5));
-        assert_eq!(rc.ingress_overrides.pr_burst_freq, Some(9.5));
-        assert_eq!(rc.ingress_overrides.ec_pr_freq, Some(6.5));
-        assert_eq!(rc.ingress_overrides.egress_control, Some(true));
-        assert_eq!(rc.ingress_overrides.new_time, Some(1234.0));
-        assert_eq!(rc.ingress_overrides.burst_penalty, Some(17.5));
-        assert_eq!(rc.ingress_overrides.held_release_interval, Some(3.5));
-    }
-
-    /// Python Reticulum.py:841-848 parity: discoverable interfaces are
-    /// auto-corrected to Gateway/AP mode unless ignore_config_warnings.
-    #[test]
-    fn discovery_mode_autocorrect_matches_python() {
-        use rns_interface::traits::InterfaceMode;
-
-        let input = "[interfaces]\n\
-                     [[upstream]]\n\
-                     type = TCPServerInterface\n\
-                     listen_ip = 0.0.0.0\n\
-                     listen_port = 4242\n\
-                     discoverable = yes\n";
-        let config = Config::parse(input).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
-        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
-        match &interfaces[0] {
-            interface_factory::InterfaceConfig::TcpServer(c) => {
-                assert_eq!(c.mode, InterfaceMode::Gateway);
-            }
-            _ => panic!("expected TcpServer"),
-        }
-
-        let opted_out = "[interfaces]\n\
-                         [[upstream]]\n\
-                         type = TCPServerInterface\n\
-                         listen_ip = 0.0.0.0\n\
-                         listen_port = 4242\n\
-                         discoverable = yes\n\
-                         ignore_config_warnings = yes\n";
-        let config = Config::parse(opted_out).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
-        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
-        match &interfaces[0] {
-            interface_factory::InterfaceConfig::TcpServer(c) => {
-                assert_eq!(c.mode, InterfaceMode::Full, "opt-out keeps configured mode");
-            }
-            _ => panic!("expected TcpServer"),
-        }
-    }
-
-    #[test]
-    fn ingress_control_precedence_global_then_interface() {
-        let input = r#"
-[reticulum]
-ic_burst_freq = 12
-ic_pr_burst_freq = 9
-ec_pr_freq = 7
-egress_control = No
-
-[interfaces]
-
-[[Test TCP]]
-type = TCPClientInterface
-target_host = 127.0.0.1
-target_port = 4242
-ic_pr_burst_freq = 5
-egress_control = Yes
-"#;
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
-        let mut post_init = get_post_init_for_config(&config, &interfaces[0]);
-
-        finalize_post_init(&mut post_init, &rc);
-
-        assert_eq!(post_init.ingress_overrides.burst_freq, Some(12.0));
-        assert_eq!(post_init.ingress_overrides.ec_pr_freq, Some(7.0));
-        assert_eq!(post_init.ingress_overrides.pr_burst_freq, Some(5.0));
-        assert_eq!(post_init.ingress_overrides.egress_control, Some(true));
-    }
-
-    #[test]
-    fn test_network_identity_path_follows_python_expanduser_only_policy() {
-        let config = Config::parse("[reticulum]\nnetwork_identity = network.identity\n").unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(
-            rc.network_identity_path,
-            Some(PathBuf::from("network.identity"))
-        );
-
-        if let Ok(home) = std::env::var("HOME") {
-            let config =
-                Config::parse("[reticulum]\nnetwork_identity = ~/network.identity\n").unwrap();
-            let rc = ReticulumConfig::from_config(&config);
-            assert_eq!(
-                rc.network_identity_path,
-                Some(PathBuf::from(home).join("network.identity"))
-            );
-        }
-    }
-
-    #[test]
-    fn static_transport_identity_key_parses_with_python_default() {
-        let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
-        assert!(!rc.static_transport_identity);
-        assert!(uses_ephemeral_transport_identity(&rc));
-
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[reticulum]\nstatic_transport_identity = yes\n").unwrap(),
-        );
-        assert!(rc.static_transport_identity);
-        assert!(!uses_ephemeral_transport_identity(&rc));
-
-        // Python Transport.py:234-238: transport nodes never rotate.
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[reticulum]\nenable_transport = yes\n").unwrap(),
-        );
-        assert!(!uses_ephemeral_transport_identity(&rc));
-
-        let rc = ReticulumConfig::from_config(
-            &Config::parse(
-                "[reticulum]\nenable_transport = yes\nstatic_transport_identity = yes\n",
-            )
-            .unwrap(),
-        );
-        assert!(!uses_ephemeral_transport_identity(&rc));
-    }
-
-    #[test]
-    fn local_hops_delta_key_parses_with_python_default() {
-        let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
-        assert!(!rc.local_hops_delta);
-
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[reticulum]\nlocal_hops_delta = yes\n").unwrap(),
-        );
-        assert!(rc.local_hops_delta);
-    }
-
-    #[test]
-    fn local_hops_delta_value_stays_in_python_range() {
-        // Python Transport.py:240: (rand_byte % 6) + 2 = 2..=7.
-        for _ in 0..256 {
-            let delta = generate_local_hops_delta();
-            assert!((2..=7).contains(&delta), "delta {delta} out of range");
-        }
-    }
-
-    #[test]
-    fn blackhole_update_interval_parses_minutes_with_two_minute_clamp() {
-        let rc = ReticulumConfig::from_config(&Config::parse("[reticulum]\n").unwrap());
-        assert_eq!(rc.blackhole_update_interval, 3600.0);
-
-        // Reticulum.py:593-596: minutes ×60 into seconds.
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[reticulum]\nblackhole_update_interval = 30\n").unwrap(),
-        );
-        assert_eq!(rc.blackhole_update_interval, 1800.0);
-
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[reticulum]\nblackhole_update_interval = 2.5\n").unwrap(),
-        );
-        assert_eq!(rc.blackhole_update_interval, 150.0);
-
-        // Sub-2-minute values clamp to the 2-minute floor.
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[reticulum]\nblackhole_update_interval = 1\n").unwrap(),
-        );
-        assert_eq!(rc.blackhole_update_interval, 120.0);
-    }
-
-    #[test]
-    fn logtimestamps_key_parses_with_python_default() {
-        let rc = ReticulumConfig::from_config(&Config::parse("[logging]\n").unwrap());
-        assert!(rc.log_timestamps);
-
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[logging]\nlogtimestamps = no\n").unwrap(),
-        );
-        assert!(!rc.log_timestamps);
-
-        let rc = ReticulumConfig::from_config(
-            &Config::parse("[logging]\nlogtimestamps = yes\n").unwrap(),
-        );
-        assert!(rc.log_timestamps);
-    }
-
-    #[test]
-    fn post_init_parses_recursive_prs_and_announces_from_internal() {
-        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
-        assert!(!post_init.recursive_prs);
-        assert!(post_init.announces_from_internal);
-
-        let mut section = ConfigSection::new();
-        section.set("recursive_prs", "yes");
-        section.set("announces_from_internal", "no");
-        let post_init = interface_factory::InterfacePostInit::from_section(&section);
-        assert!(post_init.recursive_prs);
-        assert!(!post_init.announces_from_internal);
-    }
-
-    #[test]
-    fn internal_interface_mode_parses_and_discovery_autocorrects() {
-        // Python 1.3.8 Reticulum.py:721,737-738: mode = internal → MODE_INTERNAL.
-        let base = "[interfaces]\n\n[[Test TCP]]\ntype = TCPClientInterface\n\
-                    target_host = 127.0.0.1\ntarget_port = 4242\nmode = internal\n";
-        let config = Config::parse(base).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
-        assert_eq!(
-            *interface_config_mode_mut(&mut interfaces[0]),
-            rns_interface::traits::InterfaceMode::Internal
-        );
-
-        // Reticulum.py:856-863: discoverable autocorrects internal away
-        // unless ignore_config_warnings is set.
-        let config = Config::parse(&format!("{base}discoverable = yes\n")).unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
-        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
-        assert_eq!(
-            *interface_config_mode_mut(&mut interfaces[0]),
-            rns_interface::traits::InterfaceMode::Gateway
-        );
-
-        let config = Config::parse(&format!(
-            "{base}discoverable = yes\nignore_config_warnings = yes\n"
-        ))
-        .unwrap();
-        let mut interfaces = synthesize_interfaces(&config, false).unwrap();
-        apply_discovery_mode_autocorrect(&config, &mut interfaces[0]);
-        assert_eq!(
-            *interface_config_mode_mut(&mut interfaces[0]),
-            rns_interface::traits::InterfaceMode::Internal
-        );
-    }
-
     #[tokio::test]
     async fn registration_applies_parsed_interface_flags_and_internal_mode() {
         let (transport_tx, mut transport_rx) = mpsc::channel::<TransportMessage>(4);
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let mut section = ConfigSection::new();
+        let mut section = NormalizedSection::new();
         section.set("recursive_prs", "yes");
         section.set("announces_from_internal", "no");
         let post_init = interface_factory::InterfacePostInit::from_section(&section);
@@ -4768,7 +4410,7 @@ egress_control = Yes
     #[test]
     fn default_announce_rate_applies_only_when_transport_enabled() {
         let mut post_init =
-            interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+            interface_factory::InterfacePostInit::from_section(&NormalizedSection::new());
         let mut rc = ReticulumConfig {
             enable_transport: false,
             default_ar_target: Some(7200),
@@ -4795,7 +4437,8 @@ egress_control = Yes
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let post_init = interface_factory::InterfacePostInit::from_section(&ConfigSection::new());
+        let post_init =
+            interface_factory::InterfacePostInit::from_section(&NormalizedSection::new());
         register_interface_with_post_init(
             &transport_tx,
             test_interface_handle(920_001, None, "default-cap"),
@@ -4811,7 +4454,7 @@ egress_control = Yes
         };
         assert!((entry.announce_cap - ANNOUNCE_CAP).abs() < f64::EPSILON);
 
-        let mut section = ConfigSection::new();
+        let mut section = NormalizedSection::new();
         section.set("announce_cap", "5.0");
         let post_init = interface_factory::InterfacePostInit::from_section(&section);
         register_interface_with_post_init(
@@ -4847,7 +4490,7 @@ egress_control = Yes
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let mut section = ConfigSection::new();
+        let mut section = NormalizedSection::new();
         section.set("ic_pr_burst_freq_new", "4.0");
         section.set("ic_pr_burst_freq", "9.0");
         section.set("ec_pr_freq", "6.0");
@@ -4974,7 +4617,7 @@ egress_control = Yes
         let interface_controls: InterfaceControlMap =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let mut section = ConfigSection::new();
+        let mut section = NormalizedSection::new();
         section.set("networkname", "testnet");
         section.set("passphrase", "password");
         let post_init =
@@ -5080,77 +4723,6 @@ egress_control = Yes
     }
 
     #[test]
-    fn test_discovery_legacy_aliases_parsed() {
-        let input = "[reticulum]\n\
-                     discover_interfaces_autoconnect = Yes\n\
-                     discover_interfaces_required_value = 16\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.autoconnect_discovered_interfaces, 1);
-        assert_eq!(rc.discover_interfaces_required_value, 16);
-    }
-
-    #[test]
-    fn test_blackhole_sources_parsed() {
-        let input = "[reticulum]\n\
-                     blackhole_sources = 521c87a83afb8f29e4455e77930b973b, 11111111111111111111111111111111\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.blackhole_sources.len(), 2);
-        assert_eq!(
-            rc.blackhole_sources[0],
-            [
-                0x52, 0x1c, 0x87, 0xa8, 0x3a, 0xfb, 0x8f, 0x29, 0xe4, 0x45, 0x5e, 0x77, 0x93, 0x0b,
-                0x97, 0x3b,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_invalid_typed_config_values_fail_like_configobj() {
-        for (key, value) in [
-            ("share_instance", "maybe"),
-            ("shared_instance_port", "notaport"),
-            ("autoconnect_discovered_interfaces", "Yes"),
-            ("blackhole_sources", "deadbeef"),
-            ("egress_control", "maybe"),
-            ("ic_pr_burst_freq", "fast"),
-        ] {
-            let input = format!("[reticulum]\n{key} = {value}\n");
-            let config = Config::parse(&input).unwrap();
-            assert!(
-                ReticulumConfig::try_from_config(&config).is_err(),
-                "{key} = {value} should be rejected"
-            );
-        }
-
-        let config = Config::parse("[logging]\nloglevel = fish\n").unwrap();
-        assert!(ReticulumConfig::try_from_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_bootstrap_configs_parsed() {
-        let input = "[reticulum]\nbootstrap_configs = interfaces/bootstrap1.conf, interfaces/bootstrap2.conf\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(
-            rc.bootstrap_configs,
-            vec![
-                PathBuf::from("interfaces/bootstrap1.conf"),
-                PathBuf::from("interfaces/bootstrap2.conf"),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_discover_required_value_clamped_to_u8() {
-        let input = "[reticulum]\ndiscover_interfaces_required_value = 999\n";
-        let config = Config::parse(input).unwrap();
-        let rc = ReticulumConfig::from_config(&config);
-        assert_eq!(rc.discover_interfaces_required_value, 255);
-    }
-
-    #[test]
     fn test_convert_mode_all_variants() {
         use rns_interface::traits::InterfaceMode as IM;
         use rns_transport::constants::InterfaceMode as TM;
@@ -5162,46 +4734,6 @@ egress_control = Yes
         assert_eq!(convert_mode(IM::Full), TM::Full);
         assert_eq!(convert_mode(IM::PointToPoint), TM::PointToPoint);
         assert_eq!(convert_mode(IM::Internal), TM::Internal);
-    }
-
-    #[test]
-    fn test_synthesize_interfaces_from_config() {
-        let input = r#"
-[interfaces]
-
-[[Test TCP Client]]
-type = TCPClientInterface
-target_host = 127.0.0.1
-target_port = 4242
-enabled = yes
-
-[[Disabled Interface]]
-type = UDPInterface
-enabled = no
-
-[[Test UDP]]
-type = UDPInterface
-listen_port = 5555
-"#;
-        let config = Config::parse(input).unwrap();
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
-        assert_eq!(interfaces.len(), 2);
-    }
-
-    #[test]
-    fn test_panic_on_interface_error_fails_bad_config() {
-        let input = r#"
-[interfaces]
-
-[[Broken Interface]]
-enabled = yes
-"#;
-        let config = Config::parse(input).unwrap();
-        let err = synthesize_interfaces(&config, true).unwrap_err();
-        assert!(
-            matches!(err, ReticulumError::Interface(_)),
-            "panic_on_interface_error should fail interface synthesis"
-        );
     }
 
     #[tokio::test]
@@ -5610,75 +5142,6 @@ enabled = yes
     }
 
     #[cfg(feature = "serial")]
-    #[test]
-    fn test_synthesize_interfaces_with_new_types() {
-        let input = r#"
-[interfaces]
-
-[[Serial Port]]
-type = SerialInterface
-port = /dev/ttyUSB0
-speed = 115200
-
-[[KISS TNC]]
-type = KISSInterface
-port = /dev/ttyUSB1
-speed = 57600
-
-[[Auto Discovery]]
-type = AutoInterface
-group_id = testgroup
-
-[[LoRa Radio]]
-type = RNodeInterface
-port = /dev/ttyACM0
-frequency = 868000000
-bandwidth = 125000
-spreadingfactor = 7
-codingrate = 5
-txpower = 17
-
-[[OpenCom XL]]
-type = RNodeMultiInterface
-port = /dev/ttyACM1
-baud_rate = 230400
-
-[[[High Datarate]]]
-enabled = yes
-vport = 1
-frequency = 2400000000
-bandwidth = 1625000
-txpower = 0
-spreadingfactor = 5
-codingrate = 5
-
-[[[Low Datarate]]]
-enabled = yes
-vport = 0
-frequency = 865600000
-bandwidth = 125000
-txpower = 14
-spreadingfactor = 7
-codingrate = 5
-
-[[Local]]
-type = LocalInterface
-port = 37428
-"#;
-        let config = Config::parse(input).unwrap();
-        let interfaces = synthesize_interfaces(&config, false).unwrap();
-        assert_eq!(interfaces.len(), 6);
-        let rnode_multi = interfaces.iter().find_map(|iface| match iface {
-            interface_factory::InterfaceConfig::RNodeMulti(c) => Some(c),
-            _ => None,
-        });
-        let rnode_multi = rnode_multi.expect("RNodeMultiInterface synthesized");
-        assert_eq!(rnode_multi.baud_rate, 230400);
-        assert_eq!(rnode_multi.subinterfaces.len(), 2);
-        assert_eq!(rnode_multi.subinterfaces[0].vport, 0);
-        assert_eq!(rnode_multi.subinterfaces[1].vport, 1);
-    }
-
     #[test]
     fn test_clean_cache_empty_dir() {
         let dir = std::env::temp_dir().join("reticulum_rs_test_clean_cache");

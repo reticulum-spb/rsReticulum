@@ -197,7 +197,7 @@ async fn run_local_once(args: &Args) -> ExitCode {
     let config_dir = resolve_config_dir(args.config.as_deref());
     let config_path = config_dir.join(rns_runtime::config::CONFIG_FILE_NAME);
     let config = match rns_runtime::config::Config::from_file(&config_path)
-        .and_then(|config| config.to_runtime_compat_config())
+        .and_then(|config| config.to_runtime_config())
     {
         Ok(c) => c,
         Err(e) => {

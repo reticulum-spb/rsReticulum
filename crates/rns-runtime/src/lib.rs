@@ -9,8 +9,6 @@ pub mod api_server;
 pub mod application;
 #[path = "yaml_config.rs"]
 pub mod config;
-#[path = "config.rs"]
-pub(crate) mod config_compat;
 pub mod constants;
 #[cfg(feature = "full")]
 pub mod interface_factory;
@@ -20,6 +18,7 @@ pub mod lifecycle;
 pub mod link_client;
 pub mod link_manager;
 pub mod link_session;
+pub(crate) mod normalized_config;
 pub mod platform;
 #[cfg(feature = "full")]
 pub mod probe;

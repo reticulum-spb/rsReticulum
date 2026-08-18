@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::config_compat::{Config, ConfigError};
 use crate::constants::{
     ANNOUNCE_CAP, DEFAULT_INSTANCE_NAME, LOCAL_CONTROL_PORT, LOCAL_INTERFACE_PORT,
 };
 use crate::lifecycle::ShutdownSignal;
+use crate::normalized_config::{ConfigError, NormalizedConfig as Config};
 use crate::platform::{StoragePaths, resolve_config_dir};
 use rns_transport::await_path::{AwaitPathError, await_path};
 use rns_transport::discovery::{DiscoveredInterface, DiscoveryStamper};
@@ -306,11 +306,11 @@ pub async fn connect_shared(
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
     let config_path = config_dir.join(crate::config::CONFIG_FILE_NAME);
     let config = if config_path.exists() {
-        crate::config::Config::from_file(&config_path)?.to_runtime_compat_config()?
+        crate::config::Config::from_file(&config_path)?.to_runtime_config()?
     } else {
         let typed = crate::config::Config::default();
         std::fs::write(&config_path, typed.to_yaml()?).map_err(ReticulumError::Io)?;
-        typed.to_runtime_compat_config()?
+        typed.to_runtime_config()?
     };
     let config = ReticulumConfig::try_from_config(&config)?;
     if !config.share_instance {
@@ -518,11 +518,12 @@ mod tests {
 
     #[test]
     fn client_config_reads_shared_endpoint_without_full_runtime() {
-        let config = Config::parse(
-            "[reticulum]\nshare_instance = Yes\ninstance_name = lxmf\n\
-             shared_instance_type = tcp\nshared_instance_port = 41234\n\
-             instance_control_port = 41235\n",
+        let config = crate::config::Config::parse(
+            "reticulum:\n  share_instance: true\n  instance_name: lxmf\n  shared_instance_type: tcp\n  shared_instance_port: 41234\n  instance_control_port: 41235\n",
+            "config.yaml",
         )
+        .unwrap()
+        .to_runtime_config()
         .unwrap();
         let client = ReticulumConfig::try_from_config(&config).unwrap();
         assert!(client.share_instance);
@@ -534,9 +535,12 @@ mod tests {
 
     #[test]
     fn invalid_shared_port_is_rejected() {
-        let config =
-            Config::parse("[reticulum]\nshare_instance = Yes\nshared_instance_port = invalid\n")
-                .unwrap();
-        assert!(ReticulumConfig::try_from_config(&config).is_err());
+        assert!(
+            crate::config::Config::parse(
+                "reticulum:\n  share_instance: true\n  shared_instance_port: invalid\n",
+                "config.yaml"
+            )
+            .is_err()
+        );
     }
 }
