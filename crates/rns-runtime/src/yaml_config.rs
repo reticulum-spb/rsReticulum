@@ -468,10 +468,10 @@ impl InterfaceConfig {
             Self::Pipe(v) => &v.common,
             Self::Backbone(v) => &v.common,
             Self::Serial(v) => &v.common,
-            Self::Kiss(v) => &v.serial.common,
+            Self::Kiss(v) => &v.common,
             Self::Rnode(v) => &v.common,
             Self::RnodeMulti(v) => &v.common,
-            Self::Ax25Kiss(v) => &v.serial.common,
+            Self::Ax25Kiss(v) => &v.common,
             Self::Plugin(v) => &v.common,
         }
     }
@@ -495,6 +495,12 @@ impl InterfaceConfig {
             Self::TcpClient(v) if v.target_host.trim().is_empty() || v.target_port == 0 => {
                 Err(YamlConfigError::Validation(format!(
                     "interface {:?}: target_host is required and target_port must be in 1..=65535",
+                    v.common.name
+                )))
+            }
+            Self::TcpClient(v) if v.fixed_mtu.is_some_and(|mtu| mtu < 500) => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: fixed_mtu must be at least 500",
                     v.common.name
                 )))
             }
@@ -529,7 +535,23 @@ impl InterfaceConfig {
                 "interface {:?}: port must be in 1..=65535",
                 v.common.name
             ))),
+            Self::Serial(v) if v.port.trim().is_empty() => Err(YamlConfigError::Validation(
+                format!("interface {:?}: port must not be empty", v.common.name),
+            )),
+            Self::Kiss(v) if v.port.trim().is_empty() => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: port must not be empty",
+                v.common.name
+            ))),
+            Self::Rnode(v) if v.port.trim().is_empty() => Err(YamlConfigError::Validation(
+                format!("interface {:?}: port must not be empty", v.common.name),
+            )),
             Self::Rnode(v) => validate_radio(&v.common.name, &v.radio),
+            Self::RnodeMulti(v) if v.port.trim().is_empty() || v.subinterfaces.is_empty() => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: port and at least one subinterface are required",
+                    v.common.name
+                )))
+            }
             Self::RnodeMulti(v) => {
                 let mut ports = HashSet::new();
                 for sub in &v.subinterfaces {
@@ -545,8 +567,14 @@ impl InterfaceConfig {
             }
             Self::Ax25Kiss(v) if v.ssid > 15 => Err(YamlConfigError::Validation(format!(
                 "interface {:?}: ssid must be in 0..=15",
-                v.serial.common.name
+                v.common.name
             ))),
+            Self::Ax25Kiss(v) if v.port.trim().is_empty() || v.callsign.trim().is_empty() => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: port and callsign are required",
+                    v.common.name
+                )))
+            }
             Self::Plugin(v) if v.plugin.trim().is_empty() => Err(YamlConfigError::Validation(
                 format!("interface {:?}: plugin must not be empty", v.common.name),
             )),
@@ -646,7 +674,14 @@ impl InterfaceConfig {
             }
             Self::Kiss(v) => {
                 section.set("type", "KISSInterface");
-                write_serial(section, &v.serial);
+                write_serial_fields(
+                    section,
+                    &v.port,
+                    v.baud_rate,
+                    v.data_bits,
+                    &v.parity,
+                    v.stop_bits,
+                );
                 write_kiss(
                     section,
                     v.preamble_ms,
@@ -689,7 +724,14 @@ impl InterfaceConfig {
             }
             Self::Ax25Kiss(v) => {
                 section.set("type", "AX25KISSInterface");
-                write_serial(section, &v.serial);
+                write_serial_fields(
+                    section,
+                    &v.port,
+                    v.baud_rate,
+                    v.data_bits,
+                    &v.parity,
+                    v.stop_bits,
+                );
                 section.set("callsign", &v.callsign);
                 set_num(section, "ssid", v.ssid);
                 write_kiss(
@@ -995,7 +1037,12 @@ impl Default for SerialInterfaceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KissInterfaceConfig {
     #[serde(flatten)]
-    pub serial: SerialInterfaceConfig,
+    pub common: InterfaceCommonConfig,
+    pub port: String,
+    pub baud_rate: u32,
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
     pub preamble_ms: u32,
     pub tx_tail_ms: u32,
     pub persistence: u8,
@@ -1007,7 +1054,12 @@ pub struct KissInterfaceConfig {
 impl Default for KissInterfaceConfig {
     fn default() -> Self {
         Self {
-            serial: Default::default(),
+            common: Default::default(),
+            port: String::new(),
+            baud_rate: 9600,
+            data_bits: 8,
+            parity: "N".into(),
+            stop_bits: 1,
             preamble_ms: 350,
             tx_tail_ms: 20,
             persistence: 64,
@@ -1100,7 +1152,12 @@ impl Default for RnodeSubInterfaceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct Ax25KissInterfaceConfig {
     #[serde(flatten)]
-    pub serial: SerialInterfaceConfig,
+    pub common: InterfaceCommonConfig,
+    pub port: String,
+    pub baud_rate: u32,
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
     pub callsign: String,
     pub ssid: u8,
     pub preamble_ms: u32,
@@ -1112,7 +1169,12 @@ pub struct Ax25KissInterfaceConfig {
 impl Default for Ax25KissInterfaceConfig {
     fn default() -> Self {
         Self {
-            serial: Default::default(),
+            common: Default::default(),
+            port: String::new(),
+            baud_rate: 9600,
+            data_bits: 8,
+            parity: "N".into(),
+            stop_bits: 1,
             callsign: String::new(),
             ssid: 0,
             preamble_ms: 350,
@@ -1233,11 +1295,29 @@ fn write_ingress(section: &mut crate::config::ConfigSection, ingress: &IngressCo
 }
 
 fn write_serial(section: &mut crate::config::ConfigSection, serial: &SerialInterfaceConfig) {
-    section.set("port", &serial.port);
-    set_num(section, "baud_rate", serial.baud_rate);
-    set_num(section, "data_bits", serial.data_bits);
-    section.set("parity", &serial.parity);
-    set_num(section, "stop_bits", serial.stop_bits);
+    write_serial_fields(
+        section,
+        &serial.port,
+        serial.baud_rate,
+        serial.data_bits,
+        &serial.parity,
+        serial.stop_bits,
+    );
+}
+
+fn write_serial_fields(
+    section: &mut crate::config::ConfigSection,
+    port: &str,
+    baud_rate: u32,
+    data_bits: u8,
+    parity: &str,
+    stop_bits: u8,
+) {
+    section.set("port", port);
+    set_num(section, "baud_rate", baud_rate);
+    set_num(section, "data_bits", data_bits);
+    section.set("parity", parity);
+    set_num(section, "stop_bits", stop_bits);
 }
 
 fn write_kiss(
@@ -1363,14 +1443,12 @@ pub fn interface_from_compat_section(
         }),
         #[cfg(feature = "serial")]
         Runtime::KissSerial(v) => InterfaceConfig::Kiss(KissInterfaceConfig {
-            serial: SerialInterfaceConfig {
-                common,
-                port: v.port,
-                baud_rate: v.baud_rate,
-                data_bits: v.data_bits,
-                parity: v.parity,
-                stop_bits: v.stop_bits,
-            },
+            common,
+            port: v.port,
+            baud_rate: v.baud_rate,
+            data_bits: v.data_bits,
+            parity: v.parity,
+            stop_bits: v.stop_bits,
             preamble_ms: v.preamble_ms,
             tx_tail_ms: v.txtail_ms,
             persistence: v.persistence,
@@ -1445,14 +1523,12 @@ pub fn interface_from_compat_section(
         }),
         #[cfg(feature = "serial")]
         Runtime::AX25KISS(v) => InterfaceConfig::Ax25Kiss(Ax25KissInterfaceConfig {
-            serial: SerialInterfaceConfig {
-                common,
-                port: v.port,
-                baud_rate: v.baud_rate,
-                data_bits: v.data_bits,
-                parity: v.parity,
-                stop_bits: v.stop_bits,
-            },
+            common,
+            port: v.port,
+            baud_rate: v.baud_rate,
+            data_bits: v.data_bits,
+            parity: v.parity,
+            stop_bits: v.stop_bits,
             callsign: v.callsign,
             ssid: v.ssid,
             preamble_ms: v.preamble,
@@ -1630,5 +1706,69 @@ mod tests {
     #[test]
     fn example_config_is_valid() {
         Config::parse(EXAMPLE_CONFIG, "example config.yaml").unwrap();
+    }
+
+    #[test]
+    fn every_builtin_interface_type_deserializes_and_validates() {
+        let yaml = r#"
+interfaces:
+  - { type: auto, name: Auto }
+  - { type: tcp_client, name: TCP client, target_host: example.org, target_port: 4242 }
+  - { type: tcp_server, name: TCP server, listen_port: 4242 }
+  - { type: udp, name: UDP, listen_port: 4242 }
+  - { type: local, name: Local }
+  - { type: i2p, name: I2P }
+  - { type: pipe, name: Pipe, command: /usr/bin/example }
+  - { type: backbone, name: Backbone, target_host: example.org, port: 4242 }
+  - { type: serial, name: Serial, enabled: false, port: /dev/ttyUSB0 }
+  - { type: kiss, name: KISS, enabled: false, port: /dev/ttyUSB1 }
+  - type: rnode
+    name: RNode
+    enabled: false
+    port: /dev/ttyUSB2
+    frequency: 868000000
+    bandwidth: 125000
+    spreading_factor: 9
+    coding_rate: 5
+    tx_power: 17
+  - type: rnode_multi
+    name: RNode Multi
+    enabled: false
+    port: /dev/ttyACM0
+    subinterfaces:
+      - name: Primary
+        vport: 0
+        frequency: 868000000
+        bandwidth: 125000
+        spreading_factor: 9
+        coding_rate: 5
+        tx_power: 17
+  - { type: ax25_kiss, name: AX25, enabled: false, port: /dev/ttyUSB3, callsign: NO1CLL, ssid: 0 }
+  - { type: plugin, name: Future plugin, enabled: false, plugin: sx1262, config: { reset_pin: 12 } }
+"#;
+        let config = Config::parse(yaml, "all-interfaces.yaml").unwrap();
+        assert_eq!(config.interfaces.len(), 14);
+        config.to_runtime_compat_config().unwrap();
+    }
+
+    #[test]
+    fn missing_required_interface_field_is_rejected() {
+        let yaml = "interfaces:\n  - type: tcp_client\n    name: Broken\n    target_port: 4242\n";
+        assert!(Config::parse(yaml, "config.yaml").is_err());
+    }
+
+    #[test]
+    fn invalid_enum_and_malformed_yaml_are_rejected() {
+        let invalid_enum = "interfaces:\n  - type: auto\n    name: LAN\n    mode: impossible\n";
+        assert!(Config::parse(invalid_enum, "config.yaml").is_err());
+        assert!(Config::parse("reticulum: [", "config.yaml").is_err());
+    }
+
+    #[test]
+    fn invalid_ports_and_radio_ranges_are_rejected() {
+        let port = "interfaces:\n  - type: tcp_server\n    name: TCP\n    listen_port: 0\n";
+        assert!(Config::parse(port, "config.yaml").is_err());
+        let radio = "interfaces:\n  - type: rnode\n    name: Radio\n    port: /dev/null\n    frequency: 868000000\n    bandwidth: 125000\n    spreading_factor: 20\n    coding_rate: 5\n    tx_power: 17\n";
+        assert!(Config::parse(radio, "config.yaml").is_err());
     }
 }
