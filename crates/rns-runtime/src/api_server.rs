@@ -1,12 +1,12 @@
 //! Embedded REST API server for rnsd-rs.
 //!
-//! Activated via `--features api` and the `[api]` config section:
+//! Activated via `--features api` and the `api` YAML mapping:
 //!
-//! ```ini
-//! [api]
-//! port = 8080
-//! user = admin
-//! password = change-me
+//! ```yaml
+//! api:
+//!   port: 8080
+//!   user: admin
+//!   password: change-me
 //! ```
 //!
 //! The server runs inside the rnsd process and accesses the transport
@@ -174,6 +174,7 @@ struct LoginThrottle {
 
 struct LoadedConfig {
     config: Config,
+    typed: crate::yaml_config::Config,
     source: Vec<u8>,
 }
 
@@ -207,7 +208,7 @@ struct SettingsRequest {
 
 fn save_config_snapshot(
     path: &std::path::Path,
-    config: &Config,
+    config: &crate::yaml_config::Config,
     expected: &[u8],
 ) -> Result<Vec<u8>, ApiError> {
     let current = std::fs::read(path)
@@ -218,11 +219,17 @@ fn save_config_snapshot(
         ));
     }
 
-    let backup_path = path.with_file_name("config.web-ui.bak");
+    let backup_path = path.with_file_name("config.yaml.web-ui.bak");
     atomic_write(&backup_path, expected)
         .map_err(|e| ApiError::internal(format!("failed to write config backup: {e}")))?;
 
-    let updated = config.to_ini().into_bytes();
+    config
+        .validate()
+        .map_err(|e| ApiError::bad(format!("invalid configuration: {e}")))?;
+    let updated = config
+        .to_yaml()
+        .map_err(|e| ApiError::internal(format!("failed to serialize config: {e}")))?
+        .into_bytes();
     atomic_write(path, &updated)
         .map_err(|e| ApiError::internal(format!("failed to write config: {e}")))?;
     Ok(updated)
@@ -260,7 +267,9 @@ impl AppState {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.handle.config_dir.join("config")
+        self.handle
+            .config_dir
+            .join(crate::yaml_config::CONFIG_FILE_NAME)
     }
 
     fn load_config(&self) -> Result<Config, ApiError> {
@@ -273,12 +282,23 @@ impl AppState {
             .map_err(|e| ApiError::internal(format!("failed to read config: {e}")))?;
         let text = std::str::from_utf8(&source)
             .map_err(|e| ApiError::internal(format!("config is not valid UTF-8: {e}")))?;
-        let config = Config::from_loaded_str(text, &path)
+        let typed = crate::yaml_config::Config::parse(text, &path)
             .map_err(|e| ApiError::internal(format!("failed to parse config: {e}")))?;
-        Ok(LoadedConfig { config, source })
+        let config = typed
+            .to_runtime_compat_config()
+            .map_err(|e| ApiError::internal(format!("failed to normalize config: {e}")))?;
+        Ok(LoadedConfig {
+            config,
+            typed,
+            source,
+        })
     }
 
-    fn save_config(&self, config: &Config, expected: &[u8]) -> Result<Vec<u8>, ApiError> {
+    fn save_config(
+        &self,
+        config: &crate::yaml_config::Config,
+        expected: &[u8],
+    ) -> Result<Vec<u8>, ApiError> {
         save_config_snapshot(&self.config_path(), config, expected)
     }
 
@@ -687,6 +707,12 @@ impl InterfaceRequest {
         synthesize_interface(&self.name, &section).map_err(|e| ApiError::bad(format!("{e}")))
     }
 
+    fn to_yaml_config(&self) -> Result<crate::yaml_config::InterfaceConfig, ApiError> {
+        self.validate_fields()?;
+        crate::yaml_config::interface_from_compat_section(&self.name, &self.to_config_section())
+            .map_err(|error| ApiError::bad(error.to_string()))
+    }
+
     fn validate_fields(&self) -> Result<(), ApiError> {
         #[cfg(feature = "serial")]
         if self.iface_type == "AX25KISSInterface" {
@@ -710,14 +736,23 @@ impl InterfaceRequest {
 // Config change + interface restart
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn set_interface_config(config: &mut Config, name: &str, section: ConfigSection) {
-    let interfaces = config.ensure_section("interfaces");
-    interfaces.remove_subsection(name);
-    *interfaces.add_subsection(name.to_string()) = section;
+fn set_interface_config(
+    config: &mut crate::yaml_config::Config,
+    interface: crate::yaml_config::InterfaceConfig,
+) {
+    let name = interface.common().name.as_str();
+    config
+        .interfaces
+        .retain(|existing| existing.common().name != name);
+    config.interfaces.push(interface);
 }
 
-fn remove_interface_config(config: &mut Config, name: &str) -> bool {
-    config.ensure_section("interfaces").remove_subsection(name)
+fn remove_interface_config(config: &mut crate::yaml_config::Config, name: &str) -> bool {
+    let before = config.interfaces.len();
+    config
+        .interfaces
+        .retain(|entry| entry.common().name != name);
+    config.interfaces.len() != before
 }
 
 /// Apply interface change:
@@ -729,34 +764,33 @@ fn remove_interface_config(config: &mut Config, name: &str) -> bool {
 async fn apply_interface_change(
     s: &AppState,
     iface_name: &str,
-    new_section: Option<ConfigSection>, // None = remove from config
-    old_id: Option<u64>,                // None = there was no new interface
+    new_yaml_config: Option<crate::yaml_config::InterfaceConfig>, // None = remove
+    old_id: Option<u64>,                  // None = there was no new interface
     new_config: Option<&InterfaceConfig>, // None = deletion only
     renamed_from: Option<&str>,
     rollback_interface: Option<&InterfaceConfig>,
 ) -> ApiResult<u64> {
     // ── 1. Конфиг ──────────────────────────────────────────────────────────
     let LoadedConfig {
-        mut config,
+        mut typed,
         source: original_source,
+        ..
     } = s.load_config_snapshot()?;
 
     if let Some(old_name) = renamed_from {
-        remove_interface_config(&mut config, old_name);
+        remove_interface_config(&mut typed, old_name);
     }
-    match new_section {
-        Some(section) => {
-            // Replace or add the [[iface_name]] subsection.
-            set_interface_config(&mut config, iface_name, section);
+    match new_yaml_config {
+        Some(interface) => {
+            set_interface_config(&mut typed, interface);
         }
         None => {
-            // Remove
-            if !remove_interface_config(&mut config, iface_name) {
+            if !remove_interface_config(&mut typed, iface_name) {
                 return Err(ApiError::NotFound);
             }
         }
     }
-    let applied_source = s.save_config(&config, &original_source)?;
+    let applied_source = s.save_config(&typed, &original_source)?;
 
     // ── 2. Teardown ─────────────────────────────────────────────────────────
     if let Some(id) = old_id {
@@ -1246,9 +1280,47 @@ async fn update_settings(
             section.set("password", password);
         }
     }
+    loaded.typed.reticulum.share_instance = req.share_instance;
+    loaded.typed.reticulum.instance_name = req.instance_name.trim().to_string();
+    loaded.typed.reticulum.shared_instance_type = match req
+        .shared_instance_type
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "tcp" => crate::yaml_config::SharedInstanceType::Tcp,
+        "unix" => crate::yaml_config::SharedInstanceType::Unix,
+        _ => {
+            return Err(ApiError::bad("shared_instance_type must be tcp or unix"));
+        }
+    };
+    loaded.typed.reticulum.shared_instance_port = req.shared_instance_port;
+    loaded.typed.reticulum.instance_control_port = req.instance_control_port;
+    loaded.typed.reticulum.enable_transport = req.enable_transport;
+    loaded.typed.reticulum.static_transport_identity = req.static_transport_identity;
+    loaded.typed.reticulum.local_hops_delta = req.local_hops_delta;
+    loaded.typed.reticulum.respond_to_probes = req.respond_to_probes;
+    loaded.typed.reticulum.use_implicit_proof = req.use_implicit_proof;
+    loaded.typed.reticulum.panic_on_interface_error = req.panic_on_interface_error;
+    loaded.typed.reticulum.link_mtu_discovery = req.link_mtu_discovery;
+    loaded.typed.reticulum.force_shared_instance_bitrate = req.force_shared_instance_bitrate;
+    loaded.typed.reticulum.default_ar_target = req.default_ar_target;
+    loaded.typed.reticulum.default_ar_grace = req.default_ar_grace;
+    loaded.typed.reticulum.default_ar_penalty = req.default_ar_penalty;
+    loaded.typed.reticulum.discover_interfaces = req.discover_interfaces;
+    loaded.typed.reticulum.autoconnect_discovered_interfaces =
+        req.autoconnect_discovered_interfaces;
+    loaded.typed.reticulum.required_discovery_value = req.required_discovery_value;
+    loaded.typed.logging.level = req.loglevel;
+    loaded.typed.logging.timestamps = req.logtimestamps;
+    loaded.typed.api.port = Some(req.api_port);
+    loaded.typed.api.user = Some(req.api_user.trim().to_string());
+    if let Some(password) = req.api_password.filter(|value| !value.is_empty()) {
+        loaded.typed.api.password = Some(password);
+    }
     ReticulumConfig::try_from_config(&loaded.config)
         .map_err(|e| ApiError::bad(format!("invalid settings: {e}")))?;
-    s.save_config(&loaded.config, &loaded.source)?;
+    s.save_config(&loaded.typed, &loaded.source)?;
     Ok(Json(json!({ "ok": true, "restart_required": true })))
 }
 
@@ -1312,12 +1384,12 @@ async fn create_interface(
 
     // Section for writing to the config — we build from req, not from InterfaceConfig,
     // to save only what was received (without defaults).
-    let section = req.to_config_section();
+    let yaml_config = req.to_yaml_config()?;
 
     let id = apply_interface_change(
         &s,
         &req.name,
-        Some(section),
+        Some(yaml_config),
         None,
         iface_config.as_ref(),
         None,
@@ -1357,13 +1429,13 @@ async fn update_interface(
     let rollback_interface = old_configs.get(&old_name).cloned();
 
     let iface_config = req.synthesize()?;
-    let section = req.to_config_section();
+    let yaml_config = req.to_yaml_config()?;
 
     let renamed_from = (old_name != req.name).then_some(old_name.as_str());
     let new_id = apply_interface_change(
         &s,
         &req.name,
-        Some(section),
+        Some(yaml_config),
         Some(id),
         Some(&iface_config),
         renamed_from,
@@ -1420,13 +1492,13 @@ async fn update_config_interface(
     } else {
         None
     };
-    let section = req.to_config_section();
+    let yaml_config = req.to_yaml_config()?;
     let renamed_from = (old_name != req.name).then_some(old_name.as_str());
 
     let new_id = apply_interface_change(
         &s,
         &req.name,
-        Some(section),
+        Some(yaml_config),
         old_id,
         new_config.as_ref(),
         renamed_from,
@@ -2323,7 +2395,10 @@ mod tests {
 
     #[test]
     fn interface_config_sections_can_be_created_renamed_and_deleted() {
-        let mut config = Config::parse("[interfaces]\n").unwrap();
+        let mut config = crate::yaml_config::Config {
+            interfaces: Vec::new(),
+            ..Default::default()
+        };
         let request: InterfaceRequest = serde_json::from_value(json!({
             "name": "First name",
             "type": "TCPServerInterface",
@@ -2332,22 +2407,29 @@ mod tests {
         }))
         .unwrap();
 
-        set_interface_config(&mut config, &request.name, request.to_config_section());
+        set_interface_config(&mut config, request.to_yaml_config().unwrap());
         assert!(
             config
-                .subsections("interfaces")
+                .interfaces
                 .iter()
-                .any(|(name, _)| *name == "First name")
+                .any(|interface| interface.common().name == "First name")
         );
 
         assert!(remove_interface_config(&mut config, "First name"));
-        set_interface_config(&mut config, "Renamed", request.to_config_section());
-        let serialized = config.to_ini();
-        assert!(serialized.contains("[[Renamed]]"));
-        assert!(!serialized.contains("[[First name]]"));
+        let renamed: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Renamed",
+            "type": "TCPServerInterface",
+            "listen_ip": "127.0.0.1",
+            "listen_port": 4242
+        }))
+        .unwrap();
+        set_interface_config(&mut config, renamed.to_yaml_config().unwrap());
+        let serialized = config.to_yaml().unwrap();
+        assert!(serialized.contains("name: Renamed"));
+        assert!(!serialized.contains("name: First name"));
 
         assert!(remove_interface_config(&mut config, "Renamed"));
-        assert!(config.subsections("interfaces").is_empty());
+        assert!(config.interfaces.is_empty());
         assert!(!remove_interface_config(&mut config, "Missing"));
     }
 
@@ -2362,20 +2444,25 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config");
-        let original = b"[interfaces]\n# original comment\n".to_vec();
+        let path = dir.join("config.yaml");
+        let original = b"# original comment\ninterfaces: []\n".to_vec();
         std::fs::write(&path, &original).unwrap();
 
-        let mut config = Config::parse(std::str::from_utf8(&original).unwrap()).unwrap();
-        let mut section = ConfigSection::new();
-        section.set("type", "TCPServerInterface");
-        section.set("listen_ip", "127.0.0.1");
-        section.set("listen_port", "4242");
-        set_interface_config(&mut config, "Test", section);
+        let mut config =
+            crate::yaml_config::Config::parse(std::str::from_utf8(&original).unwrap(), &path)
+                .unwrap();
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "name": "Test",
+            "type": "TCPServerInterface",
+            "listen_ip": "127.0.0.1",
+            "listen_port": 4242
+        }))
+        .unwrap();
+        set_interface_config(&mut config, request.to_yaml_config().unwrap());
 
         let applied = save_config_snapshot(&path, &config, &original).unwrap();
         assert_eq!(
-            std::fs::read(dir.join("config.web-ui.bak")).unwrap(),
+            std::fs::read(dir.join("config.yaml.web-ui.bak")).unwrap(),
             original
         );
         assert_eq!(std::fs::read(&path).unwrap(), applied);
@@ -2383,14 +2470,14 @@ mod tests {
         rollback_config_snapshot(&path, &applied, &original).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), original);
 
-        std::fs::write(&path, b"[interfaces]\n# external edit\n").unwrap();
+        std::fs::write(&path, b"# external edit\ninterfaces: []\n").unwrap();
         assert!(matches!(
             save_config_snapshot(&path, &config, &original),
             Err(ApiError::Conflict(_))
         ));
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            b"[interfaces]\n# external edit\n"
+            b"# external edit\ninterfaces: []\n"
         );
 
         let _ = std::fs::remove_dir_all(dir);

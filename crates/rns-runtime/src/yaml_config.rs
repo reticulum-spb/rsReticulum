@@ -1264,6 +1264,278 @@ fn write_radio(section: &mut crate::config::ConfigSection, radio: &RadioConfig) 
     set_opt_num(section, "airtime_limit_long", radio.airtime_limit_long);
 }
 
+/// Convert a Web/API compatibility section into the typed YAML variant. This
+/// is deliberately kept at the configuration boundary; runtime code never
+/// receives parser values.
+#[cfg(feature = "api")]
+pub fn interface_from_compat_section(
+    name: &str,
+    section: &crate::config::ConfigSection,
+) -> Result<InterfaceConfig, YamlConfigError> {
+    let mut enabled_section = section.clone();
+    enabled_section.set("enabled", "Yes");
+    let runtime = crate::interface_factory::synthesize_interface(name, &enabled_section)
+        .map_err(|error| YamlConfigError::Validation(error.to_string()))?;
+    let common = common_from_compat(name, section);
+    use crate::interface_factory::InterfaceConfig as Runtime;
+    Ok(match runtime {
+        Runtime::Auto(v) => InterfaceConfig::Auto(AutoInterfaceConfig {
+            common,
+            group_id: v.group_id,
+            discovery_scope: match v.discovery_scope {
+                rns_interface::auto::DiscoveryScope::Link => DiscoveryScope::Link,
+                rns_interface::auto::DiscoveryScope::Admin => DiscoveryScope::Admin,
+                rns_interface::auto::DiscoveryScope::Site => DiscoveryScope::Site,
+                rns_interface::auto::DiscoveryScope::Organisation => DiscoveryScope::Organisation,
+                rns_interface::auto::DiscoveryScope::Global => DiscoveryScope::Global,
+            },
+            discovery_port: v.discovery_port,
+            data_port: v.data_port,
+            multicast_address_type: match v.multicast_address_type {
+                rns_interface::auto::McastAddrType::Permanent => MulticastAddressType::Permanent,
+                rns_interface::auto::McastAddrType::Temporary => MulticastAddressType::Temporary,
+            },
+            devices: v.devices,
+            ignored_devices: v.ignored_devices,
+            configured_bitrate: v.configured_bitrate,
+        }),
+        Runtime::TcpClient(v) => InterfaceConfig::TcpClient(TcpClientInterfaceConfig {
+            common,
+            target_host: v.target_host,
+            target_port: v.target_port,
+            kiss_framing: v.kiss_framing,
+            connect_timeout: v.connect_timeout_secs,
+            max_reconnect_tries: v.max_reconnect_tries,
+            fixed_mtu: v.fixed_mtu,
+        }),
+        Runtime::TcpServer(v) => InterfaceConfig::TcpServer(TcpServerInterfaceConfig {
+            common,
+            listen_ip: v.listen_ip,
+            listen_port: v.listen_port,
+            kiss_framing: v.kiss_framing,
+            prefer_ipv6: v.prefer_ipv6,
+            device: v.device,
+        }),
+        Runtime::Udp(v) => InterfaceConfig::Udp(UdpInterfaceConfig {
+            common,
+            listen_ip: v.listen_ip,
+            listen_port: v.listen_port,
+            forward_ip: v.forward_ip,
+            forward_port: v.forward_port,
+            device: v.device,
+        }),
+        Runtime::Local(v) => InterfaceConfig::Local(LocalInterfaceConfig {
+            common,
+            port: v.port,
+        }),
+        Runtime::I2P(v) => InterfaceConfig::I2p(I2pInterfaceConfig {
+            common,
+            connectable: v.connectable,
+            peers: v.peers,
+            sam_host: v.i2p_sam_host,
+            sam_port: v.i2p_sam_port,
+        }),
+        Runtime::Pipe(v) => InterfaceConfig::Pipe(PipeInterfaceConfig {
+            common,
+            command: v.command,
+            respawn_delay: v.respawn_delay,
+        }),
+        Runtime::Backbone(v) => InterfaceConfig::Backbone(BackboneInterfaceConfig {
+            common,
+            listen_on: v.listen_on,
+            target_host: v.target_host,
+            port: v.port,
+            device: v.device,
+            prefer_ipv6: v.prefer_ipv6,
+            connect_timeout: v.connect_timeout,
+            max_reconnect_tries: v.max_reconnect_tries,
+            i2p_tunneled: v.i2p_tunneled,
+        }),
+        #[cfg(feature = "serial")]
+        Runtime::Serial(v) => InterfaceConfig::Serial(SerialInterfaceConfig {
+            common,
+            port: v.port,
+            baud_rate: v.baud_rate,
+            data_bits: v.data_bits,
+            parity: v.parity,
+            stop_bits: v.stop_bits,
+        }),
+        #[cfg(feature = "serial")]
+        Runtime::KissSerial(v) => InterfaceConfig::Kiss(KissInterfaceConfig {
+            serial: SerialInterfaceConfig {
+                common,
+                port: v.port,
+                baud_rate: v.baud_rate,
+                data_bits: v.data_bits,
+                parity: v.parity,
+                stop_bits: v.stop_bits,
+            },
+            preamble_ms: v.preamble_ms,
+            tx_tail_ms: v.txtail_ms,
+            persistence: v.persistence,
+            slot_time_ms: v.slottime_ms,
+            flow_control: v.flow_control,
+            id_interval: v.id_interval,
+            id_callsign: v.id_callsign,
+        }),
+        #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
+        Runtime::RNode(v) => InterfaceConfig::Rnode(RnodeInterfaceConfig {
+            common,
+            port: v.port,
+            radio: RadioConfig {
+                frequency: v.frequency,
+                bandwidth: v.bandwidth,
+                spreading_factor: v.spreading_factor,
+                coding_rate: v.coding_rate,
+                tx_power: v.tx_power,
+                airtime_limit_short: v.st_alock,
+                airtime_limit_long: v.lt_alock,
+            },
+            flow_control: v.flow_control,
+            id_interval: v.id_interval,
+            id_callsign: v.id_callsign,
+        }),
+        #[cfg(feature = "ble")]
+        Runtime::BleRNode(v) => InterfaceConfig::Rnode(RnodeInterfaceConfig {
+            common,
+            port: v.port,
+            radio: RadioConfig {
+                frequency: v.frequency,
+                bandwidth: v.bandwidth,
+                spreading_factor: v.spreading_factor,
+                coding_rate: v.coding_rate,
+                tx_power: v.tx_power,
+                airtime_limit_short: v.st_alock,
+                airtime_limit_long: v.lt_alock,
+            },
+            flow_control: v.flow_control,
+            id_interval: v.id_interval,
+            id_callsign: v.id_callsign,
+        }),
+        #[cfg(feature = "serial")]
+        Runtime::RNodeMulti(v) => InterfaceConfig::RnodeMulti(RnodeMultiInterfaceConfig {
+            common,
+            port: v.port,
+            baud_rate: v.baud_rate,
+            flow_control: v.flow_control,
+            subinterfaces: v
+                .subinterfaces
+                .into_iter()
+                .map(|sub| RnodeSubInterfaceConfig {
+                    name: sub.name,
+                    vport: sub.vport,
+                    enabled: sub.enabled,
+                    outgoing: sub.outgoing,
+                    flow_control: Some(sub.flow_control),
+                    mode: Some(interface_mode_from_runtime(sub.mode)),
+                    radio: RadioConfig {
+                        frequency: sub.frequency,
+                        bandwidth: sub.bandwidth,
+                        spreading_factor: sub.spreading_factor,
+                        coding_rate: sub.coding_rate,
+                        tx_power: sub.tx_power as i8,
+                        airtime_limit_short: sub.st_alock,
+                        airtime_limit_long: sub.lt_alock,
+                    },
+                })
+                .collect(),
+            id_interval: v.id_interval,
+            id_callsign: v.id_callsign,
+        }),
+        #[cfg(feature = "serial")]
+        Runtime::AX25KISS(v) => InterfaceConfig::Ax25Kiss(Ax25KissInterfaceConfig {
+            serial: SerialInterfaceConfig {
+                common,
+                port: v.port,
+                baud_rate: v.baud_rate,
+                data_bits: v.data_bits,
+                parity: v.parity,
+                stop_bits: v.stop_bits,
+            },
+            callsign: v.callsign,
+            ssid: v.ssid,
+            preamble_ms: v.preamble,
+            tx_tail_ms: v.txtail,
+            persistence: v.persistence as u8,
+            slot_time_ms: v.slottime,
+            flow_control: v.flow_control,
+        }),
+    })
+}
+
+#[cfg(feature = "api")]
+fn common_from_compat(name: &str, section: &crate::config::ConfigSection) -> InterfaceCommonConfig {
+    InterfaceCommonConfig {
+        name: name.to_string(),
+        enabled: section.get_bool("enabled").unwrap_or(true),
+        mode: section
+            .get("interface_mode")
+            .or_else(|| section.get("mode"))
+            .and_then(interface_mode_from_name)
+            .unwrap_or_default(),
+        outgoing: section.get_bool("outgoing").unwrap_or(true),
+        bitrate: section.get_uint("bitrate"),
+        announce_cap: section.get_float("announce_cap"),
+        announce_rate_target: section.get_uint("announce_rate_target"),
+        announce_rate_grace: section.get_uint("announce_rate_grace").map(|v| v as u32),
+        announce_rate_penalty: section.get_uint("announce_rate_penalty"),
+        ifac_network_name: section
+            .get("networkname")
+            .or_else(|| section.get("network_name"))
+            .map(str::to_string),
+        ifac_passphrase: section
+            .get("passphrase")
+            .or_else(|| section.get("pass_phrase"))
+            .map(str::to_string),
+        ifac_size: section.get_uint("ifac_size").map(|v| v as usize),
+        ingress_control: section.get_bool("ingress_control").unwrap_or(true),
+        ingress: IngressConfig {
+            burst_freq_new: section.get_float("ic_burst_freq_new"),
+            burst_freq: section.get_float("ic_burst_freq"),
+            path_request_burst_freq_new: section.get_float("ic_pr_burst_freq_new"),
+            path_request_burst_freq: section.get_float("ic_pr_burst_freq"),
+            new_time: section.get_float("ic_new_time"),
+            burst_hold: section.get_float("ic_burst_hold"),
+            burst_penalty: section.get_float("ic_burst_penalty"),
+            max_held_announces: section
+                .get_uint("ic_max_held_announces")
+                .map(|v| v as usize),
+            held_release_interval: section.get_float("ic_held_release_interval"),
+            egress_path_request_freq: section.get_float("ec_pr_freq"),
+            egress_control: section.get_bool("egress_control"),
+        },
+        recursive_path_requests: section.get_bool("recursive_prs").unwrap_or(false),
+        announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
+    }
+}
+
+#[cfg(feature = "api")]
+fn interface_mode_from_name(name: &str) -> Option<InterfaceMode> {
+    match name.to_ascii_lowercase().replace('-', "_").as_str() {
+        "full" => Some(InterfaceMode::Full),
+        "pointtopoint" | "point_to_point" => Some(InterfaceMode::PointToPoint),
+        "accesspoint" | "access_point" | "ap" => Some(InterfaceMode::AccessPoint),
+        "roaming" => Some(InterfaceMode::Roaming),
+        "boundary" => Some(InterfaceMode::Boundary),
+        "gateway" | "gw" => Some(InterfaceMode::Gateway),
+        "internal" => Some(InterfaceMode::Internal),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "api", feature = "serial"))]
+fn interface_mode_from_runtime(mode: rns_interface::traits::InterfaceMode) -> InterfaceMode {
+    match mode {
+        rns_interface::traits::InterfaceMode::Full => InterfaceMode::Full,
+        rns_interface::traits::InterfaceMode::PointToPoint => InterfaceMode::PointToPoint,
+        rns_interface::traits::InterfaceMode::AccessPoint => InterfaceMode::AccessPoint,
+        rns_interface::traits::InterfaceMode::Roaming => InterfaceMode::Roaming,
+        rns_interface::traits::InterfaceMode::Boundary => InterfaceMode::Boundary,
+        rns_interface::traits::InterfaceMode::Gateway => InterfaceMode::Gateway,
+        rns_interface::traits::InterfaceMode::Internal => InterfaceMode::Internal,
+    }
+}
+
 fn validate_hashes(field: &str, hashes: &[String]) -> Result<(), YamlConfigError> {
     for hash in hashes {
         if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1321,6 +1593,13 @@ mod tests {
         let error =
             Config::parse("reticulum:\n  enable_transprot: true\n", "config.yaml").unwrap_err();
         assert!(error.to_string().contains("enable_transprot"));
+    }
+
+    #[test]
+    fn rejects_unknown_interface_fields() {
+        let yaml = "interfaces:\n  - type: auto\n    name: LAN\n    discovery_prot: 29716\n";
+        let error = Config::parse(yaml, "config.yaml").unwrap_err();
+        assert!(error.to_string().contains("discovery_prot"));
     }
 
     #[test]
