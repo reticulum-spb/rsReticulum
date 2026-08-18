@@ -1,7 +1,8 @@
-# rsReticulum C plugin API prototype
+# rsReticulum plugin API
 
-This directory contains the ABI v1 C header and a minimal plugin used to
-evaluate the API before implementing the Rust loader and adapter.
+This crate contains the dependency-free Rust ABI definitions, matching public
+C header, and a minimal C loopback plugin. The Linux loader and runtime adapter
+live in `rns-interface`.
 
 Build the example with:
 
@@ -67,5 +68,3 @@ Calls for different instances may execute concurrently. A plugin synchronizes
 library-global state and keeps each instance independent. For one instance the
 host serializes `send()` calls, joins the TX worker before the single
 `destroy()` call, and never uses the instance pointer afterwards.
-
-The prototype deliberately has no Rust crate or host loader yet.

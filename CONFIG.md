@@ -322,26 +322,30 @@ Requires the Cargo `serial` feature. Uses the Serial field set and adds:
 | `slot_time_ms` | integer | `20` | CSMA slot time. |
 | `flow_control` | boolean | `false` | Enable flow control. |
 
-## `type: plugin` — reserved configuration shape
+## `type: plugin`
 
-Plugin loading and ABI support are not implemented yet. The shape is reserved
-so adding them later does not require another configuration migration.
+Linux plugins are loaded in-process through the stable C ABI. `plugin: sx1262`
+maps directly to `/usr/lib/reticulum-rs/sx1262.so`; no filename prefix is
+added. Use `rnsd-rs --list-plugin` to inspect installed libraries.
 
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `name` and common fields | — | — | Same common fields as built-ins. |
-| `plugin` | string | none | Required, non-empty plugin identifier. |
-| `config` | any YAML value with string mapping keys | `null` | Opaque to core; unknown fields are allowed recursively here. |
+| `plugin` | string | none | Required filename stem: 1–128 ASCII letters, digits, `_`, or `-`. |
+| `mtu` | integer | `500` | Maximum packet size passed to plugin `send()`, greater than zero. |
+| `config` | mapping or `null` | `null` | Serialized as opaque YAML and validated by the plugin. |
 
-An enabled plugin entry is rejected until the plugin ABI exists. A disabled
-entry can be stored and round-tripped safely:
+The plugin reports its physical bitrate and online state at runtime, so the
+common `bitrate` setting does not override it. Failure to load or create one
+plugin interface is logged but never stops other interfaces or daemon startup,
+even when `panic_on_interface_error` is enabled.
 
 ```yaml
 interfaces:
   - type: plugin
-    name: Future LoRa
-    enabled: false
+    name: SPI LoRa
     plugin: sx1262
+    mtu: 500
     config:
       spi: /dev/spidev0.0
       reset_pin: 12

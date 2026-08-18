@@ -1,5 +1,6 @@
 #include "rns_plugin.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,6 +13,22 @@ static void plugin_log(const rns_host_api_t *host,
                        const char *message) {
     host->log(host->host_context, level, (const uint8_t *)message,
               strlen(message));
+}
+
+static int config_is_empty_mapping(const uint8_t *config, size_t len) {
+    size_t begin = 0;
+    size_t end = len;
+
+    if (config == NULL) {
+        return len == 0;
+    }
+    while (begin < end && isspace((unsigned char)config[begin])) {
+        begin++;
+    }
+    while (end > begin && isspace((unsigned char)config[end - 1])) {
+        end--;
+    }
+    return end - begin == 2 && config[begin] == '{' && config[begin + 1] == '}';
 }
 
 static rns_plugin_result_t loopback_create(const rns_host_api_t *host,
@@ -34,6 +51,11 @@ static rns_plugin_result_t loopback_create(const rns_host_api_t *host,
     if (config_yaml == NULL && config_len != 0) {
         plugin_log(host, RNS_LOG_ERROR,
                    "loopback: config pointer is NULL but length is non-zero");
+        return RNS_PLUGIN_ERROR;
+    }
+    if (!config_is_empty_mapping(config_yaml, config_len)) {
+        plugin_log(host, RNS_LOG_ERROR,
+                   "loopback: config contains unknown fields");
         return RNS_PLUGIN_ERROR;
     }
 

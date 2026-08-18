@@ -70,7 +70,7 @@ static void host_rx_packet(void *opaque,
 
 static rns_plugin_t *create_instance(const rns_plugin_api_t *api,
                                      rns_host_api_t *host) {
-    static const uint8_t config[] = "echo: true\n";
+    static const uint8_t config[] = "{}\n";
     rns_plugin_t *plugin = NULL;
 
     if (api->create(host, config, sizeof(config) - 1, &plugin) != RNS_PLUGIN_OK ||
