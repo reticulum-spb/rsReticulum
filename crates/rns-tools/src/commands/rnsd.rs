@@ -9,102 +9,6 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use rns_tools::{RETICULUM_COMPAT_VERSION, RS_RETICULUM_VERSION};
 const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
-const RNSD_EXAMPLE_CONFIG: &str = r#"# This is an example Reticulum config file.
-
-[reticulum]
-enable_transport = no
-share_instance = yes
-instance_name = default
-
-# Interval in minutes at which remote blackhole sources
-# are updated. Defaults to one hour.
-# blackhole_update_interval = 60
-
-# When not running as a transport node, force the same,
-# static transport identity at every instance start.
-# Defaults to a new identity per start if transport is
-# disabled.
-# static_transport_identity = no
-
-[logging]
-loglevel = 4
-
-# You can disable timestamp inclusion in logs.
-# logtimestamps = no
-
-[interfaces]
-
-[[Default Interface]]
-type = AutoInterface
-enabled = yes
-
-[[UDP Interface]]
-type = UDPInterface
-enabled = no
-listen_ip = 0.0.0.0
-listen_port = 4242
-forward_ip = 255.255.255.255
-forward_port = 4242
-
-[[TCP Server Interface]]
-type = TCPServerInterface
-enabled = no
-listen_ip = 0.0.0.0
-listen_port = 4242
-
-[[TCP Client Interface]]
-type = TCPClientInterface
-enabled = no
-target_host = 127.0.0.1
-target_port = 4242
-
-[[I2P]]
-type = I2PInterface
-enabled = no
-connectable = yes
-peers = ykzlw5ujbaqc2xkec4cpvgyxj257wcrmmgkuxqmqcur7cq3w3lha.b32.i2p
-
-[[RNode LoRa Interface]]
-type = RNodeInterface
-enabled = no
-port = /dev/ttyUSB0
-frequency = 867200000
-bandwidth = 125000
-txpower = 7
-spreadingfactor = 8
-codingrate = 5
-flow_control = false
-
-[[Packet Radio KISS Interface]]
-type = KISSInterface
-enabled = no
-port = /dev/ttyUSB1
-speed = 115200
-databits = 8
-parity = none
-stopbits = 1
-preamble = 150
-txtail = 10
-persistence = 200
-slottime = 20
-flow_control = false
-
-[[Packet Radio AX.25 KISS Interface]]
-type = AX25KISSInterface
-callsign = NO1CLL
-ssid = 0
-enabled = no
-port = /dev/ttyUSB2
-speed = 115200
-databits = 8
-parity = none
-stopbits = 1
-flow_control = false
-preamble = 150
-txtail = 10
-persistence = 200
-slottime = 20
-"#;
 
 #[derive(Parser)]
 #[command(
@@ -137,6 +41,10 @@ struct Args {
     #[arg(long)]
     exampleconfig: bool,
 
+    /// Parse and validate a config.yaml file without starting Reticulum.
+    #[arg(long, value_name = "FILE")]
+    check: Option<PathBuf>,
+
     /// Print version and exit.
     #[arg(long)]
     version: bool,
@@ -152,8 +60,21 @@ pub(crate) async fn main() {
     }
 
     if args.exampleconfig {
-        print!("{RNSD_EXAMPLE_CONFIG}");
+        print!("{}", rns_runtime::yaml_config::EXAMPLE_CONFIG);
         return;
+    }
+
+    if let Some(path) = &args.check {
+        match rns_runtime::yaml_config::Config::from_file(path) {
+            Ok(_) => {
+                println!("configuration is valid: {}", path.display());
+                return;
+            }
+            Err(error) => {
+                eprintln!("rnsd-rs: {error}");
+                std::process::exit(2);
+            }
+        }
     }
 
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());

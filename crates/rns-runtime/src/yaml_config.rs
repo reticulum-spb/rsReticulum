@@ -10,6 +10,41 @@ use thiserror::Error;
 
 pub const CONFIG_FILE_NAME: &str = "config.yaml";
 
+pub const EXAMPLE_CONFIG: &str = r#"# rsReticulum YAML configuration
+reticulum:
+  share_instance: true
+  enable_transport: false
+
+logging:
+  level: 4
+  timestamps: true
+
+interfaces:
+  - type: auto
+    name: Default Interface
+    enabled: true
+
+  - type: udp
+    name: UDP Interface
+    enabled: false
+    listen_ip: 0.0.0.0
+    listen_port: 4242
+    forward_ip: 255.255.255.255
+    forward_port: 4242
+
+  - type: tcp_server
+    name: TCP Server Interface
+    enabled: false
+    listen_ip: 0.0.0.0
+    listen_port: 4242
+
+  - type: tcp_client
+    name: TCP Client Interface
+    enabled: false
+    target_host: 127.0.0.1
+    target_port: 4242
+"#;
+
 #[derive(Debug, Error)]
 pub enum YamlConfigError {
     #[error("failed to read configuration {path}: {source}")]
@@ -451,12 +486,49 @@ impl InterfaceConfig {
             )));
         }
         match self {
+            Self::Auto(v) if v.discovery_port == 0 || v.data_port == 0 => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: discovery_port and data_port must be in 1..=65535",
+                    v.common.name
+                )))
+            }
+            Self::TcpClient(v) if v.target_host.trim().is_empty() || v.target_port == 0 => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: target_host is required and target_port must be in 1..=65535",
+                    v.common.name
+                )))
+            }
+            Self::TcpServer(v) if v.listen_port == 0 => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: listen_port must be in 1..=65535",
+                v.common.name
+            ))),
             Self::Udp(v) if v.listen_port.is_none() && v.forward_port.is_none() => {
                 Err(YamlConfigError::Validation(format!(
                     "interface {:?}: UDP requires listen_port or forward_port",
                     v.common.name
                 )))
             }
+            Self::Udp(v) if v.listen_port == Some(0) || v.forward_port == Some(0) => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: UDP ports must be in 1..=65535",
+                    v.common.name
+                )))
+            }
+            Self::Local(v) if v.port == 0 => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: port must be in 1..=65535",
+                v.common.name
+            ))),
+            Self::I2p(v) if v.sam_port == 0 => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: sam_port must be in 1..=65535",
+                v.common.name
+            ))),
+            Self::Pipe(v) if v.command.trim().is_empty() => Err(YamlConfigError::Validation(
+                format!("interface {:?}: command must not be empty", v.common.name),
+            )),
+            Self::Backbone(v) if v.port == 0 => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: port must be in 1..=65535",
+                v.common.name
+            ))),
             Self::Rnode(v) => validate_radio(&v.common.name, &v.radio),
             Self::RnodeMulti(v) => {
                 let mut ports = HashSet::new();
@@ -543,7 +615,7 @@ impl InterfaceConfig {
             }
             Self::Local(v) => {
                 section.set("type", "LocalInterface");
-                let _ = v;
+                set_num(section, "port", v.port);
             }
             Self::I2p(v) => {
                 section.set("type", "I2PInterface");
@@ -697,18 +769,22 @@ pub enum InterfaceMode {
     Internal,
 }
 
-macro_rules! common_only {
-    ($name:ident) => {
-        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-        #[serde(default, deny_unknown_fields)]
-        pub struct $name {
-            #[serde(flatten)]
-            pub common: InterfaceCommonConfig,
-        }
-    };
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub port: u16,
 }
 
-common_only!(LocalInterfaceConfig);
+impl Default for LocalInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            port: 37428,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1269,5 +1345,10 @@ mod tests {
         let config = Config::default();
         let yaml = config.to_yaml().unwrap();
         assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+    }
+
+    #[test]
+    fn example_config_is_valid() {
+        Config::parse(EXAMPLE_CONFIG, "example config.yaml").unwrap();
     }
 }
