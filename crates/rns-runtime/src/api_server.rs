@@ -846,6 +846,7 @@ fn interface_type_name(c: &InterfaceConfig) -> &'static str {
         InterfaceConfig::I2P(_) => "I2PInterface",
         InterfaceConfig::Pipe(_) => "PipeInterface",
         InterfaceConfig::Backbone(_) => "BackboneInterface",
+        InterfaceConfig::Plugin(_) => "PluginInterface",
         #[cfg(feature = "serial")]
         InterfaceConfig::Serial(_) => "SerialInterface",
         #[cfg(feature = "serial")]

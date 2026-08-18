@@ -40,8 +40,18 @@ pub enum InterfaceConfig {
     #[cfg(feature = "serial")]
     AX25KISS(AX25KISSInterfaceConfig),
     Backbone(BackboneInterfaceConfig),
+    Plugin(PluginInterfaceRuntimeConfig),
     #[cfg(feature = "ble")]
     BleRNode(BleRNodeInterfaceConfig),
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginInterfaceRuntimeConfig {
+    pub name: String,
+    pub plugin: String,
+    pub config_yaml: Vec<u8>,
+    pub mtu: u32,
+    pub mode: InterfaceMode,
 }
 
 #[cfg(feature = "serial")]
@@ -378,8 +388,58 @@ pub fn synthesize_interface(
         #[cfg(feature = "serial")]
         "AX25KISSInterface" => synthesize_ax25kiss(name, section, mode),
         "BackboneInterface" => synthesize_backbone(name, section, mode),
+        "PluginInterface" => synthesize_plugin(name, section, mode),
         other => Err(InterfaceFactoryError::UnknownType(other.to_string())),
     }
+}
+
+fn synthesize_plugin(
+    name: &str,
+    section: &NormalizedSection,
+    mode: InterfaceMode,
+) -> Result<InterfaceConfig, InterfaceFactoryError> {
+    let plugin = section
+        .get("plugin")
+        .ok_or_else(|| InterfaceFactoryError::MissingField {
+            name: name.to_string(),
+            field: "plugin".to_string(),
+        })?
+        .to_string();
+    #[cfg(all(feature = "full", target_os = "linux"))]
+    rns_interface::plugin::validate_plugin_name(&plugin).map_err(|error| {
+        InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.plugin"),
+            message: error.to_string(),
+        }
+    })?;
+    #[cfg(not(all(feature = "full", target_os = "linux")))]
+    return Err(InterfaceFactoryError::Disabled(format!(
+        "PluginInterface '{name}' requires Linux and the 'full' feature"
+    )));
+
+    let mtu_value = section
+        .get_uint("mtu")
+        .unwrap_or(rns_wire::constants::MTU as u64);
+    let mtu = u32::try_from(mtu_value).map_err(|_| InterfaceFactoryError::InvalidValue {
+        field: format!("{name}.mtu"),
+        message: format!("{mtu_value} exceeds u32"),
+    })?;
+    if mtu == 0 {
+        return Err(InterfaceFactoryError::InvalidValue {
+            field: format!("{name}.mtu"),
+            message: "must be greater than zero".to_string(),
+        });
+    }
+    let config_yaml = section
+        .get("__plugin_config_yaml")
+        .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
+    Ok(InterfaceConfig::Plugin(PluginInterfaceRuntimeConfig {
+        name: name.to_string(),
+        plugin,
+        config_yaml,
+        mtu,
+        mode,
+    }))
 }
 
 fn synthesize_tcp_client(
@@ -1253,7 +1313,7 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
         | InterfaceConfig::AX25KISS(_) => 8,
         #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
         InterfaceConfig::RNode(_) => 8,
-        InterfaceConfig::Local(_) | InterfaceConfig::Pipe(_) => 8,
+        InterfaceConfig::Local(_) | InterfaceConfig::Pipe(_) | InterfaceConfig::Plugin(_) => 8,
         #[cfg(feature = "ble")]
         InterfaceConfig::BleRNode(_) => 8,
     }

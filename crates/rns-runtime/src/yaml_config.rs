@@ -609,9 +609,22 @@ impl InterfaceConfig {
                     v.common.name
                 )))
             }
-            Self::Plugin(v) if v.plugin.trim().is_empty() => Err(YamlConfigError::Validation(
-                format!("interface {:?}: plugin must not be empty", v.common.name),
-            )),
+            Self::Plugin(v) if !valid_plugin_name(&v.plugin) => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: plugin must contain 1-128 ASCII letters, digits, '_' or '-'",
+                    v.common.name
+                )))
+            }
+            Self::Plugin(v) if v.mtu == 0 => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: mtu must be greater than zero",
+                v.common.name
+            ))),
+            Self::Plugin(v) if !matches!(v.config, OpaqueValue::Null | OpaqueValue::Mapping(_)) => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: plugin config must be a YAML mapping",
+                    v.common.name
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -777,12 +790,15 @@ impl InterfaceConfig {
                     v.flow_control,
                 );
             }
-            Self::Plugin(v) if !v.common.enabled => section.set("type", "PluginInterface"),
             Self::Plugin(v) => {
-                return Err(YamlConfigError::Validation(format!(
-                    "interface {:?}: enabled plugin interfaces require the future plugin ABI",
-                    v.common.name
-                )));
+                section.set("type", "PluginInterface");
+                section.set("plugin", &v.plugin);
+                set_num(section, "mtu", v.mtu);
+                if !matches!(v.config, OpaqueValue::Null) {
+                    let config_yaml = serde_saphyr::to_string(&v.config)
+                        .map_err(|error| YamlConfigError::Serialize(error.to_string()))?;
+                    section.set("__plugin_config_yaml", &config_yaml);
+                }
             }
         }
         Ok(())
@@ -1220,13 +1236,38 @@ impl Default for Ax25KissInterfaceConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginInterfaceConfig {
     #[serde(flatten)]
     pub common: InterfaceCommonConfig,
     pub plugin: String,
+    #[serde(default = "default_plugin_mtu")]
+    pub mtu: u32,
     pub config: OpaqueValue,
+}
+
+impl Default for PluginInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: InterfaceCommonConfig::default(),
+            plugin: String::new(),
+            mtu: default_plugin_mtu(),
+            config: OpaqueValue::Null,
+        }
+    }
+}
+
+fn default_plugin_mtu() -> u32 {
+    rns_wire::constants::MTU as u32
+}
+
+fn valid_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1590,6 +1631,25 @@ pub fn interface_from_normalized_section(
             max_reconnect_tries: v.max_reconnect_tries,
             i2p_tunneled: v.i2p_tunneled,
         }),
+        Runtime::Plugin(v) => {
+            let config = if v.config_yaml.is_empty() {
+                OpaqueValue::Null
+            } else {
+                let yaml = std::str::from_utf8(&v.config_yaml).map_err(|_| {
+                    YamlConfigError::Validation("plugin config is not UTF-8".to_string())
+                })?;
+                serde_saphyr::from_str(yaml).map_err(|error| YamlConfigError::Parse {
+                    path: PathBuf::from("<plugin-config>"),
+                    message: error.to_string(),
+                })?
+            };
+            InterfaceConfig::Plugin(PluginInterfaceConfig {
+                common,
+                plugin: v.plugin,
+                mtu: v.mtu,
+                config,
+            })
+        }
         #[cfg(feature = "serial")]
         Runtime::Serial(v) => InterfaceConfig::Serial(SerialInterfaceConfig {
             common,
@@ -1866,7 +1926,34 @@ mod tests {
     #[test]
     fn plugin_config_is_opaque_to_core() {
         let yaml = "interfaces:\n  - type: plugin\n    name: LoRa\n    plugin: sx1262\n    config:\n      reset_pin: 12\n      modulation:\n        spreading_factor: 9\n";
-        Config::parse(yaml, "config.yaml").unwrap();
+        let config = Config::parse(yaml, "config.yaml").unwrap();
+        let normalized = config.to_runtime_config().unwrap();
+        let runtime = crate::interface_factory::synthesize_interface(
+            "LoRa",
+            normalized.subsection("interfaces", "LoRa").unwrap(),
+        )
+        .unwrap();
+        let crate::interface_factory::InterfaceConfig::Plugin(plugin) = &runtime else {
+            panic!("expected plugin interface")
+        };
+        let serialized = std::str::from_utf8(&plugin.config_yaml).unwrap();
+        let value: OpaqueValue = serde_saphyr::from_str(serialized).unwrap();
+        let InterfaceConfig::Plugin(source) = &config.interfaces[0] else {
+            panic!("expected source plugin interface")
+        };
+        assert_eq!(value, source.config);
+        assert_eq!(plugin.mtu, rns_wire::constants::MTU as u32);
+    }
+
+    #[test]
+    fn plugin_requires_mapping_config_and_safe_filename() {
+        for yaml in [
+            "interfaces:\n  - { type: plugin, name: Bad, plugin: ../bad, config: {} }\n",
+            "interfaces:\n  - { type: plugin, name: Bad, plugin: radio, config: scalar }\n",
+            "interfaces:\n  - { type: plugin, name: Bad, plugin: radio, mtu: 0, config: {} }\n",
+        ] {
+            assert!(Config::parse(yaml, "config.yaml").is_err(), "{yaml}");
+        }
     }
 
     #[test]

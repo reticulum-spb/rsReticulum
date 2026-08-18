@@ -1415,7 +1415,9 @@ pub async fn init(
                     }
                 }
                 Err(e) => {
-                    if rc.panic_on_interface_error {
+                    let is_plugin =
+                        matches!(iface_config, interface_factory::InterfaceConfig::Plugin(_));
+                    if rc.panic_on_interface_error && !is_plugin {
                         let _ = transport_tx.send(TransportMessage::Shutdown).await;
                         return Err(ReticulumError::Interface(e));
                     } else {
@@ -1874,6 +1876,9 @@ async fn register_interface_handle_with_role_and_overrides(
         .await
     {
         tracing::error!(name = %name, id, error = %e, "RegisterInterface failed — transport actor gone");
+    } else {
+        #[cfg(all(feature = "full", target_os = "linux"))]
+        rns_interface::plugin::activate_plugin_interface(id);
     }
 }
 
@@ -1943,6 +1948,9 @@ async fn register_interface_with_post_init(
         .await
     {
         tracing::error!(name = %name, id, error = %e, "RegisterInterface failed — transport actor gone");
+    } else {
+        #[cfg(all(feature = "full", target_os = "linux"))]
+        rns_interface::plugin::activate_plugin_interface(id);
     }
 }
 
@@ -2014,8 +2022,14 @@ fn get_post_init_for_config(
     let name = interface_config_name(iface_config);
     let default_ifac_size = interface_factory::default_ifac_size_for(iface_config);
     if let Some(section) = config.subsection("interfaces", name) {
-        return interface_factory::InterfacePostInit::from_section(section)
+        let mut post_init = interface_factory::InterfacePostInit::from_section(section)
             .with_default_ifac_size(default_ifac_size);
+        if matches!(iface_config, interface_factory::InterfaceConfig::Plugin(_)) {
+            // Plugin bitrate is mandatory runtime state reported through the
+            // host callback; a generic config value must not override it.
+            post_init.bitrate = None;
+        }
+        return post_init;
     }
     interface_factory::InterfacePostInit::from_section(
         &crate::normalized_config::NormalizedSection::new(),
@@ -2089,6 +2103,7 @@ fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &
         #[cfg(feature = "serial")]
         interface_factory::InterfaceConfig::AX25KISS(c) => &c.name,
         interface_factory::InterfaceConfig::Backbone(c) => &c.name,
+        interface_factory::InterfaceConfig::Plugin(c) => &c.name,
         #[cfg(feature = "ble")]
         interface_factory::InterfaceConfig::BleRNode(c) => &c.name,
     }
@@ -2124,6 +2139,7 @@ fn interface_config_mode_mut(
         #[cfg(feature = "serial")]
         interface_factory::InterfaceConfig::AX25KISS(c) => &mut c.mode,
         interface_factory::InterfaceConfig::Backbone(c) => &mut c.mode,
+        interface_factory::InterfaceConfig::Plugin(c) => &mut c.mode,
         #[cfg(feature = "ble")]
         interface_factory::InterfaceConfig::BleRNode(c) => &mut c.mode,
     }
@@ -3888,6 +3904,29 @@ async fn spawn_interface(
                 .map_err(|e| format!("Backbone server: {e}"))
             }
         }
+        interface_factory::InterfaceConfig::Plugin(c) => {
+            #[cfg(all(feature = "full", target_os = "linux"))]
+            {
+                let config = rns_interface::plugin::PluginInterfaceConfig {
+                    name: c.name.clone(),
+                    plugin: c.plugin.clone(),
+                    config_yaml: c.config_yaml.clone(),
+                    mtu: c.mtu,
+                    mode: c.mode,
+                };
+                rns_interface::plugin::spawn_plugin_interface(config, id, transport_tx)
+                    .await
+                    .map(|handle| vec![handle])
+                    .map_err(|error| format!("PluginInterface '{}': {error}", c.name))
+            }
+            #[cfg(not(all(feature = "full", target_os = "linux")))]
+            {
+                Err(format!(
+                    "PluginInterface '{}': requires Linux and the 'full' feature",
+                    c.name
+                ))
+            }
+        }
     }
 }
 
@@ -3943,6 +3982,7 @@ fn synthesize_interfaces(
     let mut interfaces = Vec::new();
 
     for (name, section) in config.subsections("interfaces") {
+        let is_plugin = section.get("type") == Some("PluginInterface");
         match interface_factory::synthesize_interface(name, section) {
             Ok(iface) => {
                 tracing::info!("configured interface: {name}");
@@ -3952,7 +3992,7 @@ fn synthesize_interfaces(
                 tracing::debug!("interface {name} is disabled");
             }
             Err(e) => {
-                if panic_on_interface_error {
+                if panic_on_interface_error && !is_plugin {
                     return Err(ReticulumError::Interface(format!(
                         "failed to synthesize interface {name}: {e}"
                     )));
