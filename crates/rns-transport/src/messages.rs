@@ -286,6 +286,10 @@ pub enum TransportMessage {
         id: InterfaceId,
         entry: InterfaceEntry,
     },
+    UpdateInterfaceBitrate {
+        id: InterfaceId,
+        bitrate: u64,
+    },
     DeregisterInterface {
         id: InterfaceId,
     },
@@ -364,6 +368,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
         TransportMessage::CacheRequest { .. } => "CacheRequest",
         TransportMessage::RequestPath { .. } => "RequestPath",
         TransportMessage::RegisterInterface { .. } => "RegisterInterface",
+        TransportMessage::UpdateInterfaceBitrate { .. } => "UpdateInterfaceBitrate",
         TransportMessage::DeregisterInterface { .. } => "DeregisterInterface",
         TransportMessage::SetStoragePaths { .. } => "SetStoragePaths",
         TransportMessage::SetTransportEnabled { .. } => "SetTransportEnabled",
@@ -714,6 +719,11 @@ impl std::fmt::Debug for TransportMessage {
                 .debug_struct("RegisterInterface")
                 .field("id", id)
                 .field("entry", entry)
+                .finish(),
+            Self::UpdateInterfaceBitrate { id, bitrate } => f
+                .debug_struct("UpdateInterfaceBitrate")
+                .field("id", id)
+                .field("bitrate", bitrate)
                 .finish(),
             Self::DeregisterInterface { id } => f
                 .debug_struct("DeregisterInterface")

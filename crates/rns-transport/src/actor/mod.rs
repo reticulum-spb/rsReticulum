@@ -578,6 +578,14 @@ impl TransportActor {
                 // for the announce job, and local shared clients only receive
                 // live announces or request-driven responses after connect.
             }
+            TransportMessage::UpdateInterfaceBitrate { id, bitrate } => {
+                if bitrate == 0 {
+                    tracing::warn!(id, "ignoring zero interface bitrate update");
+                } else if let Some(entry) = self.interfaces.get_mut(&id) {
+                    entry.bitrate = bitrate;
+                    tracing::debug!(id, bitrate, "interface bitrate updated");
+                }
+            }
             TransportMessage::DeregisterInterface { id } => {
                 debug!(id, "deregistering interface");
                 self.deregister_interface(id);
