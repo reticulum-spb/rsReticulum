@@ -36,6 +36,7 @@ sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true, features = ["with-serde"] }
 serde = { workspace = true }
+serde-saphyr = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
 nix = { workspace = true }

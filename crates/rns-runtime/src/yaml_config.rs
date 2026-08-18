@@ -1,0 +1,844 @@
+//! Typed, format-independent configuration model used by `config.yaml`.
+//!
+//! Parsing and serialization live here during the migration. Runtime code must
+//! consume these Rust types, never values from the YAML parser.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+pub const CONFIG_FILE_NAME: &str = "config.yaml";
+
+#[derive(Debug, Error)]
+pub enum YamlConfigError {
+    #[error("failed to read configuration {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("configuration error in {path}: {message}")]
+    Parse { path: PathBuf, message: String },
+    #[error("configuration validation error: {0}")]
+    Validation(String),
+    #[error("failed to serialize configuration: {0}")]
+    Serialize(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub reticulum: ReticulumConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
+    pub interfaces: Vec<InterfaceConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            reticulum: ReticulumConfig::default(),
+            logging: LoggingConfig::default(),
+            api: ApiConfig::default(),
+            interfaces: vec![InterfaceConfig::Auto(AutoInterfaceConfig {
+                common: InterfaceCommonConfig {
+                    name: "Default Interface".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })],
+        }
+    }
+}
+
+impl Config {
+    pub fn parse(input: &str, path: impl AsRef<Path>) -> Result<Self, YamlConfigError> {
+        let path = path.as_ref();
+        let config: Self =
+            serde_saphyr::from_str(input).map_err(|error| YamlConfigError::Parse {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, YamlConfigError> {
+        let path = path.as_ref();
+        let input = std::fs::read_to_string(path).map_err(|source| YamlConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::parse(&input, path)
+    }
+
+    pub fn to_yaml(&self) -> Result<String, YamlConfigError> {
+        serde_saphyr::to_string(self).map_err(|error| YamlConfigError::Serialize(error.to_string()))
+    }
+
+    pub fn validate(&self) -> Result<(), YamlConfigError> {
+        let mut names = HashSet::new();
+        for interface in &self.interfaces {
+            let name = interface.common().name.trim();
+            if name.is_empty() {
+                return Err(YamlConfigError::Validation(
+                    "interface name must not be empty".into(),
+                ));
+            }
+            if !names.insert(name) {
+                return Err(YamlConfigError::Validation(format!(
+                    "duplicate interface name: {name}"
+                )));
+            }
+            interface.validate()?;
+        }
+        self.api.validate()?;
+        validate_hashes(
+            "remote_management_allowed",
+            &self.reticulum.remote_management_allowed,
+        )?;
+        validate_hashes(
+            "interface_discovery_sources",
+            &self.reticulum.interface_discovery_sources,
+        )?;
+        validate_hashes("blackhole_sources", &self.reticulum.blackhole_sources)?;
+        if !(0..=7).contains(&self.logging.level) {
+            return Err(YamlConfigError::Validation(
+                "logging.level must be in 0..=7".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReticulumConfig {
+    pub share_instance: bool,
+    pub instance_name: String,
+    pub shared_instance_type: SharedInstanceType,
+    pub shared_instance_port: u16,
+    pub instance_control_port: u16,
+    pub enable_transport: bool,
+    pub static_transport_identity: bool,
+    pub local_hops_delta: bool,
+    pub respond_to_probes: bool,
+    pub use_implicit_proof: bool,
+    pub panic_on_interface_error: bool,
+    pub link_mtu_discovery: bool,
+    pub enable_remote_management: bool,
+    pub remote_management_allowed: Vec<String>,
+    pub rpc_key: Option<String>,
+    pub force_shared_instance_bitrate: Option<u64>,
+    pub default_ar_target: Option<u64>,
+    pub default_ar_penalty: Option<u64>,
+    pub default_ar_grace: Option<u32>,
+    pub ingress: IngressConfig,
+    pub network_identity: Option<PathBuf>,
+    pub discover_interfaces: bool,
+    pub autoconnect_discovered_interfaces: usize,
+    pub required_discovery_value: u8,
+    pub interface_discovery_sources: Vec<String>,
+    pub blackhole_sources: Vec<String>,
+    pub publish_blackhole: bool,
+    pub blackhole_update_interval_minutes: f64,
+    pub bootstrap_configs: Vec<PathBuf>,
+}
+
+impl Default for ReticulumConfig {
+    fn default() -> Self {
+        Self {
+            share_instance: true,
+            instance_name: "default".into(),
+            shared_instance_type: SharedInstanceType::default(),
+            shared_instance_port: 37428,
+            instance_control_port: 37429,
+            enable_transport: false,
+            static_transport_identity: false,
+            local_hops_delta: false,
+            respond_to_probes: false,
+            use_implicit_proof: true,
+            panic_on_interface_error: false,
+            link_mtu_discovery: true,
+            enable_remote_management: false,
+            remote_management_allowed: Vec::new(),
+            rpc_key: None,
+            force_shared_instance_bitrate: None,
+            default_ar_target: None,
+            default_ar_penalty: None,
+            default_ar_grace: None,
+            ingress: IngressConfig::default(),
+            network_identity: None,
+            discover_interfaces: false,
+            autoconnect_discovered_interfaces: 0,
+            required_discovery_value: 14,
+            interface_discovery_sources: Vec::new(),
+            blackhole_sources: Vec::new(),
+            publish_blackhole: false,
+            blackhole_update_interval_minutes: 60.0,
+            bootstrap_configs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedInstanceType {
+    Tcp,
+    Unix,
+    #[default]
+    PlatformDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    pub level: i32,
+    pub timestamps: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: 4,
+            timestamps: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiConfig {
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+}
+
+impl ApiConfig {
+    fn validate(&self) -> Result<(), YamlConfigError> {
+        if self.port.is_some()
+            && (self.user.as_deref().is_none_or(str::is_empty)
+                || self.password.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(YamlConfigError::Validation(
+                "api.user and api.password are required when api.port is set".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IngressConfig {
+    pub burst_freq_new: Option<f64>,
+    pub burst_freq: Option<f64>,
+    pub path_request_burst_freq_new: Option<f64>,
+    pub path_request_burst_freq: Option<f64>,
+    pub new_time: Option<f64>,
+    pub burst_hold: Option<f64>,
+    pub burst_penalty: Option<f64>,
+    pub max_held_announces: Option<usize>,
+    pub held_release_interval: Option<f64>,
+    pub egress_path_request_freq: Option<f64>,
+    pub egress_control: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InterfaceConfig {
+    Auto(AutoInterfaceConfig),
+    TcpClient(TcpClientInterfaceConfig),
+    TcpServer(TcpServerInterfaceConfig),
+    Udp(UdpInterfaceConfig),
+    Local(LocalInterfaceConfig),
+    I2p(I2pInterfaceConfig),
+    Pipe(PipeInterfaceConfig),
+    Backbone(BackboneInterfaceConfig),
+    Serial(SerialInterfaceConfig),
+    Kiss(KissInterfaceConfig),
+    Rnode(RnodeInterfaceConfig),
+    RnodeMulti(RnodeMultiInterfaceConfig),
+    Ax25Kiss(Ax25KissInterfaceConfig),
+    Plugin(PluginInterfaceConfig),
+}
+
+impl InterfaceConfig {
+    pub fn common(&self) -> &InterfaceCommonConfig {
+        match self {
+            Self::Auto(v) => &v.common,
+            Self::TcpClient(v) => &v.common,
+            Self::TcpServer(v) => &v.common,
+            Self::Udp(v) => &v.common,
+            Self::Local(v) => &v.common,
+            Self::I2p(v) => &v.common,
+            Self::Pipe(v) => &v.common,
+            Self::Backbone(v) => &v.common,
+            Self::Serial(v) => &v.common,
+            Self::Kiss(v) => &v.serial.common,
+            Self::Rnode(v) => &v.common,
+            Self::RnodeMulti(v) => &v.common,
+            Self::Ax25Kiss(v) => &v.serial.common,
+            Self::Plugin(v) => &v.common,
+        }
+    }
+
+    fn validate(&self) -> Result<(), YamlConfigError> {
+        if let Some(size) = self.common().ifac_size
+            && !(1..=64).contains(&size)
+        {
+            return Err(YamlConfigError::Validation(format!(
+                "interface {:?}: ifac_size must be in 1..=64",
+                self.common().name
+            )));
+        }
+        match self {
+            Self::Udp(v) if v.listen_port.is_none() && v.forward_port.is_none() => {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: UDP requires listen_port or forward_port",
+                    v.common.name
+                )))
+            }
+            Self::Rnode(v) => validate_radio(&v.common.name, &v.radio),
+            Self::RnodeMulti(v) => {
+                let mut ports = HashSet::new();
+                for sub in &v.subinterfaces {
+                    if !ports.insert(sub.vport) {
+                        return Err(YamlConfigError::Validation(format!(
+                            "interface {:?}: duplicate RNode vport {}",
+                            v.common.name, sub.vport
+                        )));
+                    }
+                    validate_radio(&format!("{}/{}", v.common.name, sub.name), &sub.radio)?;
+                }
+                Ok(())
+            }
+            Self::Ax25Kiss(v) if v.ssid > 15 => Err(YamlConfigError::Validation(format!(
+                "interface {:?}: ssid must be in 0..=15",
+                v.serial.common.name
+            ))),
+            Self::Plugin(v) if v.plugin.trim().is_empty() => Err(YamlConfigError::Validation(
+                format!("interface {:?}: plugin must not be empty", v.common.name),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InterfaceCommonConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub mode: InterfaceMode,
+    pub outgoing: bool,
+    pub bitrate: Option<u64>,
+    pub announce_cap: Option<f64>,
+    pub announce_rate_target: Option<u64>,
+    pub announce_rate_grace: Option<u32>,
+    pub announce_rate_penalty: Option<u64>,
+    pub ifac_network_name: Option<String>,
+    pub ifac_passphrase: Option<String>,
+    pub ifac_size: Option<usize>,
+    pub ingress_control: bool,
+    pub ingress: IngressConfig,
+    pub recursive_path_requests: bool,
+    pub announces_from_internal: bool,
+}
+
+impl Default for InterfaceCommonConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            mode: InterfaceMode::Full,
+            outgoing: true,
+            bitrate: None,
+            announce_cap: None,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
+            ifac_network_name: None,
+            ifac_passphrase: None,
+            ifac_size: None,
+            ingress_control: true,
+            ingress: IngressConfig::default(),
+            recursive_path_requests: false,
+            announces_from_internal: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceMode {
+    #[default]
+    Full,
+    PointToPoint,
+    AccessPoint,
+    Roaming,
+    Boundary,
+    Gateway,
+    Internal,
+}
+
+macro_rules! common_only {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct $name {
+            #[serde(flatten)]
+            pub common: InterfaceCommonConfig,
+        }
+    };
+}
+
+common_only!(LocalInterfaceConfig);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub group_id: String,
+    pub discovery_scope: DiscoveryScope,
+    pub discovery_port: u16,
+    pub data_port: u16,
+    pub multicast_address_type: MulticastAddressType,
+    pub devices: Option<Vec<String>>,
+    pub ignored_devices: Vec<String>,
+    pub configured_bitrate: Option<u64>,
+}
+impl Default for AutoInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            group_id: "reticulum".into(),
+            discovery_scope: Default::default(),
+            discovery_port: 29716,
+            data_port: 42671,
+            multicast_address_type: Default::default(),
+            devices: None,
+            ignored_devices: Vec::new(),
+            configured_bitrate: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryScope {
+    Link,
+    #[default]
+    Admin,
+    Site,
+    Organisation,
+    Global,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MulticastAddressType {
+    Permanent,
+    #[default]
+    Temporary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpClientInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub target_host: String,
+    pub target_port: u16,
+    pub kiss_framing: bool,
+    pub connect_timeout: u64,
+    pub max_reconnect_tries: Option<usize>,
+    pub fixed_mtu: Option<u32>,
+}
+impl Default for TcpClientInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            target_host: String::new(),
+            target_port: 0,
+            kiss_framing: false,
+            connect_timeout: 5,
+            max_reconnect_tries: None,
+            fixed_mtu: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpServerInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub listen_ip: String,
+    pub listen_port: u16,
+    pub kiss_framing: bool,
+    pub prefer_ipv6: bool,
+    pub device: Option<String>,
+}
+impl Default for TcpServerInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            listen_ip: "0.0.0.0".into(),
+            listen_port: 0,
+            kiss_framing: false,
+            prefer_ipv6: false,
+            device: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UdpInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub listen_ip: Option<String>,
+    pub listen_port: Option<u16>,
+    pub forward_ip: Option<String>,
+    pub forward_port: Option<u16>,
+    pub device: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct I2pInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub connectable: bool,
+    pub peers: Vec<String>,
+    pub sam_host: String,
+    pub sam_port: u16,
+}
+impl Default for I2pInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            connectable: false,
+            peers: Vec::new(),
+            sam_host: "127.0.0.1".into(),
+            sam_port: 7656,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipeInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub command: String,
+    pub respawn_delay: u64,
+}
+impl Default for PipeInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            command: String::new(),
+            respawn_delay: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackboneInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub listen_on: Option<String>,
+    pub target_host: Option<String>,
+    pub port: u16,
+    pub device: Option<String>,
+    pub prefer_ipv6: bool,
+    pub connect_timeout: u64,
+    pub max_reconnect_tries: Option<usize>,
+    pub i2p_tunneled: bool,
+}
+impl Default for BackboneInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            listen_on: None,
+            target_host: None,
+            port: 0,
+            device: None,
+            prefer_ipv6: false,
+            connect_timeout: 5,
+            max_reconnect_tries: None,
+            i2p_tunneled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SerialInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub port: String,
+    pub baud_rate: u32,
+    pub data_bits: u8,
+    pub parity: String,
+    pub stop_bits: u8,
+}
+impl Default for SerialInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            port: String::new(),
+            baud_rate: 9600,
+            data_bits: 8,
+            parity: "N".into(),
+            stop_bits: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KissInterfaceConfig {
+    #[serde(flatten)]
+    pub serial: SerialInterfaceConfig,
+    pub preamble_ms: u32,
+    pub tx_tail_ms: u32,
+    pub persistence: u8,
+    pub slot_time_ms: u32,
+    pub flow_control: bool,
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
+}
+impl Default for KissInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            serial: Default::default(),
+            preamble_ms: 350,
+            tx_tail_ms: 20,
+            persistence: 64,
+            slot_time_ms: 20,
+            flow_control: false,
+            id_interval: None,
+            id_callsign: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RadioConfig {
+    pub frequency: u32,
+    pub bandwidth: u32,
+    pub spreading_factor: u8,
+    pub coding_rate: u8,
+    pub tx_power: i8,
+    pub airtime_limit_short: Option<f32>,
+    pub airtime_limit_long: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RnodeInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub port: String,
+    #[serde(flatten)]
+    pub radio: RadioConfig,
+    pub flow_control: bool,
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RnodeMultiInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub port: String,
+    pub baud_rate: u32,
+    pub flow_control: bool,
+    pub subinterfaces: Vec<RnodeSubInterfaceConfig>,
+    pub id_interval: Option<u64>,
+    pub id_callsign: Option<String>,
+}
+impl Default for RnodeMultiInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            common: Default::default(),
+            port: String::new(),
+            baud_rate: 115200,
+            flow_control: false,
+            subinterfaces: Vec::new(),
+            id_interval: None,
+            id_callsign: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RnodeSubInterfaceConfig {
+    pub name: String,
+    pub vport: u8,
+    pub enabled: bool,
+    pub outgoing: bool,
+    pub flow_control: Option<bool>,
+    pub mode: Option<InterfaceMode>,
+    #[serde(flatten)]
+    pub radio: RadioConfig,
+}
+impl Default for RnodeSubInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            vport: 0,
+            enabled: true,
+            outgoing: true,
+            flow_control: None,
+            mode: None,
+            radio: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ax25KissInterfaceConfig {
+    #[serde(flatten)]
+    pub serial: SerialInterfaceConfig,
+    pub callsign: String,
+    pub ssid: u8,
+    pub preamble_ms: u32,
+    pub tx_tail_ms: u32,
+    pub persistence: u8,
+    pub slot_time_ms: u32,
+    pub flow_control: bool,
+}
+impl Default for Ax25KissInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            serial: Default::default(),
+            callsign: String::new(),
+            ssid: 0,
+            preamble_ms: 350,
+            tx_tail_ms: 20,
+            persistence: 64,
+            slot_time_ms: 20,
+            flow_control: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginInterfaceConfig {
+    #[serde(flatten)]
+    pub common: InterfaceCommonConfig,
+    pub plugin: String,
+    pub config: OpaqueValue,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpaqueValue {
+    #[default]
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Sequence(Vec<OpaqueValue>),
+    Mapping(BTreeMap<String, OpaqueValue>),
+}
+
+fn validate_hashes(field: &str, hashes: &[String]) -> Result<(), YamlConfigError> {
+    for hash in hashes {
+        if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(YamlConfigError::Validation(format!(
+                "reticulum.{field}: {hash:?} must be a 32-character hexadecimal identity hash"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_radio(name: &str, radio: &RadioConfig) -> Result<(), YamlConfigError> {
+    let error = |field: &str, expected: &str| {
+        YamlConfigError::Validation(format!("interface {name:?}: {field} must be {expected}"))
+    };
+    if radio.frequency == 0 {
+        return Err(error("frequency", "non-zero"));
+    }
+    if !(7_800..=1_625_000).contains(&radio.bandwidth) {
+        return Err(error("bandwidth", "in 7800..=1625000"));
+    }
+    if !(5..=12).contains(&radio.spreading_factor) {
+        return Err(error("spreading_factor", "in 5..=12"));
+    }
+    if !(5..=8).contains(&radio.coding_rate) {
+        return Err(error("coding_rate", "in 5..=8"));
+    }
+    if !(-128..=37).contains(&radio.tx_power) {
+        return Err(error("tx_power", "at most 37 dBm"));
+    }
+    for (field, value) in [
+        ("airtime_limit_short", radio.airtime_limit_short),
+        ("airtime_limit_long", radio.airtime_limit_long),
+    ] {
+        if value.is_some_and(|v| !(0.0..=100.0).contains(&v)) {
+            return Err(error(field, "in 0..=100 percent"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_config_applies_defaults_and_validates() {
+        let config = Config::parse("reticulum: {}\ninterfaces: []\n", "config.yaml").unwrap();
+        assert!(config.reticulum.share_instance);
+        assert_eq!(config.logging.level, 4);
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let error =
+            Config::parse("reticulum:\n  enable_transprot: true\n", "config.yaml").unwrap_err();
+        assert!(error.to_string().contains("enable_transprot"));
+    }
+
+    #[test]
+    fn rejects_duplicate_interface_names() {
+        let yaml = "interfaces:\n  - type: auto\n    name: LAN\n  - type: auto\n    name: LAN\n";
+        assert!(
+            Config::parse(yaml, "config.yaml")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn plugin_config_is_opaque_to_core() {
+        let yaml = "interfaces:\n  - type: plugin\n    name: LoRa\n    plugin: sx1262\n    config:\n      reset_pin: 12\n      modulation:\n        spreading_factor: 9\n";
+        Config::parse(yaml, "config.yaml").unwrap();
+    }
+
+    #[test]
+    fn default_config_round_trips() {
+        let config = Config::default();
+        let yaml = config.to_yaml().unwrap();
+        assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+    }
+}

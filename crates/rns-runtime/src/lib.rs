@@ -34,6 +34,7 @@ pub mod rnsh;
 pub mod rpc;
 #[cfg(feature = "full")]
 pub mod rpc_server;
+pub mod yaml_config;
 
 #[cfg(feature = "api")]
 pub mod api_server;

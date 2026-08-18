@@ -45,6 +45,7 @@ rmpv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
+serde-saphyr = { version = "1", default-features = false, features = ["deserialize", "serialize"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
