@@ -224,9 +224,41 @@ impl ReticulumHandle {
     }
 
     pub async fn query_control(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
-        // The local actor remains the fallback for queries that are not part
-        // of the shared control RPC protocol. Full RPC parity is layered on
-        // this common method without expanding the client interface set.
+        if matches!(query, TransportQuery::GetInterfaceStats)
+            && let Some(rpc_key) = self.config.rpc_key.as_deref()
+        {
+            let request = crate::rpc::RpcRequest::GetInterfaceStats;
+            let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
+                SharedInstanceRpcEndpoint::Tcp(port) => {
+                    crate::rpc::connect_and_request(port, rpc_key, &request, Duration::from_secs(5))
+                        .await
+                }
+                SharedInstanceRpcEndpoint::Unix(socket_path) => {
+                    crate::rpc::connect_unix_and_request(
+                        &socket_path,
+                        rpc_key,
+                        &request,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                }
+            };
+            match rpc_result {
+                Ok(crate::rpc::RpcResponse::InterfaceStats(entries)) => {
+                    return Some(interface_stats_to_transport_response(entries));
+                }
+                Ok(response) => {
+                    tracing::debug!(
+                        ?response,
+                        "unexpected shared instance interface stats response"
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "shared instance interface stats RPC failed; falling back to local actor");
+                }
+            }
+        }
+
         self.query_transport(query).await
     }
 
@@ -312,7 +344,7 @@ pub async fn connect_shared(
         std::fs::write(&config_path, typed.to_yaml()?).map_err(ReticulumError::Io)?;
         typed.to_runtime_config()?
     };
-    let config = ReticulumConfig::try_from_config(&config)?;
+    let mut config = ReticulumConfig::try_from_config(&config)?;
     if !config.share_instance {
         return Err(ReticulumError::ClientModeRequired);
     }
@@ -334,6 +366,11 @@ pub async fn connect_shared(
     let _ = transport_tx.try_send(TransportMessage::SetTransportIdentity {
         identity_hash: identity.hash,
     });
+    if config.rpc_key.is_none()
+        && let Some(private_key) = identity.get_private_key()
+    {
+        config.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
+    }
 
     let id_gen = Arc::new(AtomicU64::new(1));
     let interface_id = id_gen.fetch_add(1, Ordering::Relaxed);
@@ -488,6 +525,48 @@ fn convert_mode(
         Source::Gateway => Target::Gateway,
         Source::Internal => Target::Internal,
     }
+}
+
+fn interface_stats_to_transport_response(
+    entries: Vec<crate::rpc::InterfaceStatEntry>,
+) -> TransportQueryResponse {
+    use rns_transport::messages::InterfaceStatRpcEntry;
+
+    TransportQueryResponse::InterfaceStats(
+        entries
+            .into_iter()
+            .map(|entry| InterfaceStatRpcEntry {
+                id: entry.id,
+                name: entry.name,
+                rx_bytes: entry.rx_bytes,
+                tx_bytes: entry.tx_bytes,
+                rx_rate: entry.rx_rate,
+                tx_rate: entry.tx_rate,
+                online: entry.online,
+                bitrate: entry.bitrate,
+                mtu: entry.mtu,
+                mode: entry.mode,
+                role: entry.role,
+                announce_queue: entry.announce_queue,
+                held_announces: entry.held_announces,
+                incoming_announce_frequency: entry.incoming_announce_frequency,
+                outgoing_announce_frequency: entry.outgoing_announce_frequency,
+                incoming_pr_frequency: entry.incoming_pr_frequency,
+                outgoing_pr_frequency: entry.outgoing_pr_frequency,
+                burst_active: entry.burst_active,
+                burst_activated: entry.burst_activated,
+                pr_burst_active: entry.pr_burst_active,
+                pr_burst_activated: entry.pr_burst_activated,
+                clients: entry.clients,
+                announce_rate_target: entry.announce_rate_target,
+                announce_rate_grace: entry.announce_rate_grace,
+                announce_rate_penalty: entry.announce_rate_penalty,
+                announce_cap: entry.announce_cap,
+                ifac_size: entry.ifac_size,
+                tx_drops: entry.tx_drops,
+            })
+            .collect(),
+    )
 }
 
 pub fn get_instance() -> Option<&'static ReticulumHandle> {
