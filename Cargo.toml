@@ -11,6 +11,7 @@ members = [
     "crates/rns-runtime",
     "crates/rns-tools",
     "crates/rns-ratkey",
+    "crates/rns-plugin",
     "examples",
 ]
 
@@ -91,3 +92,4 @@ rns-protocol = { path = "crates/rns-protocol", version = "1.0.1" }
 rns-interface = { path = "crates/rns-interface", version = "1.0.1", default-features = false }
 rns-runtime = { path = "crates/rns-runtime", version = "1.0.1" }
 rns-ratkey = { path = "crates/rns-ratkey", version = "1.0.1" }
+rns-plugin = { path = "crates/rns-plugin", version = "1.0.1" }

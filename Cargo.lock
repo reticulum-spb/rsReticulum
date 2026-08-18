@@ -1900,6 +1900,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rns-plugin"
+version = "1.0.1"
+
+[[package]]
 name = "rns-protocol"
 version = "1.0.1"
 dependencies = [
