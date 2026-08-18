@@ -114,6 +114,159 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Transitional adapter for runtime components that have not yet been
+    /// changed from `ConfigSection` to the typed model. Input is always typed
+    /// YAML; this does not parse or accept the legacy file format.
+    #[doc(hidden)]
+    pub fn to_runtime_compat_config(&self) -> Result<crate::config::Config, YamlConfigError> {
+        let mut output = crate::config::Config::new();
+        {
+            let section = output.ensure_section("reticulum");
+            set_bool(section, "share_instance", self.reticulum.share_instance);
+            section.set("instance_name", &self.reticulum.instance_name);
+            let shared_type = match self.reticulum.shared_instance_type {
+                SharedInstanceType::Tcp => "tcp",
+                SharedInstanceType::Unix => "unix",
+                SharedInstanceType::PlatformDefault => {
+                    if cfg!(unix) {
+                        "unix"
+                    } else {
+                        "tcp"
+                    }
+                }
+            };
+            section.set("shared_instance_type", shared_type);
+            set_num(
+                section,
+                "shared_instance_port",
+                self.reticulum.shared_instance_port,
+            );
+            set_num(
+                section,
+                "instance_control_port",
+                self.reticulum.instance_control_port,
+            );
+            set_bool(section, "enable_transport", self.reticulum.enable_transport);
+            set_bool(
+                section,
+                "static_transport_identity",
+                self.reticulum.static_transport_identity,
+            );
+            set_bool(section, "local_hops_delta", self.reticulum.local_hops_delta);
+            set_bool(
+                section,
+                "respond_to_probes",
+                self.reticulum.respond_to_probes,
+            );
+            set_bool(
+                section,
+                "use_implicit_proof",
+                self.reticulum.use_implicit_proof,
+            );
+            set_bool(
+                section,
+                "panic_on_interface_error",
+                self.reticulum.panic_on_interface_error,
+            );
+            set_bool(
+                section,
+                "link_mtu_discovery",
+                self.reticulum.link_mtu_discovery,
+            );
+            set_bool(
+                section,
+                "enable_remote_management",
+                self.reticulum.enable_remote_management,
+            );
+            section.set_list(
+                "remote_management_allowed",
+                self.reticulum.remote_management_allowed.clone(),
+            );
+            set_opt(section, "rpc_key", self.reticulum.rpc_key.as_deref());
+            set_opt_num(
+                section,
+                "force_shared_instance_bitrate",
+                self.reticulum.force_shared_instance_bitrate,
+            );
+            set_opt_num(
+                section,
+                "default_ar_target",
+                self.reticulum.default_ar_target,
+            );
+            set_opt_num(
+                section,
+                "default_ar_penalty",
+                self.reticulum.default_ar_penalty,
+            );
+            set_opt_num(section, "default_ar_grace", self.reticulum.default_ar_grace);
+            write_ingress(section, &self.reticulum.ingress);
+            if let Some(path) = &self.reticulum.network_identity {
+                section.set("network_identity", &path.to_string_lossy());
+            }
+            set_bool(
+                section,
+                "discover_interfaces",
+                self.reticulum.discover_interfaces,
+            );
+            set_num(
+                section,
+                "autoconnect_discovered_interfaces",
+                self.reticulum.autoconnect_discovered_interfaces,
+            );
+            set_num(
+                section,
+                "required_discovery_value",
+                self.reticulum.required_discovery_value,
+            );
+            section.set_list(
+                "interface_discovery_sources",
+                self.reticulum.interface_discovery_sources.clone(),
+            );
+            section.set_list(
+                "blackhole_sources",
+                self.reticulum.blackhole_sources.clone(),
+            );
+            set_bool(
+                section,
+                "publish_blackhole",
+                self.reticulum.publish_blackhole,
+            );
+            set_num(
+                section,
+                "blackhole_update_interval",
+                self.reticulum.blackhole_update_interval_minutes,
+            );
+            section.set_list(
+                "bootstrap_configs",
+                self.reticulum
+                    .bootstrap_configs
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            );
+        }
+        {
+            let section = output.ensure_section("logging");
+            set_num(section, "loglevel", self.logging.level);
+            set_bool(section, "logtimestamps", self.logging.timestamps);
+        }
+        if self.api.port.is_some() || self.api.user.is_some() || self.api.password.is_some() {
+            let section = output.ensure_section("api");
+            set_opt_num(section, "port", self.api.port);
+            set_opt(section, "user", self.api.user.as_deref());
+            set_opt(section, "password", self.api.password.as_deref());
+        }
+        {
+            let interfaces = output.ensure_section("interfaces");
+            for interface in &self.interfaces {
+                let mut section = crate::config::ConfigSection::new();
+                interface.write_compat_section(&mut section)?;
+                *interfaces.add_subsection(interface.common().name.clone()) = section;
+            }
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -327,6 +480,163 @@ impl InterfaceConfig {
             )),
             _ => Ok(()),
         }
+    }
+
+    fn write_compat_section(
+        &self,
+        section: &mut crate::config::ConfigSection,
+    ) -> Result<(), YamlConfigError> {
+        write_common(section, self.common());
+        match self {
+            Self::Auto(v) => {
+                section.set("type", "AutoInterface");
+                section.set("group_id", &v.group_id);
+                section.set(
+                    "discovery_scope",
+                    match v.discovery_scope {
+                        DiscoveryScope::Link => "link",
+                        DiscoveryScope::Admin => "admin",
+                        DiscoveryScope::Site => "site",
+                        DiscoveryScope::Organisation => "organisation",
+                        DiscoveryScope::Global => "global",
+                    },
+                );
+                set_num(section, "discovery_port", v.discovery_port);
+                set_num(section, "data_port", v.data_port);
+                section.set(
+                    "multicast_address_type",
+                    match v.multicast_address_type {
+                        MulticastAddressType::Permanent => "permanent",
+                        MulticastAddressType::Temporary => "temporary",
+                    },
+                );
+                if let Some(devices) = &v.devices {
+                    section.set("devices", &devices.join(","));
+                }
+                section.set("ignored_devices", &v.ignored_devices.join(","));
+                set_opt_num(section, "configured_bitrate", v.configured_bitrate);
+            }
+            Self::TcpClient(v) => {
+                section.set("type", "TCPClientInterface");
+                section.set("target_host", &v.target_host);
+                set_num(section, "target_port", v.target_port);
+                set_bool(section, "kiss_framing", v.kiss_framing);
+                set_num(section, "connect_timeout", v.connect_timeout);
+                set_opt_num(section, "max_reconnect_tries", v.max_reconnect_tries);
+                set_opt_num(section, "fixed_mtu", v.fixed_mtu);
+            }
+            Self::TcpServer(v) => {
+                section.set("type", "TCPServerInterface");
+                section.set("listen_ip", &v.listen_ip);
+                set_num(section, "listen_port", v.listen_port);
+                set_bool(section, "kiss_framing", v.kiss_framing);
+                set_bool(section, "prefer_ipv6", v.prefer_ipv6);
+                set_opt(section, "device", v.device.as_deref());
+            }
+            Self::Udp(v) => {
+                section.set("type", "UDPInterface");
+                set_opt(section, "listen_ip", v.listen_ip.as_deref());
+                set_opt_num(section, "listen_port", v.listen_port);
+                set_opt(section, "forward_ip", v.forward_ip.as_deref());
+                set_opt_num(section, "forward_port", v.forward_port);
+                set_opt(section, "device", v.device.as_deref());
+            }
+            Self::Local(v) => {
+                section.set("type", "LocalInterface");
+                let _ = v;
+            }
+            Self::I2p(v) => {
+                section.set("type", "I2PInterface");
+                set_bool(section, "connectable", v.connectable);
+                section.set("peers", &v.peers.join(","));
+                section.set("i2p_sam_host", &v.sam_host);
+                set_num(section, "i2p_sam_port", v.sam_port);
+            }
+            Self::Pipe(v) => {
+                section.set("type", "PipeInterface");
+                section.set("command", &v.command);
+                set_num(section, "respawn_delay", v.respawn_delay);
+            }
+            Self::Backbone(v) => {
+                section.set("type", "BackboneInterface");
+                set_opt(section, "listen_on", v.listen_on.as_deref());
+                set_opt(section, "target_host", v.target_host.as_deref());
+                set_num(section, "port", v.port);
+                set_opt(section, "device", v.device.as_deref());
+                set_bool(section, "prefer_ipv6", v.prefer_ipv6);
+                set_num(section, "connect_timeout", v.connect_timeout);
+                set_opt_num(section, "max_reconnect_tries", v.max_reconnect_tries);
+                set_bool(section, "i2p_tunneled", v.i2p_tunneled);
+            }
+            Self::Serial(v) => {
+                section.set("type", "SerialInterface");
+                write_serial(section, v);
+            }
+            Self::Kiss(v) => {
+                section.set("type", "KISSInterface");
+                write_serial(section, &v.serial);
+                write_kiss(
+                    section,
+                    v.preamble_ms,
+                    v.tx_tail_ms,
+                    v.persistence,
+                    v.slot_time_ms,
+                    v.flow_control,
+                );
+                set_opt_num(section, "id_interval", v.id_interval);
+                set_opt(section, "id_callsign", v.id_callsign.as_deref());
+            }
+            Self::Rnode(v) => {
+                section.set("type", "RNodeInterface");
+                section.set("port", &v.port);
+                write_radio(section, &v.radio);
+                set_bool(section, "flow_control", v.flow_control);
+                set_opt_num(section, "id_interval", v.id_interval);
+                set_opt(section, "id_callsign", v.id_callsign.as_deref());
+            }
+            Self::RnodeMulti(v) => {
+                section.set("type", "RNodeMultiInterface");
+                section.set("port", &v.port);
+                set_num(section, "baud_rate", v.baud_rate);
+                set_bool(section, "flow_control", v.flow_control);
+                set_opt_num(section, "id_interval", v.id_interval);
+                set_opt(section, "id_callsign", v.id_callsign.as_deref());
+                for sub in &v.subinterfaces {
+                    let child = section.add_subsection(sub.name.clone());
+                    set_num(child, "vport", sub.vport);
+                    set_bool(child, "enabled", sub.enabled);
+                    set_bool(child, "outgoing", sub.outgoing);
+                    if let Some(flow) = sub.flow_control {
+                        set_bool(child, "flow_control", flow);
+                    }
+                    if let Some(mode) = sub.mode {
+                        child.set("mode", mode_name(mode));
+                    }
+                    write_radio(child, &sub.radio);
+                }
+            }
+            Self::Ax25Kiss(v) => {
+                section.set("type", "AX25KISSInterface");
+                write_serial(section, &v.serial);
+                section.set("callsign", &v.callsign);
+                set_num(section, "ssid", v.ssid);
+                write_kiss(
+                    section,
+                    v.preamble_ms,
+                    v.tx_tail_ms,
+                    v.persistence,
+                    v.slot_time_ms,
+                    v.flow_control,
+                );
+            }
+            Self::Plugin(v) => {
+                return Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: plugin interfaces cannot run before the plugin ABI is implemented",
+                    v.common.name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -757,6 +1067,125 @@ pub enum OpaqueValue {
     String(String),
     Sequence(Vec<OpaqueValue>),
     Mapping(BTreeMap<String, OpaqueValue>),
+}
+
+fn set_bool(section: &mut crate::config::ConfigSection, key: &str, value: bool) {
+    section.set(key, if value { "Yes" } else { "No" });
+}
+
+fn set_num(section: &mut crate::config::ConfigSection, key: &str, value: impl ToString) {
+    section.set(key, &value.to_string());
+}
+
+fn set_opt(section: &mut crate::config::ConfigSection, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        section.set(key, value);
+    }
+}
+
+fn set_opt_num<T: ToString + Copy>(
+    section: &mut crate::config::ConfigSection,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        set_num(section, key, value);
+    }
+}
+
+fn mode_name(mode: InterfaceMode) -> &'static str {
+    match mode {
+        InterfaceMode::Full => "full",
+        InterfaceMode::PointToPoint => "point_to_point",
+        InterfaceMode::AccessPoint => "access_point",
+        InterfaceMode::Roaming => "roaming",
+        InterfaceMode::Boundary => "boundary",
+        InterfaceMode::Gateway => "gateway",
+        InterfaceMode::Internal => "internal",
+    }
+}
+
+fn write_common(section: &mut crate::config::ConfigSection, common: &InterfaceCommonConfig) {
+    set_bool(section, "enabled", common.enabled);
+    section.set("mode", mode_name(common.mode));
+    set_bool(section, "outgoing", common.outgoing);
+    set_opt_num(section, "bitrate", common.bitrate);
+    set_opt_num(section, "announce_cap", common.announce_cap);
+    set_opt_num(section, "announce_rate_target", common.announce_rate_target);
+    set_opt_num(section, "announce_rate_grace", common.announce_rate_grace);
+    set_opt_num(
+        section,
+        "announce_rate_penalty",
+        common.announce_rate_penalty,
+    );
+    set_opt(section, "network_name", common.ifac_network_name.as_deref());
+    set_opt(section, "passphrase", common.ifac_passphrase.as_deref());
+    set_opt_num(section, "ifac_size", common.ifac_size);
+    set_bool(section, "ingress_control", common.ingress_control);
+    write_ingress(section, &common.ingress);
+    set_bool(section, "recursive_prs", common.recursive_path_requests);
+    set_bool(
+        section,
+        "announces_from_internal",
+        common.announces_from_internal,
+    );
+}
+
+fn write_ingress(section: &mut crate::config::ConfigSection, ingress: &IngressConfig) {
+    set_opt_num(section, "ic_burst_freq_new", ingress.burst_freq_new);
+    set_opt_num(section, "ic_burst_freq", ingress.burst_freq);
+    set_opt_num(
+        section,
+        "ic_pr_burst_freq_new",
+        ingress.path_request_burst_freq_new,
+    );
+    set_opt_num(section, "ic_pr_burst_freq", ingress.path_request_burst_freq);
+    set_opt_num(section, "ic_new_time", ingress.new_time);
+    set_opt_num(section, "ic_burst_hold", ingress.burst_hold);
+    set_opt_num(section, "ic_burst_penalty", ingress.burst_penalty);
+    set_opt_num(section, "ic_max_held_announces", ingress.max_held_announces);
+    set_opt_num(
+        section,
+        "ic_held_release_interval",
+        ingress.held_release_interval,
+    );
+    set_opt_num(section, "ec_pr_freq", ingress.egress_path_request_freq);
+    if let Some(value) = ingress.egress_control {
+        set_bool(section, "egress_control", value);
+    }
+}
+
+fn write_serial(section: &mut crate::config::ConfigSection, serial: &SerialInterfaceConfig) {
+    section.set("port", &serial.port);
+    set_num(section, "baud_rate", serial.baud_rate);
+    set_num(section, "data_bits", serial.data_bits);
+    section.set("parity", &serial.parity);
+    set_num(section, "stop_bits", serial.stop_bits);
+}
+
+fn write_kiss(
+    section: &mut crate::config::ConfigSection,
+    preamble_ms: u32,
+    tx_tail_ms: u32,
+    persistence: u8,
+    slot_time_ms: u32,
+    flow_control: bool,
+) {
+    set_num(section, "preamble", preamble_ms);
+    set_num(section, "txtail", tx_tail_ms);
+    set_num(section, "persistence", persistence);
+    set_num(section, "slottime", slot_time_ms);
+    set_bool(section, "flow_control", flow_control);
+}
+
+fn write_radio(section: &mut crate::config::ConfigSection, radio: &RadioConfig) {
+    set_num(section, "frequency", radio.frequency);
+    set_num(section, "bandwidth", radio.bandwidth);
+    set_num(section, "spreading_factor", radio.spreading_factor);
+    set_num(section, "coding_rate", radio.coding_rate);
+    set_num(section, "tx_power", radio.tx_power);
+    set_opt_num(section, "airtime_limit_short", radio.airtime_limit_short);
+    set_opt_num(section, "airtime_limit_long", radio.airtime_limit_long);
 }
 
 fn validate_hashes(field: &str, hashes: &[String]) -> Result<(), YamlConfigError> {

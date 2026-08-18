@@ -66,10 +66,10 @@ impl Platform {
 }
 
 /// Explicit `configdir` wins. Without one, use rsReticulum-specific defaults:
-/// `/etc/rsReticulum/config`, then `~/.config/rsReticulum/config`, then
+/// `/etc/rsReticulum/config.yaml`, then `~/.config/rsReticulum/config.yaml`, then
 /// `~/.rsReticulum` on Unix-like systems. Windows uses the appdata
 /// `rsReticulum` directory. Pass `--config ~/.reticulum` explicitly when
-/// intentionally sharing a Python Reticulum config.
+/// intentionally using another rsReticulum configuration directory.
 pub fn resolve_config_dir(configdir: Option<&str>) -> PathBuf {
     match configdir {
         Some(dir) => PathBuf::from(dir),
@@ -77,12 +77,12 @@ pub fn resolve_config_dir(configdir: Option<&str>) -> PathBuf {
             let platform = Platform::current();
             if !matches!(platform, Platform::Windows | Platform::Android) {
                 let etc = PathBuf::from("/etc/rsReticulum");
-                if etc.join("config").is_file() {
+                if etc.join(crate::yaml_config::CONFIG_FILE_NAME).is_file() {
                     return etc;
                 }
                 if let Ok(home) = std::env::var("HOME") {
                     let xdg = PathBuf::from(home).join(".config/rsReticulum");
-                    if xdg.join("config").is_file() {
+                    if xdg.join(crate::yaml_config::CONFIG_FILE_NAME).is_file() {
                         return xdg;
                     }
                 }

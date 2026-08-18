@@ -376,9 +376,11 @@ fn parse_string_literal(value: &str) -> Option<String> {
 }
 
 fn read_config_loglevel(config_dir: &Path) -> Option<i32> {
-    let config = rns_runtime::config::Config::from_file(&config_dir.join("config")).ok()?;
-    let section = config.section("logging")?;
-    section.get_int("loglevel").map(|v| v as i32)
+    rns_runtime::yaml_config::Config::from_file(
+        config_dir.join(rns_runtime::yaml_config::CONFIG_FILE_NAME),
+    )
+    .ok()
+    .map(|config| config.logging.level)
 }
 
 fn tracing_level(verbosity: i32) -> tracing::Level {

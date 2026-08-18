@@ -1033,7 +1033,7 @@ pub async fn init(
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
 
-    let config_path = config_dir.join("config");
+    let config_path = config_dir.join(crate::yaml_config::CONFIG_FILE_NAME);
     let (config, config_created) = load_or_create_config(&config_path)?;
     if config_created {
         tracing::info!(
@@ -3575,8 +3575,11 @@ pub async fn spawn_interface_from_config(
 
     // Load post_init from the on-disk config so IFAC, announce-rate, etc.
     // are honoured for newly added interfaces too.
-    let disk_config =
-        crate::config::Config::from_file(&handle.config_dir.join("config")).unwrap_or_default();
+    let disk_config = crate::yaml_config::Config::from_file(
+        handle.config_dir.join(crate::yaml_config::CONFIG_FILE_NAME),
+    )
+    .and_then(|config| config.to_runtime_compat_config())
+    .unwrap_or_default();
     let mut post_init = get_post_init_for_config(&disk_config, iface_config);
     finalize_post_init(&mut post_init, &handle.config);
 
@@ -3891,14 +3894,18 @@ pub fn get_instance() -> Option<&'static ReticulumHandle> {
 
 fn load_or_create_config(path: &Path) -> Result<(Config, bool), ReticulumError> {
     if path.exists() {
-        Config::from_file(path)
+        crate::yaml_config::Config::from_file(path)
+            .and_then(|config| config.to_runtime_compat_config())
             .map(|config| (config, false))
-            .map_err(ReticulumError::Config)
+            .map_err(ReticulumError::YamlConfig)
     } else {
-        Config::write_default(path).map_err(ReticulumError::Config)?;
-        Config::parse(Config::default_config())
+        let config = crate::yaml_config::Config::default();
+        let content = config.to_yaml().map_err(ReticulumError::YamlConfig)?;
+        std::fs::write(path, content).map_err(ReticulumError::Io)?;
+        config
+            .to_runtime_compat_config()
             .map(|config| (config, true))
-            .map_err(ReticulumError::Config)
+            .map_err(ReticulumError::YamlConfig)
     }
 }
 
@@ -4034,6 +4041,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 pub enum ReticulumError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
+    #[error("{0}")]
+    YamlConfig(#[from] crate::yaml_config::YamlConfigError),
     #[error("I/O error: {0}")]
     Io(std::io::Error),
     #[error("already initialized")]
