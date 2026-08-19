@@ -322,6 +322,7 @@
             <option value="KISSInterface">KISS</option>
             <option value="RNodeInterface">RNode</option>
             <option value="AX25KISSInterface">AX.25 KISS</option>
+            <option value="PluginInterface">Plugin</option>
           </select>
         </label>
         <label>Mode
@@ -697,6 +698,19 @@
           <input id="ax25-flow-control" type="checkbox">
           <span>Flow control</span>
         </label>
+      </fieldset>
+
+      <fieldset class="form-grid" id="plugin-fields" hidden disabled>
+        <legend>Plugin</legend>
+        <label class="wide">Installed plugin
+          <select id="plugin-name" required></select>
+        </label>
+        <label>MTU
+          <input id="plugin-mtu" type="number" min="1" max="4294967295"
+                 step="1" value="500" required>
+        </label>
+        <p class="wide muted" id="plugin-description"></p>
+        <div class="wide" id="plugin-config-fields"></div>
       </fieldset>
 
       <label class="check-field" id="kiss-framing-field">

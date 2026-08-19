@@ -546,6 +546,9 @@ fieldset.form-grid legend {
   font-weight: 650;
 }
 .form-grid label.wide { grid-column: 1 / -1; }
+.form-grid > .wide { grid-column: 1 / -1; }
+.plugin-schema-group + .plugin-schema-group { margin-top: 14px; }
+.plugin-object { background: #090c0b55; }
 .form-grid input, .form-grid select {
   width: 100%;
   min-width: 0;

@@ -20,6 +20,7 @@
 //! GET /api/v1/interfaces          — list of interfaces (?filter=…&all=true)
 //! GET /api/v1/interfaces/{id}     — one interface by numeric id
 //! GET /api/v1/config/interfaces   — configured interfaces, including disabled
+//! GET /api/v1/plugins             — installed interface plugins and schemas
 //! GET /api/v1/paths               — path table (?max_hops=N)
 //! GET /api/v1/links               — number of active links
 //! POST /api/v1/interfaces         — add an interface
@@ -93,6 +94,7 @@ pub async fn run_api_server(
         .route("/api/v1/status", get(status))
         .route("/api/v1/interfaces", get(interfaces).post(create_interface))
         .route("/api/v1/config/interfaces", get(config_interfaces))
+        .route("/api/v1/plugins", get(plugins))
         .route(
             "/api/v1/config/interfaces/{name}",
             put(update_config_interface).delete(delete_config_interface),
@@ -501,6 +503,11 @@ struct InterfaceRequest {
     // AX25KISSInterface
     callsign: Option<String>,
     ssid: Option<u8>,
+
+    // PluginInterface
+    plugin: Option<String>,
+    mtu: Option<u32>,
+    config: Option<Value>,
 }
 
 impl InterfaceRequest {
@@ -695,6 +702,21 @@ impl InterfaceRequest {
                 s.set("ssid", &v.to_string());
             }
         }
+        if self.iface_type == "PluginInterface" {
+            if let Some(ref plugin) = self.plugin {
+                s.set("plugin", plugin);
+            }
+            s.set(
+                "mtu",
+                &self
+                    .mtu
+                    .unwrap_or(rns_wire::constants::MTU as u32)
+                    .to_string(),
+            );
+            if let Some(config) = &self.config {
+                s.set("__plugin_config_yaml", &config.to_string());
+            }
+        }
         s
     }
 
@@ -722,12 +744,131 @@ impl InterfaceRequest {
             rns_interface::ax25kiss::parse_callsign_ssid(&format!("{callsign}-{ssid}"))
                 .map_err(ApiError::bad)?;
         }
+        if self.iface_type == "PluginInterface" {
+            let plugin = self
+                .plugin
+                .as_deref()
+                .ok_or_else(|| ApiError::bad("missing plugin"))?;
+            let config = self
+                .config
+                .as_ref()
+                .ok_or_else(|| ApiError::bad("missing plugin config"))?;
+            if !config.is_object() {
+                return Err(ApiError::bad("plugin config must be an object"));
+            }
+            if self.mtu.unwrap_or(rns_wire::constants::MTU as u32) == 0 {
+                return Err(ApiError::bad("plugin MTU must be greater than zero"));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let library = rns_interface::plugin::load_configured_library(plugin)
+                    .map_err(|error| ApiError::bad(error.to_string()))?;
+                let schema = library
+                    .info()
+                    .config_schema_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ApiError::bad(format!("plugin '{plugin}' has no config schema"))
+                    })?;
+                let schema: Value = serde_json::from_str(schema)
+                    .map_err(|error| ApiError::bad(format!("invalid plugin schema: {error}")))?;
+                validate_schema_value(&schema, config, "$", &schema)?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(ApiError::bad(
+                "interface plugins are supported only on Linux",
+            ));
+        }
         Ok(())
     }
 
     fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
     }
+}
+
+fn validate_schema_value(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    root: &Value,
+) -> Result<(), ApiError> {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .ok_or_else(|| ApiError::bad(format!("unsupported schema reference '{reference}'")))?;
+        let target = root
+            .get("$defs")
+            .and_then(|defs| defs.get(name))
+            .ok_or_else(|| ApiError::bad(format!("unresolved schema reference '{reference}'")))?;
+        return validate_schema_value(target, value, path, root);
+    }
+
+    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+        let matches = match expected {
+            "object" => value.is_object(),
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            other => return Err(ApiError::bad(format!("unsupported schema type '{other}'"))),
+        };
+        if !matches {
+            return Err(ApiError::bad(format!("{path} must be {expected}")));
+        }
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(ApiError::bad(format!("{path} is not an allowed value")));
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+            && number < minimum
+        {
+            return Err(ApiError::bad(format!("{path} must be at least {minimum}")));
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
+            && number > maximum
+        {
+            return Err(ApiError::bad(format!("{path} must be at most {maximum}")));
+        }
+    }
+
+    if let Some(text) = value.as_str()
+        && let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
+        && text.chars().count() < minimum as usize
+    {
+        return Err(ApiError::bad(format!("{path} is too short")));
+    }
+
+    if let Some(object) = value.as_object() {
+        let properties = schema.get("properties").and_then(Value::as_object);
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(key) {
+                    return Err(ApiError::bad(format!("{path}.{key} is required")));
+                }
+            }
+        }
+        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+            for key in object.keys() {
+                if properties.is_none_or(|properties| !properties.contains_key(key)) {
+                    return Err(ApiError::bad(format!("{path}.{key} is not allowed")));
+                }
+            }
+        }
+        if let Some(properties) = properties {
+            for (key, child) in object {
+                if let Some(child_schema) = properties.get(key) {
+                    validate_schema_value(child_schema, child, &format!("{path}.{key}"), root)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1087,6 +1228,49 @@ async fn config_interfaces(State(s): State<AppState>) -> ApiResult<Json<Value>> 
             .cmp(&right["name"].as_str().unwrap_or_default().to_lowercase())
     });
     Ok(Json(json!({ "interfaces": entries })))
+}
+
+async fn plugins() -> ApiResult<Json<Value>> {
+    #[cfg(target_os = "linux")]
+    {
+        let entries = rns_interface::plugin::list_available_plugins()
+            .map_err(|error| ApiError::internal(format!("cannot list plugins: {error}")))?;
+        let plugins = entries
+            .into_iter()
+            .map(|entry| {
+                let id = entry
+                    .filename
+                    .strip_suffix(".so")
+                    .unwrap_or(&entry.filename);
+                match entry.result {
+                    Ok(info) => {
+                        let schema = info
+                            .config_schema_json
+                            .as_deref()
+                            .and_then(|schema| serde_json::from_str::<Value>(schema).ok());
+                        json!({
+                            "id": id,
+                            "filename": entry.filename,
+                            "name": info.name,
+                            "version": info.version,
+                            "description": info.description,
+                            "schema": schema,
+                            "web_configurable": schema.is_some(),
+                        })
+                    }
+                    Err(error) => json!({
+                        "id": id,
+                        "filename": entry.filename,
+                        "error": error,
+                        "web_configurable": false,
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        return Ok(Json(json!({ "plugins": plugins })));
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(Json(json!({ "plugins": [] })))
 }
 
 #[derive(Deserialize)]
@@ -1675,6 +1859,10 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
             .or_else(|| section.get_float("lt_alock")),
         "callsign": section.get("callsign"),
         "ssid": section.get_uint("ssid"),
+        "plugin": section.get("plugin"),
+        "mtu": section.get_uint("mtu"),
+        "config": section.get("__plugin_config_yaml")
+            .and_then(|yaml| serde_saphyr::from_str::<Value>(yaml).ok()),
     });
     value.as_object_mut().unwrap().extend([
         ("group_id".into(), json!(section.get("group_id"))),
@@ -1806,6 +1994,14 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "max_reconnect_tries":   c.max_reconnect_tries,
             "i2p_tunneled":          c.i2p_tunneled,
             "interface_mode":        mode_to_str(c.mode),
+        }),
+        InterfaceConfig::Plugin(c) => json!({
+            "type":           "PluginInterface",
+            "plugin":         c.plugin,
+            "mtu":            c.mtu,
+            "config":         std::str::from_utf8(&c.config_yaml).ok()
+                .and_then(|yaml| serde_saphyr::from_str::<Value>(yaml).ok()),
+            "interface_mode": mode_to_str(c.mode),
         }),
         #[cfg(feature = "serial")]
         InterfaceConfig::Serial(c) => json!({
@@ -2435,6 +2631,39 @@ mod tests {
         assert!(remove_interface_config(&mut config, "Renamed"));
         assert!(config.interfaces.is_empty());
         assert!(!remove_interface_config(&mut config, "Missing"));
+    }
+
+    #[test]
+    fn plugin_schema_validator_accepts_nested_gpio_and_rejects_unknown_fields() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["spi", "cs"],
+            "$defs": {
+                "gpio": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["port", "pin"],
+                    "properties": {
+                        "port": { "type": "integer", "minimum": 0 },
+                        "pin": { "type": "integer", "minimum": 0 }
+                    }
+                }
+            },
+            "properties": {
+                "spi": { "type": "string", "minLength": 1 },
+                "cs": { "$ref": "#/$defs/gpio" }
+            }
+        });
+        let valid = json!({ "spi": "/dev/spidev0.0", "cs": { "port": 0, "pin": 13 } });
+        assert!(validate_schema_value(&schema, &valid, "$", &schema).is_ok());
+
+        let unknown =
+            json!({ "spi": "/dev/spidev0.0", "cs": { "port": 0, "pin": 13 }, "extra": true });
+        assert!(validate_schema_value(&schema, &unknown, "$", &schema).is_err());
+
+        let missing = json!({ "spi": "/dev/spidev0.0", "cs": { "port": 0 } });
+        assert!(validate_schema_value(&schema, &missing, "$", &schema).is_err());
     }
 
     #[test]

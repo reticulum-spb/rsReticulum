@@ -19,6 +19,11 @@ const interfaceState = {
   showAll: false,
   loaded: false,
 };
+const pluginState = {
+  items: [],
+  loaded: false,
+  request: null,
+};
 const pathState = {
   items: [],
   filter: "",
@@ -739,6 +744,7 @@ function setInterfaceType(type) {
   const kissSerial = document.querySelector("#kiss-fields");
   const rnode = document.querySelector("#rnode-fields");
   const ax25 = document.querySelector("#ax25-fields");
+  const plugin = document.querySelector("#plugin-fields");
   const kiss = document.querySelector("#kiss-framing-field");
   const isClient = type === "TCPClientInterface";
   const isServer = type === "TCPServerInterface";
@@ -749,6 +755,7 @@ function setInterfaceType(type) {
   const isKiss = type === "KISSInterface";
   const isRNode = type === "RNodeInterface";
   const isAx25 = type === "AX25KISSInterface";
+  const isPlugin = type === "PluginInterface";
   client.hidden = !isClient;
   client.disabled = !isClient;
   server.hidden = !isServer;
@@ -767,9 +774,180 @@ function setInterfaceType(type) {
   rnode.disabled = !isRNode;
   ax25.hidden = !isAx25;
   ax25.disabled = !isAx25;
+  plugin.hidden = !isPlugin;
+  plugin.disabled = !isPlugin;
   const usesKissFraming = isClient || isServer;
   kiss.hidden = !usesKissFraming;
   document.querySelector("#kiss-framing").disabled = !usesKissFraming;
+}
+
+async function loadPlugins() {
+  if (pluginState.loaded) return pluginState.items;
+  if (!pluginState.request) {
+    pluginState.request = apiFetch("/api/v1/plugins", { cache: "no-store" })
+      .then((body) => {
+        pluginState.items = (Array.isArray(body.plugins) ? body.plugins : [])
+          .filter((plugin) => plugin.web_configurable && plugin.schema);
+        pluginState.loaded = true;
+        return pluginState.items;
+      })
+      .finally(() => { pluginState.request = null; });
+  }
+  return pluginState.request;
+}
+
+function schemaDefinition(schema, property) {
+  if (!property?.$ref) return property;
+  const prefix = "#/$defs/";
+  return property.$ref.startsWith(prefix)
+    ? schema.$defs?.[property.$ref.slice(prefix.length)]
+    : null;
+}
+
+function schemaInput(property, value, required) {
+  let input;
+  if (Array.isArray(property.enum)) {
+    input = document.createElement("select");
+    for (const optionValue of property.enum) {
+      const option = document.createElement("option");
+      option.value = String(optionValue);
+      option.textContent = String(optionValue);
+      input.append(option);
+    }
+  } else {
+    input = document.createElement("input");
+    input.type = property.type === "string" ? "text" : "number";
+    if (property.minimum != null) input.min = String(property.minimum);
+    if (property.maximum != null) input.max = String(property.maximum);
+    if (property.minLength != null) input.minLength = Number(property.minLength);
+    input.step = property.type === "integer" ? "1" : "any";
+  }
+  input.required = required;
+  const initial = value ?? property.default;
+  if (initial != null) input.value = String(initial);
+  input.dataset.pluginValueType = property.type || "string";
+  return input;
+}
+
+function renderPluginSchema(pluginId, values = {}) {
+  const container = document.querySelector("#plugin-config-fields");
+  const description = document.querySelector("#plugin-description");
+  container.replaceChildren();
+  const plugin = pluginState.items.find((item) => item.id === pluginId);
+  description.textContent = plugin
+    ? `${plugin.name} ${plugin.version} — ${plugin.description}`
+    : "This plugin is unavailable or does not publish a configuration schema.";
+  if (!plugin) return;
+
+  const schema = plugin.schema;
+  const required = new Set(schema.required || []);
+  const groups = new Map();
+  const entries = Object.entries(schema.properties || {}).sort(([, left], [, right]) =>
+    Number(left["x-order"] || 0) - Number(right["x-order"] || 0));
+
+  for (const [key, declared] of entries) {
+    const property = schemaDefinition(schema, declared) || declared;
+    const groupName = declared["x-ui-group"] || property["x-ui-group"] || "Configuration";
+    let group = groups.get(groupName);
+    if (!group) {
+      group = document.createElement("fieldset");
+      group.className = "form-grid plugin-schema-group";
+      const legend = document.createElement("legend");
+      legend.textContent = groupName;
+      group.append(legend);
+      groups.set(groupName, group);
+      container.append(group);
+    }
+
+    const title = declared.title || property.title || key;
+    if (property.type === "object") {
+      const wrapper = document.createElement("fieldset");
+      wrapper.className = "form-grid wide plugin-object";
+      const legend = document.createElement("legend");
+      legend.textContent = title;
+      wrapper.append(legend);
+      const objectRequired = required.has(key);
+      let toggle = null;
+      if (!objectRequired) {
+        const toggleLabel = document.createElement("label");
+        toggleLabel.className = "check-field wide";
+        toggle = document.createElement("input");
+        toggle.type = "checkbox";
+        toggle.checked = values[key] != null;
+        toggle.dataset.pluginOptionalObject = key;
+        const text = document.createElement("span");
+        text.textContent = "Enable";
+        toggleLabel.append(toggle, text);
+        wrapper.append(toggleLabel);
+      }
+      const childRequired = new Set(property.required || []);
+      for (const [childKey, childProperty] of Object.entries(property.properties || {})) {
+        const label = document.createElement("label");
+        label.textContent = childProperty.title || childKey;
+        const input = schemaInput(childProperty, values[key]?.[childKey], childRequired.has(childKey));
+        input.dataset.pluginObject = key;
+        input.dataset.pluginChild = childKey;
+        if (toggle && !toggle.checked) input.disabled = true;
+        label.append(input);
+        wrapper.append(label);
+      }
+      if (toggle) {
+        toggle.addEventListener("change", () => {
+          wrapper.querySelectorAll("[data-plugin-object]").forEach((input) => {
+            input.disabled = !toggle.checked;
+          });
+        });
+      }
+      group.append(wrapper);
+      continue;
+    }
+
+    const label = document.createElement("label");
+    label.textContent = declared["x-unit"] ? `${title}, ${declared["x-unit"]}` : title;
+    const input = schemaInput(property, values[key], required.has(key));
+    input.dataset.pluginField = key;
+    if (declared.description) input.title = declared.description;
+    label.append(input);
+    group.append(label);
+  }
+}
+
+function populatePluginSelect(selected, values = {}) {
+  const select = document.querySelector("#plugin-name");
+  select.replaceChildren();
+  for (const plugin of pluginState.items) {
+    const option = document.createElement("option");
+    option.value = plugin.id;
+    option.textContent = `${plugin.name} ${plugin.version}`;
+    select.append(option);
+  }
+  if (selected && !pluginState.items.some((plugin) => plugin.id === selected)) {
+    const option = document.createElement("option");
+    option.value = selected;
+    option.textContent = `${selected} (schema unavailable)`;
+    option.disabled = true;
+    select.append(option);
+  }
+  select.value = selected || pluginState.items[0]?.id || "";
+  renderPluginSchema(select.value, values);
+}
+
+function pluginConfigPayload() {
+  const config = {};
+  document.querySelectorAll("[data-plugin-field]").forEach((input) => {
+    config[input.dataset.pluginField] = input.dataset.pluginValueType === "string"
+      ? input.value
+      : Number(input.value);
+  });
+  document.querySelectorAll("[data-plugin-object]").forEach((input) => {
+    if (input.disabled) return;
+    const key = input.dataset.pluginObject;
+    config[key] ||= {};
+    config[key][input.dataset.pluginChild] = input.dataset.pluginValueType === "string"
+      ? input.value
+      : Number(input.value);
+  });
+  return config;
 }
 
 function setBackboneRole(role) {
@@ -783,10 +961,16 @@ function setField(selector, value, fallback = "") {
   document.querySelector(selector).value = value ?? fallback;
 }
 
-function openInterfaceDialog(item = null) {
+async function openInterfaceDialog(item = null) {
   const dialog = document.querySelector("#interface-dialog");
   const form = document.querySelector("#interface-form");
   const config = item?.config || {};
+  try {
+    await loadPlugins();
+  } catch (error) {
+    pluginState.items = [];
+    showError(error);
+  }
   form.reset();
   setField("#interface-id", item?.id);
   setField("#interface-original-name", item?.name);
@@ -897,6 +1081,8 @@ function openInterfaceDialog(item = null) {
   setField("#ax25-txtail", config.txtail, 20);
   setField("#ax25-persistence", config.persistence, 64);
   setField("#ax25-slottime", config.slottime, 20);
+  setField("#plugin-mtu", config.mtu, 500);
+  populatePluginSelect(config.plugin, config.config || {});
   document.querySelector("#ax25-flow-control").checked = Boolean(config.flow_control);
   document.querySelector("#prefer-ipv6").checked = Boolean(config.prefer_ipv6);
   document.querySelector("#kiss-framing").checked = Boolean(config.kiss_framing);
@@ -1211,6 +1397,10 @@ function interfacePayload() {
     payload.persistence = Number(document.querySelector("#ax25-persistence").value);
     payload.slottime = Number(document.querySelector("#ax25-slottime").value);
     payload.flow_control = document.querySelector("#ax25-flow-control").checked;
+  } else if (type === "PluginInterface") {
+    payload.plugin = document.querySelector("#plugin-name").value;
+    payload.mtu = Number(document.querySelector("#plugin-mtu").value);
+    payload.config = pluginConfigPayload();
   }
 
   addAdvancedOptions(payload);
@@ -1395,6 +1585,9 @@ function initialize() {
   document.querySelector("#add-interface").addEventListener("click", () => openInterfaceDialog());
   document.querySelector("#interface-type").addEventListener("change", (event) => {
     setInterfaceType(event.target.value);
+  });
+  document.querySelector("#plugin-name").addEventListener("change", (event) => {
+    renderPluginSchema(event.target.value, {});
   });
   document.querySelector("#backbone-role").addEventListener("change", (event) => {
     setBackboneRole(event.target.value);

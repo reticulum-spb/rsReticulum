@@ -340,6 +340,13 @@ common `bitrate` setting does not override it. Failure to load or create one
 plugin interface is logged but never stops other interfaces or daemon startup,
 even when `panic_on_interface_error` is enabled.
 
+The web UI discovers installed plugins through `GET /api/v1/plugins`. A plugin
+is available in the editor only when it publishes a valid ABI 1.1
+`config_schema_json` object. The UI renders fields from that schema and the
+server validates submitted values against it before saving the configuration.
+There is intentionally no generic fallback form for plugins without a schema;
+ABI 1.0 plugins can still be configured directly in YAML.
+
 ```yaml
 interfaces:
   - type: plugin
