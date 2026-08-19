@@ -10,9 +10,14 @@ const {
   formatNumber,
   formatRate,
   interfaceEndpoint,
+  interfaceConfigEditable,
   matchesInterface,
   matchesPath,
 } = require("./app.js");
+
+test("allows editing schema-backed plugin interfaces", () => {
+  assert.equal(interfaceConfigEditable("PluginInterface"), true);
+});
 
 test("formats runtime metrics", () => {
   assert.equal(formatBytes(0), "0 B");

@@ -389,6 +389,21 @@ function actionButton(label, className, handler) {
   return button;
 }
 
+function interfaceConfigEditable(type) {
+  return [
+    "TCPClientInterface",
+    "TCPServerInterface",
+    "UDPInterface",
+    "AutoInterface",
+    "BackboneInterface",
+    "SerialInterface",
+    "KISSInterface",
+    "RNodeInterface",
+    "AX25KISSInterface",
+    "PluginInterface",
+  ].includes(type);
+}
+
 function interfaceDetails(item) {
   const container = document.createElement("div");
   container.className = "interface-details-container";
@@ -414,18 +429,7 @@ function interfaceDetails(item) {
   if (item.configured) {
     const actions = document.createElement("div");
     actions.className = "interface-actions";
-    const editable = [
-      "TCPClientInterface",
-      "TCPServerInterface",
-      "UDPInterface",
-      "AutoInterface",
-      "BackboneInterface",
-      "SerialInterface",
-      "KISSInterface",
-      "RNodeInterface",
-      "AX25KISSInterface",
-    ].includes(item.config?.type);
-    if (editable) {
+    if (interfaceConfigEditable(item.config?.type)) {
       actions.append(actionButton("Edit configuration", "", () => openInterfaceDialog(item)));
     }
     actions.append(actionButton("Delete", "danger", () => openDeleteDialog(item)));
@@ -1705,6 +1709,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatNumber,
     formatRate,
     interfaceEndpoint,
+    interfaceConfigEditable,
     matchesInterface,
     matchesPath,
     relativeTimestamp,
