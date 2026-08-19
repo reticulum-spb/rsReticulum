@@ -48,6 +48,15 @@ plugin discovery commands such as `rnsd-rs --list-plugin`. Info strings use
 UTF-8 pointer-plus-length values rather than NUL termination and remain valid
 while the library is loaded. All three strings are mandatory and non-empty.
 
+ABI 1.1 appends the optional `config_schema_json` field to `rns_plugin_info_t`.
+It contains a UTF-8 JSON Schema object (at most 64 KiB) describing the mapping
+passed to `create()`. The web API exposes only schema-backed plugins as
+configurable forms. UI hints use the optional `x-ui-group`, `x-order`, and
+`x-unit` annotations; validation remains defined by standard schema keywords.
+An ABI 1.0 plugin remains loadable from YAML, but cannot be configured in the
+web UI. A plugin must set `info_size` to the structure version it actually
+returns, so a 1.0 host never reads the appended field.
+
 `rnsd-rs --list-plugin` inspects every `.so` in the plugin directory in sorted
 filename order using `RTLD_NOW | RTLD_LOCAL`. A bad or incompatible library is
 shown with its error and does not stop the listing. A missing plugin directory

@@ -8,7 +8,7 @@ use core::ffi::{c_char, c_void};
 use core::mem::{offset_of, size_of};
 
 pub const ABI_MAJOR: u32 = 1;
-pub const ABI_MINOR: u32 = 0;
+pub const ABI_MINOR: u32 = 1;
 
 pub type PluginResult = i32;
 pub const OK: PluginResult = 0;
@@ -27,6 +27,7 @@ pub const RX_METADATA_SNR: u32 = 1 << 1;
 pub const PLUGIN_INFO_NAME_MAX_SIZE: usize = 128;
 pub const PLUGIN_INFO_VERSION_MAX_SIZE: usize = 64;
 pub const PLUGIN_INFO_DESCRIPTION_MAX_SIZE: usize = 4096;
+pub const PLUGIN_INFO_CONFIG_SCHEMA_MAX_SIZE: usize = 65536;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -48,10 +49,14 @@ pub struct PluginInfo {
     pub name: RnsString,
     pub version: RnsString,
     pub description: RnsString,
+    /// Optional UTF-8 JSON Schema describing the plugin-specific config map.
+    pub config_schema_json: RnsString,
 }
 
 pub const PLUGIN_INFO_V1_0_SIZE: usize =
     offset_of!(PluginInfo, description) + size_of::<RnsString>();
+pub const PLUGIN_INFO_V1_1_SIZE: usize =
+    offset_of!(PluginInfo, config_schema_json) + size_of::<RnsString>();
 
 pub type LogFn = unsafe extern "C" fn(
     host_context: *mut c_void,
@@ -142,7 +147,8 @@ mod tests {
 
     #[test]
     fn v1_minimum_sizes_end_at_last_required_field() {
-        assert_eq!(PLUGIN_INFO_V1_0_SIZE, size_of::<PluginInfo>());
+        assert!(PLUGIN_INFO_V1_0_SIZE < size_of::<PluginInfo>());
+        assert_eq!(PLUGIN_INFO_V1_1_SIZE, size_of::<PluginInfo>());
         assert_eq!(HOST_API_V1_0_SIZE, size_of::<HostApi>());
         assert_eq!(PLUGIN_API_V1_0_SIZE, size_of::<PluginApi>());
     }

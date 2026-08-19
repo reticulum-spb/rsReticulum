@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define RNS_PLUGIN_ABI_MAJOR UINT32_C(1)
-#define RNS_PLUGIN_ABI_MINOR UINT32_C(0)
+#define RNS_PLUGIN_ABI_MINOR UINT32_C(1)
 
 /*
  * ABI major versions must match exactly. A minor version may only append new
@@ -139,17 +139,28 @@ typedef struct rns_string {
 #define RNS_PLUGIN_INFO_NAME_MAX_SIZE ((size_t)128)
 #define RNS_PLUGIN_INFO_VERSION_MAX_SIZE ((size_t)64)
 #define RNS_PLUGIN_INFO_DESCRIPTION_MAX_SIZE ((size_t)4096)
+#define RNS_PLUGIN_INFO_CONFIG_SCHEMA_MAX_SIZE ((size_t)65536)
 
 typedef struct rns_plugin_info {
     /* Static, non-empty UTF-8 strings valid while the library is loaded. */
     rns_string_t name;
     rns_string_t version;
     rns_string_t description;
+    /*
+     * ABI 1.1: optional UTF-8 JSON Schema for the plugin-specific config
+     * mapping. An empty string means that no web-configurable schema is
+     * available. The string remains valid while the library is loaded.
+     */
+    rns_string_t config_schema_json;
 } rns_plugin_info_t;
 
 #define RNS_PLUGIN_INFO_V1_0_SIZE                                          \
     (offsetof(rns_plugin_info_t, description) +                            \
      sizeof(((rns_plugin_info_t *)0)->description))
+
+#define RNS_PLUGIN_INFO_V1_1_SIZE                                          \
+    (offsetof(rns_plugin_info_t, config_schema_json) +                     \
+     sizeof(((rns_plugin_info_t *)0)->config_schema_json))
 
 typedef struct rns_plugin_api {
     uint32_t abi_major;

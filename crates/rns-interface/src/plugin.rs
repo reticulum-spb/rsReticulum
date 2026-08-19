@@ -13,7 +13,8 @@ use libloading::{Library, Symbol};
 use rns_plugin::{
     ABI_MAJOR, ABI_MINOR, GET_API_SYMBOL, GetApiFn, HOST_API_V1_0_SIZE, HostApi, LOG_DEBUG,
     LOG_ERROR, LOG_INFO, LOG_TRACE, LOG_WARN, OK, PLUGIN_API_V1_0_SIZE,
-    PLUGIN_INFO_DESCRIPTION_MAX_SIZE, PLUGIN_INFO_NAME_MAX_SIZE, PLUGIN_INFO_V1_0_SIZE,
+    PLUGIN_INFO_CONFIG_SCHEMA_MAX_SIZE, PLUGIN_INFO_DESCRIPTION_MAX_SIZE,
+    PLUGIN_INFO_NAME_MAX_SIZE, PLUGIN_INFO_V1_0_SIZE, PLUGIN_INFO_V1_1_SIZE,
     PLUGIN_INFO_VERSION_MAX_SIZE, PluginApi, PluginInfo, PluginInstance, RX_METADATA_RSSI,
     RX_METADATA_SNR, RnsString, RxMetadata,
 };
@@ -32,6 +33,7 @@ pub struct LoadedPluginInfo {
     pub name: String,
     pub version: String,
     pub description: String,
+    pub config_schema_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,8 @@ pub enum PluginLoadError {
     },
     #[error("plugin '{path}' info field '{field}' is not UTF-8")]
     InvalidInfoUtf8 { path: PathBuf, field: &'static str },
+    #[error("plugin '{path}' config schema is not a JSON object: {message}")]
+    InvalidConfigSchema { path: PathBuf, message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -208,23 +212,58 @@ impl PluginLibrary {
         if api.info.is_null() || api.info_size < PLUGIN_INFO_V1_0_SIZE {
             return Err(PluginLoadError::MissingInfo(path));
         }
+        #[repr(C)]
+        struct PluginInfoV1_0 {
+            name: RnsString,
+            version: RnsString,
+            description: RnsString,
+        }
+
         // SAFETY: info_size proves that the mandatory v1.0 prefix is present;
         // the ABI requires the pointed-to structure and strings to be static.
-        let raw_info: &PluginInfo = unsafe { &*api.info };
+        let raw_info_v1_0: &PluginInfoV1_0 = unsafe { &*api.info.cast::<PluginInfoV1_0>() };
+        let config_schema_json = if api.info_size >= PLUGIN_INFO_V1_1_SIZE {
+            // SAFETY: info_size proves that the complete v1.1 structure is present.
+            let raw_info_v1_1: &PluginInfo = unsafe { &*api.info };
+            let schema = copy_optional_info_string(
+                &path,
+                "config_schema_json",
+                raw_info_v1_1.config_schema_json,
+                PLUGIN_INFO_CONFIG_SCHEMA_MAX_SIZE,
+            )?;
+            if let Some(schema) = &schema {
+                let value: serde_json::Value = serde_json::from_str(schema).map_err(|error| {
+                    PluginLoadError::InvalidConfigSchema {
+                        path: path.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                if !value.is_object() {
+                    return Err(PluginLoadError::InvalidConfigSchema {
+                        path,
+                        message: "top level must be an object".to_string(),
+                    });
+                }
+            }
+            schema
+        } else {
+            None
+        };
         let info = LoadedPluginInfo {
-            name: copy_info_string(&path, "name", raw_info.name, PLUGIN_INFO_NAME_MAX_SIZE)?,
+            name: copy_info_string(&path, "name", raw_info_v1_0.name, PLUGIN_INFO_NAME_MAX_SIZE)?,
             version: copy_info_string(
                 &path,
                 "version",
-                raw_info.version,
+                raw_info_v1_0.version,
                 PLUGIN_INFO_VERSION_MAX_SIZE,
             )?,
             description: copy_info_string(
                 &path,
                 "description",
-                raw_info.description,
+                raw_info_v1_0.description,
                 PLUGIN_INFO_DESCRIPTION_MAX_SIZE,
             )?,
+            config_schema_json,
         };
 
         Ok(Self {
@@ -719,6 +758,21 @@ fn copy_info_string(
         field,
     })?;
     Ok(text.to_owned())
+}
+
+fn copy_optional_info_string(
+    path: &Path,
+    field: &'static str,
+    value: RnsString,
+    maximum: usize,
+) -> Result<Option<String>, PluginLoadError> {
+    if value.len == 0 {
+        if value.data.is_null() {
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+    copy_info_string(path, field, value, maximum).map(Some)
 }
 
 pub fn validate_plugin_name(name: &str) -> Result<(), PluginLoadError> {
