@@ -156,7 +156,12 @@ fn resource_demo(label: &str) -> ExampleResult {
     for part in outbound.parts {
         inbound.receive_part(part);
     }
-    let assembled = inbound.assemble(None)?;
+    // No segment/multi-segment splitting happens in this demo, so the only
+    // thing that decides whether to strip a metadata prefix is whether the
+    // resource actually carries one — matching `MultiSegmentInbound::assemble_segment`'s
+    // `resource.flags.has_metadata && segment_index == 1`.
+    let strip_metadata = inbound.flags.has_metadata;
+    let assembled = inbound.assemble(None, strip_metadata)?;
     if assembled != data {
         return Err("resource round-trip mismatch".into());
     }

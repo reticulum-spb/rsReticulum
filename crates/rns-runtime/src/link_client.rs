@@ -53,6 +53,18 @@ pub enum LinkClientError {
     Channel(#[from] ChannelError),
     #[error("resource: {0}")]
     Resource(String),
+    /// The peer answered with a plain (unenveloped, no request id) Resource
+    /// on a request path that doesn't accept one -- see
+    /// [`LinkSession::request`]'s doc comment for why. Distinct from
+    /// [`Timeout`](Self::Timeout) on purpose: this is a real, observed
+    /// reply, not silence, so a caller can tell "peer answered in a way
+    /// this API can't use" from "peer never answered at all".
+    #[error(
+        "peer answered with a plain (unenveloped) resource, which this \
+         reusable-session request path does not accept for response \
+         correlation safety"
+    )]
+    PlainResourceNotAccepted,
 }
 
 #[derive(Clone)]
@@ -96,8 +108,11 @@ pub struct PreparedLinkSession {
 pub struct LinkSessionHandle {
     link_id: [u8; 16],
     command_tx: mpsc::Sender<LinkSessionCommand>,
-    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, LinkClientError>>>>,
+    inbound_rx: SharedInboundReceiver,
 }
+
+type SharedInboundReceiver =
+    Arc<tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, LinkClientError>>>>;
 
 enum LinkSessionCommand {
     Identify {
@@ -173,33 +188,47 @@ impl PreparedLinkSession {
             },
         )
         .await?;
-        send_transport(
-            &self.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: build_link_request_packet(self.destination_hash, &self.request_data),
-                destination_hash: self.destination_hash,
-            }),
-        )
-        .await?;
+        let establishment = async {
+            send_transport(
+                &self.transport_tx,
+                TransportMessage::Outbound(OutboundRequest {
+                    raw: build_link_request_packet(self.destination_hash, &self.request_data),
+                    destination_hash: self.destination_hash,
+                }),
+            )
+            .await?;
 
-        let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
-        let ed25519_bytes: [u8; 32] = self.public_key[32..]
-            .try_into()
-            .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
-        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
-        let rtt_data = self
-            .link
-            .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
-        send_transport(
-            &self.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data),
-                destination_hash: link_id,
-            }),
-        )
-        .await?;
+            let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
+            let ed25519_bytes: [u8; 32] = self.public_key[32..]
+                .try_into()
+                .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
+            let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
+            let rtt_data = self
+                .link
+                .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
+                .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
+            send_transport(
+                &self.transport_tx,
+                TransportMessage::Outbound(OutboundRequest {
+                    raw: build_data_packet(
+                        link_id,
+                        rns_wire::context::PacketContext::Lrrtt,
+                        &rtt_data,
+                    ),
+                    destination_hash: link_id,
+                }),
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = establishment {
+            let _ = self
+                .transport_tx
+                .send(TransportMessage::DeregisterDestination { hash: link_id })
+                .await;
+            return Err(error);
+        }
         Ok(LinkSession {
             transport_tx: self.transport_tx,
             identity: Arc::new(self.identity),
@@ -751,6 +780,20 @@ impl LinkSession {
     }
 
     /// Send a request and wait for its response, including Resource responses.
+    ///
+    /// Does not accept a plain (unenveloped, no request id) Resource as the
+    /// answer -- only `LinkClient::query`'s one-shot path does, since it
+    /// closes its Link immediately after and so has no later request that
+    /// reusing the correlation could misattribute to. A reusable session
+    /// has no such guarantee: without a request id there is nothing to stop
+    /// a stale or unrelated resource from being mistaken for the answer to
+    /// whatever request happens to be outstanding when it arrives (see
+    /// `resource_answers_request`). A peer that answers this way (some
+    /// NomadNet-style nodes; see `af5aecd` in this repo's history) is a
+    /// real, valid reply this call cannot use -- it returns
+    /// [`LinkClientError::PlainResourceNotAccepted`] rather than the
+    /// generic [`LinkClientError::Timeout`] a genuinely unreachable peer
+    /// would produce, so a caller can distinguish the two.
     pub async fn request(
         &mut self,
         path: &str,
@@ -763,6 +806,9 @@ impl LinkSession {
     }
 
     /// Send a request and retain metadata from a Resource-backed response.
+    ///
+    /// See [`Self::request`]'s doc comment for the plain-resource caveat --
+    /// applies here identically.
     pub async fn request_with_metadata(
         &mut self,
         path: &str,
@@ -775,6 +821,9 @@ impl LinkSession {
 
     /// Send a request while rejecting a response before Resource assembly
     /// exceeds the application-provided payload limit.
+    ///
+    /// See [`Self::request`]'s doc comment for the plain-resource caveat --
+    /// applies here identically.
     pub async fn request_with_metadata_limit(
         &mut self,
         path: &str,
@@ -812,6 +861,8 @@ impl LinkSession {
             packet_request_id,
             deadline,
             max_response_bytes,
+            None,
+            false,
         )
         .await
     }
@@ -1052,17 +1103,24 @@ impl LinkSession {
                                     rns_protocol::resource::ResourceError::DecryptFailed
                                 })
                             };
-                            let (data, proof) =
-                                transfer.complete(Some(&decrypt)).map_err(|error| {
+                            // Looked up before completing: metadata is only
+                            // physically embedded in segment 1's payload, so
+                            // `complete()` must know whether this is that
+                            // segment before it decides whether to strip it.
+                            let (original_hash, segment_index, total_segments) = segment_info
+                                .get(&resource_hash)
+                                .copied()
+                                .unwrap_or((resource_hash, 1, 1));
+                            let (data, proof) = transfer
+                                .complete(Some(&decrypt), segment_index == 1)
+                                .map_err(|error| {
                                     LinkClientError::UnexpectedResponse(format!(
                                         "resource completion: {error:?}"
                                     ))
                                 })?;
                             let metadata = transfer.resource.metadata.clone();
                             send_link_proof(&self.transport_tx, link_id, &proof)?;
-                            let (original_hash, segment_index, total_segments) = segment_info
-                                .remove(&resource_hash)
-                                .unwrap_or((resource_hash, 1, 1));
+                            segment_info.remove(&resource_hash);
                             transfers.remove(&resource_hash);
                             if total_segments > 1 {
                                 let coordinator =
@@ -1264,6 +1322,12 @@ impl LinkSession {
                         }
                     }
                     rns_wire::context::PacketContext::ResourcePrf => {
+                        // `handle_proof` mutates `transfer` (records the
+                        // verified state), so it belongs in the arm body,
+                        // not match-guard position: a guard that evaluates
+                        // `false` still falls through having already caused
+                        // that side effect, which is a correctness footgun
+                        // for whichever arm ends up matching next.
                         if transfer.handle_proof(body) {
                             return Ok(resource_hash);
                         }
@@ -1385,6 +1449,75 @@ impl LinkClient {
         }
     }
 
+    /// Public key from the transport's announce cache, or `None` if this
+    /// destination has never been heard from.
+    ///
+    /// `Recall` is a point lookup into the same cache `GetRecentAnnounces`
+    /// dumps in full — see its docs on [`TransportQuery`].
+    async fn recall_pubkey(&self, dest_hash: [u8; 16]) -> Option<[u8; 64]> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::Recall {
+                    destination_hash: dest_hash,
+                },
+                response_tx: resp_tx,
+            })
+            .await
+            .ok()?;
+        match resp_rx.await.ok()? {
+            TransportQueryResponse::Announce(Some(entry)) => entry.public_key,
+            _ => None,
+        }
+    }
+
+    /// Ask the network for a path and wait for the answering announce to
+    /// carry the destination's public key.
+    ///
+    /// Only reached when the announce cache has no entry: an announce is
+    /// dispatched to the handlers registered *at the moment it arrives*, so
+    /// a query that registers after the answering announce has already been
+    /// dispatched waits out its full timeout for an announce nothing will
+    /// re-send. Consulting the cache first is what keeps back-to-back
+    /// queries to the same destination from alternating success/timeout.
+    async fn discover_pubkey(
+        &self,
+        app_name: &str,
+        dest_hash: [u8; 16],
+        deadline: Instant,
+    ) -> Result<[u8; 64], LinkClientError> {
+        // Register the handler before the path request so the answering
+        // announce (carrying the pubkey) is observed.
+        let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
+        self.send_msg(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: Some(app_name.to_string()),
+            receive_path_responses: true,
+            callback_tx: ann_tx.clone(),
+        })
+        .await?;
+
+        // Every exit past this point must deregister. Returning `?` straight
+        // out of the path request or the wait -- the timeout case, i.e. the
+        // common one -- would leave the registration behind, and the actor
+        // only reaps it once the channel closes.
+        let outcome = async {
+            self.send_msg(TransportMessage::RequestPath {
+                destination_hash: dest_hash,
+            })
+            .await?;
+            wait_for_pubkey(&mut ann_rx, dest_hash, time_remaining(deadline)?).await
+        }
+        .await;
+
+        let _ = self
+            .transport_tx
+            .send(TransportMessage::DeregisterAnnounceHandler {
+                callback_tx: ann_tx,
+            })
+            .await;
+        outcome
+    }
+
     /// Open a Link to `app_name` on `remote_transport_hash`, send one
     /// request, return the response.
     pub async fn query(
@@ -1396,33 +1529,66 @@ impl LinkClient {
         hops: u8,
         overall_timeout: Duration,
     ) -> Result<Vec<u8>, LinkClientError> {
+        self.query_inner(
+            remote_transport_hash,
+            app_name,
+            path,
+            payload,
+            hops,
+            overall_timeout,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::query`], but sends `(bytes_received, total_bytes)` on
+    /// `progress` as resource segments arrive. `total_bytes` is only known
+    /// once the reply's `ResourceAdv` advertisement is seen, so a small
+    /// (inline, non-resource) response never sends anything at all.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_with_progress(
+        &self,
+        remote_transport_hash: [u8; 16],
+        app_name: &str,
+        path: &str,
+        payload: Vec<u8>,
+        hops: u8,
+        overall_timeout: Duration,
+        progress: mpsc::UnboundedSender<(usize, usize)>,
+    ) -> Result<Vec<u8>, LinkClientError> {
+        self.query_inner(
+            remote_transport_hash,
+            app_name,
+            path,
+            payload,
+            hops,
+            overall_timeout,
+            Some(progress),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn query_inner(
+        &self,
+        remote_transport_hash: [u8; 16],
+        app_name: &str,
+        path: &str,
+        payload: Vec<u8>,
+        hops: u8,
+        overall_timeout: Duration,
+        progress: Option<mpsc::UnboundedSender<(usize, usize)>>,
+    ) -> Result<Vec<u8>, LinkClientError> {
         let started = Instant::now();
         let deadline = started + overall_timeout;
 
         let dest_hash =
             Destination::hash_from_name_and_identity(app_name, Some(&remote_transport_hash));
 
-        // Register the handler before the path request so the answering
-        // announce (carrying the pubkey) is observed.
-        let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
-        self.send_msg(TransportMessage::RegisterAnnounceHandler {
-            aspect_filter: Some(app_name.to_string()),
-            receive_path_responses: true,
-            callback_tx: ann_tx,
-        })
-        .await?;
-
-        self.send_msg(TransportMessage::RequestPath {
-            destination_hash: dest_hash,
-        })
-        .await?;
-
-        let pubkey = wait_for_pubkey(&mut ann_rx, dest_hash, time_remaining(deadline)?).await?;
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterAnnounceHandler {
-                aspect_filter: Some(app_name.to_string()),
-            });
+        let pubkey = match self.recall_pubkey(dest_hash).await {
+            Some(pubkey) => pubkey,
+            None => self.discover_pubkey(app_name, dest_hash, deadline).await?,
+        };
 
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
         let link_id = link.link_id;
@@ -1437,89 +1603,100 @@ impl LinkClient {
         })
         .await?;
 
-        let req_pkt = build_link_request_packet(dest_hash, &request_data);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: req_pkt,
-            destination_hash: dest_hash,
-        }))
-        .await?;
+        // The destination is registered above; every exit from here on must
+        // deregister it. Returning `?` straight out of the handshake -- the
+        // timeout path, i.e. what an unreachable or slow node does -- used to
+        // skip the teardown entirely, leaking one registration per attempt.
+        let response = async {
+            let req_pkt = build_link_request_packet(dest_hash, &request_data);
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: req_pkt,
+                destination_hash: dest_hash,
+            }))
+            .await?;
 
-        let proof_data = wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
+            let proof_data =
+                wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
 
-        let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
-            LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
-        })?;
-        let identity_verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("verify key: {e}")))?;
+            let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
+                LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
+            })?;
+            let identity_verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
+                .map_err(|e| LinkClientError::ProofInvalid(format!("verify key: {e}")))?;
 
-        let rtt_data = link
-            .validate_proof(&proof_data, &identity_verify_key, &identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("{e:?}")))?;
+            let rtt_data = link
+                .validate_proof(&proof_data, &identity_verify_key, &identity_ed25519_pub)
+                .map_err(|e| LinkClientError::ProofInvalid(format!("{e:?}")))?;
 
-        let rtt_pkt =
-            build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: rtt_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+            let rtt_pkt =
+                build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: rtt_pkt,
+                destination_hash: link_id,
+            }))
+            .await?;
 
-        let our_pub = self.identity.get_public_key();
-        let our_priv = self
-            .identity
-            .get_signing_key()
-            .ok_or(LinkClientError::NoSigningKey)?;
-        let identify_data = link
-            .identify(&our_pub, &our_priv)
-            .map_err(|e| LinkClientError::LinkCrypto(format!("identify: {e:?}")))?;
-        let identify_pkt = build_data_packet(
-            link_id,
-            rns_wire::context::PacketContext::LinkIdentify,
-            &identify_data,
-        );
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: identify_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+            let our_pub = self.identity.get_public_key();
+            let our_priv = self
+                .identity
+                .get_signing_key()
+                .ok_or(LinkClientError::NoSigningKey)?;
+            let identify_data = link
+                .identify(&our_pub, &our_priv)
+                .map_err(|e| LinkClientError::LinkCrypto(format!("identify: {e:?}")))?;
+            let identify_pkt = build_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::LinkIdentify,
+                &identify_data,
+            );
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: identify_pkt,
+                destination_hash: link_id,
+            }))
+            .await?;
 
-        let req_timeout = Duration::from_secs(5);
-        let (encrypted_req, request_id) = link
-            .request(path, Some(&payload), req_timeout)
-            .map_err(|e| LinkClientError::LinkCrypto(format!("request: {e:?}")))?;
-        let request_pkt = build_data_packet(
-            link_id,
-            rns_wire::context::PacketContext::Request,
-            &encrypted_req,
-        );
-        let packet_request_id = rns_wire::hash::truncated_packet_hash(
-            &request_pkt,
-            rns_wire::flags::HeaderType::Header1,
-        );
-        link.update_pending_request_id(&request_id, packet_request_id);
-        self.send_msg(TransportMessage::Outbound(OutboundRequest {
-            raw: request_pkt,
-            destination_hash: link_id,
-        }))
-        .await?;
+            let req_timeout = Duration::from_secs(5);
+            let (encrypted_req, request_id) = link
+                .request(path, Some(&payload), req_timeout)
+                .map_err(|e| LinkClientError::LinkCrypto(format!("request: {e:?}")))?;
+            let request_pkt = build_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::Request,
+                &encrypted_req,
+            );
+            let packet_request_id = rns_wire::hash::truncated_packet_hash(
+                &request_pkt,
+                rns_wire::flags::HeaderType::Header1,
+            );
+            link.update_pending_request_id(&request_id, packet_request_id);
+            self.send_msg(TransportMessage::Outbound(OutboundRequest {
+                raw: request_pkt,
+                destination_hash: link_id,
+            }))
+            .await?;
 
-        let response = wait_for_response(
-            &self.transport_tx,
-            &mut dest_rx,
-            &mut link,
-            link_id,
-            packet_request_id,
-            time_remaining(deadline)?,
-            usize::MAX,
-        )
-        .await
-        .map(|response| response.data);
+            wait_for_response(
+                &self.transport_tx,
+                &mut dest_rx,
+                &mut link,
+                link_id,
+                packet_request_id,
+                time_remaining(deadline)?,
+                usize::MAX,
+                progress.as_ref(),
+                true,
+            )
+            .await
+            .map(|response| response.data)
+        }
+        .await;
 
         // Tear down even on failure so the remote doesn't keep link state.
         let _ = self.send_close(&mut link).await;
         let _ = self
             .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+            .send(TransportMessage::DeregisterDestination { hash: link_id })
+            .await;
 
         response
     }
@@ -1546,6 +1723,25 @@ impl LinkClient {
             destination_hash: link_id,
         }))
         .await
+    }
+}
+
+/// Whether a resource advertised on this link answers our outstanding request.
+///
+/// A response resource names the request it answers and must name ours.
+/// Implementations that reply with a plain application resource instead carry
+/// no correlation id at all -- but the link exists solely for the one request
+/// still outstanding, so such a resource is that request's answer.
+fn resource_answers_request(
+    is_response: bool,
+    adv_request_id: Option<&[u8]>,
+    request_id: &[u8; 16],
+    accept_plain_resource: bool,
+) -> bool {
+    if is_response {
+        adv_request_id == Some(request_id.as_slice())
+    } else {
+        accept_plain_resource && adv_request_id.is_none()
     }
 }
 
@@ -1612,6 +1808,7 @@ async fn wait_for_proof(
         .map_err(|_| LinkClientError::Timeout("link proof"))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_response(
     transport_tx: &mpsc::Sender<TransportMessage>,
     rx: &mut mpsc::Receiver<DestinationEvent>,
@@ -1620,7 +1817,15 @@ async fn wait_for_response(
     request_id: [u8; 16],
     deadline: Duration,
     max_response_bytes: usize,
+    progress: Option<&mpsc::UnboundedSender<(usize, usize)>>,
+    accept_plain_resource: bool,
 ) -> Result<LinkResponse, LinkClientError> {
+    // Throttled so a multi-thousand-packet transfer doesn't flood the
+    // receiver with one update per wire packet (each ~350-500 bytes).
+    const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(150);
+    let mut bytes_received = 0usize;
+    let mut last_progress_emit: Option<Instant> = None;
+
     let fut = async {
         let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
         let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
@@ -1676,9 +1881,33 @@ async fn wait_for_response(
                                 ))
                             })?;
 
-                            if !adv.flags.is_response
-                                || adv.request_id.as_deref() != Some(request_id.as_slice())
-                            {
+                            // A response resource names the request it answers,
+                            // and must name ours. Implementations that reply
+                            // with a plain application resource instead (no
+                            // response flag, no request id) carry no way to
+                            // correlate -- but this link exists solely for the
+                            // one request still outstanding, so a resource
+                            // arriving on it is that request's answer.
+                            if !resource_answers_request(
+                                adv.flags.is_response,
+                                adv.request_id.as_deref(),
+                                &request_id,
+                                accept_plain_resource,
+                            ) {
+                                // A plain resource that would have answered
+                                // this request under `accept_plain_resource:
+                                // true` is a real, observed reply on a link
+                                // dedicated to this one outstanding request --
+                                // not silence to keep waiting out. Surface it
+                                // now instead of falling through to the
+                                // generic timeout, so callers on this path
+                                // can tell the two apart.
+                                if !accept_plain_resource
+                                    && !adv.flags.is_response
+                                    && adv.request_id.is_none()
+                                {
+                                    return Err(LinkClientError::PlainResourceNotAccepted);
+                                }
                                 continue;
                             }
                             if !inbound_resources.contains_key(&adv.resource_hash) {
@@ -1763,6 +1992,27 @@ async fn wait_for_response(
                                 }
                             }
 
+                            // Approximate, not exact: counts the wire packet
+                            // once per arrival rather than crediting whichever
+                            // candidate transfer actually consumed it, which is
+                            // indistinguishable from here without changing
+                            // InboundTransfer's return type. Close enough for a
+                            // progress bar; a query has one outstanding
+                            // resource in the overwhelming majority of cases.
+                            if let Some(tx) = progress {
+                                bytes_received = bytes_received.saturating_add(body.len());
+                                let now = Instant::now();
+                                let due = last_progress_emit
+                                    .is_none_or(|last| now - last >= PROGRESS_MIN_INTERVAL);
+                                if due && advertised_bytes > 0 {
+                                    last_progress_emit = Some(now);
+                                    let _ = tx.send((
+                                        bytes_received.min(advertised_bytes),
+                                        advertised_bytes,
+                                    ));
+                                }
+                            }
+
                             if let Some(action) = action_to_send {
                                 let (context, payload) = match action {
                                     TransferAction::SendHmu(hmu) => {
@@ -1784,6 +2034,15 @@ async fn wait_for_response(
                             }
 
                             if let Some(rh) = completed_rh {
+                                // Looked up before completing, same reason as
+                                // the other resource-response path above:
+                                // metadata is only embedded in segment 1's
+                                // payload, so `complete()` needs to know
+                                // whether this is that segment first.
+                                let is_first_segment = segment_info
+                                    .get(&rh)
+                                    .map(|&(_, segment_index, _)| segment_index == 1)
+                                    .unwrap_or(true);
                                 let (assembled, proof, metadata) = {
                                     let transfer =
                                         inbound_resources.get_mut(&rh).ok_or_else(|| {
@@ -1803,8 +2062,9 @@ async fn wait_for_response(
                                             },
                                         )
                                     };
-                                    let (assembled, proof) =
-                                        transfer.complete(Some(&decrypt_fn)).map_err(|e| {
+                                    let (assembled, proof) = transfer
+                                        .complete(Some(&decrypt_fn), is_first_segment)
+                                        .map_err(|e| {
                                             LinkClientError::UnexpectedResponse(format!(
                                                 "resource assemble: {e:?}"
                                             ))
@@ -1847,16 +2107,30 @@ async fn wait_for_response(
                                 match link.handle_response_plaintext(&response_payload) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
+                                            if let Some(tx) = progress {
+                                                let _ =
+                                                    tx.send((advertised_bytes, advertised_bytes));
+                                            }
                                             return Ok(LinkResponse {
                                                 data: response_data,
                                                 metadata,
                                             });
                                         }
                                     }
-                                    Err(e) => {
-                                        return Err(LinkClientError::LinkCrypto(format!(
-                                            "resource response decode: {e:?}"
-                                        )));
+                                    // Not the msgpack `[request_id, data]`
+                                    // envelope Python RNS wraps large responses
+                                    // in. Implementations that send the payload
+                                    // raw are answering the same request, so the
+                                    // bytes are the response as they stand --
+                                    // failing here would reject every such peer.
+                                    Err(_) => {
+                                        if let Some(tx) = progress {
+                                            let _ = tx.send((advertised_bytes, advertised_bytes));
+                                        }
+                                        return Ok(LinkResponse {
+                                            data: response_payload,
+                                            metadata,
+                                        });
                                     }
                                 }
                             }
@@ -2042,6 +2316,7 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rns_transport::messages::AnnounceRpcEntry;
 
     #[test]
     fn build_link_request_packet_has_link_request_type() {
@@ -2075,6 +2350,40 @@ mod tests {
         assert_eq!(header.context, rns_wire::context::PacketContext::LinkProof);
     }
 
+    #[tokio::test]
+    async fn failed_session_establishment_deregisters_destination() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let prepared = LinkSession::prepare_on_transport(
+            transport_tx,
+            Identity::new(),
+            [0x44; 16],
+            [0x55; 64],
+            1,
+        );
+        let link_id = prepared.id();
+        let observer = tokio::spawn(async move {
+            let mut registered = 0;
+            let mut deregistered = 0;
+            while let Some(message) = transport_rx.recv().await {
+                match message {
+                    TransportMessage::RegisterDestination { hash, .. } if hash == link_id => {
+                        registered += 1;
+                    }
+                    TransportMessage::DeregisterDestination { hash } if hash == link_id => {
+                        deregistered += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (registered, deregistered)
+        });
+
+        let result = prepared.establish(Duration::from_millis(20)).await;
+        assert!(result.is_err());
+        assert_eq!(observer.await.unwrap(), (1, 1));
+    }
+
     #[test]
     fn prepared_session_exposes_link_id_without_transport_io() {
         let (transport_tx, mut transport_rx) = mpsc::channel(1);
@@ -2088,6 +2397,189 @@ mod tests {
 
         assert_ne!(prepared.id(), [0; 16]);
         assert!(transport_rx.try_recv().is_err());
+    }
+
+    /// An announce is delivered only to the handlers registered when it
+    /// arrives, so a query that waits for a fresh one after the answering
+    /// announce has already been dispatched hangs until its own timeout.
+    /// A destination already in the announce cache must not wait at all.
+    #[tokio::test]
+    async fn query_uses_cached_pubkey_without_waiting_for_an_announce() {
+        let app_name = "nomadnetwork.node";
+        let remote = [0xAB; 16];
+        let dest_hash = Destination::hash_from_name_and_identity(app_name, Some(&remote));
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(32);
+        let transport = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(msg) = transport_rx.recv().await {
+                seen.push(rns_transport::messages::msg_variant_name(&msg));
+                if let TransportMessage::Rpc { response_tx, .. } = msg {
+                    let _ = response_tx.send(TransportQueryResponse::Announce(Some(
+                        AnnounceRpcEntry {
+                            dest_hash,
+                            hops: 1,
+                            app_data: None,
+                            timestamp: 0.0,
+                            public_key: Some([0x11; 64]),
+                            ratchet: None,
+                            name_hash: [0; 10],
+                            is_path_response: false,
+                            retained: false,
+                        },
+                    )));
+                }
+            }
+            seen
+        });
+
+        // Fails at the handshake (nothing answers the link request); the
+        // pubkey stage is what's under test.
+        let _ = LinkClient::new(transport_tx, Identity::new())
+            .query(
+                remote,
+                app_name,
+                "/page/index.mu",
+                Vec::new(),
+                1,
+                Duration::from_millis(250),
+            )
+            .await;
+
+        let seen = transport.await.unwrap();
+        assert!(
+            !seen.contains(&"RegisterAnnounceHandler"),
+            "cached pubkey should skip announce discovery, saw: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&"RequestPath"),
+            "cached pubkey should skip the path request, saw: {seen:?}"
+        );
+        // It got far enough to attempt the link, i.e. it really used the key.
+        assert!(seen.contains(&"RegisterDestination"), "saw: {seen:?}");
+    }
+
+    /// The timeout path is the common one for an unreachable destination,
+    /// and it used to return without deregistering -- leaving a live
+    /// registration the actor only reaps once the channel happens to close.
+    #[tokio::test]
+    async fn query_deregisters_its_announce_handler_when_discovery_times_out() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(32);
+        let transport = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(msg) = transport_rx.recv().await {
+                seen.push(rns_transport::messages::msg_variant_name(&msg));
+                // Never heard of it, and no announce will ever arrive.
+                if let TransportMessage::Rpc { response_tx, .. } = msg {
+                    let _ = response_tx.send(TransportQueryResponse::Announce(None));
+                }
+            }
+            seen
+        });
+
+        let result = LinkClient::new(transport_tx, Identity::new())
+            .query(
+                [0xAB; 16],
+                "nomadnetwork.node",
+                "/page/index.mu",
+                Vec::new(),
+                1,
+                Duration::from_millis(150),
+            )
+            .await;
+
+        assert!(matches!(result, Err(LinkClientError::Timeout(_))));
+        let seen = transport.await.unwrap();
+        assert!(seen.contains(&"RegisterAnnounceHandler"), "saw: {seen:?}");
+        assert!(
+            seen.contains(&"DeregisterAnnounceHandler"),
+            "handler leaked on the timeout path, saw: {seen:?}"
+        );
+    }
+
+    /// Peers that answer with a plain application resource (nomad-core does)
+    /// set no response flag and no request id. Requiring both meant the
+    /// advertisement was skipped, no ResourceReq was ever sent, and the link
+    /// sat idle until it was torn down as stale.
+    #[test]
+    fn plain_resource_without_a_request_id_answers_the_outstanding_request() {
+        let ours = [0x11u8; 16];
+        let theirs = [0x22u8; 16];
+
+        // Enveloped response resources still must name our request.
+        assert!(resource_answers_request(true, Some(&ours), &ours, true));
+        assert!(!resource_answers_request(true, Some(&theirs), &ours, true));
+        assert!(!resource_answers_request(true, None, &ours, true));
+
+        // A plain resource carries no id and is taken as the answer only by
+        // the one-shot query path, which closes its Link immediately after.
+        assert!(resource_answers_request(false, None, &ours, true));
+        assert!(!resource_answers_request(false, None, &ours, false));
+        // ...but one that names a *different* request is not ours.
+        assert!(!resource_answers_request(false, Some(&theirs), &ours, true));
+    }
+
+    /// Every failed navigation used to leave a destination registered in the
+    /// transport actor: RegisterDestination happens before the handshake, and
+    /// every `?` between there and the teardown skipped the cleanup. A browser
+    /// doing repeated fetches leaks one per failure.
+    #[tokio::test]
+    async fn failed_query_still_deregisters_its_destination() {
+        let (transport_tx, mut transport_rx) = mpsc::channel(4096);
+        let transport = tokio::spawn(async move {
+            let (mut reg, mut dereg) = (0usize, 0usize);
+            while let Some(msg) = transport_rx.recv().await {
+                match msg {
+                    TransportMessage::RegisterDestination { .. } => reg += 1,
+                    TransportMessage::DeregisterDestination { .. } => dereg += 1,
+                    TransportMessage::Rpc { response_tx, .. } => {
+                        // Known peer, so discovery is skipped and the query
+                        // proceeds straight to the handshake, which nothing
+                        // answers -- the common slow/unreachable-node path.
+                        let _ = response_tx.send(TransportQueryResponse::Announce(Some(
+                            AnnounceRpcEntry {
+                                dest_hash: [0; 16],
+                                hops: 1,
+                                app_data: None,
+                                timestamp: 0.0,
+                                public_key: Some([0x11; 64]),
+                                ratchet: None,
+                                name_hash: [0; 10],
+                                is_path_response: false,
+                                retained: false,
+                            },
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            (reg, dereg)
+        });
+
+        let client = LinkClient::new(transport_tx, Identity::new());
+        const NAVIGATIONS: usize = 30;
+        for _ in 0..NAVIGATIONS {
+            let _ = client
+                .query(
+                    [0xAB; 16],
+                    "nomadnetwork.node",
+                    "/page/index.mu",
+                    Vec::new(),
+                    1,
+                    Duration::from_millis(20),
+                )
+                .await;
+        }
+        drop(client);
+
+        let (reg, dereg) = transport.await.unwrap();
+        assert_eq!(reg, NAVIGATIONS, "expected one registration per navigation");
+        assert_eq!(
+            dereg,
+            reg,
+            "leaked {} destination registrations over {NAVIGATIONS} failed navigations",
+            reg - dereg
+        );
     }
 
     #[tokio::test]
@@ -2344,5 +2836,87 @@ mod tests {
 
         drop(handle);
         worker.await.unwrap();
+    }
+
+    /// `LinkSession::request` (via `request_with_metadata_limit`'s
+    /// `accept_plain_resource: false`) must surface a peer's plain-resource
+    /// reply as `PlainResourceNotAccepted`, not silently keep waiting until
+    /// the deadline produces a generic `Timeout` indistinguishable from an
+    /// unreachable peer. This drives the real path end to end: a genuine
+    /// `OutboundResource` advertisement (no request id, no response flag --
+    /// exactly what nomad-core-style peers send), encrypted and delivered
+    /// as the peer would, through `LinkSession::request` itself.
+    #[tokio::test]
+    async fn session_request_reports_plain_resource_reply_distinctly_from_timeout() {
+        let dest_hash = [0xC7; 16];
+        let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let responder_pub = responder_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &responder_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &responder_pub, &responder_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = initiator.link_id;
+
+        let (transport_tx, _transport_rx) = mpsc::channel(4);
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let mut session = LinkSession {
+            transport_tx,
+            identity: Arc::new(Identity::new()),
+            link: initiator,
+            event_rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+
+        // A plain resource: no request id, no response flag -- the shape
+        // `OutboundResource::new` produces by construction, matching what a
+        // peer answering with a raw application resource (not Python RNS's
+        // enveloped [request_id, data] response) sends on the wire.
+        let resource = OutboundResource::new(b"peer answered anyway".to_vec(), false, None)
+            .expect("plain resource");
+        let mut transfer = OutboundTransfer::from_prebuilt(resource, Duration::from_millis(500));
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            panic!("expected a fresh outbound resource to advertise first");
+        };
+        let encrypted = responder
+            .encrypt(&advertisement)
+            .expect("responder encrypts as the peer would");
+        let raw = build_data_packet(
+            link_id,
+            rns_wire::context::PacketContext::ResourceAdv,
+            &encrypted,
+        );
+        event_tx
+            .send(DestinationEvent::InboundPacket {
+                raw,
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        // Deadline is deliberately generous relative to how fast this must
+        // resolve: a false pass from an accidentally-fast Timeout is exactly
+        // what distinguishing the two error variants guards against.
+        let result = session
+            .request("test/plain-resource", None, Duration::from_secs(2))
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(LinkClientError::PlainResourceNotAccepted)),
+            "expected PlainResourceNotAccepted, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must be detected immediately on arrival, not discovered only near the \
+             2s deadline (which would make it indistinguishable from Timeout in \
+             practice even though the variant differs); took {elapsed:?}"
+        );
     }
 }

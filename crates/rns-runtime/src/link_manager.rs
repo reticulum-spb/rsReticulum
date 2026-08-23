@@ -20,7 +20,30 @@ use rns_protocol::resource::{
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
-use rns_transport::messages::{OutboundRequest, TransportMessage};
+use rns_transport::messages::{OutboundRequest, TransportMessage, TransportQuery};
+
+/// Cadence of the housekeeping tick, and the longest the drain loop blocks
+/// between re-checking how much is still in flight.
+const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Best-effort beat after the `GetLinkCount` shutdown barrier, giving each
+/// interface driver's own outbound queue a chance to write the just-closed
+/// Links' teardown packets to the wire. The barrier proves the transport
+/// actor's single command queue processed every preceding `LinkClose`/
+/// deregister send (see `drain_and_close`'s doc comment on that RPC) --
+/// it does NOT prove the packets reached the wire: `send_to_interface`
+/// (`rns-transport/src/actor/mod.rs`) hands each packet to a SECOND queue,
+/// `InterfaceEntry::tx: mpsc::Sender<Bytes>`, consumed independently by
+/// whichever driver task owns that interface (TCP, serial, BLE, ...). That
+/// hop has no acknowledgment path back to here -- `try_send` on a full
+/// queue drops silently (see `tx_drops`) -- so this sleep cannot be turned
+/// into a real guarantee without adding delivery acknowledgment to every
+/// interface driver, a much larger change than this shutdown-races fix.
+/// Under normal (non-full-queue) conditions the second hop is a local
+/// channel send plus a socket/serial write, both far faster than this
+/// window; a genuinely stuck or saturated driver still loses the packet,
+/// exactly as it already could mid-session outside of shutdown.
+const INTERFACE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 struct ActiveLink {
     link: Link,
@@ -186,6 +209,67 @@ pub enum RequestOutcome {
 type RequestHandler = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send>;
 type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send>;
 type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
+
+/// Splits a handler outcome into the inline response to send, if any, and the
+/// resource transfer to start, if any.
+///
+/// An empty ack accompanying a resource is dropped: the client cannot tell it
+/// apart from a genuine empty response, so sending it makes the client return
+/// zero bytes and never wait for the resource that is the actual answer.
+type FetchSpec = (Vec<u8>, Option<Vec<u8>>, bool);
+fn split_reply_outcome(outcome: RequestOutcome) -> (Option<Vec<u8>>, Option<FetchSpec>) {
+    match outcome {
+        RequestOutcome::Reply(r) => (Some(r), None),
+        RequestOutcome::ReplyWithResource {
+            ack,
+            data,
+            metadata,
+            auto_compress,
+        } => {
+            let ack = if ack.is_empty() { None } else { Some(ack) };
+            (ack, Some((data, metadata, auto_compress)))
+        }
+        RequestOutcome::Drop => (None, None),
+    }
+}
+
+/// Builds the transfer start for a `fetch_spec` (a `ReplyWithResource`'s
+/// resource half), matching Python `RNS.Link.handle_request`.
+///
+/// Any resource that answers a request carries `is_response=true` and the
+/// request id on its own advertisement -- without that, a compliant client's
+/// default `resource_strategy` (`ACCEPT_NONE`) drops the resource before ever
+/// trying to read it, regardless of what the payload contains.
+///
+/// Whether the payload itself needs the msgpack `[request_id, data]` envelope
+/// is decided by the same signal a Python client dispatches on when the
+/// resource arrives: whether metadata is attached
+/// (`resource.has_metadata` in `Link.response_resource_concluded`). A file
+/// response carries metadata and is sent raw -- `Node.py`'s `serve_file`
+/// returns an open file handle, which `Link.handle_request` forwards via
+/// `Resource(file_handle, ...)` with no packing. Anything else (`serve_page`'s
+/// return value) goes through the plain branch, which always packs
+/// `umsgpack.packb([request_id, response])` first.
+fn fetch_spec_transfer_start(
+    request_id: [u8; 16],
+    data: Vec<u8>,
+    metadata: Option<Vec<u8>>,
+    auto_compress: bool,
+) -> ResourceTransferStart {
+    let data = if metadata.is_some() {
+        data
+    } else {
+        rns_link::link::Link::pack_response(&request_id, &data).unwrap_or(data)
+    };
+    ResourceTransferStart {
+        data,
+        metadata,
+        auto_compress,
+        request_id: Some(request_id.to_vec()),
+        is_response: true,
+        allow_handshake: true,
+    }
+}
 
 struct ResourceTransferStart {
     data: Vec<u8>,
@@ -379,6 +463,143 @@ impl LinkManager {
         }
     }
 
+    /// Like [`run`](Self::run), but stops on `shutdown` and drains first.
+    ///
+    /// Plain `run` only returns when the event channel closes, so a daemon
+    /// that drops the runtime on a signal cuts off any resource transfer
+    /// still on the wire: the peer sees the link go silent mid-file and
+    /// reports a timeout rather than a clean end.
+    pub async fn run_until_shutdown(
+        mut self,
+        shutdown: crate::lifecycle::ShutdownSignal,
+        drain_grace: std::time::Duration,
+    ) {
+        let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(evt) => self.handle_event(evt),
+                        None => break,
+                    }
+                }
+                _ = tick_interval.tick() => self.tick(),
+                _ = shutdown.wait() => break,
+            }
+        }
+
+        self.drain_and_close(drain_grace).await;
+    }
+
+    /// Outbound resource segments still queued or awaiting proof.
+    pub fn inflight_outbound_transfers(&self) -> usize {
+        self.active_links
+            .values()
+            .map(|link| {
+                link.outbound_resources.len()
+                    + link
+                        .outbound_split_queues
+                        .values()
+                        .map(VecDeque::len)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// All accepted Resource transfers that still need protocol traffic.
+    pub fn inflight_transfers(&self) -> usize {
+        self.inflight_outbound_transfers()
+            + self
+                .active_links
+                .values()
+                .map(|link| link.inbound_resources.len())
+                .sum::<usize>()
+    }
+
+    /// Let in-flight transfers finish (up to `grace`), then tear every link
+    /// down with an explicit close so peers don't wait out their timeouts.
+    pub async fn drain_and_close(&mut self, grace: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut tick_interval = tokio::time::interval(TICK);
+        // Consume interval's immediate first tick; subsequent ticks are paced.
+        tick_interval.tick().await;
+        while self.inflight_transfers() > 0 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    inflight = self.inflight_transfers(),
+                    "drain grace expired with transfers still in flight"
+                );
+                break;
+            }
+            tokio::select! {
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(event) => self.handle_event(event),
+                        None => break,
+                    }
+                }
+                _ = tick_interval.tick() => self.tick(),
+                _ = tokio::time::sleep(remaining) => break,
+            }
+        }
+
+        for link_id in self.active_links.keys().copied().collect::<Vec<_>>() {
+            self.close_active_link_for_shutdown(link_id).await;
+        }
+
+        // This RPC is a FIFO barrier on the transport actor's command queue:
+        // receiving its response proves that all preceding LinkClose and
+        // deregistration messages were processed by the actor -- i.e. handed
+        // off to `send_to_interface`. It does not prove the wire has them;
+        // see `INTERFACE_FLUSH_GRACE`'s doc comment for why that's a
+        // separate, deliberately best-effort step below.
+        let (barrier_tx, barrier_rx) = oneshot::channel();
+        if self
+            .transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::GetLinkCount,
+                response_tx: barrier_tx,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(TICK, barrier_rx).await;
+        }
+
+        tokio::time::sleep(INTERFACE_FLUSH_GRACE).await;
+    }
+
+    async fn close_active_link_for_shutdown(&mut self, link_id: [u8; 16]) {
+        let Some(mut active) = self.active_links.remove(&link_id) else {
+            return;
+        };
+        if let Some(teardown_data) = active.link.teardown(CloseReason::DestinationClosed) {
+            let _ = self
+                .transport_tx
+                .send(TransportMessage::Outbound(OutboundRequest {
+                    raw: Self::build_link_close_packet(&link_id, &teardown_data),
+                    destination_hash: link_id,
+                }))
+                .await;
+        }
+        if let Some(ref callback) = active.link.link_closed_callback {
+            callback(&active.link);
+        }
+        self.backchannel_links.retain(|_, id| *id != link_id);
+        if let Ok(mut identities) = self.link_identities.lock() {
+            identities.remove(&link_id);
+        }
+        let _ = self
+            .transport_tx
+            .send(TransportMessage::DeregisterDestination { hash: link_id })
+            .await;
+        if let Some(ref tx) = self.link_closed_tx {
+            let _ = tx.try_send(link_id);
+        }
+    }
+
     pub async fn run_with_commands(mut self, mut command_rx: mpsc::Receiver<LinkManagerCommand>) {
         let mut last_tick = std::time::Instant::now();
         loop {
@@ -401,6 +622,48 @@ impl LinkManager {
 
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Run the event and command loops until shutdown, then finish accepted
+    /// Resource transfers up to `drain_grace` and explicitly close every Link.
+    ///
+    /// Every exit drains, not just the `shutdown` signal: `LinkManagerCommand`
+    /// telling the loop to stop (`handle_command` returning `false`), the
+    /// command channel closing, and the event channel closing are all real
+    /// ways this manager's caller-facing loop ends, and a Link left open on
+    /// any of them is exactly the "peer sees the link go silent mid-file"
+    /// failure [`run_until_shutdown`](Self::run_until_shutdown) exists to
+    /// avoid -- that guarantee shouldn't depend on which exit fired.
+    pub async fn run_with_commands_until_shutdown(
+        mut self,
+        mut command_rx: mpsc::Receiver<LinkManagerCommand>,
+        shutdown: crate::lifecycle::ShutdownSignal,
+        drain_grace: std::time::Duration,
+    ) {
+        let mut tick_interval = tokio::time::interval(TICK);
+        loop {
+            tokio::select! {
+                command = command_rx.recv() => {
+                    match command {
+                        Some(command) => {
+                            if !self.handle_command(command) {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(event) => self.handle_event(event),
+                        None => break,
+                    }
+                }
+                _ = tick_interval.tick() => self.tick(),
+                _ = shutdown.wait() => break,
+            }
+        }
+        self.drain_and_close(drain_grace).await;
     }
 
     fn handle_command(&mut self, command: LinkManagerCommand) -> bool {
@@ -1193,9 +1456,18 @@ impl LinkManager {
                                 })
                             };
 
+                            // Looked up before completing: metadata is only
+                            // embedded in segment 1's payload, so `complete()`
+                            // needs to know whether this is that segment
+                            // before deciding whether to strip it.
+                            let is_first_segment = active
+                                .segment_routing
+                                .get(&rh)
+                                .map(|route| route.segment_index == 1)
+                                .unwrap_or(true);
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 if let Ok((assembled_data, proof)) =
-                                    transfer.complete(Some(&decrypt_fn))
+                                    transfer.complete(Some(&decrypt_fn), is_first_segment)
                                 {
                                     // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
                                     // (Packet.py:195-197). Each split segment still needs its
@@ -1679,16 +1951,7 @@ impl LinkManager {
                             RequestOutcome::Drop
                         };
 
-                        let (resp_bytes_opt, fetch_spec) = match outcome {
-                            RequestOutcome::Reply(r) => (Some(r), None),
-                            RequestOutcome::ReplyWithResource {
-                                ack,
-                                data,
-                                metadata,
-                                auto_compress,
-                            } => (Some(ack), Some((data, metadata, auto_compress))),
-                            RequestOutcome::Drop => (None, None),
-                        };
+                        let (resp_bytes_opt, fetch_spec) = split_reply_outcome(outcome);
 
                         let mut response_resource = None;
                         if let Some(resp_bytes) = resp_bytes_opt {
@@ -1752,18 +2015,14 @@ impl LinkManager {
                         }
 
                         if let Some((data, metadata, auto_compress)) = fetch_spec {
+                            let start = fetch_spec_transfer_start(
+                                request_id,
+                                data,
+                                metadata,
+                                auto_compress,
+                            );
                             if self
-                                .start_resource_transfer_inner(
-                                    &link_id,
-                                    ResourceTransferStart {
-                                        data,
-                                        metadata,
-                                        auto_compress,
-                                        request_id: None,
-                                        is_response: false,
-                                        allow_handshake: true,
-                                    },
-                                )
+                                .start_resource_transfer_inner(&link_id, start)
                                 .is_none()
                             {
                                 tracing::warn!(
@@ -2109,6 +2368,14 @@ impl LinkManager {
         link_id: &[u8; 16],
         teardown_data: &[u8],
     ) {
+        let raw = Self::build_link_close_packet(link_id, teardown_data);
+        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+            raw,
+            destination_hash: *link_id,
+        }));
+    }
+
+    fn build_link_close_packet(link_id: &[u8; 16], teardown_data: &[u8]) -> Bytes {
         let td_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
                 header_type: rns_wire::flags::HeaderType::Header1,
@@ -2124,10 +2391,7 @@ impl LinkManager {
         };
         let mut td_raw = td_header.pack();
         td_raw.extend_from_slice(teardown_data);
-        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(td_raw),
-            destination_hash: *link_id,
-        }));
+        Bytes::from(td_raw)
     }
 
     fn send_keepalive_packet(transport_tx: &mpsc::Sender<TransportMessage>, link_id: &[u8; 16]) {
@@ -2570,6 +2834,8 @@ impl LinkManager {
                 auto_compress,
                 request_id: None,
                 is_response: false,
+                // Unsolicited, unlike the reply paths: nothing has proved
+                // the link works yet, so wait for it to go Active.
                 allow_handshake: false,
             },
         )
@@ -2589,7 +2855,11 @@ impl LinkManager {
                 auto_compress: false,
                 request_id: Some(request_id.to_vec()),
                 is_response: true,
-                allow_handshake: false,
+                // As with the plain-resource reply it sits beside: the
+                // request itself proves the link carries traffic, and the
+                // responder may not have processed LRRTT yet. Requiring
+                // Active here dropped the answer with no packet sent.
+                allow_handshake: true,
             },
         )
     }
@@ -2727,8 +2997,13 @@ impl LinkManager {
         resource_hash: &[u8; 32],
     ) -> Option<(Vec<u8>, Vec<u8>)> {
         let active = self.active_links.get_mut(link_id)?;
+        let is_first_segment = active
+            .segment_routing
+            .get(resource_hash)
+            .map(|route| route.segment_index == 1)
+            .unwrap_or(true);
         let transfer = active.inbound_resources.get_mut(resource_hash)?;
-        match transfer.complete(None) {
+        match transfer.complete(None, is_first_segment) {
             Ok((data, proof)) => {
                 active.link.untrack_resource(resource_hash);
                 active.inbound_resources.remove(resource_hash);
@@ -2921,6 +3196,267 @@ mod tests {
         );
 
         let _ = identity_key;
+    }
+
+    /// Dropping the runtime on a signal used to cut links off mid-transfer,
+    /// leaving peers to wait out their own timeouts. Shutdown must close
+    /// them explicitly, and the close packet must actually be handed to the
+    /// transport.
+    #[tokio::test]
+    async fn shutdown_drain_closes_links_with_an_explicit_teardown() {
+        let dest_hash = [0xD1; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = responder.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        assert_eq!(lm.inflight_outbound_transfers(), 0);
+
+        lm.drain_and_close(std::time::Duration::from_secs(5)).await;
+        drop(event_tx);
+
+        assert_eq!(lm.active_link_count(), 0, "link left open after shutdown");
+
+        let mut sent_close = false;
+        while let Ok(msg) = transport_rx.try_recv() {
+            if let TransportMessage::Outbound(OutboundRequest { raw, .. }) = msg {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                if header.context == rns_wire::context::PacketContext::LinkClose
+                    && header.destination_hash == link_id
+                {
+                    sent_close = true;
+                }
+            }
+        }
+        assert!(sent_close, "no LinkClose packet reached the transport");
+    }
+
+    /// `run_with_commands_until_shutdown` had four exits and only one --
+    /// `shutdown.wait()` -- drained; a `LinkManagerCommand::Shutdown` sent
+    /// through the command channel (what every one of rncp/rnsh's own
+    /// command-loop shutdowns actually does) hit `handle_command`'s
+    /// `Shutdown => false` and returned immediately, skipping
+    /// `drain_and_close` entirely. This drives that exact exit and proves it
+    /// now drains too: an active Link gets an explicit LinkClose on the
+    /// wire, not silence.
+    #[tokio::test]
+    async fn run_with_commands_until_shutdown_drains_on_command_exit_not_just_signal() {
+        let dest_hash = [0xD2; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let identity_pub = identity_key.public_key();
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (mut responder, proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let rtt_data = initiator
+            .validate_proof(&proof_data, &identity_pub, &identity_pub.to_bytes())
+            .unwrap();
+        responder.receive_rtt_packet(&rtt_data).unwrap();
+        let link_id = responder.link_id;
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let (command_tx, command_rx) = mpsc::channel(4);
+        // Never triggered: this test's whole point is proving the *other*
+        // three exits drain too, not just this one (already covered by
+        // `shutdown_drain_closes_links_with_an_explicit_teardown` via
+        // `drain_and_close` directly).
+        let shutdown = crate::lifecycle::ShutdownSignal::new();
+
+        command_tx.send(LinkManagerCommand::Shutdown).await.unwrap();
+        lm.run_with_commands_until_shutdown(
+            command_rx,
+            shutdown,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let mut sent_close = false;
+        while let Ok(msg) = transport_rx.try_recv() {
+            if let TransportMessage::Outbound(OutboundRequest { raw, .. }) = msg {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                if header.context == rns_wire::context::PacketContext::LinkClose
+                    && header.destination_hash == link_id
+                {
+                    sent_close = true;
+                }
+            }
+        }
+        assert!(
+            sent_close,
+            "LinkManagerCommand::Shutdown must drain before returning, same as the \
+             shutdown-signal exit -- no LinkClose packet reached the transport"
+        );
+    }
+
+    /// `INTERFACE_FLUSH_GRACE` is a real, timed wait, not just a comment.
+    /// This is the honest limit of what's testable here per its own doc
+    /// comment: the second `mpsc` hop it's covering for
+    /// (`send_to_interface`'s `InterfaceEntry::tx`) has no driver task in
+    /// this unit test to observe delivery through, and no acknowledgment
+    /// path even in production -- that's the whole reason it's a fixed
+    /// sleep and not a real barrier. What *is* provable: the sleep executes
+    /// and actually elapses. A fake transport task answers the
+    /// `GetLinkCount` barrier RPC immediately, so with nothing else in
+    /// flight, any measured time beyond a tiny epsilon is directly
+    /// attributable to this sleep, not incidental delay elsewhere in
+    /// `drain_and_close`.
+    #[tokio::test]
+    async fn drain_and_close_waits_out_the_interface_flush_grace() {
+        let dest_hash = [0xD3; 16];
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+
+        tokio::spawn(async move {
+            while let Some(msg) = transport_rx.recv().await {
+                if let TransportMessage::Rpc {
+                    query: TransportQuery::GetLinkCount,
+                    response_tx,
+                } = msg
+                {
+                    let _ = response_tx.send(
+                        rns_transport::messages::TransportQueryResponse::IntResult(0),
+                    );
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        lm.drain_and_close(std::time::Duration::from_secs(5)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= INTERFACE_FLUSH_GRACE,
+            "drain_and_close must wait out INTERFACE_FLUSH_GRACE ({INTERFACE_FLUSH_GRACE:?}) \
+             even when nothing is in flight and the barrier resolves instantly; \
+             only waited {elapsed:?}"
+        );
+    }
+
+    /// An empty ack alongside a resource is indistinguishable from a genuine
+    /// empty response, so the client returned 0 bytes and never waited for
+    /// the resource that was the real answer -- a silent wrong success.
+    #[test]
+    fn reply_with_resource_suppresses_a_meaningless_empty_ack() {
+        let empty = RequestOutcome::ReplyWithResource {
+            ack: Vec::new(),
+            data: vec![1, 2, 3],
+            metadata: None,
+            auto_compress: true,
+        };
+        let (ack, fetch) = split_reply_outcome(empty);
+        assert!(ack.is_none(), "empty ack must not be sent");
+        assert!(fetch.is_some());
+
+        let with_ack = RequestOutcome::ReplyWithResource {
+            ack: vec![0xAA],
+            data: vec![1, 2, 3],
+            metadata: None,
+            auto_compress: true,
+        };
+        let (ack, fetch) = split_reply_outcome(with_ack);
+        assert_eq!(ack.as_deref(), Some(&[0xAA][..]), "real ack must survive");
+        assert!(fetch.is_some());
+
+        // A plain empty Reply is a real answer and must still be delivered.
+        let (ack, fetch) = split_reply_outcome(RequestOutcome::Reply(Vec::new()));
+        assert_eq!(ack.as_deref(), Some(&[][..]));
+        assert!(fetch.is_none());
+    }
+
+    /// A response resource must carry `is_response=true` and the request id
+    /// on its advertisement, matching Python `RNS.Link.handle_request` --
+    /// confirmed against a real NomadNet node on the live network, whose
+    /// oversized-page ResourceAdv carried `is_response=true` and its own
+    /// `request_id`. Without it, a compliant client's default
+    /// `resource_strategy` (`ACCEPT_NONE`) drops the resource before ever
+    /// reading it, which is why other NomadNet clients could not receive
+    /// pages or files served this way.
+    #[test]
+    fn fetch_spec_transfer_always_carries_response_id_and_flag() {
+        let request_id = [0x42; 16];
+        let start = fetch_spec_transfer_start(request_id, b"hello".to_vec(), None, false);
+        assert!(start.is_response);
+        assert_eq!(start.request_id.as_deref(), Some(request_id.as_slice()));
+    }
+
+    /// A page response (no metadata) must be wrapped in the msgpack
+    /// `[request_id, data]` envelope: real Python clients dispatch on
+    /// `resource.has_metadata` when a response resource completes, and
+    /// unconditionally `umsgpack.unpackb()` the payload when it's absent
+    /// (`Link.response_resource_concluded`). Sending raw bytes there fails to
+    /// unpack on a real client even after the is_response/request_id fix.
+    #[test]
+    fn page_response_without_metadata_is_enveloped() {
+        let request_id = [0x11; 16];
+        let start = fetch_spec_transfer_start(request_id, b"page bytes".to_vec(), None, false);
+
+        assert_ne!(
+            start.data, b"page bytes",
+            "page response must not be sent raw"
+        );
+        let mut link = Link::new_responder(
+            &Link::new_initiator([0x99; 16], 1).1,
+            &Ed25519PrivateKey::generate(),
+            [0x99; 16],
+            1,
+        )
+        .unwrap()
+        .0;
+        let (id, data) = link.handle_response_plaintext(&start.data).unwrap();
+        assert_eq!(id, request_id);
+        assert_eq!(data, b"page bytes");
+    }
+
+    /// A file response (metadata present) must stay raw: `Node.py`'s
+    /// `serve_file` hands `Link.handle_request` an open file handle, which it
+    /// wraps directly in a `Resource` with no packing at all -- and a real
+    /// client passes `resource.data` straight through when metadata is
+    /// present, without ever attempting to unpack it.
+    #[test]
+    fn file_response_with_metadata_stays_raw() {
+        let request_id = [0x22; 16];
+        let metadata = Some(b"{\"name\":\"x.bin\"}".to_vec());
+        let start =
+            fetch_spec_transfer_start(request_id, b"raw file bytes".to_vec(), metadata, true);
+        assert_eq!(start.data, b"raw file bytes");
     }
 
     #[test]
@@ -3309,6 +3845,48 @@ mod tests {
         assert_eq!(link.state, LinkState::Active);
         assert_eq!(link.expected_hops, Some(4));
         assert_eq!(initiator.expected_hops, Some(2));
+    }
+
+    /// The two branches that answer an inbound Request sit next to each other
+    /// and act on the same link at the same moment, so they must agree on
+    /// whether the link has to be Active yet. An oversized inline reply goes
+    /// out as a response resource, and if that path alone refuses to start
+    /// during the handshake the answer is dropped with no packet and no
+    /// warning -- the caller just waits out its timeout.
+    #[test]
+    fn response_resource_can_also_start_before_responder_lrrtt_activation() {
+        let dest_hash = [0x37; 16];
+        let identity_key = Ed25519PrivateKey::generate();
+        let (_initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let (responder, _proof_data) =
+            Link::new_responder(&request_data, &identity_key, dest_hash, 1).unwrap();
+        let link_id = responder.link_id;
+        assert_eq!(responder.state, LinkState::Handshake);
+
+        let (transport_tx, _transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, dest_hash, None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: responder,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+
+        let packed = rns_link::link::Link::pack_response(&[0xAB; 16], &vec![0u8; 4096]).unwrap();
+        assert!(
+            lm.start_response_resource(&link_id, packed, [0xAB; 16])
+                .is_some(),
+            "response resource was refused during handshake, so the reply is \
+             silently dropped and the requester times out"
+        );
     }
 
     #[test]

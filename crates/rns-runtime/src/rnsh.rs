@@ -32,7 +32,7 @@ use rns_transport::messages::{
     AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
-use crate::lifecycle::ShutdownSignal;
+use crate::lifecycle::{DrainCoordinator, ShutdownSignal};
 use crate::link_manager::{
     ChannelSendError, LinkChannelMessage, LinkManager, LinkManagerCommand, register_destination,
 };
@@ -134,21 +134,29 @@ pub async fn run_rnsh_listener(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RnshListenerConfig,
 ) -> Result<(), RnshError> {
-    run_rnsh_listener_inner(transport_tx, cfg, None).await
+    run_rnsh_listener_inner(transport_tx, cfg, None, None).await
 }
 
+/// `drain_coordinator` is held for the lifetime of the spawned
+/// `LinkManager`'s drain-aware run (see
+/// [`crate::lifecycle::DrainCoordinator`]), so the runtime's transport-actor
+/// teardown waits for this listener's `LinkClose` traffic to be handed off
+/// before its interface can be torn down. Pass the runtime's own
+/// `handle.drain_coordinator.clone()`.
 pub async fn run_rnsh_listener_with_shutdown(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RnshListenerConfig,
     shutdown: ShutdownSignal,
+    drain_coordinator: DrainCoordinator,
 ) -> Result<(), RnshError> {
-    run_rnsh_listener_inner(transport_tx, cfg, Some(shutdown)).await
+    run_rnsh_listener_inner(transport_tx, cfg, Some(shutdown), Some(drain_coordinator)).await
 }
 
 async fn run_rnsh_listener_inner(
     transport_tx: mpsc::Sender<TransportMessage>,
     cfg: RnshListenerConfig,
     shutdown: Option<ShutdownSignal>,
+    drain_coordinator: Option<DrainCoordinator>,
 ) -> Result<(), RnshError> {
     let signing_key = cfg
         .identity
@@ -202,9 +210,24 @@ async fn run_rnsh_listener_inner(
         });
     }
 
-    let manager_task = tokio::spawn(async move {
-        link_mgr.run_with_commands(command_rx).await;
-    });
+    // Own signal, independent of the caller-supplied `shutdown: Option<..>`
+    // above: this loop already funnels every exit (the external signal firing
+    // *or* any of its own channels closing) into the single
+    // `LinkManagerCommand::Shutdown` send below, so triggering this signal at
+    // that same point covers all of them uniformly, whether or not the
+    // caller passed one in.
+    let manager_shutdown = ShutdownSignal::new();
+    let manager_shutdown_for_task = manager_shutdown.clone();
+    let run = link_mgr.run_with_commands_until_shutdown(
+        command_rx,
+        manager_shutdown_for_task,
+        crate::lifecycle::LINK_MANAGER_DRAIN_GRACE,
+    );
+    let manager_task = if let Some(coordinator) = drain_coordinator {
+        tokio::spawn(coordinator.run_registered(run))
+    } else {
+        tokio::spawn(run)
+    };
 
     if cfg.announce_period.is_some() {
         send_announce(&transport_tx, &cfg.identity, RNSH_APP_NAME).await?;
@@ -300,7 +323,11 @@ async fn run_rnsh_listener_inner(
         }
     }
 
-    let _ = command_tx.send(LinkManagerCommand::Shutdown).await;
+    // Triggers the drain-then-close path in `run_with_commands_until_shutdown`
+    // instead of the old `LinkManagerCommand::Shutdown` send, which hit
+    // `handle_command`'s `Shutdown => false` and returned immediately with no
+    // drain and no explicit LinkClose to peers.
+    manager_shutdown.trigger();
     let _ = manager_task.await;
     Ok(())
 }
@@ -1996,6 +2023,153 @@ fn parse_identity_hash16(input: &str) -> Option<[u8; 16]> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// `rnsh` already had a `ShutdownSignal` in scope and sent
+    /// `LinkManagerCommand::Shutdown` through the command channel on exit --
+    /// which hit `handle_command`'s `Shutdown => false` and returned with no
+    /// drain, no explicit LinkClose. This drives a real Link through the
+    /// actual spawned listener (LinkRequest -> Proof -> LRRTT) to
+    /// `LinkState::Active`, triggers `shutdown`, and proves an explicit
+    /// LinkClose now reaches the transport instead of the remote-shell
+    /// session going silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_drains_an_active_link_instead_of_going_silent() {
+        let identity = Identity::new();
+        let dest_hash = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            RNSH_APP_NAME,
+        )
+        .unwrap()
+        .hash;
+        let identity_pub = identity.get_public_key();
+        let ed25519_bytes: [u8; 32] = identity_pub[32..64].try_into().unwrap();
+        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes).unwrap();
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let shutdown = ShutdownSignal::new();
+        let cfg = RnshListenerConfig {
+            identity: identity.clone(),
+            command: Vec::new(),
+            // Skips the identity gate entirely (only installed when
+            // `!allow_all`) -- this test proves drain-on-shutdown, not the
+            // separate identify/authorize flow.
+            allow_all: true,
+            allowed: Vec::new(),
+            allowed_identity_files: Vec::new(),
+            allow_remote_command: false,
+            remote_command_as_args: false,
+            announce_period: None,
+        };
+        let listener_task = tokio::spawn(run_rnsh_listener_with_shutdown(
+            transport_tx,
+            cfg,
+            shutdown.clone(),
+            DrainCoordinator::new(),
+        ));
+
+        let Some(TransportMessage::RegisterDestination {
+            delivery_tx: Some(dest_tx),
+            ..
+        }) = transport_rx.recv().await
+        else {
+            panic!("expected RegisterDestination with a delivery channel");
+        };
+
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let link_id = initiator.link_id;
+
+        let req_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::LinkRequest,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut req_raw = req_header.pack();
+        req_raw.extend_from_slice(&request_data);
+        dest_tx
+            .send(DestinationEvent::LinkRequest {
+                raw: req_raw.into(),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let Some(TransportMessage::Outbound(proof_msg)) = transport_rx.recv().await else {
+            panic!("expected an outbound LINKPROOF after the LinkRequest");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof_msg.raw).unwrap();
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::Lrproof
+        );
+        let rtt_data = initiator
+            .validate_proof(&proof_msg.raw[proof_offset..], &verify_key, &ed25519_bytes)
+            .unwrap();
+
+        let rtt_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrrtt,
+        };
+        let mut rtt_raw = rtt_header.pack();
+        rtt_raw.extend_from_slice(&rtt_data);
+        dest_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: rtt_raw.into(),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        shutdown.trigger();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut sent_close = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(100), transport_rx.recv()).await {
+                Ok(Some(TransportMessage::Outbound(msg))) => {
+                    if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&msg.raw) {
+                        if header.context == rns_wire::context::PacketContext::LinkClose
+                            && header.destination_hash == link_id
+                        {
+                            sent_close = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert!(
+            sent_close,
+            "shutdown must drain the active Link with an explicit LinkClose, not \
+             leave the session to go silent with no teardown"
+        );
+        listener_task.await.unwrap().unwrap();
+    }
 
     fn spawn_ack_manager(
         mut rx: mpsc::Receiver<LinkManagerCommand>,

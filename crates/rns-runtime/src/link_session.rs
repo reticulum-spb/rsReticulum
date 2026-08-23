@@ -107,7 +107,15 @@ impl LinkListener {
         manager.set_link_closed_channel(closed_tx);
 
         let (command_tx, command_rx) = mpsc::channel(256);
-        tokio::spawn(manager.run_with_commands(command_rx));
+        let manager_shutdown = runtime.shutdown.clone();
+        let drain_coordinator = runtime.drain_coordinator.clone();
+        tokio::spawn(
+            drain_coordinator.run_registered(manager.run_with_commands_until_shutdown(
+                command_rx,
+                manager_shutdown,
+                crate::lifecycle::LINK_MANAGER_DRAIN_GRACE,
+            )),
+        );
 
         let (event_tx, event_rx) = mpsc::channel(256);
         tokio::spawn(async move {

@@ -164,8 +164,13 @@ async fn run_listener(args: Args) -> ExitCode {
         announce_period: args.announce,
     };
 
-    match run_rnsh_listener_with_shutdown(handle.transport_tx.clone(), cfg, handle.shutdown.clone())
-        .await
+    match run_rnsh_listener_with_shutdown(
+        handle.transport_tx.clone(),
+        cfg,
+        handle.shutdown.clone(),
+        handle.drain_coordinator.clone(),
+    )
+    .await
     {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

@@ -167,6 +167,13 @@ pub struct RncpListenerConfig {
     pub fetch_jail: Option<PathBuf>,
     /// Python default on; `--no-compress` disables.
     pub fetch_auto_compress: bool,
+    /// Held for the lifetime of the spawned `LinkManager`'s drain-aware run
+    /// (see [`crate::lifecycle::DrainCoordinator`]), so the runtime's
+    /// transport-actor teardown waits for this listener's `LinkClose`
+    /// traffic to be handed off before its interface can be torn down.
+    /// Defaults to a private, unshared coordinator -- callers that care
+    /// about real shutdown ordering (the CLI) pass the runtime's own.
+    pub drain_coordinator: crate::lifecycle::DrainCoordinator,
 }
 
 impl Default for RncpListenerConfig {
@@ -181,6 +188,7 @@ impl Default for RncpListenerConfig {
             allow_fetch: false,
             fetch_jail: None,
             fetch_auto_compress: true,
+            drain_coordinator: crate::lifecycle::DrainCoordinator::new(),
         }
     }
 }
@@ -188,14 +196,19 @@ impl Default for RncpListenerConfig {
 pub struct RncpListenerHandle {
     pub destination_hash: [u8; 16],
     task: tokio::task::JoinHandle<()>,
+    shutdown: crate::lifecycle::ShutdownSignal,
 }
 
 impl RncpListenerHandle {
     pub fn destination_hash(&self) -> [u8; 16] {
         self.destination_hash
     }
+    /// Triggers a graceful shutdown: the coordination loop and the
+    /// `LinkManager` both observe the same signal, so every active Link gets
+    /// an explicit close and in-flight fetch/push transfers get their drain
+    /// grace, instead of being hard-cut mid-file.
     pub async fn shutdown(self) {
-        self.task.abort();
+        self.shutdown.trigger();
         let _ = self.task.await;
     }
 }
@@ -316,6 +329,7 @@ pub async fn spawn_rncp_listener(
 
     let app_name = cfg.app_name.clone();
     let save_dir = cfg.save_dir.clone();
+    let drain_coordinator = cfg.drain_coordinator.clone();
     let allow_all = cfg.allow_all;
     let allowed: std::collections::HashSet<[u8; 16]> = cfg.allowed.iter().copied().collect();
     let overwrite = cfg.overwrite;
@@ -323,8 +337,23 @@ pub async fn spawn_rncp_listener(
     let events_tx_cb = events_tx.clone();
     let link_control_tx_cb = link_control_tx.clone();
 
+    // Own signal (not threaded in from a caller): `shutdown()` below triggers
+    // it directly, so both the LinkManager's drain and this task's own
+    // coordination loop see the same event regardless of who calls shutdown
+    // or when. Previously `shutdown()` called `self.task.abort()`, which cut
+    // this outer loop immediately (dropping in-flight completions) and left
+    // `lm_task` running orphaned in the background -- `abort()` only cancels
+    // the future it's called on, not tasks spawned from within it, so the
+    // LinkManager kept running detached with no drain and no way to observe
+    // it finishing.
+    let shutdown = crate::lifecycle::ShutdownSignal::new();
+    let lm_shutdown = shutdown.clone();
+    let loop_shutdown = shutdown.clone();
+
     let task = tokio::spawn(async move {
-        let lm_task = tokio::spawn(async move { link_mgr.run().await });
+        let lm_task = tokio::spawn(drain_coordinator.run_registered(
+            link_mgr.run_until_shutdown(lm_shutdown, crate::lifecycle::LINK_MANAGER_DRAIN_GRACE),
+        ));
 
         let mut denied_links: std::collections::HashSet<[u8; 16]> = Default::default();
 
@@ -387,6 +416,7 @@ pub async fn spawn_rncp_listener(
                         }
                     }
                 }
+                _ = loop_shutdown.wait() => break,
             }
         }
 
@@ -402,6 +432,7 @@ pub async fn spawn_rncp_listener(
     Ok(RncpListenerHandle {
         destination_hash: dest_hash,
         task,
+        shutdown,
     })
 }
 
@@ -1360,7 +1391,10 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 
                 if let Some(rh) = completed_rh {
                     let (payload, proof, metadata, resource_hash) = match transfers.get_mut(&rh) {
-                        Some(t) => match t.complete(Some(&decrypt_fn)) {
+                        // `transfer_flags.has_metadata` above is already
+                        // cleared for segment_index > 1, so the resource's
+                        // own flag already reflects whether to strip here.
+                        Some(t) => match t.complete(Some(&decrypt_fn), true) {
                             Ok((payload, proof)) => (
                                 payload,
                                 proof,
@@ -1514,6 +1548,145 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RncpListenerHandle::shutdown()` used to `self.task.abort()` -- a hard
+    /// abort of the outer coordination loop that also left `lm_task` (the
+    /// actual `LinkManager`, spawned separately inside) running orphaned in
+    /// the background, since aborting a future doesn't cancel tasks it
+    /// spawned. This drives a real Link through the actual spawned listener
+    /// (LinkRequest -> Proof -> LRRTT) to `LinkState::Active`, calls the
+    /// public `shutdown()`, and proves an explicit LinkClose reaches the
+    /// transport instead of the file-transfer Link being cut mid-session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_drains_an_active_link_instead_of_aborting_it() {
+        let identity = Identity::new();
+        let app_name = DEFAULT_RNCP_APP_NAME.to_string();
+        let dest_hash =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, &app_name)
+                .unwrap()
+                .hash;
+        let identity_pub = identity.get_public_key();
+        let ed25519_bytes: [u8; 32] = identity_pub[32..64].try_into().unwrap();
+        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes).unwrap();
+
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let cfg = RncpListenerConfig {
+            identity: identity.clone(),
+            app_name: app_name.clone(),
+            ..Default::default()
+        };
+        let handle = spawn_rncp_listener(transport_tx, cfg, events_tx)
+            .await
+            .unwrap();
+        assert_eq!(handle.destination_hash(), dest_hash);
+
+        let Some(TransportMessage::RegisterDestination {
+            delivery_tx: Some(dest_tx),
+            ..
+        }) = transport_rx.recv().await
+        else {
+            panic!("expected RegisterDestination with a delivery channel");
+        };
+
+        let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
+        let link_id = initiator.link_id;
+
+        let req_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::LinkRequest,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut req_raw = req_header.pack();
+        req_raw.extend_from_slice(&request_data);
+        dest_tx
+            .send(DestinationEvent::LinkRequest {
+                raw: req_raw.into(),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let Some(TransportMessage::Outbound(proof_msg)) = transport_rx.recv().await else {
+            panic!("expected an outbound LINKPROOF after the LinkRequest");
+        };
+        let (proof_header, proof_offset) =
+            rns_wire::header::PacketHeader::unpack(&proof_msg.raw).unwrap();
+        assert_eq!(
+            proof_header.context,
+            rns_wire::context::PacketContext::Lrproof
+        );
+        let rtt_data = initiator
+            .validate_proof(&proof_msg.raw[proof_offset..], &verify_key, &ed25519_bytes)
+            .unwrap();
+
+        let rtt_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrrtt,
+        };
+        let mut rtt_raw = rtt_header.pack();
+        rtt_raw.extend_from_slice(&rtt_data);
+        dest_tx
+            .send(DestinationEvent::InboundPacket {
+                raw: rtt_raw.into(),
+                interface_id: 1,
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // `shutdown()` takes `self` and awaits completion -- run it
+        // concurrently with draining `transport_rx` so it can't deadlock
+        // against a transport channel this test isn't otherwise servicing.
+        let shutdown_task = tokio::spawn(handle.shutdown());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut sent_close = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), transport_rx.recv())
+                .await
+            {
+                Ok(Some(TransportMessage::Outbound(msg))) => {
+                    if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(&msg.raw) {
+                        if header.context == rns_wire::context::PacketContext::LinkClose
+                            && header.destination_hash == link_id
+                        {
+                            sent_close = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        assert!(
+            sent_close,
+            "shutdown() must drain the active Link with an explicit LinkClose, not \
+             hard-abort with the LinkManager left running detached"
+        );
+        shutdown_task.await.unwrap();
+    }
 
     #[test]
     fn metadata_roundtrip() {

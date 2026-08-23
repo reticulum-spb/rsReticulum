@@ -658,12 +658,22 @@ impl InboundResource {
     ///
     /// Steps: concatenate parts → optional decrypt → strip random hash →
     /// decompress (bounded by `MAX_EFFICIENT_SIZE` to stop decompression
-    /// bombs) → verify hash → split off metadata if `flags.has_metadata`.
+    /// bombs) → verify hash → split off metadata if `strip_metadata`.
     /// The extracted metadata is stashed in `self.metadata` and the return
     /// value is the payload only.
+    ///
+    /// `strip_metadata` is passed in rather than read from
+    /// `self.flags.has_metadata` directly because a multi-segment transfer
+    /// advertises that flag on *every* segment (matching Python
+    /// `Resource.__prepare_next_segment`'s `sent_metadata_size`, so a real
+    /// client recognises whichever segment concludes the transfer as a file
+    /// response) while the metadata bytes are only ever physically embedded
+    /// in segment 1's payload. Stripping unconditionally on the flag would
+    /// chop real data off the front of every later segment.
     pub fn assemble(
         &mut self,
         decrypt_fn: Option<&ResourceDecryptor<'_>>,
+        strip_metadata: bool,
     ) -> Result<Vec<u8>, ResourceError> {
         if !self.is_complete() {
             return Err(ResourceError::Incomplete);
@@ -701,7 +711,7 @@ impl InboundResource {
             return Err(ResourceError::HashMismatch);
         }
 
-        let payload = if self.flags.has_metadata {
+        let payload = if strip_metadata {
             if final_data.len() < 3 {
                 self.state = ResourceState::Corrupt;
                 return Err(ResourceError::InvalidMetadata {
@@ -885,6 +895,20 @@ impl MultiSegmentOutbound {
             )?;
             resource.flags.split = true;
             resource.flags.is_response = is_response;
+            // Metadata bytes are only ever physically embedded in segment 1's
+            // payload (via `segment_metadata` above), but the advertised flag
+            // must be set on every segment -- matching Python's
+            // `sent_metadata_size` propagation in
+            // `Resource.__prepare_next_segment`, which forces
+            // `has_metadata=True` on every later segment even though only
+            // the first carries the bytes. A real client checks
+            // `resource.has_metadata` on whichever segment concludes the
+            // transfer (not necessarily the first), and without this, a file
+            // response arrives with the flag false on that segment: the
+            // client then tries to msgpack-unpack the raw reassembled file
+            // as a `[request_id, data]` envelope and fails or hangs instead
+            // of using the bytes directly.
+            resource.flags.has_metadata = metadata.is_some();
             resource.segment_index = i + 1;
             resource.total_segments = total_segments;
             resource.request_id = request_id.clone();
@@ -992,7 +1016,8 @@ impl MultiSegmentInbound {
         }
         let idx = segment_index - 1;
         if let Some(ref mut resource) = self.segments[idx] {
-            let data = resource.assemble(decrypt_fn)?;
+            let strip_metadata = resource.flags.has_metadata && segment_index == 1;
+            let data = resource.assemble(decrypt_fn, strip_metadata)?;
             self.assembled_segments[idx] = Some(data);
             Ok(())
         } else {
@@ -1183,10 +1208,12 @@ impl LinkResource {
             } else {
                 None
             };
-        self.inbound
-            .as_mut()
-            .ok_or(ResourceError::Incomplete)?
-            .assemble(decrypt_fn.as_deref())
+        let inbound = self.inbound.as_mut().ok_or(ResourceError::Incomplete)?;
+        // `LinkResource` wraps a single, non-split transfer -- it is always
+        // "segment 1 of 1", so metadata (if the flag is set at all) is
+        // always stripped here.
+        let strip_metadata = inbound.flags.has_metadata;
+        inbound.assemble(decrypt_fn.as_deref(), strip_metadata)
     }
 
     /// Inbound progress in `0.0..=1.0`. Outbound transfers report 0.0
@@ -2238,12 +2265,17 @@ impl InboundTransfer {
     /// `prove()` runs. `assemble()` strips metadata from the value it
     /// returns to callers, so we reconstruct the pre-strip bytes here
     /// before hashing.
+    /// `is_first_segment` gates metadata stripping -- see
+    /// [`InboundResource::assemble`]. Always `true` for a non-split
+    /// resource, where "segment 1" is the whole and only transfer.
     pub fn complete(
         &mut self,
         decrypt_fn: Option<&ResourceDecryptor<'_>>,
+        is_first_segment: bool,
     ) -> Result<(Vec<u8>, Vec<u8>), ResourceError> {
-        let data = self.resource.assemble(decrypt_fn)?;
-        let proof_input: Vec<u8> = if self.resource.flags.has_metadata {
+        let strip_metadata = self.resource.flags.has_metadata && is_first_segment;
+        let data = self.resource.assemble(decrypt_fn, strip_metadata)?;
+        let proof_input: Vec<u8> = if strip_metadata {
             if let Some(ref meta) = self.resource.metadata {
                 let mut full = Vec::with_capacity(3 + meta.len() + data.len());
                 let len = meta.len();
@@ -2390,7 +2422,7 @@ mod tests {
         assert!(inbound.is_complete());
 
         // Assemble
-        let assembled = inbound.assemble(None).unwrap();
+        let assembled = inbound.assemble(None, inbound.flags.has_metadata).unwrap();
         assert_eq!(assembled, data);
     }
 
@@ -2430,7 +2462,7 @@ mod tests {
         }
 
         assert!(inbound.is_complete());
-        let assembled = inbound.assemble(None).unwrap();
+        let assembled = inbound.assemble(None, inbound.flags.has_metadata).unwrap();
         assert_eq!(assembled, data, "reassembled data matches despite reorder");
     }
 
@@ -2468,7 +2500,10 @@ mod tests {
             assert!(inbound.receive_part(part.clone()));
         }
         assert!(inbound.is_complete());
-        assert_eq!(inbound.assemble(None).unwrap(), data);
+        assert_eq!(
+            inbound.assemble(None, inbound.flags.has_metadata).unwrap(),
+            data
+        );
     }
 
     #[test]
@@ -2553,7 +2588,7 @@ mod tests {
 
         assert!(inbound.is_complete());
 
-        let assembled_data = inbound.assemble(None).unwrap();
+        let assembled_data = inbound.assemble(None, inbound.flags.has_metadata).unwrap();
         assert_eq!(assembled_data, data);
         assert!(inbound.metadata.is_some());
         assert_eq!(inbound.metadata.unwrap(), metadata);
@@ -2826,7 +2861,7 @@ mod tests {
         assert!(inbound.resource.is_complete());
 
         // Complete and verify
-        let (assembled, proof) = inbound.complete(None).unwrap();
+        let (assembled, proof) = inbound.complete(None, true).unwrap();
         assert_eq!(assembled, data);
         assert_eq!(proof.len(), 64); // resource_hash(32) + expected_proof(32)
     }
@@ -3043,7 +3078,7 @@ mod tests {
 
         // Step 4: Receiver completes and sends proof
         assert!(receiver.resource.is_complete());
-        let (assembled, proof) = receiver.complete(None).unwrap();
+        let (assembled, proof) = receiver.complete(None, true).unwrap();
         assert_eq!(assembled, data);
 
         // Step 5: Sender validates proof
@@ -3109,7 +3144,7 @@ mod tests {
         );
 
         // Assemble and verify
-        let (assembled, proof) = receiver.complete(None).unwrap();
+        let (assembled, proof) = receiver.complete(None, true).unwrap();
         assert_eq!(assembled.len(), data_len);
         assert_eq!(assembled, data);
 
@@ -3201,7 +3236,7 @@ mod tests {
             receiver.receive_part(part.clone());
         }
         assert!(receiver.resource.is_complete());
-        let (assembled, _proof) = receiver.complete(None).unwrap();
+        let (assembled, _proof) = receiver.complete(None, true).unwrap();
         assert_eq!(assembled, data);
     }
 
@@ -3672,7 +3707,12 @@ mod tests {
             multi_out.segments[0].metadata_size + multi_out.segments[0].data.len()
                 <= MAX_EFFICIENT_SIZE
         );
-        assert!(!multi_out.segments[1].flags.has_metadata);
+        // The *flag* is carried on every segment -- matching Python
+        // Resource.__prepare_next_segment's sent_metadata_size, which lets a
+        // real client recognise whichever segment concludes the transfer as
+        // a file response -- even though the metadata *bytes* are only ever
+        // physically embedded in segment 1's payload (asserted above).
+        assert!(multi_out.segments[1].flags.has_metadata);
 
         let total_segments = multi_out.total_segments;
         let original_hash = multi_out.original_hash;
@@ -3694,7 +3734,7 @@ mod tests {
                 let _ = inbound.receive_part(part.clone());
             }
             assert!(inbound.resource.is_complete());
-            let (payload, proof) = inbound.complete(None).unwrap();
+            let (payload, proof) = inbound.complete(None, segment.segment_index == 1).unwrap();
             assert!(segment.validate_proof(&proof));
             if let Some(meta) = inbound.resource.metadata.clone() {
                 multi_in.set_metadata(meta);
@@ -3706,6 +3746,58 @@ mod tests {
 
         assert_eq!(multi_in.metadata, Some(metadata));
         assert_eq!(multi_in.reassemble().unwrap(), original);
+    }
+
+    /// The bug this whole fix addresses: without `is_first_segment` gating
+    /// the strip, segment 2 -- which now correctly advertises
+    /// `has_metadata=true` too -- would have 3 bytes chopped off its own
+    /// real data (interpreted as a bogus length prefix), corrupting the
+    /// reassembled payload even though every byte arrived intact on the
+    /// wire.
+    #[test]
+    fn only_the_first_segment_strips_its_metadata_prefix() {
+        let original = vec![0xB3; MAX_EFFICIENT_SIZE + 500];
+        let metadata = b"\x81\xa4name\xa8file.bin".to_vec();
+        let multi_out = MultiSegmentOutbound::with_options(
+            original.clone(),
+            false,
+            Some(metadata),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let mut multi_in =
+            MultiSegmentInbound::new(multi_out.total_segments, multi_out.original_hash);
+        for segment in multi_out.segments {
+            let mut inbound = InboundTransfer::from_advertisement(
+                segment.num_parts(),
+                segment.total_size,
+                segment.data.len(),
+                segment.random_hash,
+                segment.resource_hash,
+                segment.flags,
+                segment.map_hashes.clone(),
+                Duration::from_millis(500),
+            )
+            .unwrap();
+            for part in &segment.parts {
+                let _ = inbound.receive_part(part.clone());
+            }
+            // Every segment's own advertisement says has_metadata=true now.
+            assert!(inbound.resource.flags.has_metadata);
+            let (payload, _proof) = inbound.complete(None, segment.segment_index == 1).unwrap();
+            multi_in
+                .set_segment_data(segment.segment_index, payload)
+                .unwrap();
+        }
+
+        assert_eq!(
+            multi_in.reassemble().unwrap(),
+            original,
+            "segment 2's data must arrive intact, not short by a false metadata prefix"
+        );
     }
 
     #[test]
@@ -4416,7 +4508,7 @@ mod tests {
         );
 
         // Complete and verify integrity
-        let (assembled, proof) = receiver.complete(None).unwrap();
+        let (assembled, proof) = receiver.complete(None, true).unwrap();
         assert_eq!(assembled, data);
         assert!(sender.handle_proof(&proof));
     }
@@ -4489,7 +4581,10 @@ mod tests {
         }
 
         assert!(inbound.resource.is_complete());
-        let assembled = inbound.resource.assemble(None).unwrap();
+        let assembled = inbound
+            .resource
+            .assemble(None, inbound.resource.flags.has_metadata)
+            .unwrap();
         assert_eq!(assembled, data);
     }
 
