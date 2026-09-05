@@ -1923,6 +1923,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full")]
     #[test]
     fn plugin_config_is_opaque_to_core() {
         let yaml = "interfaces:\n  - type: plugin\n    name: LoRa\n    plugin: sx1262\n    config:\n      reset_pin: 12\n      modulation:\n        spreading_factor: 9\n";

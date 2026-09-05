@@ -828,9 +828,10 @@ impl TransportActor {
                     match crate::persistence::load_announce_cache_legacy_v5(&announce_path) {
                         Ok(legacy) => {
                             let announce_cache_dir = dir.join("cache").join("announces");
-                            let migrated = crate::persistence::migrate_legacy_announce_entries(
+                            let migrated = crate::persistence::convert_legacy_announce_entries(
                                 legacy,
-                                &announce_cache_dir,
+                                (!self.shared_instance_client_mode)
+                                    .then_some(announce_cache_dir.as_path()),
                             );
                             debug!(
                                 count = migrated.len(),

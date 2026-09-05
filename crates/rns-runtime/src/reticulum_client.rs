@@ -329,10 +329,40 @@ pub async fn connect_shared(
     shutdown: ShutdownSignal,
     is_foreground: Arc<AtomicBool>,
 ) -> Result<ReticulumHandle, ReticulumError> {
+    init_with_options(
+        configdir,
+        socket_dir,
+        shutdown,
+        is_foreground,
+        Default::default(),
+    )
+    .await
+}
+
+pub async fn init_with_options(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: crate::client_options::ClientOptions,
+) -> Result<ReticulumHandle, ReticulumError> {
     if INSTANCE.get().is_some() {
         return Err(ReticulumError::AlreadyInitialized);
     }
 
+    let handle =
+        connect_shared_inner(configdir, socket_dir, shutdown, is_foreground, options).await?;
+    let _ = INSTANCE.set(handle.clone());
+    Ok(handle)
+}
+
+async fn connect_shared_inner(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: crate::client_options::ClientOptions,
+) -> Result<ReticulumHandle, ReticulumError> {
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
@@ -353,21 +383,30 @@ pub async fn connect_shared(
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     actor.is_foreground = is_foreground.clone();
-    actor.initialize_storage(paths.storage_dir.clone());
+    actor.shared_instance_client_mode = true;
+    actor.client_announce_policy = options.announce_policy;
+    if actor.shared_instance_client_mode
+        && options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::Requested
+    {
+        actor.packet_hashlist = rns_transport::hashlist::PacketHashlist::new_with_capacity(4096);
+    }
+    if options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::All {
+        actor.initialize_storage(paths.storage_dir.clone());
+    }
     tokio::spawn(async move { actor.run().await });
 
     let identity_path = paths.storage_dir.join("transport_identity");
-    let identity =
-        rns_identity::identity::Identity::from_file(&identity_path).unwrap_or_else(|_| {
-            let identity = rns_identity::identity::Identity::new();
-            let _ = identity.to_file(&identity_path);
-            identity
-        });
+    let persisted_identity = rns_identity::identity::Identity::from_file(&identity_path).ok();
+    let identity = persisted_identity
+        .clone()
+        .unwrap_or_else(rns_identity::identity::Identity::new);
     let _ = transport_tx.try_send(TransportMessage::SetTransportIdentity {
         identity_hash: identity.hash,
     });
     if config.rpc_key.is_none()
-        && let Some(private_key) = identity.get_private_key()
+        && let Some(private_key) = persisted_identity
+            .as_ref()
+            .and_then(|id| id.get_private_key())
     {
         config.rpc_key = Some(crate::rpc::derive_rpc_key(&*private_key).to_vec());
     }
@@ -394,7 +433,7 @@ pub async fn connect_shared(
                 socket_path: shared_instance_socket_path(&config.instance_name, &socket_base),
                 name: "SharedInstanceClient".to_string(),
             };
-            rns_interface::local::spawn_local_client(
+            rns_interface::local::spawn_reconnecting_local_client(
                 interface_config,
                 interface_id,
                 transport_tx.clone(),
@@ -404,7 +443,14 @@ pub async fn connect_shared(
         }
     };
 
+    let client_online = interface.online.clone();
     register_shared_interface(&transport_tx, interface).await?;
+    crate::shared_client::spawn_shared_peer_monitor(
+        transport_tx.clone(),
+        interface_id,
+        client_online,
+        shutdown.clone(),
+    );
     let (handle_tx, _handle_rx) = mpsc::channel(1);
     let shutdown_tx = transport_tx.clone();
     let shutdown_wait = shutdown.clone();
@@ -427,7 +473,6 @@ pub async fn connect_shared(
         transport_identity: Arc::new(identity),
         network_identity: None,
     };
-    let _ = INSTANCE.set(handle.clone());
     Ok(handle)
 }
 
@@ -621,5 +666,123 @@ mod tests {
             )
             .is_err()
         );
+    }
+    fn snapshot_files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(snapshot_files(&path));
+            } else {
+                files.insert(path.clone(), std::fs::read(path).unwrap());
+            }
+        }
+        files
+    }
+
+    #[tokio::test]
+    async fn strict_client_preserves_owner_files_and_receives_lxmf_announces() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir =
+            std::env::temp_dir().join(format!("rns-strict-client-{}-{port}", std::process::id()));
+        let paths = StoragePaths::from_config_dir(&dir);
+        paths.ensure_dirs().unwrap();
+        std::fs::write(dir.join(crate::config::CONFIG_FILE_NAME), format!(
+            "reticulum:\n  shared_instance_type: tcp\n  shared_instance_port: {port}\ninterfaces: []\n"
+        )).unwrap();
+        let identity = rns_identity::identity::Identity::new();
+        let (dest, raw) = crate::application::build_announce_packet(
+            &identity,
+            "lxmf.delivery",
+            Some(b"peer"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // A legacy v5 cache exercises the migration path: clients may recall
+        // its metadata, but must never materialise the embedded packet files.
+        let cached = rmpv::Value::Array(vec![
+            rmpv::Value::Array(vec![rmpv::Value::Array(vec![
+                rmpv::Value::Binary(dest.to_vec()),
+                1.into(),
+                rmpv::Value::Binary(b"peer".to_vec()),
+                rmpv::Value::F64(rns_transport::now_f64()),
+                rmpv::Value::Binary(identity.get_public_key().to_vec()),
+                rmpv::Value::Nil,
+                rmpv::Value::Binary(raw.clone()),
+                true.into(),
+                rmpv::Value::Binary(rns_identity::name_hash::name_hash("lxmf.delivery").to_vec()),
+            ])]),
+            5.into(),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &cached).unwrap();
+        std::fs::write(paths.storage_dir.join("announce_cache.msgpack"), bytes).unwrap();
+        let before = snapshot_files(&dir);
+        let shutdown = ShutdownSignal::new();
+        let handle = connect_shared_inner(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let (probe, _) = listener.accept().await.unwrap();
+        drop(probe);
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.instance_mode, InstanceMode::Client);
+        assert!(matches!(
+            handle
+                .query_transport(TransportQuery::Recall {
+                    destination_hash: dest
+                })
+                .await,
+            Some(TransportQueryResponse::Announce(Some(_)))
+        ));
+        let (events, mut rx) = mpsc::channel(4);
+        handle
+            .transport_tx
+            .send(TransportMessage::RegisterAnnounceHandler {
+                aspect_filter: Some("lxmf.delivery".into()),
+                receive_path_responses: true,
+                callback_tx: events,
+            })
+            .await
+            .unwrap();
+        // Barrier for registration and initial reconnect event.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        stream
+            .write_all(&rns_interface::hdlc::frame(&raw))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.destination_hash, dest);
+        assert_eq!(event.public_key, Some(identity.get_public_key()));
+        assert_eq!(event.app_data.as_deref(), Some(b"peer".as_slice()));
+        // Two ticks are sufficient to trigger the old initial periodic save.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(snapshot_files(&dir), before);
+        shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), handle.transport_tx.closed())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot_files(&dir),
+            before,
+            "shutdown must not write the daemon's storage"
+        );
+        drop(stream);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

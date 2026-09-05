@@ -133,7 +133,7 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
 
 async fn local_write_loop<W: AsyncWriteExt + Unpin>(
     mut writer: W,
-    mut rx: mpsc::Receiver<Bytes>,
+    rx: &mut mpsc::Receiver<Bytes>,
     online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
 ) {
@@ -167,16 +167,19 @@ where
     let online = Arc::new(AtomicBool::new(true));
     let rxb = Arc::new(AtomicU64::new(0));
     let txb = Arc::new(AtomicU64::new(0));
-    let (tx, rx) = mpsc::channel::<Bytes>(256);
-
-    tokio::spawn(local_write_loop(writer, rx, online.clone(), txb.clone()));
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
 
     let online_r = online.clone();
     let rxb_r = rxb.clone();
     let task_name = name.clone();
     let dereg_tx = transport_tx.clone();
+    let online_w = online.clone();
+    let txb_w = txb.clone();
     let read_task = tokio::spawn(async move {
-        local_read_loop(reader, id, transport_tx, online_r, rxb_r).await;
+        tokio::select! {
+            _ = local_read_loop(reader, id, transport_tx, online_r, rxb_r) => {},
+            _ = local_write_loop(writer, &mut rx, online_w, txb_w) => {},
+        }
         if dereg_on_disconnect {
             tracing::info!(name = %task_name, "local client disconnected");
             // Proactively notify so transport drops immediately.
@@ -353,6 +356,12 @@ mod platform {
         Ok(server_listener_handle(name, online, tx, read_task))
     }
 
+    pub(super) async fn connect_client_stream(
+        config: &LocalClientConfig,
+    ) -> Result<UnixStream, crate::traits::InterfaceError> {
+        Ok(connect_unix_stream(&config.socket_path).await?)
+    }
+
     pub async fn spawn_local_client_impl(
         config: LocalClientConfig,
         id: InterfaceId,
@@ -441,6 +450,12 @@ mod platform {
         Ok(server_listener_handle(name, online, tx, read_task))
     }
 
+    pub(super) async fn connect_client_stream(
+        config: &LocalClientConfig,
+    ) -> Result<TcpStream, crate::traits::InterfaceError> {
+        Ok(TcpStream::connect(fallback_tcp_addr(&config.socket_path)).await?)
+    }
+
     pub async fn spawn_local_client_impl(
         config: LocalClientConfig,
         id: InterfaceId,
@@ -492,6 +507,76 @@ pub async fn spawn_local_client(
     platform::spawn_local_client_impl(config, id, transport_tx).await
 }
 
+/// Shared-instance connection with a stable interface id, TX channel and
+/// counters across daemon restarts. The first connection must succeed.
+pub async fn spawn_reconnecting_local_client(
+    config: LocalClientConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let mut stream = platform::connect_client_stream(&config).await?;
+    let online = Arc::new(AtomicBool::new(true));
+    let rxb = Arc::new(AtomicU64::new(0));
+    let txb = Arc::new(AtomicU64::new(0));
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+    let task_online = online.clone();
+    let task_rxb = rxb.clone();
+    let task_txb = txb.clone();
+    let name = config.name.clone();
+    let read_task = tokio::spawn(async move {
+        loop {
+            let (reader, writer) = stream.into_split();
+            task_online.store(true, Ordering::SeqCst);
+            tokio::select! {
+                _ = local_read_loop(reader, id, transport_tx.clone(), task_online.clone(), task_rxb.clone()) => {},
+                _ = local_write_loop(writer, &mut rx, task_online.clone(), task_txb.clone()) => {},
+            }
+            task_online.store(false, Ordering::SeqCst);
+            let mut backoff = 1;
+            loop {
+                if rx.is_closed() || transport_tx.is_closed() {
+                    return;
+                }
+                // Do not replay packets for links that belonged to the old
+                // connection. Runtime requests fresh local announces on restore.
+                while rx.try_recv().is_ok() {}
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                match platform::connect_client_stream(&config).await {
+                    Ok(connected) => {
+                        // Also discard packets queued while we were offline.
+                        while rx.try_recv().is_ok() {}
+                        stream = connected;
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(name = %config.name, %error, "shared socket reconnect failed");
+                        backoff = (backoff * 2).min(5);
+                    }
+                }
+            }
+        }
+    });
+    Ok(InterfaceHandle {
+        id,
+        parent_id: None,
+        name,
+        mode: InterfaceMode::Full,
+        direction: InterfaceDirection {
+            inbound: true,
+            outbound: true,
+            forward: false,
+            repeat: false,
+        },
+        bitrate: 1_000_000_000,
+        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        online,
+        rxb: Some(rxb),
+        txb: Some(txb),
+        tx,
+        read_task,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +602,64 @@ mod tests {
             drop(listener);
             format!("tcp://127.0.0.1:{port}")
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_local_client_reconnects_with_stable_channel_and_counters() {
+        use tokio::io::AsyncWriteExt;
+        let path = unique_test_socket_path("rns-reconnect");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (transport, mut packets) = mpsc::channel(16);
+        let handle = spawn_reconnecting_local_client(
+            LocalClientConfig {
+                socket_path: path.clone(),
+                name: "shared test".into(),
+            },
+            77,
+            transport,
+        )
+        .await
+        .unwrap();
+        let (mut first, _) = listener.accept().await.unwrap();
+        first.write_all(&hdlc::frame(b"first")).await.unwrap();
+        let packet = packets.recv().await.unwrap();
+        assert!(
+            matches!(packet, TransportMessage::Inbound(p) if p.interface_id == 77 && &p.raw[..] == b"first")
+        );
+        let before = handle.rxb.as_ref().unwrap().load(Ordering::Relaxed);
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while handle.online.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (mut second, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        second.write_all(&hdlc::frame(b"second")).await.unwrap();
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(1), packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(packet, TransportMessage::Inbound(p) if p.interface_id == 77 && &p.raw[..] == b"second")
+        );
+        assert!(handle.online.load(Ordering::SeqCst));
+        assert!(handle.rxb.as_ref().unwrap().load(Ordering::Relaxed) > before);
+        handle.tx.send(Bytes::from_static(b"reply")).await.unwrap();
+        let mut buf = [0; 128];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), second.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], &hdlc::frame(b"reply"));
+        handle.read_task.abort();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

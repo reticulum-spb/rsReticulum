@@ -2,6 +2,39 @@ use super::*;
 use crate::now_f64;
 
 impl TransportActor {
+    fn client_wants_announce(
+        &self,
+        header: &rns_wire::header::PacketHeader,
+        payload: &[u8],
+    ) -> bool {
+        let dest = &header.destination_hash;
+        if self.local_destinations.contains(dest)
+            || self.path_requests.contains_key(dest)
+            || self.path_waiters.contains_key(dest)
+            || self.recent_announces.get(dest).is_some_and(|a| a.retained)
+        {
+            return true;
+        }
+        self.announce_handlers.iter().any(|handler| {
+            if handler.tx.is_closed() {
+                return false;
+            }
+            if header.context == rns_wire::context::PacketContext::PathResponse
+                && !handler.receive_path_responses
+            {
+                return false;
+            }
+            match &handler.aspect_filter {
+                None => true,
+                // The name hash follows the 64-byte public identity key.
+                Some(aspect) => {
+                    payload.get(64..74)
+                        == Some(rns_identity::name_hash::name_hash(aspect).as_slice())
+                }
+            }
+        })
+    }
+
     #[tracing::instrument(
         level = "trace",
         name = "actor.on_inbound",
@@ -59,6 +92,17 @@ impl TransportActor {
                 interface_id = packet.interface_id,
                 "inbound packet dropped: invalid hop count"
             );
+            return;
+        }
+
+        // An opt-in server client does not accumulate unrelated network state.
+        // This admission filter runs before dedup and signature work; admitted
+        // packets still go through the ordinary validation below.
+        if self.shared_instance_client_mode
+            && self.client_announce_policy == ClientAnnouncePolicy::Requested
+            && parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
+            && !self.client_wants_announce(&parsed, &raw[data_offset..])
+        {
             return;
         }
 

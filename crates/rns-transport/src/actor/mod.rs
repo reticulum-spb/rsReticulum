@@ -34,6 +34,15 @@ mod rpc;
 /// task. The single-owner model means the hot path has no shared state and no
 /// locks — callers drive the actor by sending typed commands rather than
 /// reaching into the tables directly.
+/// Announces retained by a shared client. Routing owners always learn all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClientAnnouncePolicy {
+    #[default]
+    All,
+    /// Learn explicitly requested destinations and registered announce aspects.
+    Requested,
+}
+
 pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
 
@@ -87,6 +96,7 @@ pub struct TransportActor {
     pub path_waiters: HashMap<[u8; 16], Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>,
 
     last_tables_cull: f64,
+    last_memory_report: f64,
     last_links_check: f64,
     last_receipts_check: f64,
     last_announces_check: f64,
@@ -142,6 +152,7 @@ pub struct TransportActor {
     /// after a shared connection drops so shutdown cannot persist an empty
     /// local routing table over the real shared instance's cache.
     pub shared_instance_client_mode: bool,
+    pub client_announce_policy: ClientAnnouncePolicy,
 
     pub storage_dir: Option<PathBuf>,
 
@@ -240,7 +251,40 @@ pub struct PacketMetrics {
     pub q: Option<f32>,
 }
 
+/// Aggregate live state for low-allocation diagnostics. Counts are not RSS;
+/// allocator capacity and runtime stacks must be measured at the process level.
+#[derive(Debug, Clone, Copy)]
+pub struct TransportMemoryStats {
+    pub paths: usize,
+    pub announces: usize,
+    pub announce_app_data_bytes: usize,
+    pub packet_hashes: usize,
+    pub links: usize,
+    pub receipts: usize,
+    pub interfaces: usize,
+    pub path_waiters: usize,
+    pub queued_messages: usize,
+}
+
 impl TransportActor {
+    pub fn memory_stats(&self) -> TransportMemoryStats {
+        TransportMemoryStats {
+            paths: self.path_table.len(),
+            announces: self.recent_announces.len(),
+            announce_app_data_bytes: self
+                .recent_announces
+                .values()
+                .map(|a| a.app_data.as_ref().map_or(0, Vec::len))
+                .sum(),
+            packet_hashes: self.packet_hashlist.len(),
+            links: self.link_table.len(),
+            receipts: self.receipt_table.len(),
+            interfaces: self.interfaces.len(),
+            path_waiters: self.path_waiters.values().map(Vec::len).sum(),
+            queued_messages: self.rx.len(),
+        }
+    }
+
     pub fn new() -> (Self, mpsc::Sender<TransportMessage>) {
         Self::new_with_capacity(4096, HASHLIST_MAXSIZE)
     }
@@ -282,6 +326,7 @@ impl TransportActor {
             path_states: HashMap::new(),
             path_waiters: HashMap::new(),
             last_tables_cull: 0.0,
+            last_memory_report: 0.0,
             last_links_check: 0.0,
             last_receipts_check: 0.0,
             last_announces_check: 0.0,
@@ -300,6 +345,7 @@ impl TransportActor {
             blackholed_snapshot: Arc::new(std::sync::RwLock::new(HashSet::new())),
             is_shared_instance: false,
             shared_instance_client_mode: false,
+            client_announce_policy: ClientAnnouncePolicy::All,
             storage_dir: None,
             last_state_save: 0.0,
             state_dirty: false,
@@ -1524,6 +1570,78 @@ mod tests {
         InboundPacket, InterfaceEntry, OutboundRequest, TransportQuery, TransportQueryResponse,
     };
     use crate::path_table::PathEntry;
+
+    #[test]
+    fn requested_client_filters_before_dedup_but_preserves_subscriptions_and_requests() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.shared_instance_client_mode = true;
+        actor.client_announce_policy = ClientAnnouncePolicy::Requested;
+        let (mut iface, _rx) = make_test_interface("SharedInstanceClient");
+        iface.role = InterfaceRole::SharedInstancePeer;
+        actor.handle_message(TransportMessage::RegisterInterface {
+            id: 1,
+            entry: iface,
+        });
+        for _ in 0..64 {
+            let (raw, _) = make_valid_announce("unrelated.application", 1);
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+        }
+        assert!(actor.path_table.is_empty());
+        assert!(actor.packet_hashlist.is_empty());
+        assert!(actor.recent_announces.is_empty());
+        let (events, mut rx) = mpsc::channel(4);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: Some("lxmf.delivery".into()),
+            receive_path_responses: true,
+            callback_tx: events,
+        });
+        let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.path_table.has_path(&dest));
+        assert_eq!(rx.try_recv().unwrap().destination_hash, dest);
+        let (raw, requested) = make_valid_announce("nomadnetwork.node", 1);
+        actor.handle_message(TransportMessage::RequestPath {
+            destination_hash: requested,
+        });
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.path_table.has_path(&requested));
+        assert!(actor.recent_announces.contains_key(&requested));
+
+        // Expiry is an opt-in client policy. Pins and in-flight requests
+        // survive it, and ordinary clients retain their existing horizon.
+        let future = crate::now_f64() + 600.0;
+        actor.path_requests.clear();
+        actor.recent_announces.get_mut(&dest).unwrap().retained = true;
+        actor.cull_client_announces(future);
+        assert!(actor.recent_announces.contains_key(&dest));
+        assert!(!actor.recent_announces.contains_key(&requested));
+        assert!(!actor.path_table.has_path(&requested));
+        actor.recent_announces.get_mut(&dest).unwrap().retained = false;
+        actor.client_announce_policy = ClientAnnouncePolicy::All;
+        actor.cull_client_announces(future);
+        assert!(actor.recent_announces.contains_key(&dest));
+        actor.client_announce_policy = ClientAnnouncePolicy::Requested;
+        actor.cull_client_announces(future);
+        assert!(actor.recent_announces.is_empty());
+    }
 
     fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
         let identity = rns_identity::identity::Identity::new();

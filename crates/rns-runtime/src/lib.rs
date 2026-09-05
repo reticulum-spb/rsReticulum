@@ -7,6 +7,7 @@ compile_error!("rns-runtime requires either the `client` or `full` feature");
 #[cfg(feature = "api")]
 pub mod api_server;
 pub mod application;
+pub mod client_options;
 #[path = "yaml_config.rs"]
 pub mod config;
 pub mod constants;
@@ -38,5 +39,6 @@ pub mod rnsh;
 pub mod rpc;
 #[cfg(feature = "full")]
 pub mod rpc_server;
+mod shared_client;
 #[cfg(feature = "api")]
 pub mod web_logs;

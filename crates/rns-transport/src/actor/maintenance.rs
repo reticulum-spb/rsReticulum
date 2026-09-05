@@ -2,8 +2,47 @@ use super::*;
 use crate::now_f64;
 
 impl TransportActor {
+    /// Opt-in clients retain recently requested metadata for five minutes,
+    /// not the daemon's seven-day network horizon. Explicit pins and active
+    /// link destinations are kept until their owners release them.
+    pub(super) fn cull_client_announces(&mut self, now: f64) {
+        if !self.shared_instance_client_mode
+            || self.client_announce_policy != ClientAnnouncePolicy::Requested
+        {
+            return;
+        }
+        let active: HashSet<[u8; 16]> = self
+            .link_table
+            .iter()
+            .map(|(_, e)| e.destination_hash)
+            .collect();
+        let expired: Vec<_> = self
+            .recent_announces
+            .values()
+            .filter(|a| {
+                !a.retained
+                    && !active.contains(&a.dest_hash)
+                    && !self.path_waiters.contains_key(&a.dest_hash)
+                    && !self.path_requests.contains_key(&a.dest_hash)
+                    && now - a.last_used.unwrap_or(a.timestamp).max(a.timestamp) > 300.0
+            })
+            .map(|a| a.dest_hash)
+            .collect();
+        for dest in expired {
+            self.recent_announces.remove(&dest);
+            self.path_table.remove(&dest);
+        }
+    }
+
     pub(super) fn on_tick(&mut self) {
         let now = now_f64();
+        if now - self.last_memory_report >= 60.0 {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(stats = ?self.memory_stats(), client = self.shared_instance_client_mode,
+                    policy = ?self.client_announce_policy, "transport memory state");
+            }
+            self.last_memory_report = now;
+        }
 
         // Startup grace delays cache cleanup so freshly restored entries
         // aren't immediately aged out before the first traffic arrives.
@@ -31,6 +70,7 @@ impl TransportActor {
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
             // Batched culls bound per-tick work; on large tables a single
             // sweep would stall the actor and back up the inbound channel.
+            self.cull_client_announces(now);
             self.path_table.cull_expired_batch(100);
             self.reverse_table.cull_expired_batch(100);
             self.tunnel_table.cull_expired_batch(50);

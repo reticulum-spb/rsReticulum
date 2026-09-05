@@ -886,6 +886,15 @@ pub fn migrate_legacy_announce_entries(
     legacy: Vec<LegacyPersistedAnnounceEntryV5>,
     announce_cache_dir: &Path,
 ) -> Vec<PersistedAnnounceEntry> {
+    convert_legacy_announce_entries(legacy, Some(announce_cache_dir))
+}
+
+/// Shared clients can recall legacy metadata without writing into the owner's
+/// cache. Only the storage owner may materialise the embedded packets on disk.
+pub(crate) fn convert_legacy_announce_entries(
+    legacy: Vec<LegacyPersistedAnnounceEntryV5>,
+    announce_cache_dir: Option<&Path>,
+) -> Vec<PersistedAnnounceEntry> {
     legacy
         .into_iter()
         .map(|e| {
@@ -896,13 +905,14 @@ pub fn migrate_legacy_announce_entries(
                     let hash = rns_wire::hash::packet_hash(&e.raw_packet, header.flags.header_type);
                     is_path_response =
                         header.context == rns_wire::context::PacketContext::PathResponse;
-                    if write_python_cached_announce_if_absent(
-                        announce_cache_dir,
-                        &hash,
-                        &e.raw_packet,
-                        None,
-                    )
-                    .is_ok()
+                    if let Some(announce_cache_dir) = announce_cache_dir
+                        && write_python_cached_announce_if_absent(
+                            announce_cache_dir,
+                            &hash,
+                            &e.raw_packet,
+                            None,
+                        )
+                        .is_ok()
                     {
                         packet_hash = Some(hash.to_vec());
                     }

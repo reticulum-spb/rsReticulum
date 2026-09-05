@@ -3,6 +3,7 @@
 //! to a Shared instance over a local socket; **Standalone** owns its
 //! interfaces and exposes no IPC. Python: `RNS/Reticulum.py`.
 
+use crate::shared_client::spawn_shared_peer_monitor;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -1029,6 +1030,24 @@ pub async fn init(
     shutdown: ShutdownSignal,
     is_foreground: Arc<AtomicBool>,
 ) -> Result<ReticulumHandle, ReticulumError> {
+    init_with_options(
+        configdir,
+        socket_dir,
+        shutdown,
+        is_foreground,
+        Default::default(),
+    )
+    .await
+}
+
+/// Configure the shared-client policy without changing full/standalone routing.
+pub async fn init_with_options(
+    configdir: Option<&str>,
+    socket_dir: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    is_foreground: Arc<AtomicBool>,
+    options: crate::client_options::ClientOptions,
+) -> Result<ReticulumHandle, ReticulumError> {
     let config_dir = resolve_config_dir(configdir);
     let paths = StoragePaths::from_config_dir(&config_dir);
     paths.ensure_dirs().map_err(ReticulumError::Io)?;
@@ -1046,7 +1065,6 @@ pub async fn init(
 
     let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
     actor.is_foreground = is_foreground.clone();
-    actor.initialize_storage(paths.storage_dir.clone());
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
     // per-boot wire-facing transport identity unless static_transport_identity
     // is set. Pre-seed the actor's hash so runtime-side wire consumers
@@ -1065,27 +1083,16 @@ pub async fn init(
 
     let shutdown_tx = transport_tx.clone();
     let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        actor.run().await;
-    });
 
     // Persistent transport identity (Python 1.3.8 Transport._identity /
     // internal_identity()): the actor keeps it for RPC-key parity and swaps
     // in the ephemeral hash itself when the policy applies.
     let transport_identity_path = paths.storage_dir.join("transport_identity");
-    let transport_identity = match rns_identity::identity::Identity::from_file(
-        &transport_identity_path,
-    ) {
-        Ok(id) => id,
-        Err(_) => {
-            let id = rns_identity::identity::Identity::new();
-            if let Err(e) = id.to_file(&transport_identity_path) {
-                tracing::warn!(path = %transport_identity_path.display(), error = %e,
-                    "failed to persist transport identity — path request identity will change on restart");
-            }
-            id
-        }
-    };
+    let persisted_transport_identity =
+        rns_identity::identity::Identity::from_file(&transport_identity_path).ok();
+    let transport_identity_created = persisted_transport_identity.is_none();
+    let transport_identity =
+        persisted_transport_identity.unwrap_or_else(rns_identity::identity::Identity::new);
     let _ = transport_tx.try_send(TransportMessage::SetTransportIdentity {
         identity_hash: transport_identity.hash,
     });
@@ -1237,7 +1244,7 @@ pub async fn init(
                     name: "SharedInstanceClient".to_string(),
                 };
                 let client_id = next_id(&id_gen);
-                match rns_interface::local::spawn_local_client(
+                match rns_interface::local::spawn_reconnecting_local_client(
                     client_config,
                     client_id,
                     transport_tx.clone(),
@@ -1284,7 +1291,7 @@ pub async fn init(
                             name: "SharedInstanceClient".to_string(),
                         };
                         let client_id = next_id(&id_gen);
-                        match rns_interface::local::spawn_local_client(
+                        match rns_interface::local::spawn_reconnecting_local_client(
                             client_config,
                             client_id,
                             transport_tx.clone(),
@@ -1309,6 +1316,28 @@ pub async fn init(
     } else {
         InstanceMode::Standalone
     };
+
+    // Decide storage ownership before restore or the first maintenance tick.
+    // Shared clients may read legacy state for compatibility, but never migrate
+    // or save the owning daemon's files.
+    actor.shared_instance_client_mode = instance_mode == InstanceMode::Client;
+    if instance_mode != InstanceMode::Client && transport_identity_created {
+        if let Err(error) = transport_identity.to_file(&transport_identity_path) {
+            tracing::warn!(%error, "failed to persist transport identity");
+        }
+    }
+    actor.client_announce_policy = options.announce_policy;
+    if actor.shared_instance_client_mode
+        && options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::Requested
+    {
+        actor.packet_hashlist = rns_transport::hashlist::PacketHashlist::new_with_capacity(4096);
+    }
+    if !actor.shared_instance_client_mode
+        || options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::All
+    {
+        actor.initialize_storage(paths.storage_dir.clone());
+    }
+    tokio::spawn(async move { actor.run().await });
 
     if instance_mode == InstanceMode::Client {
         if rc.enable_transport
@@ -1696,38 +1725,6 @@ async fn adopt_shared_instance_client(
         shutdown.clone(),
     );
     InstanceMode::Client
-}
-
-fn spawn_shared_peer_monitor(
-    transport_tx: mpsc::Sender<TransportMessage>,
-    interface_id: u64,
-    online: Arc<AtomicBool>,
-    shutdown: ShutdownSignal,
-) {
-    tokio::spawn(async move {
-        let mut was_online = false;
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            tokio::select! {
-                _ = shutdown.wait() => break,
-                _ = interval.tick() => {
-                    let is_online = online.load(std::sync::atomic::Ordering::SeqCst);
-                    if is_online == was_online {
-                        continue;
-                    }
-                    was_online = is_online;
-                    let message = if is_online {
-                        TransportMessage::SharedConnectionRestored { interface_id }
-                    } else {
-                        TransportMessage::SharedConnectionLost
-                    };
-                    if transport_tx.send(message).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
 }
 
 fn ingress_for_role(
@@ -3746,7 +3743,7 @@ async fn spawn_interface(
                     .to_string(),
                 name: c.name.clone(),
             };
-            rns_interface::local::spawn_local_client(local_config, id, transport_tx)
+            rns_interface::local::spawn_reconnecting_local_client(local_config, id, transport_tx)
                 .await
                 .map(|h| vec![h])
                 .map_err(|e| format!("Local: {e}"))
@@ -4171,44 +4168,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn shared_peer_monitor_emits_connection_lifecycle_events() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let online = Arc::new(AtomicBool::new(false));
-        let shutdown = ShutdownSignal::new();
-
-        spawn_shared_peer_monitor(tx, 7, online.clone(), shutdown.clone());
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "offline initial state should not emit a lost event"
-        );
-
-        online.store(true, std::sync::atomic::Ordering::SeqCst);
-        let restored = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
-            .await
-            .expect("restored event timed out")
-            .expect("monitor channel closed");
-        match restored {
-            TransportMessage::SharedConnectionRestored { interface_id } => {
-                assert_eq!(interface_id, 7)
-            }
-            other => panic!("expected SharedConnectionRestored, got {other:?}"),
-        }
-
-        online.store(false, std::sync::atomic::Ordering::SeqCst);
-        let lost = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
-            .await
-            .expect("lost event timed out")
-            .expect("monitor channel closed");
-        match lost {
-            TransportMessage::SharedConnectionLost => {}
-            other => panic!("expected SharedConnectionLost, got {other:?}"),
-        }
-
-        shutdown.trigger();
-    }
-
     fn write_stale_python_destination_table(storage_dir: &Path, entries: usize) {
         std::fs::create_dir_all(storage_dir).unwrap();
 
@@ -4344,6 +4303,137 @@ mod tests {
         fn valid(&self, _infohash: &[u8; 32], _stamp: &[u8], required_value: u8) -> bool {
             required_value <= 16
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_server_policy_preserves_page_requests_and_other_client_announces() {
+        use crate::client_options::ClientOptions;
+        use crate::link_client::LinkSession;
+        use crate::link_manager::RequestOutcome;
+        use crate::link_session::LinkListener;
+        use rns_transport::messages::{OutboundRequest, TransportQuery, TransportQueryResponse};
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let control = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let base =
+            std::env::temp_dir().join(format!("rns-profile-e2e-{}-{port}", std::process::id()));
+        let config = format!(
+            "reticulum:\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control}\ninterfaces: []\n"
+        );
+        let mut handles = Vec::new();
+        for (name, options) in [
+            ("daemon", ClientOptions::default()),
+            ("pages", ClientOptions::server()),
+            ("lxmf", ClientOptions::default()),
+        ] {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(crate::config::CONFIG_FILE_NAME), &config).unwrap();
+            handles.push(
+                init_with_options(
+                    Some(dir.to_str().unwrap()),
+                    None,
+                    ShutdownSignal::new(),
+                    Arc::new(AtomicBool::new(true)),
+                    options,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(handles[0].instance_mode, InstanceMode::Shared);
+        assert_eq!(handles[1].instance_mode, InstanceMode::Client);
+        assert_eq!(handles[2].instance_mode, InstanceMode::Client);
+        let identity = rns_identity::identity::Identity::new();
+        let listener = LinkListener::listen_with_request_handler(
+            &handles[1],
+            &identity,
+            "nomadnetwork.node",
+            Some(|_, _, _: Vec<u8>| RequestOutcome::Reply(b"test page".to_vec())),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        listener.announce().await.unwrap();
+        handles[2]
+            .await_path(listener.destination_hash(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        let mut session = LinkSession::open(
+            &handles[2],
+            rns_identity::identity::Identity::new(),
+            listener.destination_hash(),
+            1,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let response = session
+            .request("/page/index.mu", None, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(response, b"test page");
+        session.close().await.unwrap();
+        let (events, mut rx) = mpsc::channel(4);
+        handles[2]
+            .transport_tx
+            .send(TransportMessage::RegisterAnnounceHandler {
+                aspect_filter: Some("lxmf.delivery".into()),
+                receive_path_responses: true,
+                callback_tx: events,
+            })
+            .await
+            .unwrap();
+        let peer = rns_identity::identity::Identity::new();
+        let (dest, raw) = crate::application::build_announce_packet(
+            &peer,
+            "lxmf.delivery",
+            Some(b"peer"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        handles[0]
+            .transport_tx
+            .send(TransportMessage::RegisterDestination {
+                hash: dest,
+                app_name: "lxmf.delivery".into(),
+                delivery_tx: None,
+            })
+            .await
+            .unwrap();
+        handles[0]
+            .transport_tx
+            .send(TransportMessage::Outbound(OutboundRequest {
+                raw: raw.into(),
+                destination_hash: dest,
+            }))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.public_key, Some(peer.get_public_key()));
+        match handles[1]
+            .query_transport(TransportQuery::GetRecentAnnounces)
+            .await
+            .unwrap()
+        {
+            TransportQueryResponse::Announces(entries) => {
+                assert!(entries.iter().all(|e| e.dest_hash != dest))
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        for handle in handles {
+            handle.shutdown.trigger();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
