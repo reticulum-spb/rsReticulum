@@ -374,6 +374,10 @@ async fn connect_shared_inner(
         std::fs::write(&config_path, typed.to_yaml()?).map_err(ReticulumError::Io)?;
         typed.to_runtime_config()?
     };
+    let sqlite_storage = config
+        .section("reticulum")
+        .and_then(|s| s.get_bool("sqlite_storage"))
+        .unwrap_or(false);
     let mut config = ReticulumConfig::try_from_config(&config)?;
     if !config.share_instance {
         return Err(ReticulumError::ClientModeRequired);
@@ -390,7 +394,8 @@ async fn connect_shared_inner(
     {
         actor.packet_hashlist = rns_transport::hashlist::PacketHashlist::new_with_capacity(4096);
     }
-    if options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::All {
+    if !sqlite_storage && options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::All
+    {
         actor.initialize_storage(paths.storage_dir.clone());
     }
     tokio::spawn(async move { actor.run().await });

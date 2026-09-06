@@ -592,6 +592,9 @@ impl TransportActor {
             }
         }
 
+        #[cfg(feature = "sqlite")]
+        self.record_sqlite_announce(header.destination_hash, raw);
+
         self.send_announce_to_local_clients(
             raw,
             header.destination_hash,
@@ -651,7 +654,7 @@ impl TransportActor {
     }
 
     /// Well-known PLAIN destination hash for path-request packets.
-    fn path_request_dest_hash() -> [u8; 16] {
+    pub(super) fn path_request_dest_hash() -> [u8; 16] {
         rns_identity::destination::Destination::hash_from_name_and_identity(
             "rnstransport.path.request",
             None,

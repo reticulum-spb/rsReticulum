@@ -8,6 +8,8 @@ autobins = false
 
 [features]
 default = []
+sqlite = ["rns-runtime/sqlite"]
+sqlite-bundled = ["sqlite", "rns-runtime/sqlite-bundled"]
 hardware = ["dep:rns-ratkey"]
 api = ["rns-runtime/api"]
 

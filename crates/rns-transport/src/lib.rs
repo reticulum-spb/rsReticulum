@@ -29,5 +29,6 @@ pub mod path_table;
 pub mod persistence;
 pub mod rate_limit;
 pub mod reverse_table;
+pub mod storage;
 pub mod traffic;
 pub mod tunnel;

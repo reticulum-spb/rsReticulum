@@ -94,6 +94,7 @@ fn load_indexed_python_cached_announce(
 /// I/O (fsync-heavy on macOS: F_FULLFSYNC per file + dir) can run on the
 /// blocking pool without borrowing the actor.
 pub(super) struct RoutingSnapshot {
+    pub sqlite_announces: bool,
     pub path_table: crate::path_table::PathTable,
     pub tunnel_table: crate::tunnel::TunnelTable,
     pub blackhole_table: crate::blackhole::BlackholeTable,
@@ -116,13 +117,15 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         debug!("saved path table ({} entries)", snapshot.path_table.len());
     }
 
-    let destination_table_path = dir.join("destination_table");
-    if let Err(e) = crate::persistence::save_python_destination_table(
-        &snapshot.path_table,
-        interface_names,
-        &destination_table_path,
-    ) {
-        trace!("failed to save Python destination_table: {}", e);
+    if !snapshot.sqlite_announces {
+        let destination_table_path = dir.join("destination_table");
+        if let Err(e) = crate::persistence::save_python_destination_table(
+            &snapshot.path_table,
+            interface_names,
+            &destination_table_path,
+        ) {
+            trace!("failed to save Python destination_table: {}", e);
+        }
     }
 
     let blackhole_path = dir.join("blackhole_table.msgpack");
@@ -148,18 +151,20 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         }
     }
 
-    let announce_path = dir.join("announce_cache.msgpack");
-    if let Err(e) =
-        crate::persistence::save_announce_cache(snapshot.recent_announces.iter(), &announce_path)
-    {
-        trace!("failed to save announce cache: {}", e);
-    } else {
-        debug!(
-            "saved announce cache ({} entries)",
-            snapshot.recent_announces.len()
-        );
+    if !snapshot.sqlite_announces {
+        let announce_path = dir.join("announce_cache.msgpack");
+        if let Err(e) = crate::persistence::save_announce_cache(
+            snapshot.recent_announces.iter(),
+            &announce_path,
+        ) {
+            trace!("failed to save announce cache: {}", e);
+        } else {
+            debug!(
+                "saved announce cache ({} entries)",
+                snapshot.recent_announces.len()
+            );
+        }
     }
-
     // Per-announce Python cache files are written event-driven at receive
     // (`cache_announce_to_disk`), not re-serialized here every cycle.
 
@@ -175,13 +180,15 @@ pub(super) fn write_routing_snapshot(dir: &std::path::Path, snapshot: &RoutingSn
         );
     }
 
-    let python_tunnels_path = dir.join("tunnels");
-    if let Err(e) = crate::persistence::save_python_tunnel_table(
-        &snapshot.tunnel_table,
-        interface_names,
-        &python_tunnels_path,
-    ) {
-        trace!("failed to save Python tunnels table: {}", e);
+    if !snapshot.sqlite_announces {
+        let python_tunnels_path = dir.join("tunnels");
+        if let Err(e) = crate::persistence::save_python_tunnel_table(
+            &snapshot.tunnel_table,
+            interface_names,
+            &python_tunnels_path,
+        ) {
+            trace!("failed to save Python tunnels table: {}", e);
+        }
     }
 
     debug!(
@@ -198,6 +205,10 @@ impl TransportActor {
     /// (`cache/announces/<packet_hash>`). Misses are normal: legacy entries,
     /// cleaned cache files, or shared-instance client mode.
     pub(super) fn cached_announce_raw(&self, packet_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        #[cfg(feature = "sqlite")]
+        if let Some(state) = &self.sqlite {
+            return state.raw.get(packet_hash).cloned();
+        }
         let dir = self.storage_dir.as_ref()?;
         let announce_cache_dir = dir.join("cache").join("announces");
         match crate::persistence::load_python_cached_announce(&announce_cache_dir, packet_hash) {
@@ -222,7 +233,7 @@ impl TransportActor {
         raw: &[u8],
         interface_id: InterfaceId,
     ) {
-        if self.shared_instance_client_mode {
+        if self.shared_instance_client_mode || self.using_sqlite() {
             return;
         }
         let Some(dir) = self.storage_dir.as_ref() else {
@@ -245,10 +256,15 @@ impl TransportActor {
 
     fn routing_snapshot(&self) -> RoutingSnapshot {
         RoutingSnapshot {
+            sqlite_announces: self.using_sqlite(),
             path_table: self.path_table.clone(),
             tunnel_table: self.tunnel_table.clone(),
             blackhole_table: self.blackhole_table.clone(),
-            recent_announces: self.recent_announces.values().cloned().collect(),
+            recent_announces: if self.using_sqlite() {
+                Vec::new()
+            } else {
+                self.recent_announces.values().cloned().collect()
+            },
             interface_names: self
                 .interfaces
                 .iter()
@@ -263,6 +279,10 @@ impl TransportActor {
     /// in flight keeps `state_dirty` set so the next tick retries — two
     /// writers would race on the shared `<file>.tmp` names.
     pub(super) fn save_routing_state_async(&mut self) {
+        #[cfg(feature = "sqlite")]
+        if !self.sqlite_snapshot_ready() {
+            return;
+        }
         if self.shared_instance_client_mode {
             trace!("skipping routing-state save in shared-instance client mode");
             self.state_dirty = false;
@@ -310,6 +330,9 @@ impl TransportActor {
     /// and unlinks run on the blocking pool; the actor only snapshots.
     /// Returns true when a sweep was scheduled (or ran inline).
     pub(super) fn maybe_sweep_announce_cache(&mut self) -> bool {
+        if self.using_sqlite() {
+            return false;
+        }
         if self.shared_instance_client_mode {
             // Python parity: shared-instance clients never clean the cache —
             // an empty client routing table must not wipe files the owning
@@ -404,6 +427,10 @@ impl TransportActor {
     /// Synchronous: used by shutdown / falling-edge / RPC-forced saves where
     /// completion must be guaranteed before proceeding.
     pub(super) fn save_routing_state(&mut self) {
+        #[cfg(feature = "sqlite")]
+        if !self.sqlite_snapshot_ready() {
+            return;
+        }
         if self.shared_instance_client_mode {
             trace!("skipping routing-state save in shared-instance client mode");
             self.state_dirty = false;
@@ -524,7 +551,9 @@ impl TransportActor {
         // Python destination_table — canonical interop shape. Defer interface
         // hash remap until matching interfaces register.
         let destination_table_path = dir.join("destination_table");
-        let loaded_python_destination_table = if destination_table_path.exists() {
+        let loaded_python_destination_table = if !self.using_sqlite()
+            && destination_table_path.exists()
+        {
             match crate::persistence::load_python_destination_table(&destination_table_path) {
                 Ok(entries) => {
                     let total = entries.len();
@@ -673,7 +702,7 @@ impl TransportActor {
         // when its cached announce packet is present, mirroring upstream's
         // dependency between tunnel paths and the announce cache.
         let python_tunnels_path = dir.join("tunnels");
-        let loaded_python_tunnel_table = if python_tunnels_path.exists() {
+        let loaded_python_tunnel_table = if !self.using_sqlite() && python_tunnels_path.exists() {
             match crate::persistence::load_python_tunnel_table(&python_tunnels_path) {
                 Ok(entries) => {
                     let total = entries.len();
@@ -818,7 +847,7 @@ impl TransportActor {
 
         // announce_cache — no interface dependency, bind directly.
         let announce_path = dir.join("announce_cache.msgpack");
-        if announce_path.exists() {
+        if !self.using_sqlite() && announce_path.exists() {
             let loaded = match crate::persistence::load_announce_cache(&announce_path) {
                 Ok(entries) => Some(entries),
                 Err(v6_err) => {

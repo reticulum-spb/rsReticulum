@@ -71,6 +71,8 @@ pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub interfaces: Vec<InterfaceConfig>,
 }
 
@@ -80,6 +82,7 @@ impl Default for Config {
             reticulum: ReticulumConfig::default(),
             logging: LoggingConfig::default(),
             api: ApiConfig::default(),
+            storage: StorageConfig::default(),
             interfaces: vec![InterfaceConfig::Auto(AutoInterfaceConfig {
                 common: InterfaceCommonConfig {
                     name: "Default Interface".into(),
@@ -198,6 +201,7 @@ impl Config {
                 self.reticulum.instance_control_port,
             );
             set_bool(section, "enable_transport", self.reticulum.enable_transport);
+            set_bool(section, "sqlite_storage", self.reticulum.sqlite_storage);
             set_bool(
                 section,
                 "static_transport_identity",
@@ -297,6 +301,15 @@ impl Config {
             );
         }
         {
+            let section = output.ensure_section("storage");
+            if let Some(path) = &self.storage.database_path {
+                section.set("database_path", path.to_string_lossy().as_ref());
+            }
+            set_num(section, "page_cache_size", self.storage.page_cache_size);
+            set_num(section, "vacuum_interval", self.storage.vacuum_interval);
+            set_num(section, "vacuum_pages", self.storage.vacuum_pages);
+        }
+        {
             let section = output.ensure_section("logging");
             set_num(section, "loglevel", self.logging.level);
             set_bool(section, "logtimestamps", self.logging.timestamps);
@@ -322,6 +335,8 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReticulumConfig {
+    /// Opt-in owner storage; shared clients never open the database.
+    pub sqlite_storage: bool,
     pub share_instance: bool,
     pub instance_name: String,
     pub shared_instance_type: SharedInstanceType,
@@ -353,9 +368,31 @@ pub struct ReticulumConfig {
     pub bootstrap_configs: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Transport database directory or database file. Relative to config dir.
+    pub database_path: Option<PathBuf>,
+    pub page_cache_size: u32,
+    pub vacuum_interval: u64,
+    pub vacuum_pages: u32,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            database_path: None,
+            page_cache_size: 1024,
+            vacuum_interval: 3600,
+            vacuum_pages: 128,
+        }
+    }
+}
+
 impl Default for ReticulumConfig {
     fn default() -> Self {
         Self {
+            sqlite_storage: false,
             share_instance: true,
             instance_name: "default".into(),
             shared_instance_type: SharedInstanceType::default(),

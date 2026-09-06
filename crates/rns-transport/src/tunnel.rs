@@ -35,6 +35,10 @@ impl TunnelTable {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn insert(&mut self, entry: TunnelEntry) {
         self.entries.insert(entry.tunnel_id, entry);
     }

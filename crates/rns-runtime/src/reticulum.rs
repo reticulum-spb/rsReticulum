@@ -1332,8 +1332,54 @@ pub async fn init_with_options(
     {
         actor.packet_hashlist = rns_transport::hashlist::PacketHashlist::new_with_capacity(4096);
     }
-    if !actor.shared_instance_client_mode
-        || options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::All
+    let sqlite_storage = config
+        .section("reticulum")
+        .and_then(|s| s.get_bool("sqlite_storage"))
+        .unwrap_or(false);
+    let database_path = config
+        .section("storage")
+        .and_then(|s| s.get("database_path"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(expand_home_path)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                config_dir.join(path)
+            }
+        });
+    if sqlite_storage && !actor.shared_instance_client_mode {
+        #[cfg(feature = "sqlite")]
+        {
+            let database_path = database_path
+                .unwrap_or_else(|| paths.storage_dir.join("sqlite").join("transport.sqlite"));
+            if let Some(parent) = database_path.parent() {
+                std::fs::create_dir_all(parent).map_err(ReticulumError::Io)?;
+            }
+            actor
+                .initialize_sqlite_database_path(
+                    database_path,
+                    rns_transport::storage::SqliteOptions {
+                        page_cache_kib: config
+                            .section("storage")
+                            .and_then(|s| s.get("page_cache_size"))
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(1024)
+                            .clamp(16, 16_384),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| ReticulumError::Transport(e.to_string()))?;
+        }
+        #[cfg(not(feature = "sqlite"))]
+        return Err(ReticulumError::Transport(
+            "sqlite_storage requires a sqlite or sqlite-bundled build".into(),
+        ));
+    } else if !sqlite_storage
+        && (!actor.shared_instance_client_mode
+            || options.announce_policy == rns_transport::actor::ClientAnnouncePolicy::All)
     {
         actor.initialize_storage(paths.storage_dir.clone());
     }
@@ -4320,8 +4366,9 @@ mod tests {
         drop(reserve);
         let base =
             std::env::temp_dir().join(format!("rns-profile-e2e-{}-{port}", std::process::id()));
+        let sqlite = cfg!(feature = "sqlite");
         let config = format!(
-            "reticulum:\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control}\ninterfaces: []\n"
+            "reticulum:\n  sqlite_storage: {sqlite}\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control}\ninterfaces: []\n"
         );
         let mut handles = Vec::new();
         for (name, options) in [

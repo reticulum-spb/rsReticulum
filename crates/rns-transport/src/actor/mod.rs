@@ -29,11 +29,9 @@ mod maintenance;
 mod outbound;
 mod persistence;
 mod rpc;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
-/// Owns every routing table and drains the `TransportMessage` channel in one
-/// task. The single-owner model means the hot path has no shared state and no
-/// locks — callers drive the actor by sending typed commands rather than
-/// reaching into the tables directly.
 /// Announces retained by a shared client. Routing owners always learn all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ClientAnnouncePolicy {
@@ -43,7 +41,13 @@ pub enum ClientAnnouncePolicy {
     Requested,
 }
 
+/// Owns every routing table and drains the `TransportMessage` channel in one
+/// task. The single-owner model means the hot path has no shared state and no
+/// locks — callers drive the actor by sending typed commands rather than
+/// reaching into the tables directly.
 pub struct TransportActor {
+    #[cfg(feature = "sqlite")]
+    sqlite: Option<sqlite::SqliteState>,
     rx: mpsc::Receiver<TransportMessage>,
 
     pub path_table: PathTable,
@@ -357,6 +361,8 @@ impl TransportActor {
             pending_path_entries: Vec::new(),
             pending_tunnel_entries: Vec::new(),
             recent_announces: HashMap::new(),
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             startup_complete: false,
             startup_time: 0.0,
             channel_drops: 0,
@@ -378,9 +384,25 @@ impl TransportActor {
         self.load_state();
     }
 
+    fn using_sqlite(&self) -> bool {
+        #[cfg(feature = "sqlite")]
+        {
+            return self.sqlite.is_some();
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            false
+        }
+    }
+
     /// Run the actor event loop. Messages are processed sequentially so no
     /// routing state is ever touched from two tasks at once.
     pub async fn run(mut self) {
+        #[cfg(feature = "sqlite")]
+        if self.using_sqlite() {
+            self.run_sqlite().await;
+            return;
+        }
         let mut tick_interval = tokio::time::interval(Duration::from_millis(JOB_INTERVAL_MS));
         let mut was_foreground = true;
 
@@ -1643,7 +1665,7 @@ mod tests {
         assert!(actor.recent_announces.is_empty());
     }
 
-    fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
+    pub(super) fn make_valid_announce(app_name: &str, hops: u8) -> (Bytes, [u8; 16]) {
         let identity = rns_identity::identity::Identity::new();
         let dest_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
             app_name,
@@ -1866,7 +1888,7 @@ mod tests {
         Bytes::from(raw)
     }
 
-    fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
+    pub(super) fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(64);
         let entry = InterfaceEntry {
             name: name.to_string(),

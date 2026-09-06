@@ -43,6 +43,9 @@ base64 = "0.22"
 # Serialization
 rmp-serde = "1"
 rmpv = "1"
+# Match rsLXMF so both crates can link one libsqlite3-sys.
+rusqlite = { version = "0.32", default-features = false }
+fs2 = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"

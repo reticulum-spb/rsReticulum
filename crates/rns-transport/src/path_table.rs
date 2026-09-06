@@ -102,6 +102,14 @@ impl PathTable {
         }
     }
 
+    /// Drop all persisted routing state when a fresh storage namespace is
+    /// selected. This is intentionally explicit so clean-start SQLite mode
+    /// cannot accidentally retain a legacy snapshot.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.states.clear();
+    }
+
     /// Insert or replace a path entry. The parallel liveness state is
     /// cleared so a fresh/replacement entry never inherits a stale
     /// `Responsive`/`Unresponsive` reading from its predecessor. `get_state`

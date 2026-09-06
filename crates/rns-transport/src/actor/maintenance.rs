@@ -497,13 +497,19 @@ impl TransportActor {
                     "releasing held announce"
                 );
 
-                self.on_inbound(crate::messages::InboundPacket {
+                let packet = crate::messages::InboundPacket {
                     raw: announce.raw,
                     interface_id: announce.receiving_interface_id,
                     rssi: None,
                     snr: None,
                     q: None,
-                });
+                };
+                #[cfg(feature = "sqlite")]
+                if self.using_sqlite() {
+                    self.enqueue_sqlite(TransportMessage::Inbound(packet));
+                    continue;
+                }
+                self.on_inbound(packet);
             }
         }
     }
@@ -550,6 +556,9 @@ impl TransportActor {
     /// (6 min); pathless used entries die after `DESTINATION_TIMEOUT * 1.25`
     /// idle since last use.
     pub(super) fn cleanup_known_destinations(&mut self, now: f64) {
+        if self.using_sqlite() {
+            return;
+        }
         let used_threshold = DESTINATION_TIMEOUT as f64 * 1.25;
 
         let before = self.recent_announces.len();

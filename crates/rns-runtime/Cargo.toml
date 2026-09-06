@@ -7,6 +7,8 @@ license.workspace = true
 
 [features]
 default = ["full"]
+sqlite = ["rns-transport/sqlite"]
+sqlite-bundled = ["sqlite", "rns-transport/sqlite-bundled"]
 # Application runtime that can only attach to an already-running shared
 # Reticulum instance. It never owns hardware interfaces or starts a shared
 # server itself.
