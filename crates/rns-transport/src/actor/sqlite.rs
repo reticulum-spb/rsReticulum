@@ -20,6 +20,9 @@ pub(super) struct SqliteState {
     order: VecDeque<[u8; 16]>,
     error: Option<String>,
     last_sweep: f64,
+    last_vacuum: f64,
+    vacuum_interval: f64,
+    vacuum_pages: u32,
 }
 
 #[derive(Default)]
@@ -131,6 +134,13 @@ impl TransportActor {
                     "database path has no parent",
                 ))?;
         std::fs::create_dir_all(&directory)?;
+        // Match rsLXMF: maintenance cannot run more often than once a minute.
+        // vacuum_pages=0 remains useful as checkpoint-and-metrics mode.
+        let vacuum_interval = options
+            .vacuum_interval
+            .max(Duration::from_secs(60))
+            .as_secs_f64();
+        let vacuum_pages = options.vacuum_pages;
         let worker =
             StorageHandle::open_sqlite(database_path, storage::StorageRole::Standalone, options)
                 .await?;
@@ -144,6 +154,9 @@ impl TransportActor {
             order: VecDeque::new(),
             error: None,
             last_sweep: 0.0,
+            last_vacuum: crate::now_f64(),
+            vacuum_interval,
+            vacuum_pages,
         });
         self.storage_dir = Some(directory);
         // SQLite mode intentionally starts empty. Legacy msgpack files and
@@ -352,6 +365,23 @@ impl TransportActor {
                             clear: true,
                         })
                     }));
+                } else if crate::now_f64() - state.last_vacuum >= state.vacuum_interval
+                    && state.error.is_none()
+                    && !self
+                        .routing_save_in_flight
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    state.last_vacuum = crate::now_f64();
+                    let vacuum_pages = state.vacuum_pages;
+                    job = Some(tokio::spawn(async move {
+                        maintain(&worker, vacuum_pages).await;
+                        Ok(Prepared {
+                            message: None,
+                            entries: Vec::new(),
+                            raw: HashMap::new(),
+                            clear: false,
+                        })
+                    }));
                 }
             }
             self.sqlite.as_mut().unwrap().busy = job.is_some();
@@ -438,6 +468,27 @@ impl TransportActor {
             }
         }
         keep
+    }
+}
+
+async fn maintain(worker: &StorageHandle, vacuum_pages: u32) {
+    let started = std::time::Instant::now();
+    match call(worker, Request::Maintain { vacuum_pages }).await {
+        Ok(Reply::Maintenance(stats)) => tracing::info!(
+            database_bytes = stats.database_bytes,
+            wal_bytes = stats.wal_bytes,
+            page_size = stats.page_size,
+            page_count = stats.page_count,
+            free_pages = stats.free_pages,
+            checkpointed_frames = stats.checkpointed_frames,
+            remaining_wal_frames = stats.remaining_wal_frames,
+            vacuumed_pages = stats.vacuumed_pages,
+            page_cache_kib = stats.page_cache_kib,
+            duration_ms = started.elapsed().as_millis(),
+            "SQLite maintenance completed"
+        ),
+        Ok(_) => tracing::warn!("SQLite maintenance returned an invalid reply"),
+        Err(error) => tracing::warn!(%error, "SQLite maintenance failed"),
     }
 }
 
@@ -733,6 +784,88 @@ mod tests {
             snr: None,
             q: None,
         })
+    }
+
+    #[tokio::test]
+    async fn maintenance_options_match_lxmf_bounds() {
+        let dir = temp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut actor, _tx) = TransportActor::new();
+        actor
+            .initialize_sqlite_storage_with_options(
+                dir.clone(),
+                storage::SqliteOptions {
+                    vacuum_interval: Duration::from_secs(1),
+                    vacuum_pages: 7,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let state = actor.sqlite.as_ref().unwrap();
+        assert_eq!(state.vacuum_interval, 60.0);
+        assert_eq!(state.vacuum_pages, 7);
+        state.worker.try_shutdown().unwrap().wait().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_actor_schedules_configured_vacuum() {
+        struct ObservedMaintenance {
+            db: storage::MemoryTransportStorage,
+            observed: Option<tokio::sync::oneshot::Sender<u32>>,
+        }
+        impl storage::TransportStorage for ObservedMaintenance {
+            fn execute(&mut self, request: Request) -> storage::Result<Reply> {
+                if let Request::Maintain { vacuum_pages } = &request
+                    && let Some(observed) = self.observed.take()
+                {
+                    let _ = observed.send(*vacuum_pages);
+                }
+                self.db.execute(request)
+            }
+        }
+
+        let dir = temp();
+        let (mut actor, tx) = TransportActor::new();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        actor
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .worker
+            .try_shutdown()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let state = actor.sqlite.as_mut().unwrap();
+        state.worker = StorageHandle::start(8, move || {
+            Ok(ObservedMaintenance {
+                db: Default::default(),
+                observed: Some(observed_tx),
+            })
+        })
+        .await
+        .unwrap();
+        let now = crate::now_f64();
+        state.last_sweep = now;
+        state.last_vacuum = now - 61.0;
+        state.vacuum_interval = 60.0;
+        state.vacuum_pages = 23;
+
+        let task = tokio::spawn(actor.run_sqlite());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), observed_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            23
+        );
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

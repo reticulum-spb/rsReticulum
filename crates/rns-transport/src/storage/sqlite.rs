@@ -16,6 +16,10 @@ const COLUMNS: &str = "destination_hash,hops,app_data,timestamp,public_key,ratch
 pub struct SqliteOptions {
     pub page_cache_kib: u32,
     pub busy_timeout: Duration,
+    /// Period between passive checkpoint / incremental vacuum passes.
+    pub vacuum_interval: Duration,
+    /// Maximum freelist pages reclaimed in one maintenance pass.
+    pub vacuum_pages: u32,
     /// FULL by default: acknowledge committed pins even across power loss.
     /// false selects NORMAL, allowing loss of recent commits on power loss.
     pub durable_commits: bool,
@@ -26,6 +30,8 @@ impl Default for SqliteOptions {
         Self {
             page_cache_kib: 1024,
             busy_timeout: Duration::from_millis(50),
+            vacuum_interval: Duration::from_secs(3600),
+            vacuum_pages: 128,
             durable_commits: true,
         }
     }
@@ -33,6 +39,7 @@ impl Default for SqliteOptions {
 
 pub struct SqliteTransportStorage {
     connection: Connection,
+    path: PathBuf,
     // An advisory OS lock is held for the entire backend lifetime, including
     // idle periods. Never unlink the lock file (that would break ownership).
     _owner: File,
@@ -98,6 +105,10 @@ impl SqliteTransportStorage {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // FAT and several removable-media filesystems derive Unix mode bits
+        // from mount options and can reject chmod. Permission hardening is
+        // best-effort; SQLite open/write and ownership failures remain fatal.
+        secure_database_files(path, Path::new(&lock_path));
         connection.busy_timeout(options.busy_timeout)?;
         let application: i64 =
             connection.pragma_query_value(None, "application_id", |r| r.get(0))?;
@@ -167,8 +178,11 @@ impl SqliteTransportStorage {
         connection.prepare(
             "SELECT kind,owner_key,destination_hash,packet_hash FROM packet_refs LIMIT 0",
         )?;
+        // journal_mode may have created WAL/SHM after the first pass.
+        secure_database_files(path, Path::new(&lock_path));
         Ok(Self {
             connection,
+            path: path.to_path_buf(),
             _owner: owner,
         })
     }
@@ -253,6 +267,41 @@ fn private_file(path: &Path) -> std::io::Result<File> {
     }
     options.open(path)
 }
+
+#[cfg(unix)]
+fn secure_database_files(database_path: &Path, lock_path: &Path) {
+    secure_database_files_with(database_path, lock_path, |path, permissions| {
+        std::fs::set_permissions(path, permissions)
+    });
+}
+
+#[cfg(unix)]
+fn secure_database_files_with<F>(database_path: &Path, lock_path: &Path, mut set_permissions: F)
+where
+    F: FnMut(&Path, std::fs::Permissions) -> std::io::Result<()>,
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    for path in [
+        database_path.to_path_buf(),
+        sqlite_sidecar(database_path, "-wal"),
+        sqlite_sidecar(database_path, "-shm"),
+        lock_path.to_path_buf(),
+    ] {
+        match set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not restrict SQLite file permissions; continuing"
+            ),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn secure_database_files(_database_path: &Path, _lock_path: &Path) {}
 
 fn check_generation(conn: &Connection, generation: i64) -> Result<()> {
     let current: i64 =
@@ -428,6 +477,29 @@ impl TransportStorage for SqliteTransportStorage {
                 (SELECT coalesce(sum(length(raw_packet)),0) FROM packet_blobs), (SELECT count(*) FROM packet_refs)", [], |r| Ok(StorageStats {
                     announces:r.get(0)?,packets:r.get(1)?,packet_bytes:r.get(2)?,references:r.get(3)?,
                 }))?),
+            Request::Maintain { vacuum_pages } => {
+                let page_size = pragma_u64(&self.connection, "page_size")?;
+                let page_count = pragma_u64(&self.connection, "page_count")?;
+                let free_before = pragma_u64(&self.connection, "freelist_count")?;
+                let (busy, wal_frames, checkpointed): (u64, u64, u64) = self.connection
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                let requested = u64::from(vacuum_pages).min(free_before);
+                if requested > 0 {
+                    self.connection.execute_batch(&format!("PRAGMA incremental_vacuum({requested})"))?;
+                }
+                let free_after = pragma_u64(&self.connection, "freelist_count")?;
+                Reply::Maintenance(StorageMaintenance {
+                    database_bytes: file_size(&self.path),
+                    wal_bytes: file_size(&sqlite_sidecar(&self.path, "-wal")),
+                    page_size,
+                    page_count,
+                    free_pages: free_after,
+                    checkpointed_frames: checkpointed,
+                    remaining_wal_frames: if busy == 0 { wal_frames.saturating_sub(checkpointed) } else { wal_frames },
+                    vacuumed_pages: free_before.saturating_sub(free_after),
+                    page_cache_kib: pragma_i64(&self.connection, "cache_size")?.unsigned_abs(),
+                })
+            }
             Request::Checkpoint => {
                 let (_, frames, done): (i64,i64,i64) = self.connection.query_row("PRAGMA wal_checkpoint(PASSIVE)",[], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                 Reply::Checkpoint { remaining_frames: (frames-done).max(0) }
@@ -436,9 +508,57 @@ impl TransportStorage for SqliteTransportStorage {
     }
 }
 
+fn pragma_u64(connection: &Connection, name: &str) -> Result<u64> {
+    connection
+        .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+        .map_err(StorageError::from)
+}
+
+fn pragma_i64(connection: &Connection, name: &str) -> Result<i64> {
+    connection
+        .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+        .map_err(StorageError::from)
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+fn sqlite_sidecar(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(suffix);
+    path.into()
+}
+
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_hardening_errors_are_nonfatal() {
+        let paths = std::cell::RefCell::new(Vec::new());
+        secure_database_files_with(
+            Path::new("fat/transport.db"),
+            Path::new("fat/transport.db.lock"),
+            |path, _| {
+                paths.borrow_mut().push(path.to_path_buf());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "FAT mount controls mode bits",
+                ))
+            },
+        );
+        assert_eq!(
+            paths.into_inner(),
+            [
+                PathBuf::from("fat/transport.db"),
+                PathBuf::from("fat/transport.db-wal"),
+                PathBuf::from("fat/transport.db-shm"),
+                PathBuf::from("fat/transport.db.lock"),
+            ]
+        );
+    }
 
     #[test]
     fn full_and_read_only_fail_explicitly_without_partial_metadata() {

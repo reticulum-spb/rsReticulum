@@ -568,6 +568,46 @@ mod disk {
     }
 
     #[test]
+    fn maintenance_reports_sizes_checkpoints_and_bounds_vacuum() {
+        let t = Temp::new();
+        let mut store = open(&t.path());
+        for n in 0..32_u8 {
+            let (mut announce, raw) = fixture(&rns_identity::identity::Identity::new());
+            announce.app_data = Some(vec![n; 4096]);
+            apply(
+                &mut store,
+                vec![Mutation::PutAnnounce {
+                    announce,
+                    raw: Some(raw),
+                }],
+            );
+        }
+        removed(&mut store, Request::ClearAnnounces, 32);
+        removed(&mut store, Request::CollectPackets { limit: 128 }, 32);
+
+        let Reply::Maintenance(checkpoint_only) = store
+            .execute(Request::Maintain { vacuum_pages: 0 })
+            .unwrap()
+        else {
+            panic!("invalid maintenance reply")
+        };
+        assert!(checkpoint_only.database_bytes > 0);
+        assert!(checkpoint_only.page_size > 0);
+        assert!(checkpoint_only.page_count > 0);
+        assert_eq!(checkpoint_only.vacuumed_pages, 0);
+        assert_eq!(checkpoint_only.page_cache_kib, 1024);
+
+        let Reply::Maintenance(maintenance) = store
+            .execute(Request::Maintain { vacuum_pages: 4 })
+            .unwrap()
+        else {
+            panic!("invalid maintenance reply")
+        };
+        assert!(maintenance.vacuumed_pages <= 4);
+        assert!(maintenance.free_pages <= checkpoint_only.free_pages);
+    }
+
+    #[test]
     fn database_options_and_io_errors() {
         let t = Temp::new();
         let path = t.path();

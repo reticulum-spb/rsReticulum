@@ -1,6 +1,7 @@
 //! Incremental announce storage, independent of legacy actor snapshots.
 //!
-//! The SQLite backend is opt-in and is not yet wired into `TransportActor`.
+//! The SQLite backend is opt-in and runs through `TransportActor`'s bounded
+//! admission loop.
 //! All SQL runs on one worker thread. Use [`StorageHandle::try_submit`] and
 //! handle completion alongside packet traffic; awaiting every lookup in the
 //! actor's receive loop would serialize packet processing on disk latency.
@@ -187,6 +188,11 @@ pub enum Request {
         limit: usize,
     },
     Stats,
+    /// Passive WAL checkpoint followed by a bounded incremental vacuum.
+    /// A zero page budget keeps checkpointing and metrics enabled.
+    Maintain {
+        vacuum_pages: u32,
+    },
     Checkpoint,
 }
 
@@ -198,6 +204,19 @@ pub struct StorageStats {
     pub references: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StorageMaintenance {
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub page_size: u64,
+    pub page_count: u64,
+    pub free_pages: u64,
+    pub checkpointed_frames: u64,
+    pub remaining_wal_frames: u64,
+    pub vacuumed_pages: u64,
+    pub page_cache_kib: u64,
+}
+
 #[derive(Debug)]
 pub enum Reply {
     Generation(i64),
@@ -207,6 +226,7 @@ pub enum Reply {
     Page(AnnouncePage),
     Removed(usize),
     Stats(StorageStats),
+    Maintenance(StorageMaintenance),
     /// SQLite PASSIVE checkpoint returns how many WAL frames are uncheckpointed.
     /// Readers can defer progress; this is not reported as a successful truncation.
     Checkpoint {

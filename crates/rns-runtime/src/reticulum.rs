@@ -1367,6 +1367,19 @@ pub async fn init_with_options(
                             .and_then(|v| v.parse::<u32>().ok())
                             .unwrap_or(1024)
                             .clamp(16, 16_384),
+                        vacuum_interval: Duration::from_secs(
+                            config
+                                .section("storage")
+                                .and_then(|s| s.get("vacuum_interval"))
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(3600)
+                                .max(60),
+                        ),
+                        vacuum_pages: config
+                            .section("storage")
+                            .and_then(|s| s.get("vacuum_pages"))
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(128),
                         ..Default::default()
                     },
                 )

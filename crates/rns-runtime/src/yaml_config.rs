@@ -1921,6 +1921,21 @@ mod tests {
         let config = Config::parse("reticulum: {}\ninterfaces: []\n", "config.yaml").unwrap();
         assert!(config.reticulum.share_instance);
         assert_eq!(config.logging.level, 4);
+        assert_eq!(config.storage.vacuum_interval, 3600);
+        assert_eq!(config.storage.vacuum_pages, 128);
+    }
+
+    #[test]
+    fn sqlite_maintenance_settings_reach_runtime_config() {
+        let config = Config::parse(
+            "storage:\n  vacuum_interval: 900\n  vacuum_pages: 32\ninterfaces: []\n",
+            "config.yaml",
+        )
+        .unwrap();
+        let runtime = config.to_runtime_config().unwrap();
+        let storage = runtime.section("storage").unwrap();
+        assert_eq!(storage.get("vacuum_interval"), Some("900"));
+        assert_eq!(storage.get("vacuum_pages"), Some("32"));
     }
 
     #[test]

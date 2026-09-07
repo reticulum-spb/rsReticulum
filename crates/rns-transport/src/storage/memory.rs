@@ -205,6 +205,7 @@ impl TransportStorage for MemoryTransportStorage {
                 packet_bytes: self.packets.values().map(|p| p.len() as u64).sum(),
                 references: self.references.len() as u64,
             }),
+            Request::Maintain { .. } => Reply::Maintenance(StorageMaintenance::default()),
             Request::Checkpoint => Reply::Checkpoint {
                 remaining_frames: 0,
             },
