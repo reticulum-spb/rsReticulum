@@ -1,10 +1,15 @@
--- Version 1: announces and immutable-by-hash packet payload. Route metadata
+-- Version 3: announces and immutable-by-hash packet payload. Route metadata
 -- remains legacy until a later migration; packet_refs preserves its blobs.
 CREATE TABLE packet_blobs (
     packet_hash BLOB PRIMARY KEY CHECK(length(packet_hash)=32),
     destination_hash BLOB NOT NULL CHECK(length(destination_hash)=16),
     raw_packet BLOB NOT NULL CHECK(length(raw_packet)<=65536)
 ) WITHOUT ROWID;
+
+-- CleanKnown tests whether any packet retained by the routing snapshot belongs
+-- to a destination. Without this index that correlated lookup scans the whole
+-- packet cache once per candidate announce and cleanup becomes quadratic.
+CREATE INDEX packet_blobs_destination ON packet_blobs(destination_hash);
 
 CREATE TABLE announces (
     destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),

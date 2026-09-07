@@ -8,7 +8,8 @@ use std::{
 };
 
 const APPLICATION_ID: i64 = 0x524e5354; // RNST, never LXMF's database.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+const MIN_SCHEMA_VERSION: i64 = 2;
 const COLUMNS: &str = "destination_hash,hops,app_data,timestamp,public_key,ratchet,packet_hash,is_path_response,retained,last_used,name_hash";
 
 #[derive(Debug, Clone)]
@@ -112,7 +113,7 @@ impl SqliteTransportStorage {
             if application != APPLICATION_ID {
                 return Err(StorageError::ForeignDatabase);
             }
-            if version != SCHEMA_VERSION {
+            if !(MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&version) {
                 return Err(StorageError::Schema(version));
             }
         }
@@ -127,6 +128,19 @@ impl SqliteTransportStorage {
                 connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute_batch(include_str!("schema.sql"))?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+        } else if version == 2 {
+            // Version 2's CleanKnown query had to scan packet_blobs once for
+            // every candidate announce. On a live daemon this eventually kept
+            // the storage worker at one full core. Adding the lookup index is
+            // atomic and preserves the newly-created SQLite store in place.
+            let tx =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS packet_blobs_destination ON packet_blobs(destination_hash)",
+                [],
+            )?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }

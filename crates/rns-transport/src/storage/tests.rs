@@ -526,6 +526,48 @@ mod disk {
     }
 
     #[test]
+    fn version_two_database_gets_bounded_cleanup_lookup() {
+        let t = Temp::new();
+        let path = t.path();
+        drop(open(&path));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DROP INDEX packet_blobs_destination", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        drop(conn);
+
+        drop(open(&path));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        let mut statement = conn
+            .prepare("SELECT name FROM pragma_index_list('packet_blobs') WHERE name='packet_blobs_destination'")
+            .unwrap();
+        assert!(statement.exists([]).unwrap());
+
+        let plan: String = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM packet_blobs p
+                 WHERE p.destination_hash=?1
+                   AND EXISTS(SELECT 1 FROM packet_keep k WHERE k.packet_hash=p.packet_hash)",
+            )
+            .unwrap()
+            .query_map([&[0_u8; 16][..]], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("packet_blobs_destination"),
+            "cleanup lookup must use the destination index: {plan}"
+        );
+    }
+
+    #[test]
     fn database_options_and_io_errors() {
         let t = Temp::new();
         let path = t.path();
