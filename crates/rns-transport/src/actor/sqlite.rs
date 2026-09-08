@@ -243,7 +243,7 @@ impl TransportActor {
                 h.flags.packet_type == rns_wire::flags::PacketType::Announce
                     || h.flags.destination_type == rns_wire::flags::DestinationType::Plain
                     || h.context == rns_wire::context::PacketContext::CacheRequest
-                    || h.context == rns_wire::context::PacketContext::LinkProof
+                    || h.context == rns_wire::context::PacketContext::Lrproof
             }),
             _ => false,
         }
@@ -257,7 +257,7 @@ impl TransportActor {
                     if h.flags.packet_type == rns_wire::flags::PacketType::Announce {
                         reads.keys.push(h.destination_hash);
                     }
-                    if h.context == rns_wire::context::PacketContext::LinkProof {
+                    if h.context == rns_wire::context::PacketContext::Lrproof {
                         if let Some(e) = self.link_table.get(&h.destination_hash) {
                             reads.keys.push(e.destination_hash);
                         }
@@ -784,6 +784,48 @@ mod tests {
             snr: None,
             q: None,
         })
+    }
+
+    #[test]
+    fn lrproof_loads_destination_identity_before_transit_validation() {
+        let (mut actor, _tx) = TransportActor::new();
+        let link_id = [0xA1; 16];
+        let destination_hash = [0xB2; 16];
+        actor.link_table.insert(
+            link_id,
+            crate::link_table::LinkEntry {
+                timestamp: crate::now_f64(),
+                next_hop: None,
+                interface_id: 1,
+                remaining_hops: 1,
+                destination_hash,
+                established: false,
+                validated: false,
+                proof_timeout: crate::now_f64() + 60.0,
+                receiving_interface: 2,
+                taken_hops: 0,
+            },
+        );
+        let flags = rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type: rns_wire::flags::PacketType::Proof,
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags,
+            hops: 1,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Lrproof,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&[0; 96]);
+        let message = inbound(Bytes::from(raw));
+
+        assert!(actor.sqlite_dependent(&message));
+        assert_eq!(actor.sqlite_reads(&message).keys, vec![destination_hash]);
     }
 
     #[tokio::test]
