@@ -19,24 +19,22 @@ Callers migrating from the earlier API should wrap configured coordinates in
 a real coordinate. Existing files containing floating-point coordinates remain
 readable.
 
-`interop_tests/discovery_reference.py` generates stable maps with the real
+`vectors/rust/discovery_reference.py` in the sibling `reticulum-e2e-tests` generates stable maps with the real
 Python announcer and records acceptance and field values from the real Python
 receiver. The malformed-map checks retain real stamp validation with an explicit
 zero-cost requirement to isolate decoding. The committed fixture excludes
-random stamps and receive timestamps. `tests/discovery_parity.rs` feeds every
+random stamps and receive timestamps. `vectors/rust/tests/discovery_parity.rs` in that repository feeds every
 map to the public Rust decoder and checks the Python result, including populated
 and operator announces.
 
-From the repository root:
+From the `reticulum-e2e-tests` repository root, against a fresh source snapshot:
 
 ```bash
-PYTHONPATH=../Reticulum python interop_tests/discovery_reference.py --check
-cargo test --workspace discovery
-cargo test --workspace --no-default-features --features=sqlite-bundled discovery
+PYTHONPATH=vendor/Reticulum python vectors/rust/discovery_reference.py --check
+cargo test --manifest-path vectors/rust/Cargo.toml discovery
 ```
 
-The fixture generator requires the sibling `reticulum-e2e-tests` checkout for
-its existing Python announcer setup (override with `--suite`).
+The fixture and generator belong to that test repository.
 
 ## Stamp defaults (RUST-S9)
 
@@ -44,21 +42,19 @@ The producer default and runtime receiver minimum are both 16. YAML continues
 to accept an explicit minimum; the runtime default refers to the shared
 transport constant to prevent the two defaults diverging again.
 
-`crates/rns-runtime/tests/discovery_python.rs` passes the actual public Rust
-settings to `interop_tests/discovery_stamp_reference.py`. The Python test
+`spec/rust/tests/discovery_python.rs` in `reticulum-e2e-tests` passes the actual public Rust
+settings to `spec/rust/python/discovery_stamp_reference.py`. The Python test
 first establishes acceptance with the real receiver and stamps of exactly
 15 and 16 leading zero bits, then checks the Rust settings against that
 boundary and an explicit minimum of 15. It does not assume that mining with
 a target of 14 always produces a stamp below 16.
 
-This opt-in cross-process test requires the reference Python environment:
+From the test repository, this opt-in cross-process test requires the reference
+Python environment:
 
 ```bash
-PARITY_PYTHON=/path/to/reference/python PYTHONPATH=../Reticulum \
-  cargo test --workspace discovery_stamp_defaults_match_python_receiver -- --ignored --nocapture
-PARITY_PYTHON=/path/to/reference/python PYTHONPATH=../Reticulum \
-  cargo test --workspace --no-default-features --features=sqlite-bundled \
-  discovery_stamp_defaults_match_python_receiver -- --ignored --nocapture
+PARITY_PYTHON=/path/to/reference/python PYTHONPATH=vendor/Reticulum \
+  cargo test --manifest-path spec/rust/Cargo.toml discovery_stamp -- --ignored --nocapture
 ```
 
 The Rust PoW implementation is supplied by the embedding application through
@@ -88,9 +84,9 @@ published implementation/version fields. Run both directions with the same
 reference environment as S9:
 
 ```bash
-PARITY_PYTHON=/path/to/reference/python PYTHONPATH=../Reticulum \
-  cargo test --workspace discovery -- --include-ignored
-PARITY_PYTHON=/path/to/reference/python PYTHONPATH=../Reticulum \
-  cargo test --workspace --no-default-features --features=sqlite-bundled \
-  discovery -- --include-ignored
+PARITY_PYTHON=/path/to/reference/python PYTHONPATH=vendor/Reticulum \
+  cargo test --manifest-path vectors/rust/Cargo.toml discovery -- --include-ignored
 ```
+
+Repeat in a fresh snapshot whose standalone consumers have the same resolved
+features as the whole workspace `--no-default-features --features=sqlite-bundled`.

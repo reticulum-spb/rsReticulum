@@ -16,7 +16,7 @@ bodies. Each segment is proved before dispatch; a split request is dispatched
 only after complete reassembly. Responses retain the existing packet/Resource
 selection and request ID correlation.
 
-Cross-implementation coverage lives in `interop_tests/test_resource_requests.py`:
+Cross-implementation coverage lives in `tests/test_rsreticulum_resource_requests.py` in the sibling `reticulum-e2e-tests`:
 Python and Rust each send a request at the Python-derived packet boundary, one
 byte above it, and at 100,000 bytes. The peer's echo response must match the full
 length and SHA-256 digest. The surrounding endpoint suite also checks small
@@ -29,7 +29,7 @@ Example against an already prepared and running stack (from this repository):
 
 ```bash
 PYTHONPATH=../Reticulum:../reticulum-e2e-tests/tests python -m pytest \
-  interop_tests/test_resource_requests.py -v
+  ../reticulum-e2e-tests/tests/test_rsreticulum_resource_requests.py -v
 ```
 
 Use a fresh source snapshot and rebuild the stack for each run. Repeat with
