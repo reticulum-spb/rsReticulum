@@ -321,6 +321,15 @@ This is a breaking configuration-format change. Existing Python Reticulum
 configs must be rewritten as YAML; rsReticulum intentionally does not parse
 the old format.
 
+Python's `ifac_size` is in **bits**, while native YAML `ifac_size` is in
+**bytes** (`1..=64`). When migrating, 8 bits becomes `ifac_size: 1` and
+128 bits becomes `ifac_size: 16`. Python values below 8, or an absent field,
+select the interface class default: omit the YAML field. Other values are
+rounded down to whole bytes; values of 520 bits or more exceed Rust's limit
+and must be rejected. Programmatic migration can use
+`InterfaceCommonConfig::import_python_ifac_size(Option<i64>)`, which performs
+this conversion explicitly. YAML parsing never applies it automatically.
+
 Configuration is deserialized with `serde-saphyr` into strict Serde structs.
 It was selected because it is actively maintained, reports source locations,
 supports both reading and Web UI serialization, and does not require a native

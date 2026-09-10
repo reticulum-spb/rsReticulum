@@ -856,11 +856,38 @@ pub struct InterfaceCommonConfig {
     pub announce_rate_penalty: Option<u64>,
     pub ifac_network_name: Option<String>,
     pub ifac_passphrase: Option<String>,
+    /// IFAC length in bytes (1..=64); None selects the interface class default.
     pub ifac_size: Option<usize>,
     pub ingress_control: bool,
     pub ingress: IngressConfig,
     pub recursive_path_requests: bool,
     pub announces_from_internal: bool,
+}
+
+impl InterfaceCommonConfig {
+    /// Import the `ifac_size` field from a Python Reticulum configuration.
+    ///
+    /// Python uses bits: values below 8 (or an absent value) select the
+    /// interface class default; other values are rounded down to whole bytes.
+    /// Rust supports at most 64 bytes. An unsupported size returns an error
+    /// without changing the current field. Native YAML always uses bytes;
+    /// this explicit helper does not parse or import an entire Python config.
+    pub fn import_python_ifac_size(&mut self, bits: Option<i64>) -> Result<(), YamlConfigError> {
+        let size = match bits {
+            Some(bits) if bits >= 8 => {
+                let bytes = bits / 8;
+                if bytes > 64 {
+                    return Err(YamlConfigError::Validation(format!(
+                        "Python ifac_size {bits} bits becomes {bytes} bytes; Rust supports 1..=64 bytes"
+                    )));
+                }
+                Some(bytes as usize)
+            }
+            _ => None,
+        };
+        self.ifac_size = size;
+        Ok(())
+    }
 }
 
 impl Default for InterfaceCommonConfig {
