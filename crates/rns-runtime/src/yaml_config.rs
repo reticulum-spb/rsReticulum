@@ -416,7 +416,7 @@ impl Default for ReticulumConfig {
             network_identity: None,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
-            required_discovery_value: 14,
+            required_discovery_value: rns_transport::discovery::DEFAULT_STAMP_VALUE,
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
             publish_blackhole: false,

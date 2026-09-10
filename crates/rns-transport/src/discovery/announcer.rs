@@ -43,7 +43,7 @@ pub struct DiscoveryInterfaceConfig {
     pub coding_rate: Option<u8>,
     pub modulation: Option<String>,
     pub channel: Option<u16>,
-    /// Geolocation (defaults to 0/0/0).
+    /// Optional geolocation (unset by default).
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub height: Option<f64>,

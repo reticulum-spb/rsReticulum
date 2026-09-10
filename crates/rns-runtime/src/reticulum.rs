@@ -614,7 +614,7 @@ pub struct ReticulumConfig {
     /// Maximum number of discovered interfaces to auto-connect to. Python
     /// `autoconnect_discovered_interfaces`.
     pub autoconnect_discovered_interfaces: usize,
-    /// Minimum stamp value (leading-zero bits). Default 14 (LXStamper
+    /// Minimum stamp value (leading-zero bits). Default 16 (Discovery
     /// `DEFAULT_STAMP_VALUE`). Python `required_discovery_value`.
     pub discover_interfaces_required_value: u8,
     /// Accepted discovery publisher identities. Python

@@ -75,7 +75,7 @@ interfaces: []
 | `network_identity` | path or null | `null` | Optional network identity file. A leading `~/` is expanded using the user home directory. |
 | `discover_interfaces` | boolean | `false` | Publish and process interface-discovery announces. |
 | `autoconnect_discovered_interfaces` | integer | `0` | Maximum discovered interfaces to connect automatically; `0` disables autoconnect. |
-| `required_discovery_value` | integer | `14` | Required discovery stamp value, `0..=255`. |
+| `required_discovery_value` | integer | `16` | Required discovery stamp value, `0..=255`. |
 | `interface_discovery_sources` | sequence of strings | `[]` | Accepted discovery publisher identity hashes; each is 32 hexadecimal characters. |
 | `blackhole_sources` | sequence of strings | `[]` | Blackhole manifest publisher hashes; each is 32 hexadecimal characters. |
 | `publish_blackhole` | boolean | `false` | Publish the local blackhole table. |
