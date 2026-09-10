@@ -1,6 +1,7 @@
 //! Application-facing network orchestration corresponding to Python's
 //! `Destination`, `Packet` and `Transport` APIs.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,7 @@ use rns_identity::destination::{
     DestType, Destination, DestinationError, Direction, ProofStrategy,
 };
 use rns_identity::identity::{Identity, IdentityError};
+use rns_identity::ratchet::RatchetRing;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     AnnounceHandlerEvent, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
@@ -30,6 +32,8 @@ pub enum ApplicationError {
     Destination(#[from] DestinationError),
     #[error("identity: {0}")]
     Identity(#[from] IdentityError),
+    #[error("ratchet storage: {0}")]
+    RatchetStorage(#[from] std::io::Error),
     #[error("transport channel closed")]
     TransportClosed,
     #[error("transport channel full")]
@@ -94,6 +98,7 @@ pub struct RegisteredDestination {
     destination: Destination,
     identity: Option<Arc<Identity>>,
     event_rx: mpsc::Receiver<DestinationEvent>,
+    ratchets: Option<(RatchetRing, PathBuf)>,
 }
 
 impl RegisteredDestination {
@@ -133,6 +138,7 @@ impl RegisteredDestination {
             destination,
             identity,
             event_rx,
+            ratchets: None,
         })
     }
 
@@ -152,12 +158,78 @@ impl RegisteredDestination {
         self.destination.set_proof_strategy(strategy);
     }
 
-    pub fn enable_ratchets(&mut self, enforce: bool) {
+    /// Enable persistent destination ratchets. The first announce rotates the
+    /// loaded ring, as Python does. Storage errors leave the previous state intact.
+    pub fn enable_ratchets(&mut self, enforce: bool) -> Result<(), ApplicationError> {
+        let identity = self
+            .identity
+            .as_deref()
+            .ok_or(ApplicationError::UnknownIdentity)?;
+        let directory = self.runtime.config_dir.join("storage/ratchets");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(self.hex_hash());
+        let mut ring = match RatchetRing::load_verified(&path, identity) {
+            Ok(loaded) => loaded.into_ring(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let ring = RatchetRing::new();
+                ring.save_verified(&path, identity)?;
+                ring
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some((previous, _)) = &self.ratchets {
+            ring.set_retained_ratchets(previous.retained_ratchets());
+            ring.set_ratchet_interval(previous.ratchet_interval());
+        }
+        self.destination.local_ratchet_pub = ring.current_public_key();
+        self.ratchets = Some((ring, path));
         self.destination.enable_ratchets(enforce);
+        Ok(())
+    }
+
+    /// Set the in-memory retention limit (1..=512); trimmed keys persist on next rotation.
+    /// The bound is the existing RatchetRing storage limit.
+    pub fn set_retained_ratchets(&mut self, count: usize) -> bool {
+        self.ratchets
+            .as_mut()
+            .is_some_and(|(ring, _)| ring.set_retained_ratchets(count))
+    }
+
+    /// Set the minimum number of seconds between announce-triggered rotations.
+    pub fn set_ratchet_interval(&mut self, seconds: u64) -> bool {
+        self.ratchets
+            .as_mut()
+            .is_some_and(|(ring, _)| ring.set_ratchet_interval(seconds))
+    }
+
+    pub fn ratchet_public_key(&self) -> Option<[u8; 32]> {
+        self.destination.get_ratchet_for_announce()
+    }
+
+    pub fn retained_ratchet_count(&self) -> usize {
+        self.ratchets.as_ref().map_or(0, |(ring, _)| ring.len())
+    }
+
+    fn rotate_ratchets_if_due(&mut self, time: f64) -> Result<(), ApplicationError> {
+        if let Some((ring, path)) = &mut self.ratchets {
+            if ring.is_empty() || time > ring.last_rotation() + ring.ratchet_interval() as f64 {
+                let identity = self
+                    .identity
+                    .as_deref()
+                    .ok_or(ApplicationError::UnknownIdentity)?;
+                let prepared = ring.prepare_rotation_at(time);
+                // Never advertise a key that has not been durably stored.
+                prepared.ring().save_verified(path, identity)?;
+                let public_key = ring.commit_prepared_rotation(prepared);
+                self.destination.set_local_ratchet(public_key);
+            }
+        }
+        Ok(())
     }
 
     /// Broadcast an announce through the network.
     pub async fn announce(&mut self, app_data: Option<&[u8]>) -> Result<(), ApplicationError> {
+        self.rotate_ratchets_if_due(now())?;
         let identity = self
             .identity
             .as_deref()
@@ -185,6 +257,19 @@ impl RegisteredDestination {
                 .ok_or(ApplicationError::TransportClosed)?;
             match event {
                 DestinationEvent::AnnounceRequested(request) => {
+                    // A repeated path tag reuses its signed announce without rotating.
+                    if request.path_response {
+                        if let Some(tag) = request.tag.as_deref() {
+                            if let Some(raw) =
+                                self.destination.cached_path_response_packet(tag, now())?
+                            {
+                                self.send_raw(raw, self.hash(), request.attached_interface)
+                                    .await?;
+                                continue;
+                            }
+                        }
+                    }
+                    self.rotate_ratchets_if_due(now())?;
                     let Some(identity) = self.identity.as_deref() else {
                         continue;
                     };
@@ -214,7 +299,11 @@ impl RegisteredDestination {
                                 .as_deref()
                                 .ok_or(ApplicationError::UnknownIdentity)?;
                             self.destination
-                                .decrypt(&raw[offset..], identity)
+                                .decrypt_with_ratchets(
+                                    &raw[offset..],
+                                    identity,
+                                    self.ratchets.as_ref().map(|(ring, _)| ring.private_keys()),
+                                )
                                 .map_err(|_| ApplicationError::DecryptionFailed)?
                         }
                         _ => continue,
