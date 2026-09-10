@@ -42,9 +42,9 @@ pub struct DiscoveryInfo {
     /// Endpoint address (IP/hostname/b32 for I2P) — optional (key `0x02`).
     pub reachable_on: Option<String>,
     /// Geolocation (keys `0x03` / `0x04` / `0x05`).
-    pub latitude: f64,
-    pub longitude: f64,
-    pub height: f64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub height: Option<f64>,
     /// TCP/Backbone bind port (key `0x06`).
     pub port: Option<u16>,
     /// IFAC virtual-network overlay (keys `0x07` / `0x08`).
@@ -167,9 +167,18 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             Value::Binary(info.transport_id.to_vec()),
         ),
         (u8_key(key::NAME), Value::from(info.name.clone())),
-        (u8_key(key::LATITUDE), Value::F64(info.latitude)),
-        (u8_key(key::LONGITUDE), Value::F64(info.longitude)),
-        (u8_key(key::HEIGHT), Value::F64(info.height)),
+        (
+            u8_key(key::LATITUDE),
+            info.latitude.map(Value::F64).unwrap_or(Value::Nil),
+        ),
+        (
+            u8_key(key::LONGITUDE),
+            info.longitude.map(Value::F64).unwrap_or(Value::Nil),
+        ),
+        (
+            u8_key(key::HEIGHT),
+            info.height.map(Value::F64).unwrap_or(Value::Nil),
+        ),
     ];
 
     if let Some(addr) = &info.reachable_on {
@@ -241,6 +250,7 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
     };
 
     let mut info = DiscoveryInfo::default();
+    let mut seen_fields = Vec::new();
     let mut saw_interface_type = false;
     let mut saw_transport_id = false;
 
@@ -248,9 +258,24 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
         let Some(kb) = value_as_u8(&k) else {
             continue; // unknown/non-numeric keys are ignored for forward compat
         };
+        seen_fields.push(kb);
         match kb {
             key::NAME => {
-                info.name = value_as_string(&v, kb)?;
+                info.name = if value_is_falsy(&v) {
+                    String::new()
+                } else if let Value::String(name) = &v {
+                    name.as_str()
+                        .ok_or(AppDataError::TypeMismatch {
+                            key: kb,
+                            expected: "string",
+                        })?
+                        .to_owned()
+                } else {
+                    return Err(AppDataError::TypeMismatch {
+                        key: kb,
+                        expected: "string",
+                    });
+                };
             }
             key::TRANSPORT_ID => {
                 let bytes = value_as_bytes(&v, kb)?;
@@ -295,6 +320,17 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
         }
     }
 
+    for required in [
+        key::NAME,
+        key::TRANSPORT,
+        key::LATITUDE,
+        key::LONGITUDE,
+        key::HEIGHT,
+    ] {
+        if !seen_fields.contains(&required) {
+            return Err(AppDataError::MissingKey(required));
+        }
+    }
     if !saw_interface_type {
         return Err(AppDataError::MissingKey(key::INTERFACE_TYPE));
     }
@@ -302,6 +338,9 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
         return Err(AppDataError::MissingKey(key::TRANSPORT_ID));
     }
     info.name = sanitize_name(&info.name);
+    if info.name.is_empty() {
+        info.name = format!("Discovered {}", info.interface_type);
+    }
     if !DISCOVERABLE_INTERFACE_TYPES.contains(&info.interface_type.as_str()) {
         return Err(AppDataError::UnsupportedInterfaceType(info.interface_type));
     }
@@ -385,11 +424,27 @@ fn value_as_bytes(v: &Value, kb: u8) -> Result<Vec<u8>, AppDataError> {
     }
 }
 
-fn value_as_f64(v: &Value, kb: u8) -> Result<f64, AppDataError> {
+// Python sanitize_name applies its false-value fallback before string operations.
+fn value_is_falsy(v: &Value) -> bool {
     match v {
-        Value::F64(f) => Ok(*f),
-        Value::F32(f) => Ok(*f as f64),
-        Value::Integer(n) => Ok(n.as_f64().unwrap_or(0.0)),
+        Value::Nil => true,
+        Value::Boolean(v) => !v,
+        Value::Integer(v) => v.as_i64() == Some(0),
+        Value::F32(v) => *v == 0.0,
+        Value::F64(v) => *v == 0.0,
+        Value::String(v) => v.as_bytes().is_empty(),
+        Value::Binary(v) => v.is_empty(),
+        Value::Array(v) => v.is_empty(),
+        Value::Map(v) => v.is_empty(),
+        _ => false,
+    }
+}
+
+fn value_as_f64(v: &Value, kb: u8) -> Result<Option<f64>, AppDataError> {
+    match v {
+        Value::Nil => Ok(None),
+        Value::F64(f) => Ok(Some(*f)),
+        Value::F32(f) => Ok(Some(*f as f64)),
         _ => Err(AppDataError::TypeMismatch {
             key: kb,
             expected: "float",
@@ -415,9 +470,9 @@ mod tests {
             interface_type: "BackboneInterface".into(),
             transport_enabled: true,
             reachable_on: Some("relay.example.org".into()),
-            latitude: 51.5074,
-            longitude: -0.1278,
-            height: 35.0,
+            latitude: Some(51.5074),
+            longitude: Some(-0.1278),
+            height: Some(35.0),
             port: Some(4965),
             ifac_netname: Some("mynet".into()),
             ifac_netkey: Some("hunter2".into()),
@@ -431,9 +486,9 @@ mod tests {
             transport_id: [0x22; 16],
             interface_type: "RNodeInterface".into(),
             transport_enabled: false,
-            latitude: 52.5200,
-            longitude: 13.4050,
-            height: 50.0,
+            latitude: Some(52.5200),
+            longitude: Some(13.4050),
+            height: Some(50.0),
             frequency: Some(869_525_000),
             bandwidth: Some(125_000),
             spreading_factor: Some(8),

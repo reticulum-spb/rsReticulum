@@ -44,9 +44,9 @@ pub struct DiscoveryInterfaceConfig {
     pub modulation: Option<String>,
     pub channel: Option<u16>,
     /// Geolocation (defaults to 0/0/0).
-    pub latitude: f64,
-    pub longitude: f64,
-    pub height: f64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub height: Option<f64>,
     /// Set the `FLAG_ENCRYPTED` bit; caller supplies `encrypt` closure at
     /// announce time via [`AnnounceRequest::assemble`].
     pub encrypt: bool,
@@ -75,9 +75,9 @@ impl DiscoveryInterfaceConfig {
             coding_rate: None,
             modulation: None,
             channel: None,
-            latitude: 0.0,
-            longitude: 0.0,
-            height: 0.0,
+            latitude: None,
+            longitude: None,
+            height: None,
             encrypt: false,
             signed: true,
         }

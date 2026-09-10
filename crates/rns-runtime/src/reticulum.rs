@@ -2427,16 +2427,13 @@ fn discovery_config_for_interface(
             .map(|v| v.min(u16::MAX as u64) as u16),
         latitude: section
             .get_float("discovery_latitude")
-            .or_else(|| section.get_float("latitude"))
-            .unwrap_or(0.0),
+            .or_else(|| section.get_float("latitude")),
         longitude: section
             .get_float("discovery_longitude")
-            .or_else(|| section.get_float("longitude"))
-            .unwrap_or(0.0),
+            .or_else(|| section.get_float("longitude")),
         height: section
             .get_float("discovery_height")
-            .or_else(|| section.get_float("height"))
-            .unwrap_or(0.0),
+            .or_else(|| section.get_float("height")),
         encrypt: section.get_bool("discovery_encrypt").unwrap_or(false),
         signed: false,
     })

@@ -247,9 +247,15 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     map.push((s("hops"), Value::from(rec.hops)));
     map.push((s("value"), Value::from(rec.stamp_value)));
     map.push((s("stamp"), Value::Binary(rec.stamp.clone())));
-    map.push((s("latitude"), Value::F64(i.latitude)));
-    map.push((s("longitude"), Value::F64(i.longitude)));
-    map.push((s("height"), Value::F64(i.height)));
+    map.push((
+        s("latitude"),
+        i.latitude.map(Value::F64).unwrap_or(Value::Nil),
+    ));
+    map.push((
+        s("longitude"),
+        i.longitude.map(Value::F64).unwrap_or(Value::Nil),
+    ));
+    map.push((s("height"), i.height.map(Value::F64).unwrap_or(Value::Nil)));
     if let Some(addr) = &i.reachable_on {
         map.push((s("reachable_on"), Value::from(addr.clone())));
     }
@@ -315,9 +321,9 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         transport_id: hex16(&lookup, "transport_id").unwrap_or([0; 16]),
         name: str_or_default(&lookup, "name"),
         reachable_on: str_opt(&lookup, "reachable_on"),
-        latitude: f64_or_default(&lookup, "latitude"),
-        longitude: f64_or_default(&lookup, "longitude"),
-        height: f64_or_default(&lookup, "height"),
+        latitude: f64_opt(&lookup, "latitude"),
+        longitude: f64_opt(&lookup, "longitude"),
+        height: f64_opt(&lookup, "height"),
         port: u64_opt(&lookup, "port").map(|n| n.min(u16::MAX as u64) as u16),
         ifac_netname: str_opt(&lookup, "ifac_netname"),
         ifac_netkey: str_opt(&lookup, "ifac_netkey"),
@@ -377,13 +383,8 @@ fn bool_or_default(lookup: &HashMap<String, Value>, k: &str) -> bool {
     }
 }
 
-fn f64_or_default(lookup: &HashMap<String, Value>, k: &str) -> f64 {
-    match lookup.get(k) {
-        Some(Value::F64(f)) => *f,
-        Some(Value::F32(f)) => *f as f64,
-        Some(Value::Integer(n)) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
-    }
+fn f64_opt(lookup: &HashMap<String, Value>, k: &str) -> Option<f64> {
+    lookup.get(k).and_then(Value::as_f64)
 }
 
 fn u64_opt(lookup: &HashMap<String, Value>, k: &str) -> Option<u64> {
@@ -435,9 +436,9 @@ mod tests {
                 interface_type: "BackboneInterface".into(),
                 transport_enabled: true,
                 reachable_on: Some("1.2.3.4".into()),
-                latitude: 0.0,
-                longitude: 0.0,
-                height: 0.0,
+                latitude: Some(0.0),
+                longitude: Some(0.0),
+                height: Some(0.0),
                 port: Some(4965),
                 ..Default::default()
             },

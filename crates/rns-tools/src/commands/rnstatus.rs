@@ -726,8 +726,8 @@ fn discovered_json(record: &DiscoveredInterface) -> serde_json::Value {
     })
 }
 
-fn finite_location(value: f64) -> Option<f64> {
-    value.is_finite().then_some(value)
+fn finite_location(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| v.is_finite())
 }
 
 fn print_discovered_summary(records: &[DiscoveredInterface]) {
@@ -874,11 +874,12 @@ fn discovered_config_entry(record: &DiscoveredInterface) -> String {
     lines.join("\n")
 }
 
-fn location_summary(latitude: f64, longitude: f64, height: f64) -> String {
-    if latitude == 0.0 && longitude == 0.0 {
+fn location_summary(latitude: Option<f64>, longitude: Option<f64>, height: Option<f64>) -> String {
+    let (Some(latitude), Some(longitude)) = (finite_location(latitude), finite_location(longitude))
+    else {
         return "N/A".to_string();
-    }
-    if height != 0.0 {
+    };
+    if let Some(height) = finite_location(height) {
         format!("{latitude:.4}, {longitude:.4}, {height:.0}m h")
     } else {
         format!("{latitude:.4}, {longitude:.4}")
