@@ -1,4 +1,4 @@
-use crate::resource::{MAPHASH_LEN, ResourceFlags};
+use crate::resource::{MAPHASH_LEN, MAX_EFFICIENT_SIZE, ResourceFlags};
 
 /// Advertisement overhead in bytes (non-hashmap data).
 pub const OVERHEAD: usize = 134;
@@ -139,7 +139,7 @@ impl ResourceAdvertisement {
         let get_usize = |key: &str| -> Result<usize, String> {
             get(key)
                 .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
+                .and_then(|v| usize::try_from(v).ok())
                 .ok_or_else(|| format!("missing or invalid key: {key}"))
         };
 
@@ -154,6 +154,12 @@ impl ResourceAdvertisement {
         };
 
         let transfer_size = get_usize("t")?;
+        // Match Python's advertisement ceiling before constructing a transfer.
+        // This fixed protocol constant fits even a 32-bit usize; do not multiply
+        // or narrow the untrusted wire value when checking the bound.
+        if transfer_size > MAX_EFFICIENT_SIZE * 3 {
+            return Err("invalid transfer size".into());
+        }
         let data_size = get_usize("d")?;
         let num_parts = get_usize("n")?;
 
@@ -364,11 +370,8 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        /// ResourceAdvertisement msgpack round-trip. The existing tests
-        /// check construction / field-level behavior but not the pack →
-        /// unpack cycle. This samples the whole-struct space and locks
-        /// in: all top-level fields survive the msgpack round-trip,
-        /// including the optional `request_id` variants (Nil vs Binary).
+        /// Valid advertisements round-trip with every wire field preserved;
+        /// oversized advertisements are rejected, including when locally packed.
         #[test]
         fn proptest_resource_adv_pack_unpack_roundtrip(
             transfer_size in 0usize..=10_000_000,
@@ -405,7 +408,12 @@ mod tests {
             adv.hashmap.truncate(usable);
 
             let packed = adv.pack();
-            let unpacked = ResourceAdvertisement::unpack(&packed).unwrap();
+            let decoded = ResourceAdvertisement::unpack(&packed);
+            if transfer_size > MAX_EFFICIENT_SIZE * 3 {
+                prop_assert!(decoded.is_err());
+                return Ok(());
+            }
+            let unpacked = decoded.unwrap();
 
             prop_assert_eq!(unpacked.transfer_size, adv.transfer_size);
             prop_assert_eq!(unpacked.data_size, adv.data_size);
