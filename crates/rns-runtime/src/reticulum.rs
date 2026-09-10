@@ -2397,6 +2397,10 @@ fn discovery_config_for_interface(
         discoverable: true,
         name,
         transport_enabled,
+        operator_address: section
+            .get("discovery_lxmf_address")
+            .and_then(|value| hex::decode(value).ok())
+            .and_then(|bytes| bytes.try_into().ok()),
         announce_interval_secs: discovery_announce_interval_secs(section),
         stamp_value: section
             .get_uint("discovery_stamp_value")

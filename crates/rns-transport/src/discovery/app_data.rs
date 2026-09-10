@@ -33,6 +33,8 @@ use super::constants::{DISCOVERABLE_INTERFACE_TYPES, FLAG_ENCRYPTED, STAMP_SIZE,
 pub struct DiscoveryInfo {
     /// Human-readable interface name (key `0xFF`).
     pub name: String,
+    /// Optional 16-byte operator address (key 0xF0).
+    pub operator_address: Option<[u8; 16]>,
     /// Transport identity hash of the announcer (key `0xFE`, 16 bytes).
     pub transport_id: [u8; 16],
     /// Interface type string, e.g. `"BackboneInterface"` (key `0x00`).
@@ -166,6 +168,14 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
             u8_key(key::TRANSPORT_ID),
             Value::Binary(info.transport_id.to_vec()),
         ),
+        (
+            u8_key(key::TRANSPORT_IMPL),
+            Value::from(super::constants::IMPLEMENTATION_NAME),
+        ),
+        (
+            u8_key(key::TRANSPORT_VERS),
+            Value::from(super::constants::IMPLEMENTATION_VERSION),
+        ),
         (u8_key(key::NAME), Value::from(info.name.clone())),
         (
             u8_key(key::LATITUDE),
@@ -181,6 +191,9 @@ fn info_to_map(info: &DiscoveryInfo) -> Vec<(Value, Value)> {
         ),
     ];
 
+    if let Some(address) = info.operator_address {
+        entries.push((u8_key(key::OP_ADDR), Value::Binary(address.to_vec())));
+    }
     if let Some(addr) = &info.reachable_on {
         entries.push((u8_key(key::REACHABLE_ON), Value::from(addr.clone())));
     }
@@ -275,6 +288,18 @@ pub fn decode_info(packed: &[u8]) -> Result<DiscoveryInfo, AppDataError> {
                         key: kb,
                         expected: "string",
                     });
+                };
+            }
+            key::OP_ADDR => {
+                info.operator_address = match v {
+                    Value::Nil => None,
+                    Value::Binary(bytes) => bytes.try_into().ok(),
+                    _ => {
+                        return Err(AppDataError::TypeMismatch {
+                            key: kb,
+                            expected: "bytes or nil",
+                        });
+                    }
                 };
             }
             key::TRANSPORT_ID => {

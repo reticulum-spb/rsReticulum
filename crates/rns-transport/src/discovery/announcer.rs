@@ -24,6 +24,8 @@ pub struct DiscoveryInterfaceConfig {
     pub discoverable: bool,
     /// Name advertised in the announce.
     pub name: String,
+    /// Optional operator address included in discovery announces.
+    pub operator_address: Option<[u8; 16]>,
     pub transport_enabled: bool,
     /// Seconds between announces; defaults to [`ANNOUNCE_JOB_INTERVAL_SECS`].
     pub announce_interval_secs: u64,
@@ -62,6 +64,7 @@ impl DiscoveryInterfaceConfig {
             interface_type: "BackboneInterface".into(),
             discoverable: true,
             name,
+            operator_address: None,
             transport_enabled: true,
             announce_interval_secs: ANNOUNCE_JOB_INTERVAL_SECS,
             stamp_value: DEFAULT_STAMP_VALUE,
@@ -284,6 +287,7 @@ impl Announcer {
 fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> DiscoveryInfo {
     DiscoveryInfo {
         name: cfg.name.clone(),
+        operator_address: cfg.operator_address,
         transport_id,
         interface_type: cfg.interface_type.clone(),
         transport_enabled: cfg.transport_enabled,

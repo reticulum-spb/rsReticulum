@@ -6,7 +6,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "populated",
@@ -15,7 +16,8 @@
     "name": "Reference Node",
     "latitude": 57.0429,
     "longitude": 9.9219,
-    "height": 12.5
+    "height": 12.5,
+    "operator_address": null
   },
   {
     "case": "operator",
@@ -24,7 +26,8 @@
     "name": "Reference Node",
     "latitude": 57.0429,
     "longitude": 9.9219,
-    "height": 12.5
+    "height": 12.5,
+    "operator_address": "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
   },
   {
     "case": "name-missing",
@@ -38,7 +41,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "name-valid",
@@ -47,7 +51,8 @@
     "name": "Configured",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "name-wrong-type",
@@ -66,7 +71,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "latitude-valid",
@@ -75,7 +81,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": 12.5,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "latitude-wrong-type",
@@ -94,7 +101,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "longitude-valid",
@@ -103,7 +111,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": 12.5,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "longitude-wrong-type",
@@ -122,7 +131,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "height-valid",
@@ -131,7 +141,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": 12.5
+    "height": 12.5,
+    "operator_address": null
   },
   {
     "case": "height-wrong-type",
@@ -145,7 +156,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "name-false-False",
@@ -154,7 +166,8 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
   },
   {
     "case": "name-false-0",
@@ -163,6 +176,72 @@
     "name": "Discovered TCPServerInterface",
     "latitude": null,
     "longitude": null,
-    "height": null
+    "height": null,
+    "operator_address": null
+  },
+  {
+    "case": "operator-length-0",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0c400",
+    "accepted": true,
+    "name": "Discovered TCPServerInterface",
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "operator_address": null
+  },
+  {
+    "case": "operator-length-15",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0c40f000102030405060708090a0b0c0d0e",
+    "accepted": true,
+    "name": "Discovered TCPServerInterface",
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "operator_address": null
+  },
+  {
+    "case": "operator-length-16",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0c410000102030405060708090a0b0c0d0e0f",
+    "accepted": true,
+    "name": "Discovered TCPServerInterface",
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "operator_address": "000102030405060708090a0b0c0d0e0f"
+  },
+  {
+    "case": "operator-length-17",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0c411000102030405060708090a0b0c0d0e0f10",
+    "accepted": true,
+    "name": "Discovered TCPServerInterface",
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "operator_address": null
+  },
+  {
+    "case": "operator-nil",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0c0",
+    "accepted": true,
+    "name": "Discovered TCPServerInterface",
+    "latitude": null,
+    "longitude": null,
+    "height": null,
+    "operator_address": null
+  },
+  {
+    "case": "operator-wrong-type-'0000000000000000'",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0b030303030303030303030303030303030",
+    "accepted": false
+  },
+  {
+    "case": "operator-wrong-type-0",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf000",
+    "accepted": false
+  },
+  {
+    "case": "operator-wrong-type-False",
+    "packed": "8c00b2544350536572766572496e7465726661636501c2ccfec410c248061994b4a4920344c5b43360f509ccfda3524e53ccfca5312e352e32ccffc003c004c005c002ac3230332e302e3131332e313006cd1092ccf0c2",
+    "accepted": false
   }
 ]

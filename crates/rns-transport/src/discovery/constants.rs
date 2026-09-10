@@ -1,8 +1,12 @@
-//! Wire-level constants for on-network discovery. Values mirror
-//! `RNS/Discovery.py` 1:1; do not renumber.
+//! Wire-level discovery keys and protocol constants match `RNS/Discovery.py`.
+//! Implementation metadata identifies this Rust implementation.
 
-/// Application name used in the discovery destination
-/// `rnstransport.discovery.interface`.
+/// Implementation identifier published in discovery metadata.
+pub const IMPLEMENTATION_NAME: &str = "rsReticulum";
+/// Version of the Rust implementation publishing the announce.
+pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Application name used in `rnstransport.discovery.interface`.
 pub const APP_NAME: &str = "rnstransport";
 
 /// Destination aspect path used for discovery announces.
@@ -75,6 +79,9 @@ pub const BLACKHOLE_SOURCE_TIMEOUT_SECS: u64 = 25;
 pub mod key {
     pub const NAME: u8 = 0xFF;
     pub const TRANSPORT_ID: u8 = 0xFE;
+    pub const TRANSPORT_IMPL: u8 = 0xFD;
+    pub const TRANSPORT_VERS: u8 = 0xFC;
+    pub const OP_ADDR: u8 = 0xF0;
     pub const INTERFACE_TYPE: u8 = 0x00;
     pub const TRANSPORT: u8 = 0x01;
     pub const REACHABLE_ON: u8 = 0x02;

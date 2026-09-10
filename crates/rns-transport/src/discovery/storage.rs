@@ -242,6 +242,12 @@ fn encode_record(rec: &DiscoveredInterface) -> Result<Vec<u8>, StorageError> {
     map.push((s("type"), Value::from(i.interface_type.clone())));
     map.push((s("transport"), Value::from(i.transport_enabled)));
     map.push((s("name"), Value::from(i.name.clone())));
+    if let Some(address) = i.operator_address {
+        map.push((
+            s("operator_lxmf_address"),
+            Value::from(hex::encode(address)),
+        ));
+    }
     map.push((s("transport_id"), Value::from(hex::encode(i.transport_id))));
     map.push((s("network_id"), Value::from(hex::encode(rec.network_id))));
     map.push((s("hops"), Value::from(rec.hops)));
@@ -320,6 +326,7 @@ fn decode_record(bytes: &[u8]) -> Result<DiscoveredInterface, StorageError> {
         transport_enabled: bool_or_default(&lookup, "transport"),
         transport_id: hex16(&lookup, "transport_id").unwrap_or([0; 16]),
         name: str_or_default(&lookup, "name"),
+        operator_address: hex16(&lookup, "operator_lxmf_address"),
         reachable_on: str_opt(&lookup, "reachable_on"),
         latitude: f64_opt(&lookup, "latitude"),
         longitude: f64_opt(&lookup, "longitude"),

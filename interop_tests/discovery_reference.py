@@ -36,6 +36,7 @@ def check(name, values, accepted):
     row = {'case': name, 'packed': packed.hex(), 'accepted': accepted}
     if received:
         row.update({key: received[0][key] for key in ['name', 'latitude', 'longitude', 'height']})
+        row['operator_address'] = received[0].get('operator_lxmf_address')
     rows.append(row)
 
 for case in section['cases']:
@@ -50,6 +51,11 @@ for field, key in [('name', RNS.Discovery.NAME), ('latitude', RNS.Discovery.LATI
 # Python's name sanitizer maps false values to its fallback before calling encode.
 for value in ['', False, 0]:
     check('name-false-' + repr(value), base | {RNS.Discovery.NAME: value}, True)
+for size in [0, 15, 16, 17]:
+    check('operator-length-' + str(size), base | {RNS.Discovery.OP_ADDR: bytes(range(size))}, True)
+check('operator-nil', base | {RNS.Discovery.OP_ADDR: None}, True)
+for value in ['0' * 16, 0, False]:
+    check('operator-wrong-type-' + repr(value), base | {RNS.Discovery.OP_ADDR: value}, False)
 text = json.dumps(rows, indent=2) + '\n'
 if a.check:
     assert a.output.read_text() == text, 'regenerate the discovery fixture'

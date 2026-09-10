@@ -705,6 +705,7 @@ fn discovered_json(record: &DiscoveredInterface) -> serde_json::Value {
         "status": record.status.map(|s| s.as_str()).unwrap_or("unknown"),
         "transport": info.transport_enabled,
         "transport_id": hex::encode(info.transport_id),
+        "operator_lxmf_address": info.operator_address.map(hex::encode),
         "network_id": hex::encode(record.network_id),
         "hops": record.hops,
         "value": record.stamp_value,

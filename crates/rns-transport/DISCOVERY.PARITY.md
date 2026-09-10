@@ -36,7 +36,7 @@ cargo test --workspace --no-default-features --features=sqlite-bundled discovery
 ```
 
 The fixture generator requires the sibling `reticulum-e2e-tests` checkout for
-its existing Python announcer setup (override with `--suite`). Operator/implementation metadata (RUST-S10) remains a separate gap.
+its existing Python announcer setup (override with `--suite`).
 
 ## Stamp defaults (RUST-S9)
 
@@ -65,3 +65,32 @@ The Rust PoW implementation is supplied by the embedding application through
 `DiscoveryStamper`. These checks establish the configured costs and the Python
 acceptance boundary; they do not exercise a live Rust discovery publisher.
 Without an installed stamper, runtime discovery remains inactive.
+
+## Operator address and implementation metadata (RUST-S10)
+
+The codec publishes `TRANSPORT_IMPL=0xFD` as `rsReticulum` and
+`TRANSPORT_VERS=0xFC` as the crate version. These informational fields are
+emitted independently of received metadata; Python itself does not surface
+them from its receiver. Map ordering is not part of the contract.
+
+`OP_ADDR=0xF0` is represented by `operator_address: Option<[u8; 16]>` in the
+codec and interface announce configuration. Incoming nil and byte strings of
+any other length produce no operator address; non-byte, non-nil values reject
+the announce, matching Python. The operator address survives discovery storage
+and appears in `rnstatus --json` as `operator_lxmf_address`. The runtime's
+Reticulum-style interface config reads `discovery_lxmf_address` as hex.
+
+The Python generator covers 30 decoder cases including operator lengths and
+invalid types. `discovery_operator_address_survives_python_to_rust` checks the
+Python address through the Rust codec; `discovery_metadata_reaches_python`
+passes Rust output to the real Python receiver and verifies the address and
+published implementation/version fields. Run both directions with the same
+reference environment as S9:
+
+```bash
+PARITY_PYTHON=/path/to/reference/python PYTHONPATH=../Reticulum \
+  cargo test --workspace discovery -- --include-ignored
+PARITY_PYTHON=/path/to/reference/python PYTHONPATH=../Reticulum \
+  cargo test --workspace --no-default-features --features=sqlite-bundled \
+  discovery -- --include-ignored
+```
