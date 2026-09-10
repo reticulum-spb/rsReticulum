@@ -708,6 +708,21 @@ impl Link {
         self.request_value(path, data_value, timeout)
     }
 
+    /// Pack a request before choosing packet or Resource framing.
+    /// The initial receipt id is the plaintext hash used by Resource requests.
+    /// Packet senders must replace it with the hash of the transmitted packet.
+    pub fn prepare_request(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
+        let value = data
+            .map(msgpack_value_from_bytes_or_binary)
+            .unwrap_or(rmpv::Value::Nil);
+        self.prepare_request_value(path, value, timeout)
+    }
+
     /// Build a REQUEST payload with a MsgPack string body.
     ///
     /// Python Reticulum preserves Python `str` request bodies as MsgPack
@@ -722,6 +737,16 @@ impl Link {
     }
 
     fn request_value(
+        &mut self,
+        path: &str,
+        data_value: rmpv::Value,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, [u8; 16]), LinkCryptoError> {
+        let (packed, id) = self.prepare_request_value(path, data_value, timeout)?;
+        Ok((self.encrypt(&packed)?, id))
+    }
+
+    fn prepare_request_value(
         &mut self,
         path: &str,
         data_value: rmpv::Value,
@@ -746,8 +771,6 @@ impl Link {
         rmpv::encode::write_value(&mut packed, &array)
             .map_err(|_| LinkCryptoError::EncryptionFailed)?;
 
-        let encrypted = self.encrypt(&packed)?;
-
         // request_id is a truncated SHA-256 of the plaintext, so both sides derive
         // the same ID without exchanging it.
         let request_id = truncated_hash(&packed);
@@ -757,7 +780,7 @@ impl Link {
         let receipt = RequestReceipt::new(receipt_id, self.link_id, timeout);
         self.pending_requests.push(receipt);
 
-        Ok((encrypted, request_id))
+        Ok((packed, request_id))
     }
 
     /// Replace the initial request id with the packet-hash id used by
@@ -786,7 +809,11 @@ impl Link {
         encrypted_data: &[u8],
     ) -> Result<ParsedRequestData, LinkCryptoError> {
         let plaintext = self.decrypt(encrypted_data)?;
+        Self::unpack_request(&plaintext)
+    }
 
+    /// Parse a decrypted packet or a fully reassembled request Resource.
+    pub fn unpack_request(plaintext: &[u8]) -> Result<ParsedRequestData, LinkCryptoError> {
         // request_id = SHA-256(packed_request)[:16]
         let request_id = truncated_hash(&plaintext);
 

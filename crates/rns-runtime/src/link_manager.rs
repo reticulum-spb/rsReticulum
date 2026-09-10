@@ -1108,6 +1108,7 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::Resource => {
+                let mut completed_request = None;
                 // Python encrypts payload ONCE before chunking (Resource.py:424);
                 // chunks ride raw. Decrypt happens in InboundTransfer::complete.
                 if let Some(active) = self.active_links.get_mut(&link_id) {
@@ -1193,6 +1194,10 @@ impl LinkManager {
                                 })
                             };
 
+                            let is_request = active
+                                .inbound_resources
+                                .get(&rh)
+                                .is_some_and(|t| t.resource.flags.is_request);
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 if let Ok((assembled_data, proof)) =
                                     transfer.complete(Some(&decrypt_fn))
@@ -1264,22 +1269,28 @@ impl LinkManager {
                                                     Ok(blob) => {
                                                         let metadata = coord.metadata.take();
                                                         let total_segments = coord.total_segments;
-                                                        if let Some(ref tx) =
-                                                            self.resource_completion_tx
-                                                        {
-                                                            let _ =
-                                                                tx.try_send(ResourceCompletion {
-                                                                    link_id,
-                                                                    resource_hash: route
-                                                                        .original_hash,
-                                                                    data: blob.clone(),
-                                                                    metadata,
-                                                                });
-                                                        }
-                                                        if let Some(ref tx) =
-                                                            self.resource_completed_tx
-                                                        {
-                                                            let _ = tx.try_send((blob, link_id));
+                                                        if is_request {
+                                                            completed_request = Some(blob);
+                                                        } else {
+                                                            if let Some(ref tx) =
+                                                                self.resource_completion_tx
+                                                            {
+                                                                let _ = tx.try_send(
+                                                                    ResourceCompletion {
+                                                                        link_id,
+                                                                        resource_hash: route
+                                                                            .original_hash,
+                                                                        data: blob.clone(),
+                                                                        metadata,
+                                                                    },
+                                                                );
+                                                            }
+                                                            if let Some(ref tx) =
+                                                                self.resource_completed_tx
+                                                            {
+                                                                let _ =
+                                                                    tx.try_send((blob, link_id));
+                                                            }
                                                         }
                                                         tracing::info!(
                                                             link_id = hex::encode(link_id),
@@ -1323,25 +1334,28 @@ impl LinkManager {
                                             );
                                         }
                                     } else {
-                                        // Single-segment path: rncp channel keeps metadata +
-                                        // resource hash; the legacy LXMF channel drops both.
-                                        if let Some(ref tx) = self.resource_completion_tx {
-                                            let metadata = active
-                                                .inbound_resources
-                                                .get(&rh)
-                                                .and_then(|t| t.resource.metadata.clone());
-                                            let _ = tx.try_send(ResourceCompletion {
-                                                link_id,
-                                                resource_hash: rh,
-                                                data: assembled_data.clone(),
-                                                metadata,
-                                            });
-                                        }
+                                        if is_request {
+                                            completed_request = Some(assembled_data);
+                                        } else {
+                                            // Single-segment path: rncp channel keeps metadata +
+                                            // resource hash; the legacy LXMF channel drops both.
+                                            if let Some(ref tx) = self.resource_completion_tx {
+                                                let metadata = active
+                                                    .inbound_resources
+                                                    .get(&rh)
+                                                    .and_then(|t| t.resource.metadata.clone());
+                                                let _ = tx.try_send(ResourceCompletion {
+                                                    link_id,
+                                                    resource_hash: rh,
+                                                    data: assembled_data.clone(),
+                                                    metadata,
+                                                });
+                                            }
 
-                                        if let Some(ref tx) = self.resource_completed_tx {
-                                            let _ = tx.try_send((assembled_data, link_id));
+                                            if let Some(ref tx) = self.resource_completed_tx {
+                                                let _ = tx.try_send((assembled_data, link_id));
+                                            }
                                         }
-
                                         tracing::debug!(
                                             link_id = hex::encode(link_id),
                                             resource = hex::encode(&rh[..8]),
@@ -1353,6 +1367,11 @@ impl LinkManager {
                             active.link.untrack_resource(&rh);
                             active.inbound_resources.remove(&rh);
                         }
+                    }
+                }
+                if let Some(packed) = completed_request {
+                    if let Ok((request_id, path_hash, _, data)) = Link::unpack_request(&packed) {
+                        self.respond_to_request(link_id, request_id, path_hash, data);
                     }
                 }
             }
@@ -1653,126 +1672,15 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::Request => {
-                if let Some(active) = self.active_links.get_mut(&link_id) {
+                let parsed = self.active_links.get_mut(&link_id).and_then(|active| {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-
-                    if let Ok((_request_id, path_hash, _timestamp, data)) =
-                        active.link.handle_request(data)
-                    {
-                        // Python Reticulum uses the truncated RNS packet hash
-                        // as the request id for packet-sized Link requests.
-                        // The packed-request hash is only used for request
-                        // resources, where the request id is carried in the
-                        // Resource advertisement.
-                        let request_id =
-                            rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
-                        // request_handler_ex wins; it can schedule a resource transfer.
-                        let outcome = if let Some(ref handler) = self.request_handler_ex {
-                            handler(link_id, path_hash, data.clone())
-                        } else if let Some(ref handler) = self.request_handler {
-                            match handler(link_id, path_hash, data.clone()) {
-                                Some(r) => RequestOutcome::Reply(r),
-                                None => RequestOutcome::Drop,
-                            }
-                        } else {
-                            RequestOutcome::Drop
-                        };
-
-                        let (resp_bytes_opt, fetch_spec) = match outcome {
-                            RequestOutcome::Reply(r) => (Some(r), None),
-                            RequestOutcome::ReplyWithResource {
-                                ack,
-                                data,
-                                metadata,
-                                auto_compress,
-                            } => (Some(ack), Some((data, metadata, auto_compress))),
-                            RequestOutcome::Drop => (None, None),
-                        };
-
-                        let mut response_resource = None;
-                        if let Some(resp_bytes) = resp_bytes_opt {
-                            if let Ok(packed_response) =
-                                rns_link::link::Link::pack_response(&request_id, &resp_bytes)
-                            {
-                                if packed_response.len() <= active.link.mdu {
-                                    if let Ok(encrypted) = active.link.encrypt(&packed_response) {
-                                        let resp_header = rns_wire::header::PacketHeader {
-                                            flags: rns_wire::flags::PacketFlags {
-                                                header_type: rns_wire::flags::HeaderType::Header1,
-                                                context_flag: false,
-                                                transport_type:
-                                                    rns_wire::flags::TransportType::Broadcast,
-                                                destination_type:
-                                                    rns_wire::flags::DestinationType::Link,
-                                                packet_type: rns_wire::flags::PacketType::Data,
-                                            },
-                                            hops: 0,
-                                            transport_id: None,
-                                            destination_hash: link_id,
-                                            context: rns_wire::context::PacketContext::Response,
-                                        };
-                                        let mut resp_raw = resp_header.pack();
-                                        resp_raw.extend_from_slice(&encrypted);
-                                        active.link.record_tx(encrypted.len());
-                                        let _ = self.transport_tx.try_send(
-                                            TransportMessage::Outbound(OutboundRequest {
-                                                raw: Bytes::from(resp_raw),
-                                                destination_hash: link_id,
-                                            }),
-                                        );
-                                        tracing::debug!(
-                                            link_id = hex::encode(link_id),
-                                            request_id = hex::encode(request_id),
-                                            resp_len = resp_bytes.len(),
-                                            "link request handled — response sent"
-                                        );
-                                    }
-                                } else {
-                                    response_resource = Some((packed_response, request_id));
-                                }
-                            }
-                        } else {
-                            tracing::debug!(
-                                link_id = hex::encode(link_id),
-                                request_id = hex::encode(request_id),
-                                path = hex::encode(path_hash),
-                                "link request received — no handler response"
-                            );
-                        }
-
-                        if let Some((packed_response, request_id)) = response_resource {
-                            let _ =
-                                self.start_response_resource(&link_id, packed_response, request_id);
-                            tracing::debug!(
-                                link_id = hex::encode(link_id),
-                                request_id = hex::encode(request_id),
-                                "link request handled — response sent as resource"
-                            );
-                        }
-
-                        if let Some((data, metadata, auto_compress)) = fetch_spec {
-                            if self
-                                .start_resource_transfer_inner(
-                                    &link_id,
-                                    ResourceTransferStart {
-                                        data,
-                                        metadata,
-                                        auto_compress,
-                                        request_id: None,
-                                        is_response: false,
-                                        allow_handshake: true,
-                                    },
-                                )
-                                .is_none()
-                            {
-                                tracing::warn!(
-                                    link_id = hex::encode(link_id),
-                                    "link request resource response could not be started"
-                                );
-                            }
-                        }
-                    }
+                    active.link.handle_request(data).ok()
+                });
+                if let Some((_, path_hash, _, data)) = parsed {
+                    let request_id =
+                        rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
+                    self.respond_to_request(link_id, request_id, path_hash, data);
                 }
             }
             rns_wire::context::PacketContext::Response => {
@@ -1873,6 +1781,121 @@ impl LinkManager {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Dispatch both packet and Resource requests through the same application handler.
+    fn respond_to_request(
+        &mut self,
+        link_id: [u8; 16],
+        request_id: [u8; 16],
+        path_hash: [u8; 16],
+        data: Vec<u8>,
+    ) {
+        let Some(active) = self.active_links.get_mut(&link_id) else {
+            return;
+        };
+        // request_handler_ex wins; it can schedule a resource transfer.
+        let outcome = if let Some(ref handler) = self.request_handler_ex {
+            handler(link_id, path_hash, data.clone())
+        } else if let Some(ref handler) = self.request_handler {
+            match handler(link_id, path_hash, data.clone()) {
+                Some(r) => RequestOutcome::Reply(r),
+                None => RequestOutcome::Drop,
+            }
+        } else {
+            RequestOutcome::Drop
+        };
+
+        let (resp_bytes_opt, fetch_spec) = match outcome {
+            RequestOutcome::Reply(r) => (Some(r), None),
+            RequestOutcome::ReplyWithResource {
+                ack,
+                data,
+                metadata,
+                auto_compress,
+            } => (Some(ack), Some((data, metadata, auto_compress))),
+            RequestOutcome::Drop => (None, None),
+        };
+
+        let mut response_resource = None;
+        if let Some(resp_bytes) = resp_bytes_opt {
+            if let Ok(packed_response) =
+                rns_link::link::Link::pack_response(&request_id, &resp_bytes)
+            {
+                if packed_response.len() <= active.link.mdu {
+                    if let Ok(encrypted) = active.link.encrypt(&packed_response) {
+                        let resp_header = rns_wire::header::PacketHeader {
+                            flags: rns_wire::flags::PacketFlags {
+                                header_type: rns_wire::flags::HeaderType::Header1,
+                                context_flag: false,
+                                transport_type: rns_wire::flags::TransportType::Broadcast,
+                                destination_type: rns_wire::flags::DestinationType::Link,
+                                packet_type: rns_wire::flags::PacketType::Data,
+                            },
+                            hops: 0,
+                            transport_id: None,
+                            destination_hash: link_id,
+                            context: rns_wire::context::PacketContext::Response,
+                        };
+                        let mut resp_raw = resp_header.pack();
+                        resp_raw.extend_from_slice(&encrypted);
+                        active.link.record_tx(encrypted.len());
+                        let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                            OutboundRequest {
+                                raw: Bytes::from(resp_raw),
+                                destination_hash: link_id,
+                            },
+                        ));
+                        tracing::debug!(
+                            link_id = hex::encode(link_id),
+                            request_id = hex::encode(request_id),
+                            resp_len = resp_bytes.len(),
+                            "link request handled — response sent"
+                        );
+                    }
+                } else {
+                    response_resource = Some((packed_response, request_id));
+                }
+            }
+        } else {
+            tracing::debug!(
+                link_id = hex::encode(link_id),
+                request_id = hex::encode(request_id),
+                path = hex::encode(path_hash),
+                "link request received — no handler response"
+            );
+        }
+
+        if let Some((packed_response, request_id)) = response_resource {
+            let _ = self.start_response_resource(&link_id, packed_response, request_id);
+            tracing::debug!(
+                link_id = hex::encode(link_id),
+                request_id = hex::encode(request_id),
+                "link request handled — response sent as resource"
+            );
+        }
+
+        if let Some((data, metadata, auto_compress)) = fetch_spec {
+            if self
+                .start_resource_transfer_inner(
+                    &link_id,
+                    ResourceTransferStart {
+                        data,
+                        metadata,
+                        auto_compress,
+                        request_id: None,
+                        is_response: false,
+                        allow_handshake: true,
+                    },
+                )
+                .is_none()
+            {
+                tracing::warn!(
+                    link_id = hex::encode(link_id),
+                    "link request resource response could not be started"
+                );
             }
         }
     }

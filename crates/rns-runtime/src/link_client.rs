@@ -782,35 +782,57 @@ impl LinkSession {
         deadline: Duration,
         max_response_bytes: usize,
     ) -> Result<LinkResponse, LinkClientError> {
-        let (encrypted, request_id) = self
+        let expires = Instant::now() + deadline;
+        let (packed, request_id) = self
             .link
-            .request(path, data, deadline)
+            .prepare_request(path, data, deadline)
             .map_err(|error| LinkClientError::LinkCrypto(format!("request: {error:?}")))?;
-        let packet = build_data_packet(
-            self.id(),
-            rns_wire::context::PacketContext::Request,
-            &encrypted,
-        );
-        let packet_request_id =
-            rns_wire::hash::truncated_packet_hash(&packet, rns_wire::flags::HeaderType::Header1);
-        self.link
-            .update_pending_request_id(&request_id, packet_request_id);
-        send_transport(
-            &self.transport_tx,
-            TransportMessage::Outbound(OutboundRequest {
-                raw: packet,
-                destination_hash: self.id(),
-            }),
-        )
-        .await?;
+        let response_id = match self.link.classify_request(packed) {
+            rns_link::link::RequestSendMode::Packet(packed) => {
+                let encrypted = self
+                    .link
+                    .encrypt(&packed)
+                    .map_err(|error| LinkClientError::LinkCrypto(format!("request: {error:?}")))?;
+                let packet = build_data_packet(
+                    self.id(),
+                    rns_wire::context::PacketContext::Request,
+                    &encrypted,
+                );
+                let id = rns_wire::hash::truncated_packet_hash(
+                    &packet,
+                    rns_wire::flags::HeaderType::Header1,
+                );
+                self.link.update_pending_request_id(&request_id, id);
+                send_transport(
+                    &self.transport_tx,
+                    TransportMessage::Outbound(OutboundRequest {
+                        raw: packet,
+                        destination_hash: self.id(),
+                    }),
+                )
+                .await?;
+                id
+            }
+            rns_link::link::RequestSendMode::Resource(packed) => {
+                self.send_resource_inner(
+                    packed,
+                    None,
+                    true,
+                    time_remaining(expires)?,
+                    Some(request_id),
+                )
+                .await?;
+                request_id
+            }
+        };
         let link_id = self.link.link_id;
         wait_for_response(
             &self.transport_tx,
             &mut self.event_rx,
             &mut self.link,
             link_id,
-            packet_request_id,
-            deadline,
+            response_id,
+            time_remaining(expires)?,
             max_response_bytes,
         )
         .await
@@ -1160,6 +1182,18 @@ impl LinkSession {
         auto_compress: bool,
         deadline: Duration,
     ) -> Result<[u8; 32], LinkClientError> {
+        self.send_resource_inner(data, metadata, auto_compress, deadline, None)
+            .await
+    }
+
+    async fn send_resource_inner(
+        &mut self,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+        deadline: Duration,
+        request_id: Option<[u8; 16]>,
+    ) -> Result<[u8; 32], LinkClientError> {
         let keys = self
             .link
             .session_keys()
@@ -1189,7 +1223,11 @@ impl LinkSession {
             (resource.original_hash, resource.segments)
         };
         let deadline = Instant::now() + deadline;
-        for resource in resources {
+        for mut resource in resources {
+            if let Some(id) = request_id {
+                resource.flags.is_request = true;
+                resource.request_id = Some(id.to_vec());
+            }
             let transfer = OutboundTransfer::from_prebuilt(resource, self.rtt());
             self.send_resource_transfer(transfer, deadline).await?;
         }
