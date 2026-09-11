@@ -2216,3 +2216,31 @@ timeout10s, общий deadline45s; никаких внешних узлов/и�
 Следующие проверки: Rust initiator → Python responder, async MTU discovery
 по настоящему сетевому пути, transit/multi-peer и сопоставимые нагрузочные
 измерения throughput/latency/drops/RSS. Этап 5 открыт, версия остаётся 1.0.1.
+
+### Продолжение этапа 5: Rust initiator → Python responder по TCP
+
+Python peer получил responder-режим: создаёт локальную identity/destination,
+обрабатывает Rust LINKREQUEST через эталонный `Link.validate_request`, подписывает
+LRPROOF и принимает LRRTT через `Link.rtt_packet`. Тестовый адаптер применяет
+fixed-interface clamp из локальной ветки Transport.py до validate_request;
+полный Python daemon/driver и его nullable HW_MTU policy не запускаются.
+
+Новый ignored Rust test использует настоящий TcpClient driver и transport actor.
+Прямой маршрут предварительно внесён в path table; offer берётся из ответа
+GetNextHopMtu для этого маршрута. После проверки Python подписи Rust подтверждает
+привязку proof к интерфейсу через штатный ConfirmLocalLinkProof. Шифрование и
+handshake выполняет библиотечный Link, не LinkSession::open.
+
+Матрица offer/cap/expected: 32768/500/500, 32768/1196/1196,
+524288/262144/262144, 1196/262144/1196. Проверяются одинаковые link_id/MTU/MDU,
+payload1 и полный MDU в обе стороны, размер wire packet <= negotiated MTU.
+Общий deadline45s, socket timeout10s, ОС выбирает loopback ports; child
+kill_on_drop и task guard ограничивают время жизни ресурсов.
+
+`cargo test -p rns-runtime --test link_mtu_tcp -- --include-ignored`:
+3 passed в default и 3 passed в client-only сборке (по четыре MTU случая на
+каждый тест). Workspace all-targets check успешен; fmt/diff check чистые.
+Прежние warnings без изменений. Эталон ea98db4f не изменён.
+
+Далее: полный async LinkSession open с MTU discovery, transit/multi-peer и
+сопоставимые throughput/latency/drop/RSS измерения. Этап 5 открыт, версия 1.0.1.

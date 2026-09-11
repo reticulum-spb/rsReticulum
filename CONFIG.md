@@ -268,13 +268,17 @@ paths, authenticated MTU agreement and in-memory encrypted payloads up to MDU.
 loopback TCP driver, actor and responder: MTU 500/1196/262144, full-MDU payloads
 in both directions and receive recovery after oversized frames. The peer uses
 the Rust Link library with an explicit offer. Running the same test target with
-`-- --include-ignored` also checks a Python 1.5.2 Link initiator against the Rust
-responder over TCP, including signed proof validation and full-MDU data both ways.
+`-- --include-ignored` also checks Python 1.5.2 Link interop in both handshake
+directions over TCP, including signed proof validation and full-MDU data both ways.
 It requires the local reference (`RNS_PYTHON_ROOT`, default `/home/room/src/Reticulum`)
 and Python (`RNS_PYTHON_BIN`, default `/usr/bin/python3.11`). The Python peer uses
 stubbed daemon routing and watchdog services, but actual Link/Packet crypto and
-packing. Rust async initiator discovery, Python responder, transit paths and
-load/RSS benchmarks are not covered by these tests.
+packing. The Python responder adapter applies a fixed-interface MTU clamp before
+the reference `Link.validate_request`. The Rust initiator test queries the actor's
+next-hop MTU on a seeded direct route and confirms proof binding through the actor;
+it uses the Link library, not `LinkSession::open*`. Full async session opening,
+announce/path discovery, transit paths and load/RSS benchmarks remain outside
+these tests.
 Applications constructing
 LinkRequest events directly must now supply `max_mtu` (500 preserves the old cap).
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately

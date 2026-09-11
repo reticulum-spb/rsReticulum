@@ -1,4 +1,4 @@
-"""Python 1.5.2 Link initiator over loopback TCP, without a Reticulum daemon.
+"""Python 1.5.2 Link peer over loopback TCP, without a Reticulum daemon.
 
 Only daemon services (routing, outbound socket and watchdog scheduling) are
 stubbed. Link construction, proof validation, ECDH, MDU and packet encryption
@@ -15,24 +15,36 @@ import RNS
 from RNS.Interfaces.TCPInterface import HDLC
 
 RNS.loglevel = RNS.LOG_NONE
+RNS.Transport.owner = SimpleNamespace(is_connected_to_shared_instance=False)
+responder = len(sys.argv) > 2 and sys.argv[2] == "responder"
+if responder:
+    identity = RNS.Identity()
+    destination = RNS.Destination(identity, RNS.Destination.IN,
+                                  RNS.Destination.SINGLE, "test", "mtu")
 with socket.socket() as listener:
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     listener.settimeout(10)
-    print(json.dumps({"port": listener.getsockname()[1]}), flush=True)
+    hello = {"port": listener.getsockname()[1]}
+    if responder:
+        hello.update(public_key=identity.get_public_key().hex(), destination=destination.hash.hex())
+    print(json.dumps(hello), flush=True)
     connection, _ = listener.accept()
 
 with connection:
     connection.settimeout(10)
     config = json.loads(input())
     offer, expected = config["offer"], config["expected"]
-    identity = RNS.Identity(create_keys=False)
-    identity.load_public_key(bytes.fromhex(config["public_key"]))
-    destination = RNS.Destination(identity, RNS.Destination.OUT,
-                                  RNS.Destination.SINGLE, "test", "mtu")
-    assert destination.hash.hex() == config["destination"]
+    if not responder:
+        identity = RNS.Identity(create_keys=False)
+        identity.load_public_key(bytes.fromhex(config["public_key"]))
+        destination = RNS.Destination(identity, RNS.Destination.OUT,
+                                      RNS.Destination.SINGLE, "test", "mtu")
+        assert destination.hash.hex() == config["destination"]
     RNS.Transport.owner = SimpleNamespace(is_connected_to_shared_instance=False)
-    RNS.Reticulum.get_instance = staticmethod(lambda: SimpleNamespace(get_first_hop_timeout=lambda _: 1))
+    RNS.Reticulum.get_instance = staticmethod(lambda: SimpleNamespace(
+        get_first_hop_timeout=lambda _: 1, get_packet_rssi=lambda _: None,
+        get_packet_snr=lambda _: None, get_packet_q=lambda _: None))
     RNS.Reticulum.link_mtu_discovery = staticmethod(lambda: True)
     RNS.Transport.hops_to = staticmethod(lambda _: 1)
     RNS.Transport.next_hop_interface_hw_mtu = staticmethod(lambda _: offer)
@@ -72,28 +84,50 @@ with connection:
                     assert len(buffer) <= 2 * expected
         return pending.popleft()
 
-    link = RNS.Link(destination)
-    assert RNS.Link.mtu_from_lr_packet(link.packet) == offer
-    while True:
-        proof = receive()
-        if proof.destination_hash == link.link_id and proof.context == RNS.Packet.LRPROOF:
-            break
-    assert proof.packet_type == RNS.Packet.PROOF
-    assert RNS.Link.mtu_from_lp_packet(proof) == expected
-    link.validate_proof(proof)  # Also sends the encrypted LRRTT packet.
-    assert link.status == RNS.Link.ACTIVE, "Rust LRPROOF failed Python validation"
+    if responder:
+        request = receive()
+        assert request.packet_type == RNS.Packet.LINKREQUEST
+        assert request.destination_hash == destination.hash
+        assert RNS.Link.mtu_from_lr_packet(request) == offer
+        # Adapt the local-destination Transport.py clamp for a fixed-MTU socket.
+        # Link.validate_request itself deliberately does not impose interface caps.
+        cap = config["cap"]
+        if cap < offer:
+            request.data = request.data[:-3] + RNS.Link.signalling_bytes(cap, RNS.Link.mode_from_lr_packet(request))
+        request.destination = destination
+        link = RNS.Link.validate_request(destination, request.data, request)
+        assert link is not None, "Python rejected Rust LINKREQUEST"
+        rtt = receive()
+        assert rtt.destination_hash == link.link_id and rtt.context == RNS.Packet.LRRTT
+        link.rtt_packet(rtt)
+    else:
+        link = RNS.Link(destination)
+        assert RNS.Link.mtu_from_lr_packet(link.packet) == offer
+        while True:
+            proof = receive()
+            if proof.destination_hash == link.link_id and proof.context == RNS.Packet.LRPROOF:
+                break
+        assert proof.packet_type == RNS.Packet.PROOF
+        assert RNS.Link.mtu_from_lp_packet(proof) == expected
+        link.validate_proof(proof)  # Also sends the encrypted LRRTT packet.
+    assert link.status == RNS.Link.ACTIVE, "Python Link handshake failed"
     assert link.mtu == expected
     print(json.dumps({"mtu": link.mtu, "mdu": link.mdu,
                       "link_id": link.link_id.hex()}), flush=True)
     for length in [1, link.mdu]:
         payload = bytes(index % 256 for index in range(length))
-        packet = RNS.Packet(link, payload)
-        packet.send()
-        assert len(packet.raw) <= expected
+        if not responder:
+            packet = RNS.Packet(link, payload)
+            packet.send()
+            assert len(packet.raw) <= expected
         while True:
             reply = receive()
             if reply.destination_hash == link.link_id and reply.packet_type == RNS.Packet.DATA:
                 break
         assert reply.context == RNS.Packet.NONE
         assert link.decrypt(reply.data) == payload
+        if responder:
+            packet = RNS.Packet(link, payload)
+            packet.send()
+            assert len(packet.raw) <= expected
     print(json.dumps({"complete": True}), flush=True)

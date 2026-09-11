@@ -7,7 +7,11 @@ use rns_link::link::Link;
 use rns_runtime::link_manager::LinkManager;
 use rns_transport::actor::TransportActor;
 use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::InterfaceEntry;
+use rns_transport::messages::{
+    OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+};
 use rns_wire::context::PacketContext;
 use rns_wire::flags::{DestinationType, HeaderType, PacketFlags, PacketType, TransportType};
 use rns_wire::header::PacketHeader;
@@ -316,6 +320,194 @@ async fn exercise_python(offer: u32, cap: u32, expected: u32) {
             (0..length).map(|i| (i % 256) as u8).collect::<Vec<_>>()
         );
         manager.send_link_packet(&link_id, &payload).unwrap();
+    }
+    let report: serde_json::Value =
+        serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(report["complete"], true);
+    assert!(child.wait().await.unwrap().success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Python reference and local TCP sockets"]
+async fn rust_initiator_python_responder_large_mtu_tcp_roundtrip() {
+    timeout(Duration::from_secs(45), async {
+        for (offer, cap, expected) in [
+            (32768, 500, 500),
+            (32768, 1196, 1196),
+            (524288, 262144, 262144),
+            (1196, 262144, 1196),
+        ] {
+            exercise_python_responder(offer, cap, expected).await;
+        }
+    })
+    .await
+    .expect("Python responder TCP MTU regression timed out");
+}
+
+async fn receive_link_packet(events: &mut mpsc::Receiver<DestinationEvent>) -> bytes::Bytes {
+    loop {
+        if let DestinationEvent::InboundPacket { raw, interface_id } = events.recv().await.unwrap()
+        {
+            assert_eq!(interface_id, 1);
+            return raw;
+        }
+    }
+}
+
+async fn exercise_python_responder(offer: u32, cap: u32, expected: u32) {
+    let mut child = tokio::process::Command::new(
+        std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+    )
+    .args(["-B", "-c", include_str!("link_mtu_peer.py")])
+    .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+    .arg("responder")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::inherit())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut peer_input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let hello: serde_json::Value =
+        serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+    let port = u16::try_from(hello["port"].as_u64().unwrap()).unwrap();
+    let dest: [u8; 16] = hex::decode(hello["destination"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let identity: [u8; 64] = hex::decode(hello["public_key"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let public_bytes: [u8; 32] = identity[32..].try_into().unwrap();
+    let public = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&public_bytes).unwrap();
+    let (mut actor, input) = TransportActor::new();
+    let mut tasks = Tasks(Vec::new());
+    let mut config = tcp::TcpClientConfig::new("python-responder", "127.0.0.1", port);
+    config.fixed_mtu = Some(offer);
+    config.receive_ifac_size = Some(0);
+    config.max_reconnect_tries = Some(1);
+    let handle = tcp::spawn_tcp_client(config, 1, input.clone())
+        .await
+        .unwrap();
+    tasks.0.push(handle.read_task);
+    // Do not send the first request until the real driver is connected.
+    while !handle.online.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    let mut entry = InterfaceEntry::new(
+        handle.name,
+        InterfaceMode::Full,
+        InterfaceDirection::bidirectional(),
+        handle.bitrate,
+        handle.mtu,
+        handle.tx,
+    );
+    entry.online = Some(handle.online);
+    entry.diagnostics = handle.diagnostics;
+    actor.interfaces.insert(1, entry);
+    // Seed a known direct route; route discovery/announce is not under test.
+    actor.path_table.insert(
+        dest,
+        rns_transport::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Full),
+    );
+    tasks.0.push(tokio::spawn(actor.run()));
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    input
+        .send(TransportMessage::Rpc {
+            query: TransportQuery::GetNextHopMtu { dest },
+            response_tx,
+        })
+        .await
+        .unwrap();
+    let TransportQueryResponse::IntResult(mtu) = response_rx.await.unwrap() else {
+        panic!("MTU query response");
+    };
+    assert_eq!(mtu, i64::from(offer));
+    let (mut link, request) = Link::new_initiator_with_mtu(dest, 1, u32::try_from(mtu).unwrap());
+    let (event_tx, mut events) = mpsc::channel(16);
+    input
+        .send(TransportMessage::RegisterDestination {
+            hash: link.link_id,
+            app_name: "test.mtu.link".into(),
+            delivery_tx: Some(event_tx),
+        })
+        .await
+        .unwrap();
+    let config = serde_json::json!({"offer": offer, "cap": cap, "expected": expected});
+    peer_input
+        .write_all(format!("{config}\n").as_bytes())
+        .await
+        .unwrap();
+    input
+        .send(TransportMessage::Outbound(OutboundRequest {
+            raw: packet(dest, PacketType::LinkRequest, PacketContext::None, &request).into(),
+            destination_hash: dest,
+        }))
+        .await
+        .unwrap();
+    let proof = receive_link_packet(&mut events).await;
+    let (header, offset) = PacketHeader::unpack(&proof).unwrap();
+    assert_eq!(header.context, PacketContext::Lrproof);
+    assert_eq!(header.destination_hash, link.link_id);
+    let rtt = link
+        .validate_proof(&proof[offset..], &public, &public_bytes)
+        .unwrap();
+    assert_eq!(link.mtu, expected);
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    input
+        .send(TransportMessage::Rpc {
+            query: TransportQuery::ConfirmLocalLinkProof {
+                link_id: link.link_id,
+                interface_id: 1,
+                dest,
+                hops: header.hops,
+                rebalance: false,
+            },
+            response_tx,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        response_rx.await.unwrap(),
+        TransportQueryResponse::BoolResult(true)
+    ));
+    input
+        .send(TransportMessage::Outbound(OutboundRequest {
+            raw: packet(link.link_id, PacketType::Data, PacketContext::Lrrtt, &rtt).into(),
+            destination_hash: link.link_id,
+        }))
+        .await
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(report["link_id"], hex::encode(link.link_id));
+    assert_eq!(report["mtu"].as_u64(), Some(u64::from(expected)));
+    assert_eq!(report["mdu"].as_u64(), Some(link.mdu as u64));
+    for length in [1, link.mdu] {
+        let payload: Vec<u8> = (0..length).map(|i| (i % 256) as u8).collect();
+        let raw = packet(
+            link.link_id,
+            PacketType::Data,
+            PacketContext::None,
+            &link.encrypt(&payload).unwrap(),
+        );
+        assert!(raw.len() <= expected as usize);
+        input
+            .send(TransportMessage::Outbound(OutboundRequest {
+                raw: raw.into(),
+                destination_hash: link.link_id,
+            }))
+            .await
+            .unwrap();
+        let reply = receive_link_packet(&mut events).await;
+        let (header, offset) = PacketHeader::unpack(&reply).unwrap();
+        assert_eq!(header.destination_hash, link.link_id);
+        assert_eq!(header.flags.packet_type, PacketType::Data);
+        assert_eq!(header.context, PacketContext::None);
+        assert!(reply.len() <= expected as usize);
+        assert_eq!(link.decrypt(&reply[offset..]).unwrap(), payload);
     }
     let report: serde_json::Value =
         serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
