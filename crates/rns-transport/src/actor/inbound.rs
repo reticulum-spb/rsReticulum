@@ -720,9 +720,8 @@ impl TransportActor {
                 if let Some(synth_data) = crate::tunnel::TunnelSynthesisData::unpack(payload) {
                     let ed25519_pub_bytes: [u8; 32] = {
                         let mut buf = [0u8; 32];
-                        // First 32 bytes of the 64-byte public_key blob are
-                        // the Ed25519 signing key; remaining 32 are X25519.
-                        buf.copy_from_slice(&synth_data.public_key[..32]);
+                        // Identity encodes X25519 first, then the Ed25519 signing key.
+                        buf.copy_from_slice(&synth_data.public_key[32..64]);
                         buf
                     };
 

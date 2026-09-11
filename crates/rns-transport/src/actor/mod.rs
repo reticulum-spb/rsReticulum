@@ -6892,6 +6892,31 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_synthesis_validates_identity_signing_key() {
+        let identity = rns_identity::identity::Identity::from_private_key(&[0x37; 64]).unwrap();
+        let raw = crate::tunnel::build_tunnel_synthesis_packet(&identity, [0x42; 32]).unwrap();
+        for valid in [false, true] {
+            let (mut actor, _tx) = TransportActor::new();
+            actor.is_transport_enabled = true;
+            let (interface, _rx) = make_test_interface("tunnel");
+            actor.interfaces.insert(1, interface);
+            let mut packet = raw.clone();
+            if !valid {
+                // Corrupt the signature, keeping the identity and tunnel ID unchanged.
+                *packet.last_mut().unwrap() ^= 1;
+            }
+            actor.on_inbound(crate::messages::InboundPacket {
+                raw: Bytes::from(packet),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            assert_eq!(actor.tunnel_table.len(), usize::from(valid));
+        }
+    }
+
+    #[test]
     fn test_cache_request_handler() {
         let dir = std::env::temp_dir().join("rns_cache_request_handler");
         let _ = std::fs::remove_dir_all(&dir);
