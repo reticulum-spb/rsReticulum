@@ -4,6 +4,103 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
+#[tokio::test]
+#[ignore = "real loopback no-drain deadline; takes at least 12 seconds"]
+async fn client_stalled_socket_closes_and_deregisters() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = BackboneClientConfig::new(
+        "stalled-client",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    config.max_reconnect_tries = Some(1);
+    let (transport_tx, mut events) = mpsc::channel(8);
+    let handle = spawn_backbone_client(config, 72, transport_tx)
+        .await
+        .unwrap();
+    let mut task = handle.read_task;
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+        let payload = Bytes::from(vec![42; HW_MTU as usize]);
+        for _ in 0..32 {
+            handle.tx.try_send(payload.clone()).unwrap();
+        }
+        // Do not read or close either peer half. Only the TX no-progress
+        // deadline can end the connection; leave the sender alive too.
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: 72 })
+        ));
+        (&mut task).await.unwrap();
+        assert!(!handle.online.load(Ordering::SeqCst));
+        assert!(handle.tx.is_closed());
+        let sent = handle.txb.unwrap().load(Ordering::Relaxed);
+        assert!(sent > 0 && sent < 32 * (u64::from(HW_MTU) + 2));
+        // Kernel-accepted bytes may still drain after writer termination.
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(4 * 1024 * 1024)
+            .unwrap();
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received.len() as u64, sent);
+        let frame = hdlc::frame(&payload);
+        for (index, byte) in received.into_iter().enumerate() {
+            assert_eq!(byte, frame[index % frame.len()]);
+        }
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn client_writer_completion_closes_silent_peer_and_deregisters() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = BackboneClientConfig::new(
+        "writer-completion",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    config.max_reconnect_tries = Some(1);
+    let (transport_tx, mut events) = mpsc::channel(8);
+    let handle = spawn_backbone_client(config, 71, transport_tx)
+        .await
+        .unwrap();
+    let mut task = handle.read_task;
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let payload = Bytes::from_static(b"last~}packet");
+        handle.tx.send(payload.clone()).await.unwrap();
+        drop(handle.tx);
+        // Peer keeps its sending half open: reader cannot drive disconnect.
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, hdlc::frame(&payload));
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: 71 })
+        ));
+        (&mut task).await.unwrap();
+        assert!(!handle.online.load(Ordering::SeqCst));
+        assert_eq!(
+            handle.txb.unwrap().load(Ordering::Relaxed),
+            received.len() as u64
+        );
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
 struct Writer {
     bytes: Arc<std::sync::Mutex<Vec<u8>>>,
     calls: Arc<AtomicU64>,

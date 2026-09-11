@@ -621,8 +621,6 @@ pub async fn spawn_backbone_client(
             let (conn_tx, conn_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
             let c_online_w = c_online.clone();
             let c_txb = task_txb.clone();
-            let write_handle =
-                tokio::spawn(backbone_write_loop(writer, conn_rx, c_online_w, c_txb));
 
             let rx_ref = rx.clone();
             let fwd_handle = tokio::spawn(async move {
@@ -636,13 +634,16 @@ pub async fn spawn_backbone_client(
 
             let c_online_r = c_online.clone();
             let c_rxb = task_rxb.clone();
-            backbone_read_loop(reader, id, transport_tx.clone(), c_online_r, c_rxb).await;
+            // Either half ending must close the whole connection. In particular,
+            // a TX deadline must not leave us waiting on a silent peer's reader.
+            tokio::select! {
+                _ = backbone_read_loop(reader, id, transport_tx.clone(), c_online_r, c_rxb) => {},
+                _ = backbone_write_loop(writer, conn_rx, c_online_w, c_txb) => {},
+            }
 
             online2.store(false, Ordering::SeqCst);
             fwd_handle.abort();
             let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
 
             if let Some(max) = max_tries {
                 tries += 1;

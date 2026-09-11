@@ -1292,3 +1292,39 @@ idle дольше 12 секунд и timeout ровно на границе с �
 1 ignored (с разрешением локальных сокетов); `cargo check --workspace --all-targets`,
 `cargo fmt --all -- --check` и `git diff --check` — успешно. Check сохраняет
 прежние предупреждения database_path и tracing_subscriber::prelude.
+
+### Этап 5 — исправление lifecycle клиента при завершении TX
+
+При проверке точки подключения учёта TX backlog обнаружен пробел предыдущего
+изменения: connection select существовал у принятых сервером peers, но клиент
+запускал writer отдельно и ожидал только reader. Поэтому завершение writer,
+включая новый timeout, само по себе не переводило клиент в reconnect/deregister.
+Утверждение предыдущего раздела о connection select для общего клиентского
+пути было преждевременным; настоящим изменением этот путь исправлен.
+
+Клиент теперь ожидает reader и writer через один select. Завершение любого
+из них отменяет другой и освобождает обе socket halves; forwarding task
+останавливается и ожидается, online сбрасывается, затем выполняется прежняя
+политика reconnect/max_reconnect_tries. Отдельного detached writer нет.
+
+Добавлены два loopback regression tests:
+
+- Обычный: закрытие TX sender дописывает последний escaped frame и завершает
+  соединение с молчащим peer, не закрывающим свою отправляющую половину;
+  проверяются EOF, offline, TX counter и deregistration при max tries = 1.
+- Ignored длительный: 32 ссылки Bytes на payload 1 MiB, peer не читает,
+  receive buffer уменьшен до 4096. При живом sender TX no-drain timeout
+  вызывает offline/deregistration и закрытие очереди. После возобновления
+  чтения kernel-accepted prefix побайтово совпадает с исходным HDLC stream,
+  а его длина — с TX counter. Один run занял 23.45 s вместе с draining.
+  Это проверка lifecycle одного peer, не throughput/RSS benchmark.
+
+Проверки: `cargo test -p rns-interface --lib --quiet` — 188 passed, 2 ignored;
+`cargo test -p rns-interface client_stalled_socket -- --ignored --nocapture` —
+1 passed. Сетевые тесты выполнены с loopback-разрешением.
+`cargo check --workspace --all-targets` — успешно с прежними warnings;
+`cargo fmt --all -- --check`, `git diff --check` — успешно.
+
+Учёт байтов очередей и адаптивный egress controller в этом изменении
+не добавлены: сначала устранён найденный lifecycle-пробел. Они остаются
+следующим участком этапа 5.
