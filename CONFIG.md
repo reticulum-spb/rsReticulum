@@ -145,12 +145,26 @@ Python, overlong tags are counted but still truncated and processed; PR payloads
 shorter than 16 bytes are ignored without a violation. IFAC violations cover
 authentication failure, a missing required IFAC flag/tag and an unexpected IFAC
 flag on an unprotected interface. Packet-filter hits currently count early
-packet-hash duplicate rejection. Blackhole rejection, ingress policy, PR-tag
+packet-hash duplicate rejection and early PLAIN/GROUP rejection. Blackhole rejection, ingress policy, PR-tag
 deduplication and queue overflow are not counted as these filter hits.
 
-Coverage is not yet the full Python 1.5.2 packet filter: MTU boundaries,
-transport-address filtering, PLAIN/GROUP rules and dispatch-time violation
-sites remain to be completed. CLI and remote-management display are pending.
+Frames exceeding the registered interface MTU are rejected before header
+processing. Matching Python 1.5.2, the check compares the **IFAC-stripped** size
+to `interface MTU + ifac_size` (bytes); equality is accepted. Announces also
+have an independent 500-byte stripped-frame ceiling even on large-MTU links.
+Both size failures increment `protocol_violations`, not queue drops.
+
+Before hop adjustment, PLAIN/GROUP packets with wire hops above 1, or with
+announce type, are filtered. Keepalive/resource/cache-request/channel contexts
+are exempt, and shared clients bypass these checks and early hash dedup.
+Valid PLAIN/GROUP packets also bypass hash dedup. This does not bypass IFAC,
+MTU, signature checks or the Rust client's opt-in announce policy. PLAIN/GROUP
+rejection increments only `packet_filter_hits`, matching the actual Python
+preprocess order (the packet's receiving interface is assigned after filtering).
+
+Coverage is not yet the full Python 1.5.2 packet filter: transport-address
+filtering, active-Link hash exceptions and dispatch-time violation sites remain
+to be completed. CLI and remote-management display are pending.
 
 ### Ingress mappings
 

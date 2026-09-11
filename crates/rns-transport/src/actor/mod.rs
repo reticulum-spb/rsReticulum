@@ -4328,6 +4328,304 @@ mod tests {
     }
 
     #[test]
+    fn inbound_mtu_uses_stripped_length_and_ifac_allowance() {
+        for ifac_size in [0, 4] {
+            for len in [499, 500, 501, 503, 504, 505] {
+                let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+                let (mut iface, _rx) = make_test_interface("mtu");
+                iface.ifac_size = ifac_size;
+                let key = rns_identity::ifac::derive_ifac_key(Some("mtu"), None).unwrap();
+                iface.ifac_key = (ifac_size > 0).then_some(key);
+                actor.interfaces.insert(1, iface);
+                let mut raw = make_data_packet([9; 16], 0).to_vec();
+                raw.resize(len, 0x55);
+                if ifac_size > 0 {
+                    raw = crate::ifac::ifac_sign(&raw, &key, ifac_size);
+                }
+                actor.handle_message(TransportMessage::Inbound(InboundPacket {
+                    raw: raw.into(),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                }));
+                let admitted = len <= 500 + ifac_size;
+                assert_eq!(
+                    actor.inbound_queues.snapshot().total,
+                    usize::from(admitted),
+                    "len={len}, ifac={ifac_size}"
+                );
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                    u64::from(!admitted)
+                );
+                assert_eq!(actor.interfaces[&1].inbound_diagnostics.ifac_violations, 0);
+                assert_eq!(actor.inbound_queues.snapshot().dropped, [0; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn announce_mtu_is_500_even_on_large_ifac_interface() {
+        let identity = rns_identity::identity::Identity::new();
+        let app = "test.mtu.announce";
+        let dest = rns_identity::destination::Destination::hash_from_name_and_identity(
+            app,
+            Some(&identity.hash),
+        );
+        let (mut header, _) =
+            rns_wire::header::PacketHeader::unpack(&make_data_packet(dest, 0)).unwrap();
+        header.flags.packet_type = rns_wire::flags::PacketType::Announce;
+        let header = header.pack().unwrap();
+        let base = rns_identity::announce::AnnounceData::create(&identity, app, None, None)
+            .unwrap()
+            .pack()
+            .len();
+        for len in [499, 500, 501] {
+            let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+            let (mut iface, _rx) = make_test_interface("large-mtu");
+            iface.mtu = 65535;
+            iface.ingress = crate::ingress::IngressController::disabled();
+            let key = rns_identity::ifac::derive_ifac_key(Some("mtu"), None).unwrap();
+            iface.ifac_key = Some(key);
+            iface.ifac_size = 4;
+            actor.interfaces.insert(1, iface);
+            let payload = rns_identity::announce::AnnounceData::create(
+                &identity,
+                app,
+                Some(&vec![0x55; len - header.len() - base]),
+                None,
+            )
+            .unwrap()
+            .pack();
+            let mut raw = header.clone();
+            raw.extend_from_slice(&payload);
+            assert_eq!(raw.len(), len);
+            let raw = crate::ifac::ifac_sign(&raw, &key, 4);
+            actor.handle_message(TransportMessage::Inbound(InboundPacket {
+                raw: raw.into(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            }));
+            assert_eq!(
+                actor.inbound_queues.snapshot().heights,
+                [0, usize::from(len <= 500), 0, 0]
+            );
+            assert_eq!(
+                actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                u64::from(len > 500)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_group_filter_checks_wire_hops_with_context_and_client_exemptions() {
+        use rns_wire::{context::PacketContext, flags::DestinationType};
+        for dest_type in [DestinationType::Plain, DestinationType::Group] {
+            for hops in [0, 1, 2, 127] {
+                for context in [PacketContext::None, PacketContext::Keepalive] {
+                    for client in [false, true] {
+                        let (mut actor, _input, _control) =
+                            TransportActor::new_with_control_channel();
+                        actor.shared_instance_client_mode = client;
+                        let (iface, _rx) = make_test_interface("filter");
+                        actor.interfaces.insert(1, iface);
+                        let (mut header, _) = rns_wire::header::PacketHeader::unpack(
+                            &make_data_packet([9; 16], hops),
+                        )
+                        .unwrap();
+                        header.flags.destination_type = dest_type;
+                        header.context = context;
+                        let packet = || InboundPacket {
+                            raw: header.pack().unwrap().into(),
+                            interface_id: 1,
+                            rssi: None,
+                            snr: None,
+                            q: None,
+                        };
+                        let expected = client || context == PacketContext::Keepalive || hops <= 1;
+                        let prepared = actor.prepare_inbound(packet());
+                        assert_eq!(
+                            prepared.is_some(),
+                            expected,
+                            "{dest_type:?} {hops} {context:?} client={client}"
+                        );
+                        assert_eq!(
+                            actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+                            u64::from(!expected)
+                        );
+                        assert_eq!(
+                            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                            0
+                        );
+                        if let Some(prepared) = prepared {
+                            actor.dispatch_inbound(prepared);
+                            assert!(
+                                actor.prepare_inbound(packet()).is_some(),
+                                "PLAIN/GROUP duplicates bypass hash filter"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires read-only Python reference; set RNS_PYTHON_ROOT and RNS_PYTHON_BIN"]
+    fn admission_boundaries_match_python_preprocess() {
+        use rns_wire::{
+            context::PacketContext,
+            flags::{DestinationType, PacketType},
+        };
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let mut input = String::new();
+        let mut expected = String::new();
+        for dest_type in [
+            DestinationType::Single,
+            DestinationType::Plain,
+            DestinationType::Group,
+        ] {
+            for hops in [0, 1, 2, 127, 128] {
+                for context in [PacketContext::None, PacketContext::Keepalive] {
+                    for client in [false, true] {
+                        for mtu in [40, 500] {
+                            let (mut actor, _input, _control) =
+                                TransportActor::new_with_control_channel();
+                            actor.shared_instance_client_mode = client;
+                            let (mut iface, _rx) = make_test_interface("oracle");
+                            iface.mtu = mtu;
+                            actor.interfaces.insert(1, iface);
+                            let (mut header, _) = rns_wire::header::PacketHeader::unpack(
+                                &make_data_packet([9; 16], hops),
+                            )
+                            .unwrap();
+                            header.flags.destination_type = dest_type;
+                            header.flags.packet_type = PacketType::Data;
+                            header.context = context;
+                            let mut raw = header.pack().unwrap();
+                            raw.resize(41, 0x55);
+                            input.push_str(&format!(
+                                "{} {} {mtu}\n",
+                                hex::encode(&raw),
+                                u8::from(client)
+                            ));
+                            let accepted = actor
+                                .prepare_inbound(InboundPacket {
+                                    raw: raw.into(),
+                                    interface_id: 1,
+                                    rssi: None,
+                                    snr: None,
+                                    q: None,
+                                })
+                                .is_some();
+                            let diagnostics = actor.interfaces[&1].inbound_diagnostics;
+                            expected.push_str(&format!(
+                                "{} {} {}\n",
+                                u8::from(accepted),
+                                diagnostics.protocol_violations,
+                                diagnostics.packet_filter_hits
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let mut child = Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .args([
+            "-B",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/inbound_filter_reference.py"
+            ),
+        ])
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        // Keep the input below pipe capacity or write concurrently with output.
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()).unwrap());
+        let output = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+
+    #[test]
+    fn plain_group_announces_are_filtered_before_signature_work() {
+        use rns_wire::flags::DestinationType;
+        for destination_type in [DestinationType::Plain, DestinationType::Group] {
+            for client in [false, true] {
+                let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+                actor.shared_instance_client_mode = client;
+                let (mut iface, _rx) = make_test_interface("announce-filter");
+                iface.ingress = crate::ingress::IngressController::disabled();
+                actor.interfaces.insert(1, iface);
+                let (raw, _) = make_valid_announce("test.filter.announce", 0);
+                let (mut header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                header.flags.destination_type = destination_type;
+                let mut frame = header.pack().unwrap();
+                frame.extend_from_slice(&raw[offset..]);
+                // Destination type is not part of the announce signature.
+                let prepared = actor.prepare_inbound(InboundPacket {
+                    raw: frame.into(),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                });
+                assert_eq!(prepared.is_some(), client);
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+                    u64::from(!client)
+                );
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_client_bypasses_early_single_packet_hash_filter() {
+        for client in [false, true] {
+            let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+            actor.shared_instance_client_mode = client;
+            let (iface, _rx) = make_test_interface("client-filter");
+            actor.interfaces.insert(1, iface);
+            let packet = || InboundPacket {
+                raw: make_data_packet([9; 16], 0),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            };
+            let prepared = actor.prepare_inbound(packet()).unwrap();
+            actor.dispatch_inbound(prepared);
+            assert_eq!(actor.prepare_inbound(packet()).is_some(), client);
+            assert_eq!(
+                actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+                u64::from(!client)
+            );
+        }
+    }
+
+    #[test]
     fn path_request_tag_violations_are_counted_without_changing_truncation() {
         let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
         let (iface, _rx) = make_test_interface("source");

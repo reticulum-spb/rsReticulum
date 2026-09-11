@@ -160,6 +160,17 @@ impl TransportActor {
             packet.raw.clone()
         };
 
+        // Python 1.5.2 checks the stripped frame against HW_MTU + IFAC size.
+        // Subtraction avoids overflow without changing that inclusive boundary.
+        if self
+            .interfaces
+            .get(&packet.interface_id)
+            .is_some_and(|entry| raw.len().saturating_sub(entry.ifac_size) > entry.mtu as usize)
+        {
+            self.protocol_violation(packet.interface_id);
+            return None;
+        }
+
         let (mut parsed, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
             Ok((header, offset)) => (header, offset),
             Err(e) => {
@@ -233,6 +244,25 @@ impl TransportActor {
                 | rns_wire::context::PacketContext::Channel
         );
 
+        let plain_or_group = matches!(
+            parsed.flags.destination_type,
+            rns_wire::flags::DestinationType::Plain | rns_wire::flags::DestinationType::Group
+        );
+        // packet_filter runs before inbound hop adjustment. Context exemptions
+        // and shared-client bypass precede PLAIN/GROUP validation in Python.
+        if !self.shared_instance_client_mode
+            && !skip_hashlist
+            && plain_or_group
+            && (parsed.hops > 1
+                || parsed.flags.packet_type == rns_wire::flags::PacketType::Announce)
+        {
+            // In Python preprocess, receiving_interface is assigned only
+            // after packet_filter, so this rejection increments filter_hits
+            // but not the optional protocol_violation call inside that filter.
+            self.packet_filter_hit(packet.interface_id);
+            return None;
+        }
+
         // On shared media (e.g. LoRa) we overhear our own forwards and link
         // traffic; if we dedup against that, legitimate copies disappear.
         // Defer the hashlist check for packets owned by the link table or
@@ -240,7 +270,12 @@ impl TransportActor {
         let defer_hashlist = self.link_table.contains(&parsed.destination_hash)
             || parsed.context == rns_wire::context::PacketContext::Lrproof;
 
-        if !skip_hashlist && !defer_hashlist && self.packet_hashlist.contains(&pkt_hash) {
+        if !self.shared_instance_client_mode
+            && !plain_or_group
+            && !skip_hashlist
+            && !defer_hashlist
+            && self.packet_hashlist.contains(&pkt_hash)
+        {
             // SINGLE announces are retransmitted to refresh paths, so an
             // exact duplicate is expected and must not be dropped.
             if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
@@ -265,6 +300,10 @@ impl TransportActor {
         );
 
         let announce = if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+            if raw.len() > rns_wire::constants::MTU {
+                self.protocol_violation(packet.interface_id);
+                return None;
+            }
             Some(self.prepare_announce(&raw, &parsed, data_offset, packet.interface_id)?)
         } else {
             None

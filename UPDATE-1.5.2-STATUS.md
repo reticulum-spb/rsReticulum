@@ -727,3 +727,49 @@ Blackhole, ingress hold, queue overflow и административная оч
 checks, transport-address/PLAIN/GROUP/shared-client filter semantics,
 дополнительные dispatch-time violation sites, ротация PR tags и traffic flow.
 Диагностика CLI/remote-management остаётся этапом 7; версия не изменена.
+
+## Этап 4 — MTU и PLAIN/GROUP early filtering
+
+До разбора заголовка проверяется размер IFAC-stripped кадра относительно
+`InterfaceEntry.mtu + ifac_size`; арифметика без переполнения. Ровно предел
+допустим. Это намеренно сохраняет порядок Python Transport.py:1788–1804,
+включая IFAC-добавку после снятия тега, а не вводит другой wire-MTU контракт.
+Announce имеет дополнительный предел 500 байт до подписи/постановки в очередь,
+независимый от большого MTU интерфейса. Превышение даёт protocol_violation,
+не overflow drop. YAML ifac_size по-прежнему в байтах.
+
+Ранний фильтр PLAIN/GROUP использует wire hops (до adjusted_inbound_hops):
+не допускает hops >1 и announce type. Context exemptions сохранены; PLAIN/GROUP
+data не отбрасывается как повтор по packet hash. Shared clients обходят эти
+части packet_filter, включая early hash dedup, как Python, но не IFAC, MTU,
+announce signature и отдельную Rust Requested-client policy. Проверки активных
+Link и их hash exceptions не менялись.
+
+Нюанс эталона: Packet.receiving_interface изначально None (Packet.py:166),
+а preprocess присваивает его лишь после packet_filter. Поэтому PLAIN/GROUP
+отказ на обычном входе увеличивает только packet_filter_hits, несмотря на
+условный protocol_violation внутри самого фильтра. Сохранено фактическое
+поведение 1.5.2, подтверждённое выполнением эталонного кода.
+
+Проверки:
+
+- `cargo test -p rns-transport --lib admission_boundaries_match_python_preprocess -- --ignored --nocapture`:
+  passed, 120 комбинаций destination type/hops/context/client mode/MTU.
+  Oracle извлекает AST оригинальных packet_filter и admission prefix,
+  использует настоящий RNS.Packet, сравнивает admission и оба counters.
+  Runtime Python не запускается, только импорт; `-B`, read-only checkout.
+  Подпись, IFAC crypto и дальнейший dispatch этим oracle не проверяются.
+- Rust boundary tests: DATA 499/500/501/503/504/505 с IFAC 0/4;
+  подписанные IFAC announces 499/500/501 на интерфейсе MTU 65535;
+  PLAIN/GROUP hops 0/1/2/127, context/client exemptions и повторы;
+  PLAIN/GROUP announces; shared-client SINGLE duplicate bypass.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  448 passed, 2 ignored.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  4 ignored. После sandbox PermissionDenied повтор с loopback-разрешением.
+- Workspace all-targets, runtime client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` собираются; новых warnings нет.
+
+Этап 4 остаётся частичным: ранняя адресация transport, сверка hash exceptions
+для активных Link, дополнительные violation sites, ротация PR tags и
+traffic-flow статистика. Этапы 5–7 и финальная интеграция ещё не завершены.
