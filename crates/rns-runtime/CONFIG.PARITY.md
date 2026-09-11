@@ -21,3 +21,11 @@ Cross-implementation checks live in `../reticulum-e2e-tests`:
   and bounds. Network class defaults are checked separately from conversion.
 - `tests/test_rsreticulum_interop.py::test_ifac_protects_the_python_to_rust_segment`
   verifies actual delivery through matching Python and Rust IFAC settings.
+
+`default_ifac_size_for(Local)` returns 16 bytes, matching the inherited
+`Interface.DEFAULT_IFAC_SIZE` on Python's `LocalClientInterface` and
+`LocalServerInterface`. Other class defaults are unchanged. This is a class
+contract: the normal local interface path does not attach an IFAC identity.
+The paired default-size assertions in `spec/rust/python/test_reference_contract.py`
+and `spec/rust/tests/reference_contract.rs` cover Local, TCP, UDP and Pipe;
+no synthetic live Local IFAC scenario is required.

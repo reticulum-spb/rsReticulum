@@ -1297,7 +1297,7 @@ fn normalize_announce_cap_percent(value: f64) -> Option<f64> {
     }
 }
 
-/// Python `DEFAULT_IFAC_SIZE`: network interfaces 16 bytes, serial/packet-radio 8.
+/// Python `DEFAULT_IFAC_SIZE`: network/local interfaces 16 bytes, serial/packet-radio 8.
 pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
     match config {
         InterfaceConfig::TcpClient(_)
@@ -1305,7 +1305,8 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
         | InterfaceConfig::Udp(_)
         | InterfaceConfig::Auto(_)
         | InterfaceConfig::I2P(_)
-        | InterfaceConfig::Backbone(_) => 16,
+        | InterfaceConfig::Backbone(_)
+        | InterfaceConfig::Local(_) => 16,
         #[cfg(feature = "serial")]
         InterfaceConfig::Serial(_)
         | InterfaceConfig::KissSerial(_)
@@ -1313,7 +1314,7 @@ pub fn default_ifac_size_for(config: &InterfaceConfig) -> usize {
         | InterfaceConfig::AX25KISS(_) => 8,
         #[cfg(any(feature = "serial", feature = "rnode-tcp"))]
         InterfaceConfig::RNode(_) => 8,
-        InterfaceConfig::Local(_) | InterfaceConfig::Pipe(_) | InterfaceConfig::Plugin(_) => 8,
+        InterfaceConfig::Pipe(_) | InterfaceConfig::Plugin(_) => 8,
         #[cfg(feature = "ble")]
         InterfaceConfig::BleRNode(_) => 8,
     }
