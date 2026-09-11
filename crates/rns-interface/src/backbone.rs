@@ -642,7 +642,10 @@ pub async fn spawn_backbone_server(
                     let handle = InterfaceHandle {
                         id: client_id,
                         parent_id: Some(id),
-                        diagnostics: Some(ingress),
+                        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+                            crate::traits::optimise_mtu(bitrate),
+                            Some(ingress),
+                        )),
                         name: client_name,
                         mode,
                         direction: InterfaceDirection {
@@ -676,7 +679,10 @@ pub async fn spawn_backbone_server(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: Some(diagnostics),
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            crate::traits::optimise_mtu(bitrate),
+            Some(diagnostics),
+        )),
         name,
         mode,
         direction: InterfaceDirection {
@@ -882,7 +888,10 @@ pub async fn spawn_backbone_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: Some(ingress),
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            crate::traits::optimise_mtu(bitrate),
+            Some(ingress),
+        )),
         name,
         mode,
         direction: InterfaceDirection {

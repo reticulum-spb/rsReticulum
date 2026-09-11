@@ -433,7 +433,10 @@ pub async fn spawn_tcp_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            fixed_mtu.or_else(|| crate::traits::optimise_mtu(bitrate)),
+            None,
+        )),
         name,
         mode,
         direction: InterfaceDirection {
@@ -503,7 +506,10 @@ async fn spawn_tcp_accepted(
     InterfaceHandle {
         id,
         parent_id: Some(parent_id),
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            crate::traits::optimise_mtu(bitrate),
+            None,
+        )),
         name,
         mode,
         direction: InterfaceDirection {
@@ -590,7 +596,10 @@ pub async fn spawn_tcp_server(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            crate::traits::optimise_mtu(bitrate),
+            None,
+        )),
         name,
         mode,
         direction: InterfaceDirection {
@@ -627,6 +636,7 @@ mod tests {
             config.fixed_mtu = Some(mtu);
             let handle = spawn_tcp_client(config, 1, tx.clone()).await.unwrap();
             assert_eq!(handle.mtu, mtu);
+            assert_eq!(handle.diagnostics.as_ref().unwrap().link_mtu(), Some(mtu));
             handle.read_task.abort();
             let _ = handle.read_task.await;
         }

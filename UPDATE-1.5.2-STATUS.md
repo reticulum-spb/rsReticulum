@@ -1839,3 +1839,39 @@ transport семантика. Отдельные AUTOCONFIGURE_MTU/FIXED_MTU р�
 1 passed. Workspace all-targets, runtime client-only tests и fmt/diff checks
 успешны; прежние warnings сохраняются. Полные suites в этом блоке повторно
 не запускались. Этап 5, версия и пользовательский план остаются без изменений.
+
+### Этап 5 — TCP/Backbone capabilities и transit Link MTU clamp
+
+Добавлена driver capability link_mtu()->Option<u32> через существующий
+InterfaceDiagnostics metadata channel. LinkMtuDiagnostics оборачивает прежний
+объект и делегирует ingress-control/blocked-IP методы; runtime уже переносит
+этот Arc в actor registration. Отдельное поле raw mtu не переосмыслено.
+TCP client сообщает fixed_mtu либо automatic MTU; TCP server/children —
+automatic. Backbone parent/children/client — automatic, None ниже 62500 bit/s.
+Другие драйверы пока не сообщают capability и считаются без MTU upgrade.
+
+При transit LinkRequest с exact payload 64+3 bytes и nonzero offer транспорт
+ограничивает MTU минимумом offer, incoming raw MTU и outgoing negotiable MTU.
+Без outgoing capability удаляются три signalling bytes. Ключи и Link ID
+сохраняются; relay table использует прежнюю identity. Zero offer, обычные
+64-byte requests и другие payload lengths не меняются. Local destination
+ветка не изменена: существующий local Link cap 500 остаётся.
+
+Это частичная capability migration: нет полного nullable HW_MTU, Local/Auto
+и прочих driver capabilities, next-hop MTU RPC и новых mode-validation
+protocol violations. Mode bits сохраняются без новой валидации. Rust явно
+не увеличивает offer и при неизвестном incoming interface использует offer
+как предел; Python min(nh_mtu, ph_mtu) в этом месте может встретить None.
+RX limits драйверов этим изменением не расширены.
+
+Новый actor matrix проверяет обе стороны clamp, отсутствие увеличения,
+удаление unsupported signalling и zero offer, неизменность ключей/Link ID
+и relay entry. Старый legacy forwarding test сохранён. Driver tests проверяют
+fixed TCP capability и Backbone parent/child capability вместе с сохранением
+ingress/fast-flap diagnostics. Shared runtime registration использует тот же
+metadata Arc; отдельная live RPC проверка не выполнялась.
+
+Проверки: целевые forwarding tests — 2 passed; interface lib — 220 passed,
+5 ignored; transport lib (default features) — 459 passed, 4 ignored.
+Workspace all-targets и runtime client-only tests checks успешны; прежние
+warnings сохраняются. Этап 5 остаётся открытым; версия проекта не менялась.

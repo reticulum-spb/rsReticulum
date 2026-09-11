@@ -237,7 +237,7 @@ Python's generic processing-exception counter is not implemented as a Rust
 panic catcher: expected parse/validation failures use explicit rejection paths,
 while actor invariant failures are programming errors, not automatically blamed
 on the peer. This is not a claim that every processing path is panic-free.
-Path-MTU signalling diagnostics still depend on pending transport clamping.
+Path-MTU signalling diagnostics remain incomplete.
 CLI and remote-management display are pending.
 
 ### Local Link MTU negotiation (partial)
@@ -250,8 +250,17 @@ before the proof is returned and agrees with the initiator after validation.
 Offers too small to fit an encrypted payload produce an MDU of zero, not an
 unsigned underflow or the default payload capacity. This is defensive arithmetic,
 not a guarantee that handshake frames fit such a small offered MTU.
-Interface capability propagation, transit MTU clamping and the associated
-protocol-violation counters still remain pending.
+TCP and Backbone now expose negotiable MTU through driver metadata, separately
+from the raw receive limit. Transit Link Requests with exactly 64 key bytes plus
+3 signalling bytes retain at most the offered, incoming-interface and outgoing
+negotiable MTU. If the outgoing driver does not expose this capability, nonzero
+MTU signalling is removed. Zero offers and requests without exact signalling
+remain unchanged. Link ID and key material are preserved.
+TCP uses its automatic MTU or explicit `fixed_mtu`; Backbone uses its automatic
+curve (no upgrade below its minimum bitrate). Other drivers are not yet wired
+and conservatively disable transit upgrades. Full nullable hardware MTU,
+next-hop MTU RPC, mode-validation diagnostics and larger local Links remain
+unfinished. Advertising a capability does not remove existing driver RX limits.
 
 ### Path-request tag history
 

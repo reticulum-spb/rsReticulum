@@ -1155,6 +1155,38 @@ impl TransportActor {
             };
             let remaining_hops = path.hops;
             let next_hop = path.next_hop;
+            let mut forwarded = forwarded;
+            // Link identity excludes the optional three-byte MTU signalling.
+            // Restrict only exact 64-byte keys + 3-byte signalling requests.
+            let (_, payload_offset) = match rns_wire::header::PacketHeader::unpack(&forwarded) {
+                Ok(parsed) => parsed,
+                Err(_) => return,
+            };
+            if forwarded.len() == payload_offset + 67 {
+                let offset = payload_offset + 64;
+                let offer = u32::from_be_bytes([
+                    0,
+                    forwarded[offset] & 0x1f,
+                    forwarded[offset + 1],
+                    forwarded[offset + 2],
+                ]);
+                if offer != 0 {
+                    let next = self
+                        .interfaces
+                        .get(&target_interface)
+                        .and_then(|entry| entry.diagnostics.as_ref())
+                        .and_then(|capabilities| capabilities.link_mtu());
+                    if let Some(next) = next.filter(|mtu| *mtu > 0) {
+                        let previous = self.interfaces.get(&interface_id).map(|entry| entry.mtu);
+                        let clamped = offer.min(next).min(previous.unwrap_or(offer));
+                        let bytes = clamped.to_be_bytes();
+                        forwarded[offset] = (forwarded[offset] & 0xe0) | (bytes[1] & 0x1f);
+                        forwarded[offset + 1..offset + 3].copy_from_slice(&bytes[2..]);
+                    } else {
+                        forwarded.truncate(offset);
+                    }
+                }
+            }
             self.send_to_interface(target_interface, &forwarded);
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
                 path.touch();

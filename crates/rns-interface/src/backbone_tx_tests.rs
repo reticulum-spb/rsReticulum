@@ -141,6 +141,30 @@ async fn listener_children_inherit_configured_bitrate_and_mtu() {
             assert_eq!(parent.bitrate, bitrate);
             assert_eq!(parent.mtu, mtu_for_bitrate(bitrate));
             assert_eq!((child.bitrate, child.mtu), (parent.bitrate, parent.mtu));
+            assert_eq!(
+                child.diagnostics.as_ref().unwrap().link_mtu(),
+                Some(child.mtu)
+            );
+            assert!(
+                child
+                    .diagnostics
+                    .as_ref()
+                    .unwrap()
+                    .dataplane_ingress()
+                    .is_some()
+            );
+            assert_eq!(
+                parent.diagnostics.as_ref().unwrap().link_mtu(),
+                Some(parent.mtu)
+            );
+            assert!(
+                parent
+                    .diagnostics
+                    .as_ref()
+                    .unwrap()
+                    .blocked_ip_list()
+                    .is_some()
+            );
             assert_eq!(child.parent_id, Some(parent.id));
             let limit = child.mtu as usize + 16;
             peer.write_all(&hdlc::frame(&vec![hdlc::ESC; limit + 1]))

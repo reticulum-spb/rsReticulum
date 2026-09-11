@@ -67,6 +67,11 @@ pub struct TimerTick {
 
 /// Live diagnostics and optional flow controls owned by an interface driver.
 pub trait InterfaceDiagnostics: Send + Sync {
+    /// Negotiable Link MTU (automatic or fixed); None disables MTU upgrades.
+    /// This is distinct from the raw receive limit in InterfaceEntry::mtu.
+    fn link_mtu(&self) -> Option<u32> {
+        None
+    }
     /// Optional Backbone dataplane control, independent of announce/PR limits.
     fn dataplane_ingress(&self) -> Option<&crate::backbone_ingress::IngressControl> {
         None
@@ -74,6 +79,30 @@ pub trait InterfaceDiagnostics: Send + Sync {
     /// Snapshot with expired entries removed. Non-Backbone drivers return None.
     fn blocked_ip_list(&self) -> Option<Vec<String>> {
         None
+    }
+}
+
+/// Attach immutable MTU capabilities without losing driver-owned flow controls.
+pub struct LinkMtuDiagnostics {
+    mtu: Option<u32>,
+    inner: Option<Arc<dyn InterfaceDiagnostics>>,
+}
+
+impl LinkMtuDiagnostics {
+    pub fn new(mtu: Option<u32>, inner: Option<Arc<dyn InterfaceDiagnostics>>) -> Arc<Self> {
+        Arc::new(Self { mtu, inner })
+    }
+}
+
+impl InterfaceDiagnostics for LinkMtuDiagnostics {
+    fn link_mtu(&self) -> Option<u32> {
+        self.mtu
+    }
+    fn dataplane_ingress(&self) -> Option<&crate::backbone_ingress::IngressControl> {
+        self.inner.as_ref()?.dataplane_ingress()
+    }
+    fn blocked_ip_list(&self) -> Option<Vec<String>> {
+        self.inner.as_ref()?.blocked_ip_list()
     }
 }
 
