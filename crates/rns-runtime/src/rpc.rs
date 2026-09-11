@@ -120,6 +120,12 @@ pub enum RpcRequest {
 pub enum RpcResponse {
     PathTable(Vec<PathTableEntry>),
     InterfaceStats(Vec<InterfaceStatEntry>),
+    /// Encoded as the normal Python interface_stats dictionary with queue fields.
+    /// Existing interface-only decoders intentionally continue returning InterfaceStats.
+    InterfaceStatsWithQueues(
+        Vec<InterfaceStatEntry>,
+        rns_transport::inbound_queue::InboundQueueStats,
+    ),
     RateTable(Vec<RateTableEntry>),
     StringResult(Option<String>),
     HashResult(Option<Vec<u8>>),
@@ -517,7 +523,8 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 })
                 .collect(),
         ),
-        RpcResponse::InterfaceStats(entries) => {
+        RpcResponse::InterfaceStats(entries)
+        | RpcResponse::InterfaceStatsWithQueues(entries, _) => {
             let interfaces = entries
                 .iter()
                 .map(|e| {
@@ -597,14 +604,51 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
             let txb = entries.iter().map(|e| e.tx_bytes).sum::<u64>();
             let rxs = entries.iter().map(|e| e.rx_rate).sum::<u64>();
             let txs = entries.iter().map(|e| e.tx_rate).sum::<u64>();
-            py_dict(vec![
+            let mut fields = vec![
                 ("interfaces", PyValue::List(interfaces)),
                 ("rxb", PyValue::Int(i128::from(rxb))),
                 ("txb", PyValue::Int(i128::from(txb))),
                 ("rxs", PyValue::Int(i128::from(rxs))),
                 ("txs", PyValue::Int(i128::from(txs))),
                 ("rss", PyValue::None),
-            ])
+            ];
+            if let RpcResponse::InterfaceStatsWithQueues(_, queues) = resp {
+                let snapshot = queues.snapshot;
+                fields.push(("rxqt", PyValue::Int(snapshot.total as i128)));
+                // MessagePack integers are at most u64; saturate the aggregate.
+                fields.push((
+                    "rxqtd",
+                    PyValue::Int(i128::from(
+                        snapshot
+                            .dropped
+                            .iter()
+                            .copied()
+                            .fold(0u64, u64::saturating_add),
+                    )),
+                ));
+                let total_capacity: f64 = queues.capacities.iter().map(|v| *v as f64).sum();
+                fields.push((
+                    "tqpressure",
+                    PyValue::Float(snapshot.total as f64 / total_capacity),
+                ));
+                for (i, (height, dropped, pressure)) in [
+                    ("rxqd", "rxqdd", "dqpressure"),
+                    ("rxqa", "rxqad", "aqpressure"),
+                    ("rxqp", "rxqpd", "pqpressure"),
+                    ("rxqil", "rxqild", "ilqpressure"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    fields.push((height, PyValue::Int(snapshot.heights[i] as i128)));
+                    fields.push((dropped, PyValue::Int(i128::from(snapshot.dropped[i]))));
+                    fields.push((
+                        pressure,
+                        PyValue::Float(snapshot.heights[i] as f64 / queues.capacities[i] as f64),
+                    ));
+                }
+            }
+            py_dict(fields)
         }
         RpcResponse::RateTable(entries) => PyValue::List(
             entries
@@ -1721,6 +1765,60 @@ pub enum RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_queue_fields_use_python_names_without_breaking_old_decoders() {
+        use rns_transport::inbound_queue::{InboundQueueSnapshot, InboundQueueStats};
+        let queues = InboundQueueStats {
+            capacities: [2, 4, 8, 16],
+            snapshot: InboundQueueSnapshot {
+                total: 13,
+                heights: [1, 4, 0, 8],
+                dropped: [1, 2, 3, 4],
+            },
+        };
+        let encoded =
+            encode_response(&RpcResponse::InterfaceStatsWithQueues(vec![], queues)).unwrap();
+        let value = decode_umsgpack(&encoded).unwrap();
+        let dict = as_dict(&value).unwrap();
+        for (key, expected) in [
+            ("rxqt", 13),
+            ("rxqd", 1),
+            ("rxqa", 4),
+            ("rxqp", 0),
+            ("rxqil", 8),
+            ("rxqtd", 10),
+            ("rxqdd", 1),
+            ("rxqad", 2),
+            ("rxqpd", 3),
+            ("rxqild", 4),
+        ] {
+            assert_eq!(dict_get(dict, key), Some(&PyValue::Int(expected)));
+        }
+        for (key, expected) in [
+            ("tqpressure", 13.0 / 30.0),
+            ("dqpressure", 0.5),
+            ("aqpressure", 1.0),
+            ("pqpressure", 0.0),
+            ("ilqpressure", 0.5),
+        ] {
+            assert_eq!(dict_get(dict, key), Some(&PyValue::Float(expected)));
+        }
+        assert!(
+            matches!(decode_response_for_request(&encoded, &RpcRequest::GetInterfaceStats).unwrap(), RpcResponse::InterfaceStats(entries) if entries.is_empty())
+        );
+        let legacy = response_to_py_value(&RpcResponse::InterfaceStats(vec![]));
+        assert!(dict_get(as_dict(&legacy).unwrap(), "rxqt").is_none());
+        let mut saturated = queues;
+        saturated.snapshot.dropped = [u64::MAX; 4];
+        let encoded =
+            encode_response(&RpcResponse::InterfaceStatsWithQueues(vec![], saturated)).unwrap();
+        let value = decode_umsgpack(&encoded).unwrap();
+        assert_eq!(
+            dict_get(as_dict(&value).unwrap(), "rxqtd"),
+            Some(&PyValue::Int(u64::MAX as i128))
+        );
+    }
 
     #[test]
     fn test_request_roundtrip() {

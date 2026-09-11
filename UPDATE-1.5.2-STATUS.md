@@ -637,3 +637,52 @@ job. Throughput, задержки и dataplane throttling относятся к 
 Этап 4 остаётся частичным: далее live queue counters в RPC/API/UI, ранние
 protocol/IFAC violation counters, MTU/filter semantics и ротация PR tags.
 Этапы 5–7 и итоговая интеграция ещё не завершены; версия не изменена.
+
+## Этап 4 — live queue counters в RPC/API/Web UI
+
+Добавлен `GetInboundQueueStats`: actor возвращает единый snapshot текущих
+высот, drops и настроенных capacities четырёх классов. Legacy single-channel
+actor возвращает None, а не фиктивные нулевые показатели активных очередей.
+Очереди и счётчики принадлежат локальному actor; raw/control/storage каналы
+не входят в эти показатели. Очистка после dispatch не сбрасывает drops.
+
+Shared-instance RPC `interface_stats` дополнен top-level полями Python 1.5.2
+`rxqt/rxqd/rxqa/rxqp/rxqil`, `rxqtd/rxqdd/rxqad/rxqpd/rxqild` и пятью
+`*qpressure` по `Reticulum.py:1596–1610`. Pressure — доля ёмкости, не проценты.
+Общий drop counter насыщается на u64::MAX для MessagePack, индивидуальные
+счётчики уже насыщаемые. Существующий Rust decoder по-прежнему возвращает
+InterfaceStats(Vec), игнорируя дополнительные поля: пользователи прежнего
+API не получают другую форму ответа. RPC server получает queue snapshot
+отдельно от interface counters; общая атомарность всех метрик не заявляется.
+
+`/api/v1/status.inbound_queues` содержит capacities/heights/dropped и total.
+Dashboard показывает четыре класса, ёмкость, заполнение в процентах и drops.
+При отсутствии поля, null или сбое загрузки состояние показывается как
+Unavailable, без сохранения устаревших нулей/показателей. Некорректные значения
+и числа за пределами точности JS не выдаются за точные счётчики.
+
+Проверки:
+
+- Actor regression проверяет все четыре заполненные очереди, drops, capacities,
+  total до/после dispatch и None в legacy mode.
+- RPC тесты проверяют точные Python-имена, pressure, насыщение суммы drops,
+  чтение расширенного ответа старым decoder и реальные лимиты actor через
+  обработчик `interface_stats`.
+- JSON-тест фиксирует форму API и null; JS-тест — четыре строки и fallback.
+- `cargo test -p rns-runtime --test inbound_queue_rpc_python -- --ignored`:
+  1 passed. Переполненные Rust очереди → RPC MessagePack → эталонный
+  `RNS/vendor/umsgpack.py` Python 3.11. Запуск с `-B`, без RNS runtime/сокетов,
+  эталонный checkout не изменён. Это codec interop, не нагрузочный сетевой тест.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 234 passed,
+  4 ignored; повтор с loopback-разрешением после 9 sandbox PermissionDenied.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  441 passed, 1 ignored.
+- `node --test crates/rns-runtime/web/app.test.js`: passed.
+
+Сборки `cargo check --workspace --all-targets`, runtime client-only и
+runtime `api,serial,rnode-tcp,sqlite-bundled` прошли; форматирование и
+`git diff --check` — без ошибок. Новых warnings нет.
+
+Этап 4 остаётся частичным: ранние protocol/IFAC violation counters, MTU/filter
+семантика, ротация PR tags и оставшаяся traffic-flow статистика. Вывод очередей
+в `rnstatus-rs` и remote-management — ещё не выполненная часть этапа 7.

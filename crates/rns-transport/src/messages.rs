@@ -408,6 +408,7 @@ pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
 pub enum TransportQuery {
     GetPathTable,
     GetInterfaceStats,
+    GetInboundQueueStats,
     GetRateTable,
     GetLinkCount,
     GetRecentAnnounces,
@@ -595,6 +596,8 @@ pub enum TransportQuery {
 pub enum TransportQueryResponse {
     PathTable(Vec<PathTableRpcEntry>),
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
+    /// None for legacy single-channel actors without priority queue dispatch.
+    InboundQueueStats(Option<crate::inbound_queue::InboundQueueStats>),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
     /// Response to `Recall` — `None` if we've never seen a valid announce

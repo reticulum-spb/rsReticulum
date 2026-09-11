@@ -55,11 +55,19 @@ impl InboundQueueLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InboundQueueSnapshot {
     pub total: usize,
     pub heights: [usize; 4],
     pub dropped: [u64; 4],
+}
+
+/// One actor-owned observation; counts exclude raw/control/storage channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InboundQueueStats {
+    pub capacities: [usize; 4],
+    #[serde(flatten)]
+    pub snapshot: InboundQueueSnapshot,
 }
 
 /// Single-owner storage: snapshot reads and queue mutations are serialized by
@@ -72,6 +80,13 @@ pub struct InboundQueues<T> {
 }
 
 impl<T> InboundQueues<T> {
+    pub fn stats(&self) -> InboundQueueStats {
+        InboundQueueStats {
+            capacities: self.limits.sizes(),
+            snapshot: self.snapshot(),
+        }
+    }
+
     pub fn new(limits: InboundQueueLimits) -> Self {
         Self {
             queues: std::array::from_fn(|_| VecDeque::new()),

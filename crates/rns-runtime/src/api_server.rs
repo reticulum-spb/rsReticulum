@@ -1190,6 +1190,15 @@ fn session_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 
 async fn status(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let stats = fetch_interfaces(&s).await?;
+    let queues = match s.query(TransportQuery::GetInboundQueueStats).await? {
+        TransportQueryResponse::InboundQueueStats(queues) => queues,
+        TransportQueryResponse::Error(error) => return Err(ApiError::internal(error)),
+        other => {
+            return Err(ApiError::internal(format!(
+                "unexpected queue response: {other:?}"
+            )));
+        }
+    };
     let sections = load_interface_sections(&s)?;
     let configs = load_interface_configs_from_sections(&sections);
     let total_rx: u64 = stats.iter().map(|e| e.rx_bytes).sum();
@@ -1198,6 +1207,7 @@ async fn status(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({
         "interfaces_total":  stats.len(),
         "interfaces_online": online,
+        "inbound_queues": queues,
         "rx_bytes_total":    total_rx,
         "tx_bytes_total":    total_tx,
         "interfaces":        stats.iter().map(|e| merge_iface_json(
@@ -2237,6 +2247,26 @@ fn visible_by_default(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_status_json_preserves_all_classes_and_unavailability() {
+        use rns_transport::inbound_queue::{InboundQueueSnapshot, InboundQueueStats};
+        let queues = Some(InboundQueueStats {
+            capacities: [2, 4, 8, 16],
+            snapshot: InboundQueueSnapshot {
+                total: 13,
+                heights: [1, 4, 0, 8],
+                dropped: [0, 3, 2, 1],
+            },
+        });
+        assert_eq!(
+            json!({"inbound_queues": queues}),
+            json!({"inbound_queues": {
+                "capacities": [2, 4, 8, 16], "total": 13, "heights": [1, 4, 0, 8], "dropped": [0, 3, 2, 1]
+            }})
+        );
+        assert_eq!(json!(Option::<InboundQueueStats>::None), Value::Null);
+    }
+
     #[test]
     fn inbound_queue_changes_require_restart() {
         let running = super::ReticulumConfig::default();

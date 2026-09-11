@@ -265,6 +265,7 @@ function formatFrequency(value) {
 }
 
 function resetDashboardMetrics() {
+  renderInboundQueues(null);
   document.querySelector("#metric-interfaces").textContent = "—";
   document.querySelector("#metric-online").textContent = "Status unavailable";
   document.querySelector("#metric-rx").textContent = "—";
@@ -273,6 +274,7 @@ function resetDashboardMetrics() {
 }
 
 function renderDashboard(status, links) {
+  renderInboundQueues(status.inbound_queues);
   const total = Number(status.interfaces_total) || 0;
   const online = Number(status.interfaces_online) || 0;
   document.querySelector("#metric-interfaces").textContent = total.toLocaleString();
@@ -281,6 +283,35 @@ function renderDashboard(status, links) {
   document.querySelector("#metric-tx").textContent = formatBytes(status.tx_bytes_total);
   document.querySelector("#metric-links").textContent =
     (Number(links.link_count) || 0).toLocaleString();
+}
+
+function inboundQueueRows(queues) {
+  const valid = queues && [queues.capacities, queues.heights, queues.dropped]
+    .every((values) => Array.isArray(values) && values.length === 4);
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  return ["Data / proofs / links", "Announces", "Path requests", "Ingress-limited"]
+    .map((label, i) => {
+      if (!valid) return [label, "Unavailable", "—"];
+      const capacity = queues.capacities[i];
+      const height = queues.heights[i];
+      const occupancy = count(height) && count(capacity) && capacity > 0 && height <= capacity
+        ? `${formatNumber(height)} / ${formatNumber(capacity)} (${(height / capacity * 100).toFixed(1)}%)`
+        : "Unavailable";
+      return [label, occupancy, count(queues.dropped[i]) ? formatNumber(queues.dropped[i]) : "—"];
+    });
+}
+
+function renderInboundQueues(queues) {
+  const body = document.querySelector("#inbound-queue-rows");
+  body.replaceChildren(...inboundQueueRows(queues).map((values) => {
+    const row = document.createElement("tr");
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+    return row;
+  }));
 }
 
 function setDashboardBusy(busy) {
@@ -1730,6 +1761,7 @@ function initialize() {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    inboundQueueRows,
     formatBytes,
     formatDuration,
     formatFrequency,

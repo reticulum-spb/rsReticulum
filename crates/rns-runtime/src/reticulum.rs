@@ -417,7 +417,8 @@ fn rpc_response_to_transport_response(
                 .collect();
             TransportQueryResponse::PathTable(entries)
         }
-        RpcResponse::InterfaceStats(entries) => {
+        RpcResponse::InterfaceStats(entries)
+        | RpcResponse::InterfaceStatsWithQueues(entries, _) => {
             let entries = entries
                 .into_iter()
                 .map(|entry| InterfaceStatRpcEntry {

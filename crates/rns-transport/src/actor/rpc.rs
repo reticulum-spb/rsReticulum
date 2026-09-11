@@ -8,6 +8,11 @@ impl TransportActor {
     ) -> crate::messages::TransportQueryResponse {
         use crate::messages::*;
         match query {
+            TransportQuery::GetInboundQueueStats => TransportQueryResponse::InboundQueueStats(
+                self.control_rx
+                    .as_ref()
+                    .map(|_| self.inbound_queues.stats()),
+            ),
             TransportQuery::GetPathTable => {
                 let entries: Vec<PathTableRpcEntry> = self
                     .path_table

@@ -101,6 +101,34 @@ substantial memory under load. All values and their sum must fit platform
 `usize`. Python 1.5.2 ignores non-positive overrides; strict Rust YAML rejects
 them as configuration errors instead of silently falling back to defaults.
 
+### Inbound queue diagnostics
+
+`GET /api/v1/status` includes `inbound_queues` with `capacities`, `heights`,
+`dropped` (four-element arrays in DATA/announce/PR/IL order) and `total`
+(current queued packets). The dashboard displays occupancy, configured capacity
+and overflow drops for each class. These are local actor metrics, excluding
+raw-interface, control and SQLite storage queues. Drops accumulate for the actor
+lifetime; rejected invalid packets and administrative queue cleanup are not
+counted as overflow. A legacy single-channel actor returns `null`, displayed as
+unavailable; an older API response without the field is also supported.
+
+The shared-instance MessagePack `interface_stats` response includes the Python
+1.5.2 top-level fields below; existing interface entries are unchanged.
+
+| Class | Queued packets | Overflow drops | Pressure (fraction, not percent) |
+|---|---|---|---|
+| DATA | `rxqd` | `rxqdd` | `dqpressure` |
+| Announce | `rxqa` | `rxqad` | `aqpressure` |
+| PR | `rxqp` | `rxqpd` | `pqpressure` |
+| IL | `rxqil` | `rxqild` | `ilqpressure` |
+| Total | `rxqt` | `rxqtd` | `tqpressure` |
+
+Queue counts and pressure come from one actor snapshot. Interface counters are
+sampled separately. The total drop counter saturates at `u64::MAX`, the maximum
+unsigned MessagePack integer. Existing Rust interface-only RPC decoders retain
+their response shape and ignore these additional fields. `rnstatus-rs` display
+and remote-management propagation of queue metrics remain pending.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

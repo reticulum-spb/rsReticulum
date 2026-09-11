@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const test = require("node:test");
 const {
+  inboundQueueRows,
   formatBytes,
   formatDuration,
   formatFrequency,
@@ -14,6 +15,17 @@ const {
   matchesInterface,
   matchesPath,
 } = require("./app.js");
+
+test("renders independent queue occupancy and drops, with old-server fallback", () => {
+  const rows = inboundQueueRows({ capacities: [2, 4, 8, 16], heights: [1, 4, 0, 8], dropped: [0, 3, 2, 1] });
+  assert.deepEqual(rows.map((row) => row[1]), ["1 / 2 (50.0%)", "4 / 4 (100.0%)", "0 / 8 (0.0%)", "8 / 16 (50.0%)"]);
+  assert.deepEqual(rows.map((row) => row[2]), ["0", "3", "2", "1"]);
+  for (const missing of [undefined, null, {}, { capacities: [1] }]) {
+    assert.ok(inboundQueueRows(missing).every((row) => row[1] === "Unavailable" && row[2] === "—"));
+  }
+  const invalid = inboundQueueRows({ capacities: [0, 2, 2, 2], heights: [0, -1, 3, 0], dropped: [null, -1, Number.MAX_SAFE_INTEGER + 1, 0] });
+  assert.ok(invalid.slice(0, 3).every((row) => row[1] === "Unavailable" && row[2] === "—"));
+});
 
 test("allows editing schema-backed plugin interfaces", () => {
   assert.equal(interfaceConfigEditable("PluginInterface"), true);

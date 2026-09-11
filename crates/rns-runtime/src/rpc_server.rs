@@ -347,7 +347,13 @@ async fn process_rpc_request(
                             tx_drops: e.tx_drops,
                         })
                         .collect();
-                    RpcResponse::InterfaceStats(rpc_entries)
+                    match query_transport(transport_tx, TransportQuery::GetInboundQueueStats).await
+                    {
+                        Some(TransportQueryResponse::InboundQueueStats(Some(queues))) => {
+                            RpcResponse::InterfaceStatsWithQueues(rpc_entries, queues)
+                        }
+                        _ => RpcResponse::InterfaceStats(rpc_entries),
+                    }
                 }
                 _ => RpcResponse::Error(
                     "transport actor did not answer interface stats query".to_string(),
@@ -979,6 +985,28 @@ listener.close()
         }
 
         let _ = tx.send(TransportMessage::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn interface_stats_include_live_actor_queue_capacities() {
+        use rns_transport::{actor::TransportActor, inbound_queue::InboundQueueLimits};
+        let (actor, input, control) = TransportActor::new_with_control_channel_and_queue_limits(
+            InboundQueueLimits::new([2, 3, 4, 5]).unwrap(),
+        );
+        let task = tokio::spawn(actor.run());
+        let response = process_rpc_request(RpcRequest::GetInterfaceStats, &control).await;
+        let RpcResponse::InterfaceStatsWithQueues(_, queues) = response else {
+            panic!("missing queue stats")
+        };
+        assert_eq!(queues.capacities, [2, 3, 4, 5]);
+        assert_eq!(queues.snapshot.total, 0);
+        assert_eq!(queues.snapshot.dropped, [0; 4]);
+        drop(input);
+        drop(control);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

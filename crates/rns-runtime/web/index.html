@@ -91,6 +91,17 @@
           </article>
         </div>
 
+        <section class="card">
+          <h2>Inbound queues</h2>
+          <p>Admitted packets, highest priority first. Overflow drops since runtime startup; raw, control and storage channels are excluded.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Class</th><th>Queued / capacity</th><th>Dropped</th></tr></thead>
+              <tbody id="inbound-queue-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="card runtime-card">
           <div>
             <span class="eyebrow">Runtime status</span>

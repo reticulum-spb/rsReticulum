@@ -4048,6 +4048,15 @@ mod tests {
         }
         assert_eq!(actor.inbound_queues.snapshot().heights, sizes);
         assert_eq!(actor.inbound_queues.snapshot().dropped, [1; 4]);
+        let TransportQueryResponse::InboundQueueStats(Some(stats)) =
+            actor.handle_query(TransportQuery::GetInboundQueueStats)
+        else {
+            panic!("missing live queue stats")
+        };
+        assert_eq!(stats.capacities, sizes);
+        assert_eq!(stats.snapshot.heights, sizes);
+        assert_eq!(stats.snapshot.total, 10);
+        assert_eq!(stats.snapshot.dropped, [1; 4]);
         assert_eq!(actor.channel_drops, 4);
         for class in TrafficClass::ALL {
             for _ in 0..sizes[class as usize] {
@@ -4057,6 +4066,22 @@ mod tests {
             }
         }
         assert_eq!(actor.inbound_queues.snapshot().total, 0);
+        let TransportQueryResponse::InboundQueueStats(Some(stats)) =
+            actor.handle_query(TransportQuery::GetInboundQueueStats)
+        else {
+            panic!("missing drained queue stats")
+        };
+        assert_eq!(stats.snapshot.total, 0);
+        assert_eq!(stats.snapshot.dropped, [1; 4]);
+    }
+
+    #[test]
+    fn legacy_actor_queue_stats_are_unavailable() {
+        let (mut actor, _input) = TransportActor::new();
+        assert!(matches!(
+            actor.handle_query(TransportQuery::GetInboundQueueStats),
+            TransportQueryResponse::InboundQueueStats(None)
+        ));
     }
 
     #[test]
