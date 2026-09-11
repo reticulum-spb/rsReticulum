@@ -350,10 +350,6 @@ impl TransportActor {
             return;
         };
 
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.received_path_request();
-        }
-
         let now = now_f64();
         let mut unique_tag = Vec::with_capacity(32);
         unique_tag.extend_from_slice(&requested_dest);
@@ -365,6 +361,37 @@ impl TransportActor {
             }
         }
         self.discovery_pr_tags.insert(unique_tag, now);
+
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ingress.received_path_request();
+        }
+
+        // A new tag for an already engaged discovery adds a waiter, not a
+        // second recursive search. Duplicate tags were rejected above. Check
+        // expiry here too, so admission never depends on the maintenance tick.
+        if self
+            .discovery_path_requests
+            .get(&requested_dest)
+            .is_some_and(|request| now > request.timeout)
+        {
+            self.discovery_path_requests.remove(&requested_dest);
+        }
+        if self.discovery_path_requests.contains_key(&requested_dest) {
+            let allowed = self
+                .interfaces
+                .get_mut(&interface_id)
+                .is_some_and(|entry| !entry.ingress.should_ingress_limit_pr());
+            if allowed {
+                let request = self
+                    .discovery_path_requests
+                    .get_mut(&requested_dest)
+                    .unwrap();
+                if !request.requesting_interfaces.contains(&interface_id) {
+                    request.requesting_interfaces.push(interface_id);
+                }
+            }
+            return;
+        }
 
         if self.local_destinations.contains(&requested_dest) {
             debug!(
@@ -504,14 +531,6 @@ impl TransportActor {
             );
             self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false, false);
         } else if self.is_transport_enabled && should_search_unknown {
-            if self.discovery_path_requests.contains_key(&requested_dest) {
-                debug!(
-                    dest = %hex::encode(requested_dest),
-                    "not forwarding path request — discovery request is already waiting"
-                );
-                return;
-            }
-
             let ingress_limited = self
                 .interfaces
                 .get_mut(&interface_id)
@@ -532,7 +551,7 @@ impl TransportActor {
             self.discovery_path_requests.insert(
                 requested_dest,
                 DiscoveryPathRequest {
-                    requesting_interface: interface_id,
+                    requesting_interfaces: vec![interface_id],
                     timeout: now + PATH_REQUEST_TIMEOUT,
                 },
             );

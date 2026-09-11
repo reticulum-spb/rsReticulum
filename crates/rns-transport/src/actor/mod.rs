@@ -233,9 +233,11 @@ pub struct RecentAnnounce {
     pub name_hash: [u8; 10],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DiscoveryPathRequest {
-    pub requesting_interface: InterfaceId,
+    /// Unique live interfaces waiting for this destination. Until early queue
+    /// admission is integrated, entries are created only by an engaged search.
+    pub requesting_interfaces: Vec<InterfaceId>,
     pub timeout: f64,
 }
 
@@ -1117,8 +1119,12 @@ impl TransportActor {
             .retain(|(_, interface_id), _| *interface_id != id);
         self.pending_local_path_requests
             .retain(|_, waiting_interface| *waiting_interface != id);
-        self.discovery_path_requests
-            .retain(|_, request| request.requesting_interface != id);
+        self.discovery_path_requests.retain(|_, request| {
+            request
+                .requesting_interfaces
+                .retain(|waiting| *waiting != id);
+            !request.requesting_interfaces.is_empty()
+        });
         self.interfaces.remove(&id);
         if role == Some(InterfaceRole::SharedInstancePeer) {
             tracing::warn!(
@@ -6121,7 +6127,7 @@ mod tests {
         actor.discovery_path_requests.insert(
             dest_discovery,
             DiscoveryPathRequest {
-                requesting_interface: 1,
+                requesting_interfaces: vec![1],
                 timeout: now_f64() + PATH_REQUEST_TIMEOUT,
             },
         );
@@ -8600,7 +8606,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_path_requests_still_count_toward_ingress_frequency() {
+    fn duplicate_path_requests_do_not_count_toward_ingress_frequency() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
 
@@ -8622,15 +8628,15 @@ mod tests {
         actor.handle_inbound_path_request(&payload, 1);
 
         assert!(boundary_rx.try_recv().is_err());
-        assert!(
+        assert_eq!(
             actor
                 .interfaces
                 .get(&1)
                 .unwrap()
                 .ingress
-                .incoming_pr_frequency()
-                > 0.0,
-            "duplicate tagged PRs must still contribute to ingress PR stats"
+                .incoming_pr_frequency(),
+            0.0,
+            "Python 1.5.2 rejects duplicate tags before recording PR frequency"
         );
     }
 
@@ -9015,6 +9021,143 @@ mod tests {
     }
 
     #[test]
+    fn discovery_batches_interfaces_and_fans_out_only_a_valid_answer() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        actor.transport_identity_hash = Some([0x44; 16]);
+        let (mut first, mut first_rx) = make_test_interface("first");
+        first.mode = InterfaceMode::Gateway;
+        first.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, first);
+        let (mut second, mut second_rx) = make_test_interface("second");
+        second.mode = InterfaceMode::Full;
+        second.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(2, second);
+        let (source, mut source_rx) = make_test_interface("source");
+        actor.interfaces.insert(3, source);
+        let (limited, mut limited_rx) = make_test_interface("limited");
+        actor.interfaces.insert(4, limited);
+
+        let (announce, dest) = make_valid_announce("test.discovery.batch", 1);
+        let first_request = make_path_request_payload_with_tag(dest, None, [1; 16]);
+        actor.handle_inbound_path_request(&first_request, 1);
+        source_rx.try_recv().expect("one recursive search");
+        while second_rx.try_recv().is_ok() {}
+        while limited_rx.try_recv().is_ok() {}
+
+        let second_request = make_path_request_payload_with_tag(dest, None, [2; 16]);
+        actor.handle_inbound_path_request(&second_request, 2);
+        actor.handle_inbound_path_request(
+            &make_path_request_payload_with_tag(dest, None, [3; 16]),
+            2,
+        );
+        // Same tag received on another interface is still a duplicate, not a
+        // new waiter. A new tag on an ingress-limited interface cannot join.
+        actor.handle_inbound_path_request(&second_request, 4);
+        prime_ingress_pr_burst(&mut actor, 4);
+        actor.handle_inbound_path_request(
+            &make_path_request_payload_with_tag(dest, None, [4; 16]),
+            4,
+        );
+        assert_eq!(
+            actor.discovery_path_requests[&dest].requesting_interfaces,
+            [1, 2]
+        );
+        assert!(
+            source_rx.try_recv().is_err(),
+            "batched requests must not search again"
+        );
+
+        let mut corrupt = announce.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        actor.on_inbound(InboundPacket {
+            raw: corrupt.into(),
+            interface_id: 3,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(actor.discovery_path_requests.contains_key(&dest));
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+
+        actor.on_inbound(InboundPacket {
+            raw: announce,
+            interface_id: 3,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let first_response = first_rx.try_recv().expect("first waiter answered");
+        let second_response = second_rx.try_recv().expect("second waiter answered");
+        assert_eq!(first_response, second_response);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&first_response).unwrap();
+        assert_eq!(header.destination_hash, dest);
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::PathResponse
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert!(
+            second_rx.try_recv().is_err(),
+            "one response per interface, not per tag"
+        );
+        assert!(limited_rx.try_recv().is_err());
+        assert!(!actor.discovery_path_requests.contains_key(&dest));
+    }
+
+    #[test]
+    fn discovery_deregister_removes_only_departed_waiters() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xDA; 16];
+        actor.discovery_path_requests.insert(
+            dest,
+            DiscoveryPathRequest {
+                requesting_interfaces: vec![1, 2],
+                timeout: now_f64() + PATH_REQUEST_TIMEOUT,
+            },
+        );
+        actor.deregister_interface(1);
+        assert_eq!(
+            actor.discovery_path_requests[&dest].requesting_interfaces,
+            [2]
+        );
+        actor.deregister_interface(2);
+        assert!(!actor.discovery_path_requests.contains_key(&dest));
+    }
+
+    #[test]
+    fn discovery_expired_waiters_do_not_prevent_a_new_search_before_tick() {
+        let (mut actor, _tx) = TransportActor::new();
+        actor.is_transport_enabled = true;
+        let (mut requester, _rx) = make_test_interface("requester");
+        requester.mode = InterfaceMode::Gateway;
+        requester.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, requester);
+        let (source, mut source_rx) = make_test_interface("source");
+        actor.interfaces.insert(3, source);
+        let dest = [0xDB; 16];
+        actor.discovery_path_requests.insert(
+            dest,
+            DiscoveryPathRequest {
+                requesting_interfaces: vec![2],
+                timeout: 0.0,
+            },
+        );
+        actor.handle_inbound_path_request(
+            &make_path_request_payload_with_tag(dest, None, [1; 16]),
+            1,
+        );
+        source_rx
+            .try_recv()
+            .expect("expired discovery must not suppress a new search");
+        assert_eq!(
+            actor.discovery_path_requests[&dest].requesting_interfaces,
+            [1]
+        );
+    }
+
+    #[test]
     fn discovery_path_request_is_answered_by_later_matching_announce() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
@@ -9073,8 +9216,8 @@ mod tests {
             &announce_raw[announce_offset..]
         );
         assert!(
-            actor.discovery_path_requests.contains_key(&dest),
-            "Python leaves discovery_path_requests in place until timeout cleanup"
+            !actor.discovery_path_requests.contains_key(&dest),
+            "Python 1.5.2 consumes discovery waiters when the answer arrives"
         );
     }
 
@@ -9085,7 +9228,7 @@ mod tests {
         actor.discovery_path_requests.insert(
             requested,
             DiscoveryPathRequest {
-                requesting_interface: 1,
+                requesting_interfaces: vec![1],
                 timeout: 0.0,
             },
         );

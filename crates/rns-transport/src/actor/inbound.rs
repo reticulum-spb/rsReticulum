@@ -522,15 +522,16 @@ impl TransportActor {
 
             if let Some(request) = self
                 .discovery_path_requests
-                .get(&header.destination_hash)
-                .copied()
+                .remove(&header.destination_hash)
             {
                 if let Some(response) = self.path_response_from_cached_announce(
                     raw,
                     header.destination_hash,
                     header.hops,
                 ) {
-                    self.send_to_interface(request.requesting_interface, &response);
+                    for interface_id in request.requesting_interfaces {
+                        self.send_to_interface(interface_id, &response);
+                    }
                 }
             }
 
