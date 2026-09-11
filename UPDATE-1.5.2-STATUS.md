@@ -1712,3 +1712,35 @@ shared_medium, диагностика и multi-peer нагрузочные ср�
 Проверки: interface lib — 211 passed, 5 ignored; отдельный Python oracle —
 1 passed. Workspace all-targets и runtime client-only tests checks успешны;
 прежние warnings сохраняются. Сетевые тесты выполнены с loopback-разрешением.
+
+### Этап 5 — точный IFAC allowance для Backbone RX
+
+Backbone driver configs получили receive_ifac_size: Some(0..=64) задаёт
+точный допуск, None сохраняет прежний консервативный допуск 64 bytes для
+прямых callers, ещё не передающих настройку. Некорректные значения отвергаются
+до bind/connect и создания задач. Это параметр границы RX, не включение IFAC.
+
+Runtime передаёт размер до spawn во всех Backbone путях: старт из YAML,
+добавление из конфигурации, административные client/server helpers и discovery
+autoconnect. Размер определяется тем же выводом IFAC key, что при регистрации:
+нет ключа — нулевой допуск; есть ключ — explicit size или class default 16.
+Один только ifac_size без credentials не расширяет лимит. Accepted children
+наследуют receive limit listener, reconnect использует исходную настройку.
+Actor сохраняет независимую проверку и аутентификацию IFAC.
+
+Loopback client test расширен до None/0/1/16/64; проверяет точную верхнюю
+границу, overflow на один байт и восстановление. Listener/child test теперь
+проверяет наследование допуска 16 bytes на четырёх bitrate/MTU ступенях.
+Добавлены rejection test для invalid driver sizes, runtime test соответствия
+allowance регистрации и YAML matrix для listener/client с отсутствующими,
+default и explicit IFAC settings. Как и раньше, driver fixtures проверяют
+длину/framing, а не криптографию. Python source HEAD ea98db4f не изменён;
+max_frame_len и наследование ifac_size сверены с BackboneInterface.py.
+
+Проверки: interface lib — 212 passed, 5 ignored; runtime API lib — 239 passed,
+5 ignored, включая YAML matrix (она также отдельно прошла целевой запуск).
+Workspace all-targets, client-only tests и fmt/diff checks успешны;
+прежние warnings сохраняются.
+Этап 5 не завершён: minimum/service frames, capabilities/Link clamp,
+shared_medium, диагностика и multi-peer нагрузочные сравнения ещё открыты.
+Пользовательский план и версия проекта не изменены.

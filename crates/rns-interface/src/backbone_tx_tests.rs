@@ -6,49 +6,68 @@ use tokio::io::AsyncWrite;
 
 #[tokio::test]
 async fn reader_mtu_allowance_accepts_boundary_rejects_overflow_and_resyncs() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut config = BackboneClientConfig::new(
-        "receive-mtu",
-        "127.0.0.1",
-        listener.local_addr().unwrap().port(),
-    );
-    config.bitrate = 100_000_000;
-    config.max_reconnect_tries = Some(1);
-    let (tx, mut events) = mpsc::channel(8);
-    let handle = spawn_backbone_client(config, 78, tx).await.unwrap();
-    let mut task = handle.read_task;
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        let (mut peer, _) = listener.accept().await.unwrap();
-        let limit = handle.mtu as usize + 64;
-        let valid = vec![hdlc::FLAG; limit];
-        peer.write_all(&hdlc::frame(&valid)).await.unwrap();
-        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
-            panic!("boundary frame")
-        };
-        assert_eq!(packet.raw.as_ref(), valid);
-        peer.write_all(&hdlc::frame(&vec![hdlc::ESC; limit + 1]))
-            .await
-            .unwrap();
-        peer.write_all(&hdlc::frame(b"resynchronised"))
-            .await
-            .unwrap();
-        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
-            panic!("resynchronised frame")
-        };
-        assert_eq!(packet.raw.as_ref(), b"resynchronised");
-        peer.shutdown().await.unwrap();
-        assert!(matches!(
-            events.recv().await,
-            Some(TransportMessage::DeregisterInterface { id: 78 })
-        ));
-        (&mut task).await.unwrap();
-    })
-    .await;
-    if result.is_err() {
-        task.abort();
-        let _ = task.await;
+    for ifac_size in [None, Some(0), Some(1), Some(16), Some(64)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = BackboneClientConfig::new(
+            "receive-mtu",
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+        );
+        config.bitrate = 100_000_000;
+        config.receive_ifac_size = ifac_size;
+        config.max_reconnect_tries = Some(1);
+        let (tx, mut events) = mpsc::channel(8);
+        let handle = spawn_backbone_client(config, 78, tx).await.unwrap();
+        let mut task = handle.read_task;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let limit = handle.mtu as usize + ifac_size.unwrap_or(64);
+            let valid = vec![hdlc::FLAG; limit];
+            peer.write_all(&hdlc::frame(&valid)).await.unwrap();
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("boundary frame")
+            };
+            assert_eq!(packet.raw.as_ref(), valid);
+            peer.write_all(&hdlc::frame(&vec![hdlc::ESC; limit + 1]))
+                .await
+                .unwrap();
+            peer.write_all(&hdlc::frame(b"resynchronised"))
+                .await
+                .unwrap();
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("resynchronised frame")
+            };
+            assert_eq!(packet.raw.as_ref(), b"resynchronised");
+            peer.shutdown().await.unwrap();
+            assert!(matches!(
+                events.recv().await,
+                Some(TransportMessage::DeregisterInterface { id: 78 })
+            ));
+            (&mut task).await.unwrap();
+        })
+        .await;
+        if result.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        result.unwrap();
     }
-    result.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_receive_ifac_size_is_rejected_before_spawn() {
+    let mut client = BackboneClientConfig::new("invalid", "127.0.0.1", 1);
+    client.receive_ifac_size = Some(65);
+    let (tx, _) = mpsc::channel(1);
+    assert!(spawn_backbone_client(client, 1, tx.clone()).await.is_err());
+    let mut server = BackboneServerConfig::new("invalid", "127.0.0.1", 0);
+    server.receive_ifac_size = Some(usize::MAX);
+    let (handles, _) = mpsc::channel(1);
+    assert!(
+        spawn_backbone_server(server, 1, Arc::new(AtomicU64::new(2)), tx, handles)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -59,6 +78,7 @@ async fn listener_children_inherit_configured_bitrate_and_mtu() {
         drop(reservation);
         let mut config = BackboneServerConfig::new("mtu-parent", "127.0.0.1", port);
         config.bitrate = bitrate;
+        config.receive_ifac_size = Some(16);
         config.fast_flap.enabled = false;
         let (tx, mut events) = mpsc::channel(8);
         let (handles_tx, mut handles) = mpsc::channel(8);
@@ -66,12 +86,22 @@ async fn listener_children_inherit_configured_bitrate_and_mtu() {
             .await
             .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(3), async {
-            let peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let child = handles.recv().await.unwrap();
             assert_eq!(parent.bitrate, bitrate);
             assert_eq!(parent.mtu, mtu_for_bitrate(bitrate));
             assert_eq!((child.bitrate, child.mtu), (parent.bitrate, parent.mtu));
             assert_eq!(child.parent_id, Some(parent.id));
+            let limit = child.mtu as usize + 16;
+            peer.write_all(&hdlc::frame(&vec![hdlc::ESC; limit + 1]))
+                .await
+                .unwrap();
+            let valid = vec![hdlc::FLAG; limit];
+            peer.write_all(&hdlc::frame(&valid)).await.unwrap();
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("child must reject overflow and accept exact IFAC boundary")
+            };
+            assert_eq!(packet.raw.as_ref(), valid);
             drop(peer);
             assert!(matches!(
                 events.recv().await,

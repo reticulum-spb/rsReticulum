@@ -48,6 +48,8 @@ const TX_CHANNEL_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct BackboneServerConfig {
+    /// Known wire IFAC bytes (0 when disabled); None retains a 64-byte allowance.
+    pub receive_ifac_size: Option<usize>,
     pub bitrate: u64,
     pub fast_flap: FastFlapConfig,
     /// None selects Python-compatible process-wide IP history.
@@ -64,6 +66,7 @@ pub struct BackboneServerConfig {
 impl BackboneServerConfig {
     pub fn new(name: &str, ip: &str, port: u16) -> Self {
         Self {
+            receive_ifac_size: None,
             bitrate: BITRATE_GUESS,
             fast_flap: FastFlapConfig::default(),
             fast_flap_table: None,
@@ -79,6 +82,8 @@ impl BackboneServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct BackboneClientConfig {
+    /// Known wire IFAC bytes (0 when disabled); None retains a 64-byte allowance.
+    pub receive_ifac_size: Option<usize>,
     pub bitrate: u64,
     pub name: String,
     pub target_host: String,
@@ -92,6 +97,7 @@ pub struct BackboneClientConfig {
 impl BackboneClientConfig {
     pub fn new(name: &str, host: &str, port: u16) -> Self {
         Self {
+            receive_ifac_size: None,
             bitrate: CHILD_BITRATE_GUESS,
             name: name.to_string(),
             target_host: host.to_string(),
@@ -102,6 +108,17 @@ impl BackboneClientConfig {
             mode: InterfaceMode::Full,
         }
     }
+}
+
+fn receive_limit(bitrate: u64, ifac_size: Option<usize>) -> std::io::Result<u32> {
+    let size = ifac_size.unwrap_or(64);
+    if size > 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Backbone receive IFAC size must be 0..=64 bytes",
+        ));
+    }
+    Ok(mtu_for_bitrate(bitrate) + size as u32)
 }
 
 fn keepalive_durations() -> (Duration, Duration, u32, Duration) {
@@ -164,7 +181,7 @@ async fn backbone_read_loop(
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
     ingress: Arc<IngressControl>,
-    mtu: u32,
+    max_decoded_size: u32,
 ) {
     struct ResetIngress(Arc<IngressControl>);
     impl Drop for ResetIngress {
@@ -173,9 +190,7 @@ async fn backbone_read_loop(
         }
     }
     let _reset = ResetIngress(ingress.clone());
-    // Driver does not yet own the configured IFAC size. Admit at most the
-    // largest valid IFAC (64 bytes); actor enforces the exact registered size.
-    let mut deframer = hdlc::HdlcDeframer::with_max_decoded_size(mtu as usize + 64);
+    let mut deframer = hdlc::HdlcDeframer::with_max_decoded_size(max_decoded_size as usize);
     // Large read buffer amortises syscalls independently of frame boundaries.
     let mut buf = vec![0u8; 65536];
     'receive: loop {
@@ -196,7 +211,7 @@ async fn backbone_read_loop(
                 if deframer.oversized_frames() != rejected {
                     tracing::debug!(
                         interface_id,
-                        mtu,
+                        max_decoded_size,
                         dropped = deframer.oversized_frames() - rejected,
                         "backbone oversized HDLC frames rejected"
                     );
@@ -515,6 +530,7 @@ pub async fn spawn_backbone_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let receive_limit = receive_limit(config.bitrate, config.receive_ifac_size)?;
     config
         .fast_flap
         .validate()
@@ -600,7 +616,7 @@ pub async fn spawn_backbone_server(
                     };
                     let read_handle = tokio::spawn(async move {
                         tokio::select! {
-                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r, reader_ingress, mtu) => {},
+                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r, reader_ingress, receive_limit) => {},
                             _ = controlled_write_loop(writer, c_rx, c_online_w, c_txb_w, accounting) => {},
                         }
                         connection_online.store(false, Ordering::SeqCst);
@@ -688,6 +704,7 @@ pub async fn spawn_backbone_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let receive_limit = receive_limit(config.bitrate, config.receive_ifac_size)?;
     let online = Arc::new(AtomicBool::new(false));
     let online2 = online.clone();
     let (tx, rx, accounting) = byte_channel(TX_CHANNEL_DEPTH, HIGH_WATERMARK, encoded_len);
@@ -818,7 +835,7 @@ pub async fn spawn_backbone_client(
                     c_online_r,
                     c_rxb,
                     reader_ingress.clone(),
-                    mtu,
+                    receive_limit,
                 );
                 let writing =
                     controlled_write_loop(writer, conn_rx, c_online_w, c_txb, accounting.clone());

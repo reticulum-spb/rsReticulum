@@ -1536,6 +1536,7 @@ pub async fn init_with_options(
 
             match spawn_interface(
                 iface_config,
+                wire_ifac_size(&post_init),
                 iface_id,
                 interface_transport_tx.clone(),
                 id_gen.clone(),
@@ -2129,6 +2130,14 @@ fn derive_ifac_key_from_post_init(
         .ok()
     } else {
         None
+    }
+}
+
+fn wire_ifac_size(post_init: &interface_factory::InterfacePostInit) -> usize {
+    if derive_ifac_key_from_post_init(post_init).is_some() {
+        post_init.ifac_size.unwrap_or(post_init.default_ifac_size)
+    } else {
+        0
     }
 }
 
@@ -3015,6 +3024,14 @@ async fn spawn_discovered_backbone_client(
     );
     let mut config = rns_interface::backbone::BackboneClientConfig::new(&name, host, port);
     config.mode = discovered_backbone_client_mode(&handle.config);
+    let mut post_init =
+        interface_factory::InterfacePostInit::from_section(&NormalizedSection::new())
+            .with_default_ifac_size(16);
+    finalize_post_init(&mut post_init, &handle.config);
+    post_init.ifac_network_name = record.info.ifac_netname.clone();
+    apply_autoconnect_routing_defaults(&mut post_init, &handle.config);
+    post_init.ifac_passphrase = record.info.ifac_netkey.clone();
+    config.receive_ifac_size = Some(wire_ifac_size(&post_init));
     let iface_handle = rns_interface::backbone::spawn_backbone_client(
         config,
         id,
@@ -3023,13 +3040,6 @@ async fn spawn_discovered_backbone_client(
     .await
     .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
-    let mut post_init =
-        interface_factory::InterfacePostInit::from_section(&NormalizedSection::new())
-            .with_default_ifac_size(16);
-    finalize_post_init(&mut post_init, &handle.config);
-    post_init.ifac_network_name = record.info.ifac_netname.clone();
-    apply_autoconnect_routing_defaults(&mut post_init, &handle.config);
-    post_init.ifac_passphrase = record.info.ifac_netkey.clone();
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
     register_interface_with_post_init(
         &handle.transport_tx,
@@ -3440,6 +3450,7 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
         config.connect_timeout_secs = t;
     }
     config.max_reconnect_tries = runtime_config.max_reconnect_tries;
+    config.receive_ifac_size = Some(post_init.as_ref().map(wire_ifac_size).unwrap_or(0));
 
     let iface_handle = rns_interface::backbone::spawn_backbone_client(
         config,
@@ -3506,6 +3517,7 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
     let id = next_id(&handle.id_gen);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let mut config = rns_interface::backbone::BackboneServerConfig::new(name, listen_ip, port);
+    config.receive_ifac_size = Some(post_init.as_ref().map(wire_ifac_size).unwrap_or(0));
     config.prefer_ipv6 = prefer_ipv6;
     config.device = device.map(ToString::to_string);
 
@@ -4013,6 +4025,7 @@ pub async fn spawn_interface_from_config(
 
     let iface_handles = spawn_interface(
         iface_config,
+        wire_ifac_size(&post_init),
         id,
         handle.interface_transport_tx.clone(),
         handle.id_gen.clone(),
@@ -4078,6 +4091,7 @@ pub async fn spawn_interface_from_config(
 
 async fn spawn_interface(
     iface_config: &interface_factory::InterfaceConfig,
+    receive_ifac_size: usize,
     id: u64,
     transport_tx: mpsc::Sender<TransportMessage>,
     id_gen: Arc<AtomicU64>,
@@ -4326,6 +4340,7 @@ async fn spawn_interface(
             if let Some(host) = c.target_host.as_deref() {
                 let mut config =
                     rns_interface::backbone::BackboneClientConfig::new(&c.name, host, c.port);
+                config.receive_ifac_size = Some(receive_ifac_size);
                 if let Some(bitrate) = c.bitrate {
                     config.bitrate = bitrate;
                 }
@@ -4341,6 +4356,7 @@ async fn spawn_interface(
                 let listen_ip = c.listen_on.as_deref().unwrap_or("0.0.0.0");
                 let mut config =
                     rns_interface::backbone::BackboneServerConfig::new(&c.name, listen_ip, c.port);
+                config.receive_ifac_size = Some(receive_ifac_size);
                 if let Some(bitrate) = c.bitrate {
                     config.bitrate = bitrate;
                 }
@@ -4554,6 +4570,50 @@ pub enum ReticulumError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backbone_yaml_wire_ifac_size_uses_active_credentials() {
+        use super::*;
+        for (extra, expected) in [
+            ("", 0),
+            ("    ifac_size: 64\n", 0),
+            ("    ifac_network_name: net\n", 16),
+            ("    ifac_network_name: net\n    ifac_size: 1\n", 1),
+            ("    ifac_passphrase: secret\n    ifac_size: 64\n", 64),
+        ] {
+            for endpoint in ["listen_on", "target_host"] {
+                let yaml = format!(
+                    "interfaces:\n  - type: backbone\n    name: relay\n    {endpoint}: 127.0.0.1\n    port: 4242\n{extra}"
+                );
+                let typed = crate::config::Config::parse(&yaml, "config.yaml").unwrap();
+                let config = typed.to_runtime_config().unwrap();
+                let interface = synthesize_interfaces(&config, true).unwrap().remove(0);
+                let post = get_post_init_for_config(&config, &interface);
+                assert_eq!(wire_ifac_size(&post), expected, "{yaml}");
+            }
+        }
+    }
+
+    #[test]
+    fn backbone_wire_ifac_size_matches_registration() {
+        let mut post = super::interface_factory::InterfacePostInit::from_section(
+            &super::NormalizedSection::new(),
+        )
+        .with_default_ifac_size(16);
+        assert_eq!(super::wire_ifac_size(&post), 0);
+        post.ifac_size = Some(64);
+        assert_eq!(super::wire_ifac_size(&post), 0);
+        post.ifac_network_name = Some("network".into());
+        for size in [1, 16, 64] {
+            post.ifac_size = Some(size);
+            assert_eq!(super::wire_ifac_size(&post), size);
+        }
+        post.ifac_size = None;
+        assert_eq!(super::wire_ifac_size(&post), 16);
+        post.ifac_network_name = None;
+        post.ifac_passphrase = Some(String::new());
+        assert_eq!(super::wire_ifac_size(&post), 16);
+    }
+
     #[test]
     fn gravity_defaults_explicit_zero_and_autoconnect_override() {
         use super::*;
