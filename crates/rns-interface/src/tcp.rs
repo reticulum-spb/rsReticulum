@@ -183,6 +183,7 @@ async fn tcp_read_loop(
     transport_tx: mpsc::Sender<TransportMessage>,
     state: Arc<TcpInterfaceState>,
     kiss_framing: bool,
+    mtu: u32,
 ) {
     let mut buf = [0u8; 32768];
 
@@ -220,7 +221,10 @@ async fn tcp_read_loop(
             }
         }
     } else {
-        let mut deframer = hdlc::HdlcDeframer::new();
+        // TCP does not yet receive the actual IFAC size. Keep a conservative
+        // 64-byte allowance; exact IFAC validation remains in the actor.
+        let mut deframer =
+            hdlc::HdlcDeframer::with_max_decoded_size((mtu as usize).saturating_add(64));
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
@@ -228,7 +232,17 @@ async fn tcp_read_loop(
                     break;
                 }
                 Ok(n) => {
-                    for frame in deframer.feed(&buf[..n]) {
+                    let rejected = deframer.oversized_frames();
+                    let frames = deframer.feed(&buf[..n]);
+                    if deframer.oversized_frames() != rejected {
+                        tracing::debug!(
+                            interface_id,
+                            mtu,
+                            dropped = deframer.oversized_frames() - rejected,
+                            "TCP oversized HDLC frames rejected"
+                        );
+                    }
+                    for frame in frames {
                         if frame.is_empty() {
                             continue;
                         }
@@ -309,6 +323,9 @@ pub async fn spawn_tcp_client(
     let mode = config.mode;
     let kiss_framing = config.kiss_framing;
     let fixed_mtu = config.fixed_mtu;
+    let bitrate: u64 = 10_000_000;
+    let mtu =
+        fixed_mtu.unwrap_or_else(|| crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU));
 
     // Wrap rx so it survives reconnects; forwarder task feeds per-connection channel.
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -402,6 +419,7 @@ pub async fn spawn_tcp_client(
                 transport_tx.clone(),
                 state.clone(),
                 kiss_framing,
+                mtu,
             )
             .await;
 
@@ -429,7 +447,6 @@ pub async fn spawn_tcp_client(
         }
     });
 
-    let bitrate: u64 = 10_000_000;
     Ok(InterfaceHandle {
         id,
         parent_id: None,
@@ -446,8 +463,7 @@ pub async fn spawn_tcp_client(
             repeat: false,
         },
         bitrate,
-        mtu: fixed_mtu
-            .unwrap_or_else(|| crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU)),
+        mtu,
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -492,8 +508,10 @@ async fn spawn_tcp_accepted(
 
     let handle_name = name.clone();
     let dereg_tx = transport_tx.clone();
+    let bitrate: u64 = 10_000_000;
+    let mtu = crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU);
     let read_task = tokio::spawn(async move {
-        tcp_read_loop(reader, id, transport_tx, state, kiss_framing).await;
+        tcp_read_loop(reader, id, transport_tx, state, kiss_framing, mtu).await;
         online2.store(false, Ordering::SeqCst);
         tracing::info!(name = %handle_name, "accepted TCP client disconnected");
         // Proactively notify transport so broadcasts stop targeting this dead tx.
@@ -502,7 +520,6 @@ async fn spawn_tcp_accepted(
             .await;
     });
 
-    let bitrate: u64 = 10_000_000;
     InterfaceHandle {
         id,
         parent_id: Some(parent_id),
@@ -519,7 +536,7 @@ async fn spawn_tcp_accepted(
             repeat: false,
         },
         bitrate,
-        mtu: crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU),
+        mtu,
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -621,6 +638,50 @@ pub async fn spawn_tcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hdlc_reader_uses_fixed_mtu_with_escape_and_ifac_allowance() {
+        for fixed_mtu in [None, Some(500), Some(524288)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config =
+                TcpClientConfig::new("rx-mtu", "127.0.0.1", listener.local_addr().unwrap().port());
+            config.fixed_mtu = fixed_mtu;
+            config.max_reconnect_tries = Some(1);
+            let (tx, mut events) = mpsc::channel(8);
+            let handle = spawn_tcp_client(config, 9, tx).await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let limit = handle.mtu as usize + 64;
+                let boundary = vec![hdlc::FLAG; limit];
+                peer.write_all(&hdlc::frame(&boundary)).await.unwrap();
+                let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                    panic!("boundary")
+                };
+                assert_eq!(packet.raw.as_ref(), boundary);
+                for byte in [42, hdlc::ESC] {
+                    peer.write_all(&hdlc::frame(&vec![byte; limit + 1]))
+                        .await
+                        .unwrap();
+                }
+                peer.write_all(&hdlc::frame(b"after oversized TCP frames"))
+                    .await
+                    .unwrap();
+                let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                    panic!("resync")
+                };
+                assert_eq!(packet.raw.as_ref(), b"after oversized TCP frames");
+                peer.shutdown().await.unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(TransportMessage::DeregisterInterface { id: 9 })
+                ));
+            })
+            .await;
+            handle.read_task.abort();
+            let _ = handle.read_task.await;
+            result.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn fixed_mtu_is_validated_before_client_spawn() {

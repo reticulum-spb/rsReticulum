@@ -1907,3 +1907,26 @@ matrix дополнена Local 262144 и Auto 1196. Interface lib — 222 passe
 5 ignored; целевые forwarding tests — 2 passed. Workspace all-targets,
 runtime client-only tests и fmt/diff checks успешны; прежние warnings остаются.
 Этап 5 остаётся открытым; версия и пользовательский план не изменены.
+
+### Этап 5 — TCP HDLC receive limit из driver MTU
+
+Перед снятием local Link cap проверена receive цепочка. TCP HDLC всё ещё
+использовал legacy encoded limit 524288 независимо от сообщаемого MTU.
+Теперь клиент вычисляет MTU до spawn и передаёт его reader; accepted peer
+использует ту же automatic оценку, что его handle. Decoded limit — MTU+64,
+encoded accumulator — удвоенный decoded limit без delimiters. IFAC allowance
+пока консервативный: точная настройка в TCP driver ещё не передаётся.
+Сложение saturating для представимости usize на 32-bit targets.
+
+Overflow debug-логируется, не доходит до actor и не увеличивает его violation
+counters; чтение восстанавливается на следующем FLAG. Это framing/length
+проверка, не IFAC authentication. KISS branch и минимальная длина TCP frames
+не менялись; local Link cap 500 остаётся. Крупные fixed_mtu — административная
+настройка границы, не обещание ограниченного RSS независимо от её значения.
+
+Новый loopback test проверяет default automatic MTU, fixed 500 и fixed 524288:
+полностью escaped boundary MTU+64, plain/escaped overflow на один байт,
+resynchronisation и deregistration после EOF. Используются structural payloads,
+не криптографические IFAC packets. Interface lib — 223 passed, 5 ignored;
+workspace all-targets, runtime client-only tests и fmt/diff checks успешны.
+Прежние warnings сохраняются; этап 5 открыт, версия не менялась.
