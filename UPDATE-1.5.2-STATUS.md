@@ -337,3 +337,54 @@ transport/RPC получают count и list из одного снимка. `bl
 
 Следующий этап — приоритетные входящие очереди и path requests (этап 4).
 Версия и полная заявленная совместимость 1.5.2 пока не меняются.
+
+## Этап 4, часть 1 — контейнер очередей и сверка с Python
+
+Этап 4 **не завершён**. Добавлен `rns-transport/src/inbound_queue.rs`:
+четыре ограниченные FIFO с порядком Data → Announce → PathRequest →
+IngressLimited, defaults 1024/128/128/8, независимым drop-tail и согласованным
+снимком высот/потерь. Положительные размеры проверяются без предварительной
+аллокации всей ёмкости; переполнение суммарного размера отклоняется. Удаление
+пакетов интерфейса сохраняет порядок остальных и не считается overflow.
+
+Это actor-owned контейнер, **пока не подключённый к рабочему actor**. YAML
+параметры не добавлялись, чтобы не предоставлять неработающие настройки.
+Контейнер не проверяет пакеты, не обеспечивает async wakeup и не включает
+Backbone high-water throttling (последнее относится к этапу 5).
+Строгий Python приоритет допускает starvation младших классов при непрерывном
+data-потоке; round-robin не подставлялся вместо эталонной семантики.
+
+Проверки:
+
+- `cargo test -p rns-transport --lib --quiet`: 408 passed, включая пять новых
+  тестов defaults/границ, FIFO/приоритета, независимого переполнения,
+  вытеснения младших классов и удаления интерфейса; 40 000 попыток вставки
+  в перегруженные очереди сохраняют заданный предел.
+- `cargo test -p rns-transport --test inbound_queue_python -- --ignored`:
+  1 passed. Сравнены результаты и snapshots после каждой из 4300 операций
+  с настоящим классом `InboundQueues` из локального Python ea98db4f.
+  Oracle извлекает AST только этого класса, не запускает Reticulum, сокеты
+  или хранилище. `/usr/bin/python3.11 -B` не изменяет reference; throttling
+  намеренно исключён высоким watermark. Тест по умолчанию ignored из-за
+  зависимости от внешнего checkout; пути задаются RNS_PYTHON_ROOT и RNS_PYTHON_BIN.
+- `cargo check --workspace --all-targets`: успешно; прежние warnings
+  database_path и tracing_subscriber::prelude не изменялись.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно.
+
+Подтверждённые точки следующей интеграции:
+
+1. Оба цикла `actor/mod.rs::run` и `actor/sqlite.rs::run_sqlite` сейчас читают
+   один канал. Управление/shutdown нужно отделить на входе, не просто поставить
+   ещё четыре очереди за тем же забитым каналом. Сохранить SQLite shutdown.
+2. До постановки в классовую очередь нужны IFAC/MTU/hop/filter checks,
+   валидация announce, ingress admission и дедупликация PR tag. Существующие
+   проверки в `actor/inbound.rs` нельзя повторно выполнять при drain: это
+   удвоит учёт частот и может отфильтровать уже принятый пакет.
+3. Rust `DiscoveryPathRequest` хранит один requesting_interface; Python 1.5.2
+   хранит список requesting_interfaces и engaged. Нужен отдельный inflight
+   gate до очереди, без подмены `path_requests` или pending_local requests.
+4. Python gate timeout равен 45 секундам; Rust константа равна 120 и используется
+   также для хранения duplicate tags. Нельзя менять её механически, не разделив
+   эти назначения и не проверив очистку и повторные запросы.
+5. Далее провести YAML → runtime → обе actor-петли → статистика/API/UI,
+   тесты перегрузки/управления/shutdown, batching и ответов всем ожидающим.

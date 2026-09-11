@@ -21,6 +21,7 @@ pub mod constants;
 pub mod discovery;
 pub mod hashlist;
 pub mod ifac;
+pub mod inbound_queue;
 pub mod ingress;
 pub mod link_messages;
 pub mod link_table;
