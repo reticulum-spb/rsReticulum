@@ -162,9 +162,21 @@ MTU, signature checks or the Rust client's opt-in announce policy. PLAIN/GROUP
 rejection increments only `packet_filter_hits`, matching the actual Python
 preprocess order (the packet's receiving interface is assigned after filtering).
 
-Coverage is not yet the full Python 1.5.2 packet filter: transport-address
-filtering, active-Link hash exceptions and dispatch-time violation sites remain
-to be completed. CLI and remote-management display are pending.
+Non-announce packets carrying a transport ID other than this actor's identity
+are filtered before context exemptions, including keepalive/resource traffic
+and packets for a local destination. Announces and shared clients bypass this
+address check. Custom actor embeddings must initialise the transport identity
+before receiving addressed Header2 traffic; the runtime does so at startup.
+
+Link-table packets and LRPROOF proofs do not bypass early duplicate lookup.
+Instead, recording their hash is deferred until routing/validation claims the
+packet. The insertion decision uses the current Link table at dispatch, so
+control changes while a packet is queued cannot prematurely record an overheard
+packet. LRPROOF deferral applies to PROOF type, not arbitrary packets with that
+context. Existing context exemptions remain unchanged.
+
+Full receive-diagnostics coverage still requires additional dispatch-time
+violation sites. CLI and remote-management display are pending.
 
 ### Ingress mappings
 

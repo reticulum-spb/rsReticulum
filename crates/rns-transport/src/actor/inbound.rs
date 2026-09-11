@@ -200,6 +200,19 @@ impl TransportActor {
             return None;
         }
 
+        // Check routing address before all context/hash exemptions. A shared
+        // client delegates this filter to its owner; announces carry the
+        // announcing transport's identity and are deliberately exempt.
+        if !self.shared_instance_client_mode
+            && parsed.flags.packet_type != rns_wire::flags::PacketType::Announce
+            && parsed
+                .transport_id
+                .is_some_and(|id| Some(id) != self.transport_identity_hash)
+        {
+            self.packet_filter_hit(packet.interface_id);
+            return None;
+        }
+
         if self
             .local_link_interfaces
             .get(&parsed.destination_hash)
@@ -263,17 +276,9 @@ impl TransportActor {
             return None;
         }
 
-        // On shared media (e.g. LoRa) we overhear our own forwards and link
-        // traffic; if we dedup against that, legitimate copies disappear.
-        // Defer the hashlist check for packets owned by the link table or
-        // carrying link-proof context.
-        let defer_hashlist = self.link_table.contains(&parsed.destination_hash)
-            || parsed.context == rns_wire::context::PacketContext::Lrproof;
-
         if !self.shared_instance_client_mode
             && !plain_or_group
             && !skip_hashlist
-            && !defer_hashlist
             && self.packet_hashlist.contains(&pkt_hash)
         {
             // SINGLE announces are retransmitted to refresh paths, so an
@@ -327,7 +332,7 @@ impl TransportActor {
             announce,
             path_request,
             released_from_ingress,
-            remember_hash: (!skip_hashlist && !defer_hashlist).then_some(pkt_hash),
+            remember_hash: (!skip_hashlist).then_some(pkt_hash),
         })
     }
 
@@ -363,7 +368,15 @@ impl TransportActor {
         // Python records admitted hashes in _inbound, not in the queue's
         // admission filter: an overflow drop must not poison later retries.
         if let Some(hash) = packet.remember_hash {
-            self.packet_hashlist.insert(hash);
+            // Defer INSERTION (not the early hash lookup) for transit links
+            // and LRPROOF proofs until routing/validation succeeds. Consult
+            // current state: control messages can change links while queued.
+            let deferred = self.link_table.contains(&packet.header.destination_hash)
+                || (packet.header.flags.packet_type == rns_wire::flags::PacketType::Proof
+                    && packet.header.context == rns_wire::context::PacketContext::Lrproof);
+            if !deferred {
+                self.packet_hashlist.insert(hash);
+            }
         }
         let PreparedInbound {
             raw,

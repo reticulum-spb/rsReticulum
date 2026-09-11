@@ -3076,6 +3076,8 @@ mod tests {
     #[test]
     fn shared_instance_peer_delivers_header2_link_request_to_local_destination() {
         let (mut actor, _tx) = TransportActor::new();
+        // Runtime sets this when attaching the SharedInstancePeer driver.
+        actor.shared_instance_client_mode = true;
         actor.transport_identity_hash = Some([0xAA; 16]);
 
         let (mut shared_peer, _peer_rx) = make_test_interface("shared_peer");
@@ -4494,10 +4496,13 @@ mod tests {
             for hops in [0, 1, 2, 127, 128] {
                 for context in [PacketContext::None, PacketContext::Keepalive] {
                     for client in [false, true] {
-                        for mtu in [40, 500] {
+                        for (mtu, transport_id) in [40, 500].into_iter().flat_map(|mtu| {
+                            [None, Some([0; 16]), Some([7; 16])].map(|id| (mtu, id))
+                        }) {
                             let (mut actor, _input, _control) =
                                 TransportActor::new_with_control_channel();
                             actor.shared_instance_client_mode = client;
+                            actor.transport_identity_hash = Some([0; 16]);
                             let (mut iface, _rx) = make_test_interface("oracle");
                             iface.mtu = mtu;
                             actor.interfaces.insert(1, iface);
@@ -4508,6 +4513,12 @@ mod tests {
                             header.flags.destination_type = dest_type;
                             header.flags.packet_type = PacketType::Data;
                             header.context = context;
+                            header.transport_id = transport_id;
+                            if transport_id.is_some() {
+                                header.flags.header_type = rns_wire::flags::HeaderType::Header2;
+                                header.flags.transport_type =
+                                    rns_wire::flags::TransportType::Transport;
+                            }
                             let mut raw = header.pack().unwrap();
                             raw.resize(41, 0x55);
                             input.push_str(&format!(
@@ -4621,6 +4632,154 @@ mod tests {
             assert_eq!(
                 actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
                 u64::from(!client)
+            );
+        }
+    }
+
+    #[test]
+    fn transport_address_filter_exempts_announces_but_not_local_destinations() {
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        actor.transport_identity_hash = Some([0xAA; 16]);
+        let (mut iface, _rx) = make_test_interface("address");
+        iface.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, iface);
+        let destination = [0x55; 16];
+        actor.local_destinations.insert(destination);
+        let packet = |raw| InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        };
+        assert!(
+            actor
+                .prepare_inbound(packet(make_header2_data_packet(
+                    [0xBB; 16],
+                    destination,
+                    0,
+                    &[1; 32]
+                )))
+                .is_none()
+        );
+        assert!(
+            actor
+                .prepare_inbound(packet(make_header2_link_request_packet(
+                    [0xBB; 16],
+                    destination,
+                    0,
+                    &[1; 64]
+                )))
+                .is_none()
+        );
+        let (announce, _, _) = make_header2_announce([0xBB; 16], "test.filter.address", 0);
+        assert!(actor.prepare_inbound(packet(announce)).is_some());
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+            2
+        );
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            0
+        );
+        assert_eq!(actor.inbound_queues.snapshot().dropped, [0; 4]);
+    }
+
+    #[test]
+    fn link_hash_lookup_is_early_but_insertion_uses_current_dispatch_state() {
+        use rns_wire::{context::PacketContext, flags::PacketType};
+        let link_id = [9; 16];
+        let link = || crate::link_table::LinkEntry {
+            timestamp: now_f64(),
+            next_hop: None,
+            interface_id: 2,
+            remaining_hops: 1,
+            destination_hash: [8; 16],
+            established: false,
+            validated: false,
+            proof_timeout: now_f64() + 120.0,
+            receiving_interface: 3,
+            taken_hops: 1,
+        };
+        for (kind, context) in [
+            (PacketType::Data, PacketContext::None),
+            (PacketType::Proof, PacketContext::Lrproof),
+            (PacketType::Data, PacketContext::Lrproof),
+        ] {
+            let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+            let (iface, _rx) = make_test_interface("link");
+            actor.interfaces.insert(1, iface);
+            actor.link_table.insert(link_id, link());
+            let (mut header, _) =
+                rns_wire::header::PacketHeader::unpack(&make_data_packet(link_id, 0)).unwrap();
+            header.flags.packet_type = kind;
+            header.context = context;
+            let raw: Bytes = header.pack().unwrap().into();
+            let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+            let packet = || InboundPacket {
+                raw: raw.clone(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            };
+            assert!(actor.prepare_inbound(packet()).is_some());
+            actor.packet_hashlist.insert(hash);
+            assert!(
+                actor.prepare_inbound(packet()).is_none(),
+                "known {kind:?}/{context:?} must not bypass lookup"
+            );
+            assert_eq!(
+                actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+                1
+            );
+        }
+        // A link registered while an admitted packet waits must still defer
+        // recording an overheard packet which it cannot claim.
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let (iface, _rx) = make_test_interface("late-link");
+        actor.interfaces.insert(1, iface);
+        let raw = make_data_packet(link_id, 0);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+        let packet = || InboundPacket {
+            raw: raw.clone(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        };
+        let prepared = actor.prepare_inbound(packet()).unwrap();
+        actor.link_table.insert(link_id, link());
+        actor.dispatch_inbound(prepared);
+        assert!(!actor.packet_hashlist.contains(&hash));
+        let prepared = actor.prepare_inbound(packet()).unwrap();
+        actor.link_table.remove(&link_id);
+        actor.dispatch_inbound(prepared);
+        assert!(actor.packet_hashlist.contains(&hash));
+        // LRPROOF deferral requires PROOF packet type, not just the context.
+        for kind in [PacketType::Proof, PacketType::Data] {
+            let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+            let (iface, _rx) = make_test_interface("proof-type");
+            actor.interfaces.insert(1, iface);
+            let mut header = header.clone();
+            header.flags.packet_type = kind;
+            header.context = PacketContext::Lrproof;
+            let raw: Bytes = header.pack().unwrap().into();
+            let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+            let prepared = actor
+                .prepare_inbound(InboundPacket {
+                    raw,
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                })
+                .unwrap();
+            actor.dispatch_inbound(prepared);
+            assert_eq!(
+                actor.packet_hashlist.contains(&hash),
+                kind == PacketType::Data
             );
         }
     }
@@ -5686,6 +5845,7 @@ mod tests {
         actor.interfaces.insert(1, entry1);
 
         let transport_id = [0xAA; 16];
+        actor.transport_identity_hash = Some(transport_id);
         let dest_hash = [0xBB; 16];
         actor.local_destinations.insert(dest_hash);
 

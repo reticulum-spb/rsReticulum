@@ -773,3 +773,47 @@ Link и их hash exceptions не менялись.
 Этап 4 остаётся частичным: ранняя адресация transport, сверка hash exceptions
 для активных Link, дополнительные violation sites, ротация PR tags и
 traffic-flow статистика. Этапы 5–7 и финальная интеграция ещё не завершены.
+
+## Этап 4 — transport ID и отложенная запись Link hashes
+
+До context/hash exemptions отклоняются non-announce Header2 пакеты с чужим
+transport ID, включая кадры для локальной destination. Отказ увеличивает
+packet_filter_hits. Shared clients обходят проверку; announces сохраняют
+transport ID источника и также освобождены от неё. Незаданный identity actor
+не разрешает произвольный Header2: runtime инициализирует identity при старте,
+а custom embeddings должны явно сделать это до приёма адресованного трафика.
+
+Исправлено разделение проверки и записи packet hash по Transport.py:1624–1680,
+1938–1961. Наличие LinkEntry или LRPROOF context больше не отключает ранний
+поиск уже известного хеша. Откладывается именно запись: для пакета из актуальной
+Link table либо PROOF с LRPROOF context она остаётся в routing/validation после
+подтверждения направления. Решение принимается при dispatch, а не сохраняется
+при admission: Link может появиться/исчезнуть за время ожидания. Остальные
+context exemptions и Rust bounded hash cache сохранены.
+
+Два прежних unit fixtures уточнены: shared-peer тест теперь включает
+shared_instance_client_mode, как настоящий runtime; тест локального Header2
+явно задаёт соответствующий transport identity. Ослабления фильтра для этих
+fixtures нет. Неправильный ID для локальной destination проверяется отдельно.
+
+Проверки:
+
+- `admission_boundaries_match_python_preprocess -- --ignored`: 360 сценариев
+  против исполняемого Python admission prefix. Добавлены Header1, свой/чужой
+  Header2 transport ID, в том числе keepalive и shared-client exemptions.
+- Новые unit tests проверяют local destination/LINKREQUEST rejection,
+  announce exemption, ранний hash lookup для Link и LRPROOF, изменение Link
+  table между admission и dispatch, различие DATA/LRPROOF и PROOF/LRPROOF.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  450 passed, 2 ignored.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  4 ignored; повтор с разрешением на loopback после sandbox PermissionDenied.
+- `cargo test -p rns-runtime --features api link_rebalance_and_active_route_binding --lib -- --ignored --nocapture`:
+  2 Python packet interop passed (normal/legacy Link rebalance proofs).
+- Workspace all-targets, runtime client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` собираются. Форматирование и diff checks
+  проходят; новых warnings нет; эталонный checkout не изменён.
+
+Этап 4 ещё частичный: ротация PR tags, дополнительные dispatch-time violation
+sites и оставшаяся traffic-flow статистика. Этапы 5–7 и итоговая интеграция
+не завершены; версия не менялась.
