@@ -477,6 +477,11 @@ pub enum TransportQuery {
     GetNextHopBitrate {
         dest: [u8; 16],
     },
+    /// In-process negotiable Link MTU. IntResult(-1) means unknown/unsupported.
+    /// Does not imply that a local Link has negotiated this MTU.
+    GetNextHopMtu {
+        dest: [u8; 16],
+    },
     GetNextHopInterfaceId {
         dest: [u8; 16],
     },

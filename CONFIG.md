@@ -261,8 +261,13 @@ curve (no upgrade below its minimum bitrate). Local IPC uses the Python default
 262144 bytes, not the automatic curve's 524288-byte result at 1 Gbit/s; Auto
 advertises its fixed 1196-byte MTU regardless of configured bitrate. Remaining
 drivers conservatively disable transit upgrades. Full nullable hardware MTU,
-next-hop MTU RPC and larger local Links remain
+external next-hop MTU RPC and larger local Links remain
 unfinished. Advertising a capability does not remove existing driver RX limits.
+In-process callers can use `ReticulumHandle::next_hop_mtu(destination)` to
+query the local actor's next-hop capability. It returns `None` for unknown
+paths or unsupported interfaces, and uses the shared-server interface for a
+local destination when no live path exists. It does not query a remote daemon
+or change a Link's negotiated MTU.
 When transit MTU clamping reduces an offer, an unsupported signalling mode
 causes the request to be dropped and increments the incoming interface's
 `protocol_violations`; no relay entry is created. Like Python, this mode check

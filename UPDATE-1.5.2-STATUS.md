@@ -2063,3 +2063,28 @@ Interface lib — 228 passed, 5 ignored. Этап 5 остаётся откры�
 
 Runtime API lib — 239 passed, 5 ignored; workspace all-targets, runtime
 client-only tests и fmt/diff checks успешны; прежние warnings сохраняются.
+
+### Этап 5 — in-process next-hop MTU query
+
+Добавлен TransportQuery::GetNextHopMtu: actor выбирает live path interface,
+а при отсутствии live path для local destination — SharedServer fallback,
+как соседние next-hop queries. Возвращается именно link_mtu capability,
+не raw receive MTU. Без интерфейса/capability ответ IntResult(-1).
+ReticulumHandle::next_hop_mtu(destination) предоставляет Option<u32> API,
+используя query_transport текущего процесса, включая shared-client режим.
+Внешний control RPC/remote-daemon lookup этим изменением не добавлены.
+
+Это подготовка к выбору предложения инициатором, не включение больших Links:
+new_initiator всё ещё предлагает 500, responder сохраняет 500-byte cap.
+Проверен Python Transport.next_hop_interface_hw_mtu, который также требует
+AUTOCONFIGURE_MTU/FIXED_MTU capability, а не просто большого HW_MTU.
+
+Actor test проверяет unknown path, большой raw MTU без capability, local
+SharedServer fallback, приоритет live path, отсутствующий path interface,
+expired path с fallback и без него. Путь не переходит на SharedServer только
+потому, что его зарегистрированный интерфейс пропал: fallback применяется
+при отсутствии live path. Набор transport tests и проверки сборки выполнены.
+
+Проверки: целевой test — 1 passed; transport lib — 460 passed, 4 ignored.
+Workspace all-targets, runtime client-only tests и fmt/diff checks успешны;
+прежние warnings сохраняются. Этап 5 открыт; версия проекта не менялась.

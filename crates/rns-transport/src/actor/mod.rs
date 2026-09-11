@@ -3787,6 +3787,54 @@ mod tests {
     }
 
     #[test]
+    fn next_hop_mtu_uses_capability_and_shared_destination_fallback() {
+        use crate::messages::{TransportQuery, TransportQueryResponse};
+        let (mut actor, _) = TransportActor::new();
+        let dest = [0x55; 16];
+        let query = |actor: &mut TransportActor| match actor
+            .handle_query(TransportQuery::GetNextHopMtu { dest })
+        {
+            TransportQueryResponse::IntResult(value) => value,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(query(&mut actor), -1);
+        let (mut entry, _) = make_test_interface("shared");
+        entry.role = InterfaceRole::SharedServer;
+        entry.mtu = 524288; // A large raw MTU alone must not enable upgrades.
+        actor.interfaces.insert(1, entry);
+        actor.local_destinations.insert(dest);
+        assert_eq!(query(&mut actor), -1);
+        actor.interfaces.get_mut(&1).unwrap().diagnostics =
+            Some(crate::messages::LinkMtuDiagnostics::new(Some(262144), None));
+        assert_eq!(query(&mut actor), 262144);
+        let (mut next, _) = make_test_interface("auto");
+        next.diagnostics = Some(crate::messages::LinkMtuDiagnostics::new(Some(1196), None));
+        actor.interfaces.insert(2, next);
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(None, 1, 2, InterfaceMode::Full),
+        );
+        assert_eq!(query(&mut actor), 1196, "live path precedes local fallback");
+        actor.interfaces.remove(&2);
+        assert_eq!(
+            query(&mut actor),
+            -1,
+            "missing path interface must not borrow shared capability"
+        );
+        actor.local_destinations.remove(&dest);
+        assert_eq!(query(&mut actor), -1);
+        actor.local_destinations.insert(dest);
+        actor.path_table.get_live_mut(&dest).unwrap().expires = 0.0;
+        assert_eq!(
+            query(&mut actor),
+            262144,
+            "expired route permits local fallback"
+        );
+        actor.local_destinations.remove(&dest);
+        assert_eq!(query(&mut actor), -1, "expired route has no negotiable MTU");
+    }
+
+    #[test]
     fn shared_instance_peer_delivers_header2_link_request_to_local_destination() {
         let (mut actor, _tx) = TransportActor::new();
         // Runtime sets this when attaching the SharedInstancePeer driver.

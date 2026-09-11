@@ -215,6 +215,19 @@ impl ReticulumHandle {
         result
     }
 
+    /// Query this runtime's next-hop Link MTU capability, not a negotiated MTU.
+    /// Unknown paths and interfaces without upgrades return None. This uses
+    /// the local actor even when attached to a shared daemon.
+    pub async fn next_hop_mtu(&self, destination: [u8; 16]) -> Option<u32> {
+        match self
+            .query_transport(TransportQuery::GetNextHopMtu { dest: destination })
+            .await?
+        {
+            TransportQueryResponse::IntResult(value) => u32::try_from(value).ok(),
+            _ => None,
+        }
+    }
+
     /// Query the authoritative control plane.
     ///
     /// In client mode, Python proxies Reticulum control methods to the local
