@@ -222,11 +222,13 @@ impl TransportActor {
 
         // Drop pending path-request markers after the upstream gate timeout.
         self.path_requests
-            .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
+            .retain(|_, last| now - *last <= PATH_REQUEST_GATE_TIMEOUT);
+        self.inflight_path_requests
+            .retain(|_, request| now - request.started_at <= PATH_REQUEST_GATE_TIMEOUT);
         self.discovery_path_requests
             .retain(|_, request| now < request.timeout);
         self.discovery_pr_tags
-            .retain(|_, last| now - *last < PATH_REQUEST_GATE_TIMEOUT);
+            .retain(|_, last| now - *last < DISCOVERY_PR_TAG_RETENTION);
         // Python `max_pr_tags` hard cap on top of the time gate: a tag storm
         // inside the gate window must not grow the map without bound.
         if self.discovery_pr_tags.len() > MAX_DISCOVERY_PR_TAGS {

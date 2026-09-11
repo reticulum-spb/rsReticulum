@@ -50,8 +50,12 @@ pub const LOCAL_REBROADCASTS_MAX: u32 = 2;
 /// Path request timeout (seconds).
 pub const PATH_REQUEST_TIMEOUT: f64 = 15.0;
 
-/// Duplicate inbound path request tag retention (seconds).
-pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 120.0;
+/// Python 1.5.2 local and in-flight path request gate (seconds).
+pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 45.0;
+/// Legacy Rust tag history lifetime, independent of the request gate.
+pub const DISCOVERY_PR_TAG_RETENTION: f64 = 120.0;
+/// Rust safety bound for unresolved incoming destinations.
+pub const MAX_INFLIGHT_PATH_REQUESTS: usize = 32_000;
 
 /// Maximum queued automatic discovery path requests after failed link setup.
 pub const MAX_QUEUED_DISCOVERY_PRS: usize = 32;

@@ -355,7 +355,7 @@ impl TransportActor {
         unique_tag.extend_from_slice(&requested_dest);
         unique_tag.extend_from_slice(tag);
         if let Some(last) = self.discovery_pr_tags.get(&unique_tag) {
-            if now - last < PATH_REQUEST_GATE_TIMEOUT {
+            if now - last < DISCOVERY_PR_TAG_RETENTION {
                 trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
                 return;
             }
@@ -366,34 +366,16 @@ impl TransportActor {
             entry.ingress.received_path_request();
         }
 
-        // A new tag for an already engaged discovery adds a waiter, not a
-        // second recursive search. Duplicate tags were rejected above. Check
-        // expiry here too, so admission never depends on the maintenance tick.
-        if self
-            .discovery_path_requests
-            .get(&requested_dest)
-            .is_some_and(|request| now > request.timeout)
-        {
-            self.discovery_path_requests.remove(&requested_dest);
-        }
-        if self.discovery_path_requests.contains_key(&requested_dest) {
-            let allowed = self
-                .interfaces
-                .get_mut(&interface_id)
-                .is_some_and(|entry| !entry.ingress.should_ingress_limit_pr());
-            if allowed {
-                let request = self
-                    .discovery_path_requests
-                    .get_mut(&requested_dest)
-                    .unwrap();
-                if !request.requesting_interfaces.contains(&interface_id) {
-                    request.requesting_interfaces.push(interface_id);
-                }
-            }
+        let ingress_limited = self
+            .interfaces
+            .get_mut(&interface_id)
+            .is_some_and(|entry| entry.ingress.should_ingress_limit_pr());
+        if !self.admit_inflight_path_request(requested_dest, interface_id, ingress_limited, now) {
             return;
         }
 
         if self.local_destinations.contains(&requested_dest) {
+            self.inflight_path_requests.remove(&requested_dest);
             debug!(
                 dest = %hex::encode(requested_dest),
                 "answering path request — destination is local"
@@ -443,6 +425,7 @@ impl TransportActor {
                 && path.interface_id == interface_id;
 
             if requestor_is_next_hop {
+                self.inflight_path_requests.remove(&requested_dest);
                 debug!(
                     dest = %hex::encode(requested_dest),
                     "not answering path request — requester is our next hop"
@@ -450,6 +433,7 @@ impl TransportActor {
                 return;
             }
             if same_roaming_interface {
+                self.inflight_path_requests.remove(&requested_dest);
                 debug!(
                     dest = %hex::encode(requested_dest),
                     "not answering path request on roaming interface learned from same interface"
@@ -509,8 +493,10 @@ impl TransportActor {
                         source_interface: None,
                     },
                 );
+                self.inflight_path_requests.remove(&requested_dest);
                 return;
             }
+            self.inflight_path_requests.remove(&requested_dest);
         }
 
         // Python 1.5.2: boundary discovers only through boundary/gateway,
@@ -531,10 +517,13 @@ impl TransportActor {
             );
             self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false, false);
         } else if self.is_transport_enabled && should_search_unknown {
-            let ingress_limited = self
-                .interfaces
-                .get_mut(&interface_id)
-                .is_some_and(|iface| iface.ingress.should_ingress_limit_pr());
+            if self
+                .discovery_path_requests
+                .get(&requested_dest)
+                .is_some_and(|request| request.engaged)
+            {
+                return;
+            }
             if ingress_limited {
                 debug!(
                     dest = %hex::encode(requested_dest),
@@ -548,13 +537,19 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "forwarding path request on other interfaces"
             );
-            self.discovery_path_requests.insert(
-                requested_dest,
-                DiscoveryPathRequest {
-                    requesting_interfaces: vec![interface_id],
+            let request = self
+                .discovery_path_requests
+                .entry(requested_dest)
+                .or_insert_with(|| DiscoveryPathRequest {
+                    requesting_interfaces: Vec::new(),
                     timeout: now + PATH_REQUEST_TIMEOUT,
-                },
-            );
+                    engaged: false,
+                });
+            if !request.requesting_interfaces.contains(&interface_id) {
+                request.requesting_interfaces.push(interface_id);
+            }
+            request.engaged = true;
+            request.timeout = now + PATH_REQUEST_TIMEOUT;
             self.forward_path_request(
                 requested_dest,
                 Some(interface_id),
@@ -579,6 +574,60 @@ impl TransportActor {
                 "ignoring unknown path request on non-discovery interface"
             );
         }
+    }
+
+    /// Early destination gate, separate from tag dedup and recursive discovery.
+    /// Returns true only for the first request within the gate window.
+    pub(super) fn admit_inflight_path_request(
+        &mut self,
+        dest: [u8; 16],
+        interface_id: InterfaceId,
+        ingress_limited: bool,
+        now: f64,
+    ) -> bool {
+        if self
+            .inflight_path_requests
+            .get(&dest)
+            .is_some_and(|request| now - request.started_at > PATH_REQUEST_GATE_TIMEOUT)
+        {
+            self.inflight_path_requests.remove(&dest);
+        }
+        if self
+            .discovery_path_requests
+            .get(&dest)
+            .is_some_and(|request| now > request.timeout)
+        {
+            self.discovery_path_requests.remove(&dest);
+        }
+        if self.inflight_path_requests.contains_key(&dest) {
+            if !ingress_limited && self.interfaces.contains_key(&interface_id) {
+                let request = self.discovery_path_requests.entry(dest).or_insert_with(|| {
+                    DiscoveryPathRequest {
+                        requesting_interfaces: Vec::new(),
+                        timeout: now + PATH_REQUEST_TIMEOUT,
+                        engaged: false,
+                    }
+                });
+                if !request.requesting_interfaces.contains(&interface_id) {
+                    request.requesting_interfaces.push(interface_id);
+                }
+            }
+            return false;
+        }
+        if self.inflight_path_requests.len() >= MAX_INFLIGHT_PATH_REQUESTS {
+            // Maintenance reclaims expired entries. Do not scan the whole
+            // table for every new destination during an overload flood.
+            tracing::debug!("in-flight path request limit reached; dropping new destination");
+            return false;
+        }
+        self.inflight_path_requests.insert(
+            dest,
+            InflightPathRequest {
+                started_at: now,
+                receiving_interface: interface_id,
+            },
+        );
+        true
     }
 
     fn build_path_request_packet(&self, destination_hash: [u8; 16], tag: Option<&[u8]>) -> Vec<u8> {

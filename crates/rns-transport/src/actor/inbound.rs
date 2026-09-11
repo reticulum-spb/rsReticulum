@@ -519,6 +519,7 @@ impl TransportActor {
             self.state_dirty = true;
             // Wake any callers waiting on a path for this destination.
             self.fire_path_waiters(&header.destination_hash);
+            self.inflight_path_requests.remove(&header.destination_hash);
 
             if let Some(request) = self
                 .discovery_path_requests

@@ -79,6 +79,7 @@ pub struct TransportActor {
     pub destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
     pub path_requests: HashMap<[u8; 16], f64>,
+    pub inflight_path_requests: HashMap<[u8; 16], InflightPathRequest>,
     /// Python `discovery_path_requests`: external interfaces waiting for a
     /// matching announce while this transport recursively searches elsewhere.
     pub discovery_path_requests: HashMap<[u8; 16], DiscoveryPathRequest>,
@@ -235,10 +236,16 @@ pub struct RecentAnnounce {
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryPathRequest {
-    /// Unique live interfaces waiting for this destination. Until early queue
-    /// admission is integrated, entries are created only by an engaged search.
+    /// Unique live interfaces waiting for this destination.
     pub requesting_interfaces: Vec<InterfaceId>,
     pub timeout: f64,
+    pub engaged: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InflightPathRequest {
+    pub started_at: f64,
+    pub receiving_interface: InterfaceId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +335,7 @@ impl TransportActor {
             destination_channels: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
+            inflight_path_requests: HashMap::new(),
             discovery_pr_tags: HashMap::new(),
             pending_discovery_prs: VecDeque::new(),
             path_interface_suppressions: HashMap::new(),
@@ -865,6 +873,7 @@ impl TransportActor {
         self.packet_metrics.clear();
         self.packet_metrics_order.clear();
         self.discovery_path_requests.clear();
+        self.inflight_path_requests.clear();
         self.pending_local_path_requests.clear();
         self.pending_discovery_prs.clear();
         self.last_discovery_pr_tx = 0.0;
@@ -1126,6 +1135,21 @@ impl TransportActor {
             !request.requesting_interfaces.is_empty()
         });
         self.interfaces.remove(&id);
+        self.inflight_path_requests.retain(|dest, request| {
+            if request.receiving_interface != id {
+                return true;
+            }
+            if let Some(next) = self
+                .discovery_path_requests
+                .get(dest)
+                .and_then(|waiting| waiting.requesting_interfaces.first())
+            {
+                request.receiving_interface = *next;
+                true
+            } else {
+                false
+            }
+        });
         if role == Some(InterfaceRole::SharedInstancePeer) {
             tracing::warn!(
                 interface_id = id,
@@ -2323,6 +2347,10 @@ mod tests {
         );
 
         actor.handle_inbound_path_request(&make_path_request_payload(target_dest, None), 1);
+        assert!(
+            !actor.inflight_path_requests.contains_key(&target_dest),
+            "cached response resolves the gate before deferred transmission"
+        );
         assert_eq!(
             local_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty),
@@ -6127,6 +6155,7 @@ mod tests {
         actor.discovery_path_requests.insert(
             dest_discovery,
             DiscoveryPathRequest {
+                engaged: true,
                 requesting_interfaces: vec![1],
                 timeout: now_f64() + PATH_REQUEST_TIMEOUT,
             },
@@ -8599,10 +8628,27 @@ mod tests {
 
         let third_tag = make_path_request_payload_with_tag(requested, None, [0xC7; 16]);
         actor.handle_inbound_path_request(&third_tag, 1);
-        boundary_rx.try_recv().expect(
-            "same destination should forward again after the waiting discovery entry expires",
+        assert!(
+            boundary_rx.try_recv().is_err(),
+            "discovery timeout does not expire the independent inflight gate"
         );
-        assert_eq!(actor.discovery_pr_tags.len(), 3);
+        assert!(!actor.discovery_path_requests[&requested].engaged);
+        actor
+            .inflight_path_requests
+            .get_mut(&requested)
+            .unwrap()
+            .started_at = 0.0;
+        actor
+            .discovery_path_requests
+            .get_mut(&requested)
+            .unwrap()
+            .timeout = 0.0;
+        let fourth_tag = make_path_request_payload_with_tag(requested, None, [0xD8; 16]);
+        actor.handle_inbound_path_request(&fourth_tag, 1);
+        boundary_rx.try_recv().expect(
+            "same destination should forward again after both discovery and inflight expire",
+        );
+        assert_eq!(actor.discovery_pr_tags.len(), 4);
     }
 
     #[test]
@@ -8990,6 +9036,15 @@ mod tests {
         assert!(request.path_response);
         assert_eq!(request.tag.as_deref(), Some(&tag[..]));
         assert_eq!(request.attached_interface, Some(1));
+        assert!(!actor.inflight_path_requests.contains_key(&dest));
+        actor.handle_inbound_path_request(
+            &make_path_request_payload_with_tag(dest, None, [0xDC; 16]),
+            1,
+        );
+        assert!(
+            event_rx.try_recv().is_ok(),
+            "local answer releases the gate for a new tag"
+        );
     }
 
     #[test]
@@ -9018,6 +9073,82 @@ mod tests {
                 .expect("target interface should receive packet"),
             raw
         );
+    }
+
+    #[test]
+    fn inflight_gate_has_independent_strict_timeout_and_unengaged_waiters() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, _rx) = make_test_interface("waiter");
+        actor.interfaces.insert(2, iface);
+        let dest = [0xF1; 16];
+        assert_eq!(PATH_REQUEST_GATE_TIMEOUT, 45.0);
+        assert_eq!(DISCOVERY_PR_TAG_RETENTION, 120.0);
+        assert!(actor.admit_inflight_path_request(dest, 1, false, 100.0));
+        assert!(!actor.admit_inflight_path_request(dest, 2, false, 110.0));
+        assert!(!actor.discovery_path_requests[&dest].engaged);
+        assert_eq!(
+            actor.discovery_path_requests[&dest].requesting_interfaces,
+            [2]
+        );
+        assert_eq!(actor.discovery_path_requests[&dest].timeout, 125.0);
+        assert!(!actor.admit_inflight_path_request(dest, 2, false, 120.0));
+        assert_eq!(actor.discovery_path_requests[&dest].timeout, 125.0);
+        assert_eq!(actor.inflight_path_requests[&dest].started_at, 100.0);
+        assert!(!actor.admit_inflight_path_request(dest, 2, true, 145.0));
+        assert!(
+            !actor.discovery_path_requests.contains_key(&dest),
+            "limited request cannot recreate expired waiters"
+        );
+        assert!(actor.admit_inflight_path_request(dest, 2, false, 145.001));
+    }
+
+    #[test]
+    fn inflight_gate_is_bounded_and_cleanup_preserves_remaining_waiters() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, _rx) = make_test_interface("waiter");
+        actor.interfaces.insert(2, iface);
+        let now = now_f64();
+        let dest = [0xF2; 16];
+        assert!(actor.admit_inflight_path_request(dest, 1, false, now));
+        assert!(!actor.admit_inflight_path_request(dest, 2, false, now));
+        actor.deregister_interface(1);
+        assert_eq!(actor.inflight_path_requests[&dest].receiving_interface, 2);
+        actor.deregister_interface(2);
+        assert!(!actor.inflight_path_requests.contains_key(&dest));
+        for value in 0..MAX_INFLIGHT_PATH_REQUESTS {
+            let key = (value as u128).to_le_bytes();
+            assert!(actor.admit_inflight_path_request(key, 1, false, now));
+        }
+        assert!(!actor.admit_inflight_path_request([0xFF; 16], 1, false, now));
+        assert_eq!(
+            actor.inflight_path_requests.len(),
+            MAX_INFLIGHT_PATH_REQUESTS
+        );
+        actor.clear_shared_connection_state();
+        assert!(actor.inflight_path_requests.is_empty());
+        assert!(actor.admit_inflight_path_request(dest, 1, false, now));
+        actor.handle_query(TransportQuery::DropPathTable);
+        assert!(actor.inflight_path_requests.is_empty());
+    }
+
+    #[test]
+    fn inflight_gate_maintenance_expires_without_shortening_tag_history() {
+        let (mut actor, _tx) = TransportActor::new();
+        let dest = [0xF3; 16];
+        let start = now_f64() - 46.0;
+        actor.inflight_path_requests.insert(
+            dest,
+            InflightPathRequest {
+                started_at: start,
+                receiving_interface: 1,
+            },
+        );
+        actor.path_requests.insert(dest, start);
+        actor.discovery_pr_tags.insert(vec![1; 32], start);
+        actor.on_tick();
+        assert!(actor.inflight_path_requests.is_empty());
+        assert!(actor.path_requests.is_empty());
+        assert_eq!(actor.discovery_pr_tags.len(), 1);
     }
 
     #[test]
@@ -9104,6 +9235,7 @@ mod tests {
         );
         assert!(limited_rx.try_recv().is_err());
         assert!(!actor.discovery_path_requests.contains_key(&dest));
+        assert!(!actor.inflight_path_requests.contains_key(&dest));
     }
 
     #[test]
@@ -9113,6 +9245,7 @@ mod tests {
         actor.discovery_path_requests.insert(
             dest,
             DiscoveryPathRequest {
+                engaged: true,
                 requesting_interfaces: vec![1, 2],
                 timeout: now_f64() + PATH_REQUEST_TIMEOUT,
             },
@@ -9140,6 +9273,7 @@ mod tests {
         actor.discovery_path_requests.insert(
             dest,
             DiscoveryPathRequest {
+                engaged: true,
                 requesting_interfaces: vec![2],
                 timeout: 0.0,
             },
@@ -9228,6 +9362,7 @@ mod tests {
         actor.discovery_path_requests.insert(
             requested,
             DiscoveryPathRequest {
+                engaged: true,
                 requesting_interfaces: vec![1],
                 timeout: 0.0,
             },
