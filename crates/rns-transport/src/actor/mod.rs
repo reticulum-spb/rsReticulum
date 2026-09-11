@@ -2284,6 +2284,39 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_samples_control_rates_for_interface_queries() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("sampled");
+        entry.ingress.traffic_sampler.sample(
+            &mut entry.ingress.traffic,
+            std::time::Instant::now() - std::time::Duration::from_secs(2),
+        );
+        entry.ingress.traffic.received_announce(500);
+        entry.ingress.traffic.sent_path_request(50);
+        actor.interfaces.insert(1, entry);
+        actor.last_links_check = 0.0;
+        actor.on_tick();
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!()
+        };
+        assert!(stats[0].control_traffic.arxs > 0.0);
+        assert!(stats[0].control_traffic.arxs <= 2000.0);
+        assert!(
+            (stats[0].control_traffic.arxs / stats[0].control_traffic.ptxs - 10.0).abs() < 1e-10
+        );
+        assert_eq!(stats[0].control_traffic.atxs, 0.0);
+        // A new registration has neither stale rates nor the old baseline.
+        actor.deregister_interface(1);
+        let (replacement, _rx) = make_test_interface("replacement");
+        actor.interfaces.insert(1, replacement);
+        actor.last_links_check = 0.0;
+        actor.on_tick();
+        assert_eq!(actor.interfaces[&1].ingress.traffic, Default::default());
+    }
+
+    #[test]
     fn control_traffic_tx_counts_only_accepted_frames_without_ifac() {
         let (mut actor, _tx) = TransportActor::new();
         let (mut entry, _old_rx) = make_test_interface("flow");

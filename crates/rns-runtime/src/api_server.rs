@@ -1856,6 +1856,14 @@ fn merge_iface_json(
     ] {
         v[key] = Value::from(value);
     }
+    for (key, value) in [
+        ("arxs", e.control_traffic.arxs),
+        ("atxs", e.control_traffic.atxs),
+        ("prxs", e.control_traffic.prxs),
+        ("ptxs", e.control_traffic.ptxs),
+    ] {
+        v[key] = Value::from(value);
+    }
 
     if let Some(section) = section {
         v["config"] = iface_section_json(section);
@@ -1897,6 +1905,10 @@ fn config_only_iface_json(name: &str, section: &NormalizedSection) -> Value {
         "ptxb": null,
         "prxc": null,
         "ptxc": null,
+        "arxs": null,
+        "atxs": null,
+        "prxs": null,
+        "ptxs": null,
         "ifac_violations": null,
         "packet_filter_hits": null,
         "announce_queue": 0,
@@ -2329,6 +2341,10 @@ mod tests {
             ptxb: u64::MAX,
             prxc: 7,
             ptxc: 8,
+            arxs: 12.5,
+            atxs: 25.0,
+            prxs: 37.5,
+            ptxs: 50.0,
         };
         let value = merge_iface_json(&stats[0], None, None);
         for (key, expected) in [
@@ -2343,6 +2359,10 @@ mod tests {
         ] {
             assert_eq!(value[key], expected);
         }
+        assert_eq!(value["arxs"], 12.5);
+        assert_eq!(value["atxs"], 25.0);
+        assert_eq!(value["prxs"], 37.5);
+        assert_eq!(value["ptxs"], 50.0);
         drop(input);
         drop(control);
         tokio::time::timeout(std::time::Duration::from_secs(2), task)

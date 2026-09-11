@@ -152,8 +152,21 @@ This is not a physical-delivery acknowledgement: a driver can subsequently
 drop the packet. Python invokes its counters at separate outbound/announce-queue
 sites; Rust intentionally centralizes this accounting at channel admission.
 These counters are per registered endpoint; parent-interface aggregation,
-global external totals, class byte rates/composition and PPS remain pending.
+global external totals, traffic composition and PPS remain pending.
 Existing frequency estimates and ingress/egress limits are unchanged.
+
+The interface entries also expose `arxs`, `atxs`, `prxs`, `ptxs`: sampled
+announce/PR RX/TX speeds in **bits per second**. These per-interface extensions
+use the names of Python's global speed fields; they are not global totals.
+The details panel labels them explicitly as `bit/s`. Do not interpret them as
+the existing API `rx_rate`/`tx_rate` byte-per-second fields.
+Maintenance samples approximately once per second, dividing byte deltas by
+the actual monotonic elapsed time and multiplying by eight. The first sample
+establishes a baseline and reports zero; an idle interval returns the rates
+to zero. Queries read the last sample without changing the measurement window.
+Re-registration resets both rates and baseline. Old RPC responses default to
+zero; inactive configured interfaces expose `null`. Parent/global aggregation
+and the legacy general-traffic sampler are not changed by this calculation.
 
 ### Receive violation diagnostics (partial 1.5.2 coverage)
 

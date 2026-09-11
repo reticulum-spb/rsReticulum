@@ -7,6 +7,7 @@ const {
   inboundQueueRows,
   formatBytes,
   formatControlTraffic,
+  formatBitRate,
   formatDuration,
   formatFrequency,
   formatNumber,
@@ -33,6 +34,11 @@ test("allows editing schema-backed plugin interfaces", () => {
 });
 
 test("formats runtime metrics", () => {
+  assert.equal(formatBitRate(0), "0 bit/s");
+  assert.equal(formatBitRate(12.5), `${(12.5).toLocaleString()} bit/s`);
+  for (const unavailable of [null, undefined, -1, Infinity, NaN, "12"]) {
+    assert.equal(formatBitRate(unavailable), "—");
+  }
   assert.equal(formatControlTraffic(2, 1500), "2 / 1.5 kB");
   assert.equal(formatControlTraffic(0, 0), "0 / 0 B");
   for (const unavailable of [null, undefined, -1, Number.MAX_SAFE_INTEGER + 1]) {

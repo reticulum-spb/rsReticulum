@@ -167,6 +167,13 @@ impl TransportActor {
 
         if now - self.last_links_check >= LINKS_CHECK_INTERVAL {
             self.traffic.update_speeds();
+            let sampled_at = std::time::Instant::now();
+            for entry in self.interfaces.values_mut() {
+                entry
+                    .ingress
+                    .traffic_sampler
+                    .sample(&mut entry.ingress.traffic, sampled_at);
+            }
             self.last_links_check = now;
         }
 

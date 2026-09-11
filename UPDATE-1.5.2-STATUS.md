@@ -972,3 +972,48 @@ Parent aggregation, глобальные внешние totals, PPS, CLI/remote 
 остаются для продолжения диагностики (этап 7); они не подменены простым
 суммированием новых endpoint counters. Этапы 5–7 и финальная интеграция не
 завершены. Версия и пользовательский план не изменены; push не выполнялся.
+
+## Этап 4 — измерение скоростей announce/PR
+
+Добавлены `arxs`, `atxs`, `prxs`, `ptxs` в endpoint ControlTraffic, RPC/API
+и Web UI. Единицы — **бит/с**, согласно выражениям `count_traffic_loop` Python:
+`delta_bytes * 8 / elapsed_seconds`. Это per-interface расширение диагностики
+Rust с именами Python global speed fields, не готовые глобальные totals.
+
+Каждая регистрация хранит один baseline (Instant + четыре byte counters).
+Первый maintenance sample только устанавливает baseline; следующие используют
+фактическую монотонную длительность, а не предполагаемую одну секунду. Idle
+interval обнуляет скорости; query не изменяет окно. Нулевая/обратная отметка
+не сдвигает baseline; защитный saturating delta не превращает сброс counters
+в огромную скорость. Sampling вызывается в существующем примерно 1 Hz
+maintenance gate; сам gate по-прежнему использует wall-clock actor scheduling.
+
+Полная цепочка наследует прежние full/client bridges; MessagePack добавляет
+float поля, старые ответы дают 0, malformed negative/non-finite RPC rates
+также нормализуются в 0. API inactive interfaces возвращает null. UI явно
+пишет bit/s и не выдаёт отсутствующую скорость за нулевую. Существующие общие
+`rx_rate`/`tx_rate`, frequency estimates и общий legacy TrafficCounter не менялись.
+
+Проверки:
+
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  458 passed (четыре ignored после добавления нового Python oracle).
+  Управляемые интервалы, delayed/idle sample, reset, invalid time;
+  реальный maintenance → query, новая регистрация без старого baseline.
+- `cargo test -p rns-runtime --features api --lib --quiet`:
+  236 passed, 5 ignored; API float mapping, RPC round-trip, старый JSON/RPC.
+- `cargo test -p rns-transport --features sqlite-bundled --lib control_rates_match_python_transport_expressions -- --ignored`:
+  1 passed. AST oracle выполняет реальные четыре выражения скоростей Python
+  на интервалах 2.5, 1.5, 0.125 и 10 секунд; runtime RNS не запускается.
+  Это проверка формул, не Python scheduler/parent aggregation.
+- `cargo test -p rns-runtime --features api --lib control_traffic_rpc_matches_python_interface_counters -- --ignored`:
+  прежняя Python/RPC проверка counters сохранена.
+- Node Web UI tests, fmt и diff check успешны; workspace all-targets,
+  runtime client-only и `api,serial,rnode-tcp,sqlite-bundled` собираются.
+
+Этап 4 ещё частичный: композиция traffic flow и смешанная нагрузка, прежние
+exception/MTU signalling границы. Для композиции требуется согласованный
+общий учёт: processed RX может включать повторный preprocess held announce,
+TX admission не равен физической передаче. Parent aggregation, внешние totals,
+PPS и CLI/remote presentation по-прежнему не объявлены готовыми. Этапы 5–7
+и финальная интеграция не завершены. Версия не менялась, push не выполнялся.

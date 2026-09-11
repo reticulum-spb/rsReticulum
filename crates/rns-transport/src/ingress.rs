@@ -69,6 +69,7 @@ pub struct HeldAnnounce {
 #[derive(Debug)]
 pub struct IngressController {
     pub(crate) traffic: crate::traffic::ControlTraffic,
+    pub(crate) traffic_sampler: crate::traffic::ControlTrafficSampler,
     created: Instant,
     enabled: bool,
     /// Incoming announce timestamps; capped at `IA_FREQ_SAMPLES`.
@@ -105,6 +106,7 @@ impl IngressController {
         let now = Instant::now();
         Self {
             traffic: Default::default(),
+            traffic_sampler: Default::default(),
             created: now,
             enabled: true,
             ia_freq_deque: VecDeque::with_capacity(IA_FREQ_SAMPLES),

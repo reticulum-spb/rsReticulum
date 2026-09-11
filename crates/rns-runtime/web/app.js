@@ -233,6 +233,11 @@ function formatControlTraffic(packets, bytes) {
   return `${valid(packets) ? formatNumber(packets) : "—"} / ${valid(bytes) ? formatBytes(bytes) : "—"}`;
 }
 
+function formatBitRate(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} bit/s` : "—";
+}
+
 function formatBytes(value) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
@@ -469,6 +474,8 @@ function interfaceDetails(item) {
     detailItem("Announce TX packets / bytes", formatControlTraffic(item.atxc, item.atxb)),
     detailItem("Path request RX packets / bytes", formatControlTraffic(item.prxc, item.prxb)),
     detailItem("Path request TX packets / bytes", formatControlTraffic(item.ptxc, item.ptxb)),
+    detailItem("Announce RX / TX speed", `${formatBitRate(item.arxs)} / ${formatBitRate(item.atxs)}`),
+    detailItem("Path request RX / TX speed", `${formatBitRate(item.prxs)} / ${formatBitRate(item.ptxs)}`),
   );
   container.append(details);
   if (item.configured) {
@@ -1776,6 +1783,7 @@ if (typeof module !== "undefined" && module.exports) {
     inboundQueueRows,
     formatBytes,
     formatControlTraffic,
+    formatBitRate,
     formatDuration,
     formatFrequency,
     formatNumber,

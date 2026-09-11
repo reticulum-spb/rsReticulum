@@ -564,6 +564,10 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                         ("ptxb", PyValue::Int(i128::from(e.control_traffic.ptxb))),
                         ("prxc", PyValue::Int(i128::from(e.control_traffic.prxc))),
                         ("ptxc", PyValue::Int(i128::from(e.control_traffic.ptxc))),
+                        ("arxs", PyValue::Float(e.control_traffic.arxs)),
+                        ("atxs", PyValue::Float(e.control_traffic.atxs)),
+                        ("prxs", PyValue::Float(e.control_traffic.prxs)),
+                        ("ptxs", PyValue::Float(e.control_traffic.ptxs)),
                         ("txb", PyValue::Int(i128::from(e.tx_bytes))),
                         ("rxs", PyValue::Int(i128::from(e.rx_rate))),
                         ("txs", PyValue::Int(i128::from(e.tx_rate))),
@@ -879,6 +883,22 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
                     ptxb: dict_get(m, "ptxb").and_then(py_u64).unwrap_or(0),
                     prxc: dict_get(m, "prxc").and_then(py_u64).unwrap_or(0),
                     ptxc: dict_get(m, "ptxc").and_then(py_u64).unwrap_or(0),
+                    arxs: dict_get(m, "arxs")
+                        .and_then(py_f64)
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0),
+                    atxs: dict_get(m, "atxs")
+                        .and_then(py_f64)
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0),
+                    prxs: dict_get(m, "prxs")
+                        .and_then(py_f64)
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0),
+                    ptxs: dict_get(m, "ptxs")
+                        .and_then(py_f64)
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0),
                 },
                 inbound_diagnostics: rns_transport::messages::InboundDiagnostics {
                     protocol_violations: dict_get(m, "protocol_violations")
@@ -1918,6 +1938,10 @@ mod tests {
                 ptxb: u64::MAX,
                 prxc: 7,
                 ptxc: 8,
+                arxs: 12.5,
+                atxs: 25.0,
+                prxs: 37.5,
+                ptxs: 50.0,
             },
             inbound_diagnostics: rns_transport::messages::InboundDiagnostics {
                 protocol_violations: 11,
@@ -2071,7 +2095,8 @@ mod tests {
         assert_eq!(value["ptxb"], u64::MAX);
         assert!(value.get("control_traffic").is_none());
         for key in [
-            "arxb", "atxb", "arxc", "atxc", "prxb", "ptxb", "prxc", "ptxc",
+            "arxb", "atxb", "arxc", "atxc", "prxb", "ptxb", "prxc", "ptxc", "arxs", "atxs", "prxs",
+            "ptxs",
         ] {
             value.as_object_mut().unwrap().remove(key);
         }
