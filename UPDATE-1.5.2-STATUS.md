@@ -2088,3 +2088,28 @@ expired path с fallback и без него. Путь не переходит н
 Проверки: целевой test — 1 passed; transport lib — 460 passed, 4 ignored.
 Workspace all-targets, runtime client-only tests и fmt/diff checks успешны;
 прежние warnings сохраняются. Этап 5 открыт; версия проекта не менялась.
+
+### Этап 5 — explicit MTU handshake API библиотеки Link
+
+Добавлены Link::new_initiator_with_mtu, new_responder_with_mtu и вариант
+new_responder_with_signer_and_mtu для внешнего подписанта. Инициатор использует
+явный MTU в signalling, pending state и MDU. Responder ограничивает nonzero
+offer заданным максимумом, подписывает именно эффективный MTU и хранит тот же
+MTU/MDU. Missing/zero offer сохраняет базовые 500. Явные параметры bounds
+нормализуются в 500..=MTU_BYTEMASK (2097151), без wrap через битовую маску.
+Малый nonzero wire offer по-прежнему может уменьшить effective MTU ниже 500.
+
+Старые constructors делегируют новым с лимитом 500. Runtime пока использует
+старые constructors: ни next-hop query в инициатор, ни incoming capability в
+responder в этом блоке не подключены. Это рабочий opt-in library API, не
+объявление полной поддержки больших Links через runtime/сеть.
+
+Новый handshake test: шесть пар offer/cap × обычный/внешний signer. Проверены
+wire offer, signed proof, Link ID, совпадение MTU/MDU после proof+RTT,
+двустороннее encryption/decryption payload до 64 KiB. Включены bounds 0 и
+u32::MAX, уменьшение по каждой стороне и fallback500. Верхний MTU проверяется
+как signalling/state, не передачей 2 MiB по реальному интерфейсу.
+
+Link lib — 99 passed, 1 ignored; workspace all-targets и runtime client-only
+tests checks успешны. Прежние warnings сохраняются; этап 5 открыт, версия
+и пользовательский план не менялись.

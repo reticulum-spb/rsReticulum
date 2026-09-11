@@ -250,6 +250,12 @@ before the proof is returned and agrees with the initiator after validation.
 Offers too small to fit an encrypted payload produce an MDU of zero, not an
 unsigned underflow or the default payload capacity. This is defensive arithmetic,
 not a guarantee that handshake frames fit such a small offered MTU.
+Library callers can explicitly opt into larger handshakes with
+`Link::new_initiator_with_mtu`, `new_responder_with_mtu` or the external-signer
+variant `new_responder_with_signer_and_mtu`. Explicit interface limits are
+bounded to 500..=2097151; responder proof and MDU use the smaller offered limit.
+The existing constructors and runtime still use 500. These APIs do not discover
+or validate a network path's actual capacity on the caller's behalf.
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately
 from the raw receive limit. Transit Link Requests with exactly 64 key bytes plus
 3 signalling bytes retain at most the offered, incoming-interface and outgoing

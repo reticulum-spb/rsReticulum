@@ -203,9 +203,19 @@ impl Link {
         ),
     )]
     pub fn new_initiator(destination_hash: [u8; 16], hops: u8) -> (Self, Vec<u8>) {
+        Self::new_initiator_with_mtu(destination_hash, hops, rns_wire::constants::MTU as u32)
+    }
+
+    /// Offer an explicit interface/path MTU. Values are bounded to the base
+    /// protocol MTU and the 21-bit signalling maximum, never bit-wrapped.
+    pub fn new_initiator_with_mtu(
+        destination_hash: [u8; 16],
+        hops: u8,
+        mtu: u32,
+    ) -> (Self, Vec<u8>) {
+        let mtu = mtu.clamp(rns_wire::constants::MTU as u32, MTU_BYTEMASK);
         let ephemeral_keys = EphemeralKeys::generate();
-        let signalling = SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32)
-            .expect("enabled signalling mode");
+        let signalling = SignallingData::new(DEFAULT_MODE, mtu).expect("enabled signalling mode");
         let request_data = LinkRequestData::pack(&ephemeral_keys, signalling);
         let link_id = compute_link_id(&destination_hash, &request_data);
 
@@ -216,7 +226,7 @@ impl Link {
 
         let establishment_cost = request_data.len();
 
-        let link = Self {
+        let mut link = Self {
             link_id,
             state: LinkState::Pending,
             is_initiator: true,
@@ -233,7 +243,7 @@ impl Link {
             activated_at: None,
             stale_since: None,
             keepalive: KeepaliveState::new(true),
-            mtu: rns_wire::constants::MTU as u32,
+            mtu,
             mdu: rns_wire::constants::ENCRYPTED_MDU,
             resource_strategy: ResourceStrategy::default(),
             pending_requests: Vec::new(),
@@ -264,6 +274,7 @@ impl Link {
             link_closed_callback: None,
         };
 
+        link.update_mdu();
         (link, request_data)
     }
 
@@ -450,6 +461,24 @@ impl Link {
         destination_hash: [u8; 16],
         hops: u8,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
+        Self::new_responder_with_mtu(
+            request_data,
+            identity_signing_key,
+            destination_hash,
+            hops,
+            rns_wire::constants::MTU as u32,
+        )
+    }
+
+    /// Respond with at most the supplied interface/path MTU. Existing callers
+    /// of new_responder retain the 500-byte cap.
+    pub fn new_responder_with_mtu(
+        request_data: &[u8],
+        identity_signing_key: &Ed25519PrivateKey,
+        destination_hash: [u8; 16],
+        hops: u8,
+        max_mtu: u32,
+    ) -> Result<(Self, Vec<u8>), HandshakeError> {
         let identity_ed25519_pub = identity_signing_key.public_key().to_bytes();
         Self::new_responder_inner(
             request_data,
@@ -457,6 +486,7 @@ impl Link {
             destination_hash,
             hops,
             Some(identity_signing_key),
+            max_mtu,
             |signed_data| Some(identity_signing_key.sign(signed_data)),
         )
     }
@@ -472,12 +502,35 @@ impl Link {
     where
         F: FnOnce(&[u8]) -> Option<[u8; 64]>,
     {
+        Self::new_responder_with_signer_and_mtu(
+            request_data,
+            identity_ed25519_pub,
+            destination_hash,
+            hops,
+            rns_wire::constants::MTU as u32,
+            sign_fn,
+        )
+    }
+
+    /// External-signer variant of the explicit MTU responder API.
+    pub fn new_responder_with_signer_and_mtu<F>(
+        request_data: &[u8],
+        identity_ed25519_pub: &[u8; 32],
+        destination_hash: [u8; 16],
+        hops: u8,
+        max_mtu: u32,
+        sign_fn: F,
+    ) -> Result<(Self, Vec<u8>), HandshakeError>
+    where
+        F: FnOnce(&[u8]) -> Option<[u8; 64]>,
+    {
         Self::new_responder_inner(
             request_data,
             identity_ed25519_pub,
             destination_hash,
             hops,
             None,
+            max_mtu,
             sign_fn,
         )
     }
@@ -488,6 +541,7 @@ impl Link {
         destination_hash: [u8; 16],
         hops: u8,
         identity_signing_key: Option<&Ed25519PrivateKey>,
+        max_mtu: u32,
         sign_fn: F,
     ) -> Result<(Self, Vec<u8>), HandshakeError>
     where
@@ -496,13 +550,13 @@ impl Link {
         let request = LinkRequestData::unpack(request_data)?;
         let link_id = compute_link_id(&destination_hash, request_data);
 
-        // Python treats a zero offer as the default MTU. Until the runtime
-        // supplies interface MTU capabilities, keep the existing 500-byte cap,
-        // but sign exactly the MTU that this responder will actually use.
+        // Python treats a zero offer as the default MTU. Explicit caps are
+        // bounded to the wire range; legacy constructors supply 500.
+        let max_mtu = max_mtu.clamp(rns_wire::constants::MTU as u32, MTU_BYTEMASK);
         let mtu = if request.signalling.mtu == 0 {
             rns_wire::constants::MTU as u32
         } else {
-            request.signalling.mtu.min(rns_wire::constants::MTU as u32)
+            request.signalling.mtu.min(max_mtu)
         };
         let signalling = SignallingData::new(request.signalling.mode, mtu)
             .map_err(|error| HandshakeError::UnsupportedMode(error.0))?;
@@ -1736,6 +1790,69 @@ mod tests {
                     encrypted.len() + rns_wire::constants::HEADER_MINSIZE + 1 <= expected as usize
                 );
                 assert_eq!(initiator.decrypt(&encrypted).unwrap(), payload);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_mtu_handshake_agrees_and_transfers_large_payloads() {
+        let dest = [0xAD; 16];
+        let key = Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        for (offer, cap, expected) in [
+            (32768, 1196, 1196),
+            (1196, 262144, 1196),
+            (524288, 262144, 262144),
+            (u32::MAX, u32::MAX, MTU_BYTEMASK),
+            (0, 0, 500),
+            (32768, 0, 500),
+        ] {
+            for external in [false, true] {
+                let (mut initiator, request) = Link::new_initiator_with_mtu(dest, 1, offer);
+                assert_eq!(
+                    LinkRequestData::unpack(&request).unwrap().signalling.mtu,
+                    offer.clamp(500, MTU_BYTEMASK)
+                );
+                let (mut responder, proof) = if external {
+                    Link::new_responder_with_signer_and_mtu(
+                        &request,
+                        &public.to_bytes(),
+                        dest,
+                        1,
+                        cap,
+                        |data| Some(key.sign(data)),
+                    )
+                    .unwrap()
+                } else {
+                    Link::new_responder_with_mtu(&request, &key, dest, 1, cap).unwrap()
+                };
+                assert_eq!(responder.link_id, initiator.link_id);
+                assert_eq!(
+                    LinkProofData::unpack(&proof).unwrap().signalling.mtu,
+                    expected
+                );
+                let rtt = initiator
+                    .validate_proof(&proof, &public, &public.to_bytes())
+                    .unwrap();
+                responder.receive_rtt_packet(&rtt).unwrap();
+                assert_eq!((initiator.mtu, responder.mtu), (expected, expected));
+                assert_eq!(initiator.mdu, responder.mdu);
+                let payload = vec![42; initiator.mdu.min(65536)];
+                if expected > 500 {
+                    assert!(payload.len() > 500);
+                }
+                assert_eq!(
+                    responder
+                        .decrypt(&initiator.encrypt(&payload).unwrap())
+                        .unwrap(),
+                    payload
+                );
+                assert_eq!(
+                    initiator
+                        .decrypt(&responder.encrypt(&payload).unwrap())
+                        .unwrap(),
+                    payload
+                );
             }
         }
     }
