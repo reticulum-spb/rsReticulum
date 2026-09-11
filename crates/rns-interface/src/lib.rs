@@ -13,6 +13,8 @@ pub mod ax25kiss;
 pub mod backbone;
 #[cfg(feature = "full")]
 pub mod backbone_flap;
+#[cfg(feature = "full")]
+pub mod backbone_flow;
 #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]
 pub mod ble_central_apple;
 #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]

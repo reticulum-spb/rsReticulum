@@ -1328,3 +1328,47 @@ idle дольше 12 секунд и timeout ровно на границе с �
 Учёт байтов очередей и адаптивный egress controller в этом изменении
 не добавлены: сначала устранён найденный lifecycle-пробел. Они остаются
 следующим участком этапа 5.
+
+### Этап 5 — проверенная политика адаптивного egress (ещё не подключена)
+
+Добавлен `backbone_flow::EgressController`: независимый от socket/queue
+владелец состояния Python 1.5.2 `_dp_ec_evaluate`. Он принимает полный
+encoded backlog, sendable bytes и cumulative successful writes, возвращает
+Open/Gated/Disconnect. Это подготовительный компонент, не включённый
+адаптивный backpressure: существующий Sender<Bytes> ещё не даёт полного
+учёта очереди. Работающий writer пока использует прежний no-progress timeout,
+теперь с общей константой DEAD_TIME из нового модуля.
+
+Семантика политики:
+
+- Интервал 1 s, mid watermark 128 KiB, high watermark 4 MiB, 3 zero-drain
+  ticks, max ETA 10 s, release ETA 5 s и dead time 12 s.
+- При backlog >128 KiB ETA >10 включает gate, ETA <5 снимает его;
+  равенство 5/10 сохраняет состояние. Backlog <=128 KiB снимает gate.
+- Пустой buffered или sendable сбрасывает gate/zero ticks и last_drain
+  до проверки dead time. Dead check выполняется до учёта свежего drained.
+- Drain rate использует фиксированный интервал 1 s, как Python, а не
+  реальное время между задержанными вызовами evaluate.
+- Predicate допуска целого encoded frame принимает ровно high watermark,
+  отклоняет превышение, stalled и u64 overflow. Он не резервирует bytes:
+  проверку и enqueue будущий владелец очереди должен делать атомарно.
+- Каждому connection нужен отдельный controller; Disconnect терминален.
+  Требуются монотонные timestamps/counters; saturating arithmetic — защита
+  Rust от underflow, не заявленный паритет неверных snapshots.
+
+Проверки: пять обычных boundary/state tests. Отдельный ignored Python oracle
+AST-извлекает исходный метод и DP_EC constants из локального reference без
+запуска Reticulum daemon; заменены только логирование/socket side effects.
+400 детерминированных последовательностей, 2609 samples: 1842 Open,
+367 Gated, 400 Disconnect. Совпали решения и внутренние stalled/zero ticks/
+last_drain/previous_sent. Oracle проверяет policy, не реальный socket teardown.
+
+`cargo test -p rns-interface --lib --quiet`: 193 passed, 3 ignored;
+`cargo test -p rns-interface sampled_policy_matches_python_152 -- --ignored --nocapture`:
+1 passed. `cargo check --workspace --all-targets`, fmt check и diff check
+успешны; прежние workspace warnings сохраняются.
+
+Далее требуется byte-accounted admission на границе actor→driver, корректное
+освобождение backlog при partial writes/drop/reconnect, подключение gate и
+drop counters. Ограничивать только encoded batch writer было бы неполным
+учётом: клиент сейчас имеет также внешнюю и forwarding mpsc queues.

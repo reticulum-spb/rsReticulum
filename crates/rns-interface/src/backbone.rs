@@ -167,7 +167,7 @@ const TX_COALESCE_TARGET: usize = 65536;
 const TX_COALESCE_FRAMES: usize = 64;
 // Python 1.5.2 DP_EC_DEAD_TIME. Only pending socket output is timed,
 // never an idle connection waiting for the next application frame.
-const TX_DEAD_TIME: Duration = Duration::from_secs(12);
+const TX_DEAD_TIME: Duration = crate::backbone_flow::DEAD_TIME;
 
 #[cfg(test)]
 #[path = "backbone_tx_tests.rs"]
