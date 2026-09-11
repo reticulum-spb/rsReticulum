@@ -1771,3 +1771,42 @@ runtime client-only tests checks успешны. Прежние warnings сох�
 Python Backbone/HDLC source сверены статически. I2P использует отдельный
 read_watchdog с FLAG FLAG probes и process_incoming guard для empty payload;
 его watchdog/liveness parity этим изменением не заявляется. Этап 5 открыт.
+
+### Этап 5 — I2P empty probes и read watchdog
+
+Подключены ранее неиспользуемые I2P liveness timings: tick 1 s, probe после
+строго >10 s без завершённой data-записи, stale после >20 s без чтения,
+закрытие после >110 s. Любые прочитанные байты, включая пустые HDLC probes,
+обновляют receive timestamp. Как Python, probes FLAG FLAG не обновляют
+last_write и data TX totals: после idle threshold повторяются каждый tick
+до следующей data-записи. Пустые frames по-прежнему не доходят до transport.
+Stale/active пока только debug log, не поле diagnostics/RPC/UI.
+
+Общий i2p_connection используется инициатором и accepted peers. Reader,
+serialized writer и watchdog — scoped futures: EOF, writer error, timeout
+или abort закрывают остальные операции и сбрасывают online. Это исправляет
+прежние независимые writer tasks: ошибка записи могла оставить reader ждать,
+а server writer мог пережить reader. Client forwarding тоже scoped и отменяется
+вместе с connection; после завершения действует прежний reconnect pacer.
+Server accepted peer завершает task; существующая схема регистрации не менялась.
+
+Rust adaptations: monotonic Tokio time и skip missed ticks; probe ждёт
+завершения текущего кадра вместо конкурентной записи в сокет. Watchdog работает
+независимо от блокировки transport admission/socket write. При длительно полной
+очереди чтение не продвигается и timeout может закрыть соединение с unread
+kernel bytes — это не признак подтверждённой смерти удалённого узла.
+Нет отдельного write deadline при продолжающемся RX. RX totals сохраняют
+physical bytes; TX теперь учитывает завершённые framed data writes, не попытки,
+но partial bytes до ошибки не учитываются. Полная унификация counters впереди.
+
+Шесть новых tests на in-memory duplex и виртуальном времени: строгие 110/111 s
+и renewal, период probes и reset после data TX, empty prefetched/fragmented
+probes без transport delivery, timeout при одновременно blocked admission
+и writer, abort teardown, writer failure при idle reader. Это не проверка
+реальной I2P сети, SAM handshake/reconnect integration или полного Python oracle;
+Python read_watchdog/process_incoming сверены статически с локальным эталоном.
+
+Проверки: interface lib — 219 passed, 5 ignored. Workspace all-targets и
+runtime client-only tests checks успешны; прежние warnings сохраняются.
+Этап 5 остаётся открытым: capabilities/Link clamp, shared_medium, полная
+диагностика и multi-peer нагрузочные сравнения не завершены. Версия прежняя.

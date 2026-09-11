@@ -467,6 +467,26 @@ At least one of `listen_port` and `forward_port` is required.
 | `sam_host` | string | `127.0.0.1` | SAM API host. |
 | `sam_port` | integer | `7656` | SAM API port, `1..=65535`. |
 
+Connected I2P streams use a one-second liveness tick. After more than 10 seconds
+without a completed data write, the serialized writer sends an empty HDLC
+probe (`7E 7E`) each tick until another data write completes. Probes do not
+advance the data-write timestamp or TX totals. Any received bytes, including
+empty probes, refresh receive liveness; empty frames never reach transport.
+After more than 20 seconds without received bytes, stale/active transitions
+are debug-logged; after more than 110 seconds the watchdog closes the stream.
+These states are not yet exposed through RPC/UI. The client uses its existing
+reconnect policy; accepted peers terminate their connection task.
+
+Reader, writer and watchdog share one connection lifetime: EOF, write failure,
+read timeout or task cancellation drops the other operations and marks it
+offline, including blocked transport admission. Probes cannot interleave with
+an in-progress frame, so blocked writes can delay probes. A full transport
+queue also stops socket reads; if it remains blocked for the receive timeout,
+the connection closes even when unread bytes remain in the kernel.
+I2P RX totals still count physical bytes; TX counts completed framed data writes
+(not probes or a partial write that subsequently fails). No external I2P/SAM
+interoperability or complete diagnostics parity is implied by these checks.
+
 ## `type: pipe`
 
 | Field | Type | Default | Constraints |
@@ -501,7 +521,7 @@ before transport admission and dataplane ingress packet accounting, matching
 Python's strict `frame_len > HEADER_MINSIZE` check before IFAC removal. Physical
 RX bytes still include these frames; short-frame drops are debug-logged and do
 not reach actor violation counters. This is not header or IFAC authentication.
-I2P keepalive/watchdog parity is a separate, unfinished task.
+I2P uses its separate empty-frame keepalive and watchdog described above.
 
 TX combines already queued HDLC frames into encoded batches of at most 64 KiB,
 processing at most 64 frames per batch. It does not wait for more traffic to

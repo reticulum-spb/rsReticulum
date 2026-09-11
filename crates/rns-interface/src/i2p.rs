@@ -510,44 +510,33 @@ pub async fn spawn_i2p_client(
             let buffered = stream_buf_reader.buffer().to_vec();
             let raw_reader = stream_buf_reader.into_inner();
 
-            let (conn_tx, mut conn_rx) = mpsc::channel::<Bytes>(256);
-            let online_w = online_task.clone();
-            let txb_w = task_txb.clone();
-            let write_handle = tokio::spawn(async move {
-                while let Some(data) = conn_rx.recv().await {
-                    if !online_w.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let framed = hdlc::frame(&data);
-                    txb_w.fetch_add(framed.len() as u64, Ordering::Relaxed);
-                    if let Err(e) = stream_writer.write_all(&framed).await {
-                        tracing::warn!(error = %e, "I2P client: write error");
-                        break;
-                    }
-                }
-                online_w.store(false, Ordering::SeqCst);
-            });
-
+            let (conn_tx, conn_rx) = mpsc::channel::<Bytes>(256);
             let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
+            let forwarding = async move {
                 let mut guard = rx_ref.lock().await;
                 while let Some(data) = guard.recv().await {
                     if conn_tx.send(data).await.is_err() {
                         break;
                     }
                 }
-            });
-
-            let online_r = online_task.clone();
-            let rxb_r = task_rxb.clone();
-            i2p_read_loop(raw_reader, &buffered, id, &transport_tx, &online_r, &rxb_r).await;
-
-            online_task.store(false, Ordering::SeqCst);
-
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
-            write_handle.abort();
-            let _ = write_handle.await;
+            };
+            let connection = i2p_connection(
+                raw_reader,
+                stream_writer,
+                &buffered,
+                id,
+                &transport_tx,
+                &online_task,
+                &task_rxb,
+                &task_txb,
+                conn_rx,
+            );
+            tokio::pin!(connection);
+            // Both futures are scoped to this connection, including cancellation.
+            tokio::select! {
+                _ = &mut connection => {},
+                _ = forwarding => { connection.await; },
+            }
 
             if pacer.give_up() {
                 tracing::warn!(name = %config.name, "I2P client: max reconnect tries reached");
@@ -741,33 +730,22 @@ pub async fn spawn_i2p_server_with_id(
                 let c_txb = Arc::new(AtomicU64::new(0));
                 let (c_tx, c_rx) = mpsc::channel::<Bytes>(256);
 
-                let c_online_w = c_online.clone();
-                let c_txb_w = c_txb.clone();
-                tokio::spawn(async move {
-                    let mut rx = c_rx;
-                    while let Some(data) = rx.recv().await {
-                        let framed = hdlc::frame(&data);
-                        c_txb_w.fetch_add(framed.len() as u64, Ordering::Relaxed);
-                        if let Err(e) = accept_writer.write_all(&framed).await {
-                            tracing::warn!(error = %e, "I2P server peer: write error");
-                            break;
-                        }
-                    }
-                    c_online_w.store(false, Ordering::SeqCst);
-                });
-
                 let c_online_r = c_online.clone();
                 let c_rxb_r = c_rxb.clone();
+                let c_txb_w = c_txb.clone();
                 let transport_tx2 = transport_tx.clone();
                 let peer_name = client_name.clone();
                 let c_read_task = tokio::spawn(async move {
-                    i2p_read_loop(
+                    i2p_connection(
                         raw_reader,
+                        accept_writer,
                         &buffered,
                         client_id,
                         &transport_tx2,
                         &c_online_r,
                         &c_rxb_r,
+                        &c_txb_w,
+                        c_rx,
                     )
                     .await;
                     tracing::info!(name = %peer_name, "I2P server: peer disconnected");
@@ -833,22 +811,110 @@ pub async fn spawn_i2p_server_with_id(
     })
 }
 
-/// HDLC read loop.
-///
-/// `initial_data` seeds the deframer with bytes the `BufReader` prefetched
-/// past the SAM handshake replies before the raw reader was taken.
-async fn i2p_read_loop(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
+// Shared receive timestamp lets watchdog teardown run even while transport
+// admission or socket output is blocked. Any received byte renews liveness.
+type LastRead = std::sync::Mutex<tokio::time::Instant>;
+
+async fn i2p_watchdog(last_read: &LastRead, interface_id: InterfaceId) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+    let mut stale = false;
+    loop {
+        tick.tick().await;
+        let elapsed = last_read.lock().unwrap().elapsed();
+        let next_stale = elapsed > std::time::Duration::from_secs(I2P_PROBE_AFTER * 2);
+        if next_stale != stale {
+            stale = next_stale;
+            tracing::debug!(interface_id, stale, "I2P tunnel liveness changed");
+        }
+        if elapsed > std::time::Duration::from_secs(I2P_READ_TIMEOUT) {
+            tracing::warn!(interface_id, "I2P read watchdog expired");
+            return;
+        }
+    }
+}
+
+async fn i2p_write_loop<W: tokio::io::AsyncWrite + Unpin>(
+    mut writer: W,
+    mut rx: mpsc::Receiver<Bytes>,
+    txb: &AtomicU64,
+) -> std::io::Result<()> {
+    let mut last_write = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            data = rx.recv() => {
+                let Some(data) = data else { return Ok(()) };
+                let framed = hdlc::frame(&data);
+                writer.write_all(&framed).await?;
+                txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
+                last_write = tokio::time::Instant::now();
+            }
+            _ = tick.tick() => {
+                if last_write.elapsed() > std::time::Duration::from_secs(I2P_PROBE_AFTER) {
+                    writer.write_all(&[hdlc::FLAG, hdlc::FLAG]).await?;
+                    // Python probes do not advance last_write or data TX totals:
+                    // once idle >10s, probe once per watchdog tick until data TX.
+                }
+            }
+        }
+    }
+}
+
+async fn i2p_connection<R, W>(
+    reader: R,
+    writer: W,
     initial_data: &[u8],
     interface_id: InterfaceId,
     transport_tx: &mpsc::Sender<TransportMessage>,
     online: &AtomicBool,
     rxb: &AtomicU64,
+    txb: &AtomicU64,
+    rx: mpsc::Receiver<Bytes>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    struct OfflineOnDrop<'a>(&'a AtomicBool);
+    impl Drop for OfflineOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _offline = OfflineOnDrop(online);
+    let last_read = LastRead::new(tokio::time::Instant::now());
+    tokio::select! {
+        _ = i2p_read_loop(reader, initial_data, interface_id, transport_tx, online, rxb, &last_read) => {},
+        result = i2p_write_loop(writer, rx, txb) => {
+            if let Err(error) = result {
+                tracing::warn!(interface_id, %error, "I2P write failed");
+            }
+        },
+        _ = i2p_watchdog(&last_read, interface_id) => {},
+    }
+}
+
+/// HDLC read loop.
+///
+/// `initial_data` seeds the deframer with bytes the `BufReader` prefetched
+/// past the SAM handshake replies before the raw reader was taken.
+async fn i2p_read_loop<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    initial_data: &[u8],
+    interface_id: InterfaceId,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    online: &AtomicBool,
+    rxb: &AtomicU64,
+    last_read: &LastRead,
 ) {
     let mut deframer = hdlc::HdlcDeframer::new();
     let mut buf = [0u8; 4096];
 
     if !initial_data.is_empty() {
+        *last_read.lock().unwrap() = tokio::time::Instant::now();
         rxb.fetch_add(initial_data.len() as u64, Ordering::Relaxed);
         for frame in deframer.feed(initial_data) {
             if frame.is_empty() {
@@ -876,6 +942,7 @@ async fn i2p_read_loop(
                 break;
             }
             Ok(n) => {
+                *last_read.lock().unwrap() = tokio::time::Instant::now();
                 rxb.fetch_add(n as u64, Ordering::Relaxed);
                 for frame in deframer.feed(&buf[..n]) {
                     if frame.is_empty() {
@@ -951,6 +1018,10 @@ impl ReconnectPacer {
         self.backoff = self.initial;
     }
 }
+
+#[cfg(test)]
+#[path = "i2p_liveness_tests.rs"]
+mod liveness_tests;
 
 #[cfg(test)]
 mod tests {
