@@ -1878,7 +1878,10 @@ pub fn interface_from_normalized_section(
             fast_flapping_threshold: v.fast_flap.threshold_secs,
             fast_flapping_grace: v.fast_flap.grace,
             fast_flapping_block_time: v.fast_flap.block_time_secs / 60.0,
-            common,
+            common: InterfaceCommonConfig {
+                bitrate: v.bitrate.or(common.bitrate),
+                ..common
+            },
             listen_on: v.listen_on,
             target_host: v.target_host,
             port: v.port,

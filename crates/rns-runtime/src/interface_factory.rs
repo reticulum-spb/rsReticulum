@@ -234,6 +234,8 @@ pub struct AX25KISSInterfaceConfig {
 /// `TCP_USER_TIMEOUT` tuning matches Python `set_timeouts_linux()`.
 #[derive(Debug, Clone)]
 pub struct BackboneInterfaceConfig {
+    /// Passed to the driver before listener children can be accepted.
+    pub bitrate: Option<u64>,
     pub fast_flap: rns_interface::backbone_flap::FastFlapConfig,
     pub name: String,
     pub listen_on: Option<String>,
@@ -1196,6 +1198,7 @@ fn synthesize_backbone(
     let i2p_tunneled = section.get_bool("i2p_tunneled").unwrap_or(false);
 
     Ok(InterfaceConfig::Backbone(BackboneInterfaceConfig {
+        bitrate: section.get_uint("bitrate"),
         fast_flap: {
             let config = rns_interface::backbone_flap::FastFlapConfig {
                 enabled: section.get_bool("block_fast_flapping").unwrap_or(true),
@@ -2370,6 +2373,37 @@ mod tests {
                 assert!(c.listen_on.is_none());
             }
             _ => panic!("expected Backbone"),
+        }
+    }
+
+    #[test]
+    fn backbone_bitrate_is_available_before_driver_spawn() {
+        for client in [false, true] {
+            let mut section = NormalizedSection::new();
+            section.set("type", "BackboneInterface");
+            section.set("port", "4242");
+            section.set("bitrate", "200000000");
+            if client {
+                section.set("target_host", "127.0.0.1");
+            } else {
+                section.set("listen_ip", "127.0.0.1");
+            }
+            let InterfaceConfig::Backbone(config) =
+                synthesize_interface("bitrate", &section).unwrap()
+            else {
+                panic!("Backbone config")
+            };
+            assert_eq!(config.bitrate, Some(200_000_000));
+            assert_eq!(
+                InterfacePostInit::from_section(&section).bitrate,
+                config.bitrate
+            );
+            #[cfg(feature = "api")]
+            {
+                let yaml =
+                    crate::config::interface_from_normalized_section("bitrate", &section).unwrap();
+                assert_eq!(yaml.common().bitrate, Some(200_000_000));
+            }
         }
     }
 

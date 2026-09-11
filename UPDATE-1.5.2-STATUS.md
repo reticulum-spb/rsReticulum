@@ -1644,3 +1644,36 @@ IFAC allowance и transport capability/Link clamp ещё требуют отде
 Workspace all-targets, runtime client-only tests check и fmt/diff checks
 успешны; прежние warnings сохраняются. Полный interface suite выполнен с
 loopback-разрешением.
+
+### Этап 5 — bitrate/MTU listener и дочерних Backbone peers
+
+Listener default bitrate приведён к Python 1.5.2: 100 Mbit/s вместо 1 Gbit/s.
+В driver configs listener/client добавлен bitrate; MTU вычисляется перед
+spawn из исправленной общей таблицы. Parent handle теперь сообщает этот MTU
+(по умолчанию 32768 вместо прежних 500). Accepted child копирует bitrate и
+вычисленный MTU listener, вместо независимой постоянной оценки. Клиент тоже
+вычисляет handle MTU по настроенному bitrate до подключения.
+
+Общий YAML bitrate сохраняется в BackboneInterfaceConfig фабрики и передаётся
+driver config до spawn. Прежде post_init менял только bitrate actor entry,
+не влияя на driver MTU и детей listener. Обратное typed YAML-преобразование
+сохраняет bitrate; новых YAML keys не добавлено. Rust struct literals новых
+driver configs должны задавать bitrate; constructors сохраняют defaults.
+
+Loopback test проверяет parent/child пары на 62500, 100M, 200M и 1G bit/s,
+включая точные равенства MTU. Отдельный client test проверяет 200 Mbit/s →
+65536 bytes в handle до завершения connect. Factory test сверяет driver
+bitrate с post_init в client/listener режимах и typed YAML преобразование.
+
+Границы изменения: ниже 62500 bit/s сохранён Rust fallback 500, поскольку
+handle.mtu не nullable; явный bitrate=0 также остаётся Rust explicit value,
+а не Python truthy-config fallback. Административные runtime helpers без
+bitrate-параметра используют default. HW_MTU constant — ceiling, не фактический
+MTU каждого handle. Deframer receive limits/IFAC allowance не менялись,
+shared_medium/capabilities и Link clamp ещё не завершены. Версия прежняя.
+
+Проверки: interface lib — 208 passed, 4 ignored; runtime API lib — 237 passed,
+5 ignored. Workspace all-targets и runtime client-only tests checks успешны;
+fmt/diff checks успешны после форматирования. В новом YAML assertion исправлен
+путь модуля: файл yaml_config.rs экспортируется как crate::config.
+Прежние warnings сохраняются; сетевые tests выполнены с loopback-разрешением.

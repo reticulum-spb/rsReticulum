@@ -5,6 +5,58 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
 #[tokio::test]
+async fn listener_children_inherit_configured_bitrate_and_mtu() {
+    for bitrate in [62_500, 100_000_000, 200_000_000, 1_000_000_000] {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut config = BackboneServerConfig::new("mtu-parent", "127.0.0.1", port);
+        config.bitrate = bitrate;
+        config.fast_flap.enabled = false;
+        let (tx, mut events) = mpsc::channel(8);
+        let (handles_tx, mut handles) = mpsc::channel(8);
+        let parent = spawn_backbone_server(config, 1, Arc::new(AtomicU64::new(2)), tx, handles_tx)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let child = handles.recv().await.unwrap();
+            assert_eq!(parent.bitrate, bitrate);
+            assert_eq!(parent.mtu, mtu_for_bitrate(bitrate));
+            assert_eq!((child.bitrate, child.mtu), (parent.bitrate, parent.mtu));
+            assert_eq!(child.parent_id, Some(parent.id));
+            drop(peer);
+            assert!(matches!(
+                events.recv().await,
+                Some(TransportMessage::DeregisterInterface { id: 2 })
+            ));
+            child.read_task.await.unwrap();
+        })
+        .await;
+        parent.read_task.abort();
+        let _ = parent.read_task.await;
+        result.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn client_metadata_uses_configured_bitrate_before_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = BackboneClientConfig::new(
+        "mtu-client",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    config.bitrate = 200_000_000;
+    config.max_reconnect_tries = Some(1);
+    let (tx, _events) = mpsc::channel(8);
+    let handle = spawn_backbone_client(config, 1, tx).await.unwrap();
+    assert_eq!((handle.bitrate, handle.mtu), (200_000_000, 65_536));
+    handle.read_task.abort();
+    let _ = handle.read_task.await;
+}
+
+#[tokio::test]
 async fn full_transport_fin_and_reset_cancel_unsent_frame() {
     for reset in [false, true] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

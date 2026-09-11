@@ -25,11 +25,12 @@ use rns_transport::backbone_ingress::{IngressControl, RECEIVE_BUFFER};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 use rns_transport::tx_queue::{OutboundFrame, TxAccounting, TxLease, byte_channel};
 
-/// 1 MiB MTU — also the SO_RCVBUF/SNDBUF target (kernel clamps).
+/// Absolute Backbone MTU ceiling and SO_SNDBUF target (kernel clamps).
+/// Actual handle MTU follows bitrate; SO_RCVBUF uses dataplane ingress tuning.
 pub const HW_MTU: u32 = 1_048_576;
 
 /// Listener-side bitrate guess advertised on the parent handle.
-pub const BITRATE_GUESS: u64 = 1_000_000_000;
+pub const BITRATE_GUESS: u64 = 100_000_000;
 
 /// Per-peer guess (100 Mbps) — drives [`crate::traits::optimise_mtu`] → 32 KiB MTU.
 pub const CHILD_BITRATE_GUESS: u64 = 100_000_000;
@@ -47,6 +48,7 @@ const TX_CHANNEL_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct BackboneServerConfig {
+    pub bitrate: u64,
     pub fast_flap: FastFlapConfig,
     /// None selects Python-compatible process-wide IP history.
     pub fast_flap_table: Option<Arc<FastFlapTable>>,
@@ -62,6 +64,7 @@ pub struct BackboneServerConfig {
 impl BackboneServerConfig {
     pub fn new(name: &str, ip: &str, port: u16) -> Self {
         Self {
+            bitrate: BITRATE_GUESS,
             fast_flap: FastFlapConfig::default(),
             fast_flap_table: None,
             name: name.to_string(),
@@ -76,6 +79,7 @@ impl BackboneServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct BackboneClientConfig {
+    pub bitrate: u64,
     pub name: String,
     pub target_host: String,
     pub target_port: u16,
@@ -88,6 +92,7 @@ pub struct BackboneClientConfig {
 impl BackboneClientConfig {
     pub fn new(name: &str, host: &str, port: u16) -> Self {
         Self {
+            bitrate: CHILD_BITRATE_GUESS,
             name: name.to_string(),
             target_host: host.to_string(),
             target_port: port,
@@ -116,8 +121,8 @@ fn tune_stream(stream: &TcpStream) {
     let _ = socket2::SockRef::from(stream).set_recv_buffer_size(RECEIVE_BUFFER);
 }
 
-fn child_mtu() -> u32 {
-    crate::traits::optimise_mtu(CHILD_BITRATE_GUESS)
+fn mtu_for_bitrate(bitrate: u64) -> u32 {
+    crate::traits::optimise_mtu(bitrate)
         .map(|m| m.min(HW_MTU))
         .unwrap_or(rns_wire::constants::MTU as u32)
 }
@@ -522,6 +527,8 @@ pub async fn spawn_backbone_server(
     let online2 = online.clone();
     let name = config.name.clone();
     let mode = config.mode;
+    let bitrate = config.bitrate;
+    let mtu = mtu_for_bitrate(bitrate);
 
     // Parent listener is inbound-only; drain task warns on stray writes.
     let (tx, mut listener_rx) = mpsc::channel::<Bytes>(1);
@@ -606,8 +613,8 @@ pub async fn spawn_backbone_server(
                             forward: false,
                             repeat: false,
                         },
-                        bitrate: CHILD_BITRATE_GUESS,
-                        mtu: child_mtu(),
+                        bitrate,
+                        mtu,
                         online: c_online,
                         rxb: Some(c_rxb),
                         txb: Some(c_txb),
@@ -640,8 +647,8 @@ pub async fn spawn_backbone_server(
             forward: false,
             repeat: false,
         },
-        bitrate: BITRATE_GUESS,
-        mtu: rns_wire::constants::MTU as u32,
+        bitrate,
+        mtu,
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
@@ -674,6 +681,8 @@ pub async fn spawn_backbone_client(
     let name = config.name.clone();
     let mode = config.mode;
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let bitrate = config.bitrate;
+    let mtu = mtu_for_bitrate(bitrate);
 
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
@@ -842,8 +851,8 @@ pub async fn spawn_backbone_client(
             forward: false,
             repeat: false,
         },
-        bitrate: CHILD_BITRATE_GUESS,
-        mtu: child_mtu(),
+        bitrate,
+        mtu,
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
@@ -952,7 +961,7 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(HW_MTU, 1_048_576);
-        assert_eq!(BITRATE_GUESS, 1_000_000_000);
+        assert_eq!(BITRATE_GUESS, 100_000_000);
         assert_eq!(CHILD_BITRATE_GUESS, 100_000_000);
         assert_eq!(RECONNECT_WAIT, 5);
     }
@@ -985,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_child_mtu_uses_100mbps_curve() {
-        let mtu = child_mtu();
+        let mtu = mtu_for_bitrate(CHILD_BITRATE_GUESS);
         assert_eq!(mtu, 32_768);
         assert!(mtu <= HW_MTU);
         assert!(mtu >= rns_wire::constants::MTU as u32 / 2);

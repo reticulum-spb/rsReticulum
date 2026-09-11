@@ -4326,6 +4326,9 @@ async fn spawn_interface(
             if let Some(host) = c.target_host.as_deref() {
                 let mut config =
                     rns_interface::backbone::BackboneClientConfig::new(&c.name, host, c.port);
+                if let Some(bitrate) = c.bitrate {
+                    config.bitrate = bitrate;
+                }
                 config.mode = c.mode;
                 config.prefer_ipv6 = c.prefer_ipv6;
                 config.connect_timeout_secs = c.connect_timeout;
@@ -4338,6 +4341,9 @@ async fn spawn_interface(
                 let listen_ip = c.listen_on.as_deref().unwrap_or("0.0.0.0");
                 let mut config =
                     rns_interface::backbone::BackboneServerConfig::new(&c.name, listen_ip, c.port);
+                if let Some(bitrate) = c.bitrate {
+                    config.bitrate = bitrate;
+                }
                 config.fast_flap = c.fast_flap.clone();
                 config.mode = c.mode;
                 config.prefer_ipv6 = c.prefer_ipv6;
