@@ -679,6 +679,17 @@ driver baseline, not a before/after speedup comparison, production capacity
 estimate or transport-actor ingress/fairness benchmark; build profile, kernel
 buffers and host scheduling affect the results.
 
+`cargo test -p rns-runtime --test backbone_ingress_load -- --nocapture` covers
+the actor-facing path separately in `full` builds (Backbone is not part of
+client-only builds). Two real Backbone TCP peers send 4096 unique
+256-byte packets each, filling the raw ingress channel before the actor starts.
+With four slots per admitted traffic class, the test reconciles all 8192 DATA
+packets as application deliveries or queue drops, checks per-peer order and
+control-query responsiveness, then verifies fresh deliveries on both sockets.
+Only DATA drops are expected; the application delivery channel is sized to avoid
+adding unrelated application drops. This bounded burst is not a fairness or
+throughput benchmark, and does not require a particular adaptive-gate timing.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |

@@ -2337,3 +2337,36 @@ Python-эталон ea98db4f не изменён.
 Остаются сопоставимый baseline старой реализации, расширенная конкуренция
 peers через actor/ingress, peak/RSS измерения и прочие незавершённые сценарии
 этапа 5. Этап открыт, версия остаётся 1.0.1.
+
+### Продолжение этапа 5: два Backbone peers через входные очереди actor
+
+Добавлен full-only integration test `backbone_ingress_load` с двумя настоящими
+BackboneClient TCP drivers. Два peers отправляют по4096 уникальных DATA-пакетов
+по256 bytes; actor запускается после заполнения raw ingress channel, то есть
+начальное давление возникает от драйверов, не от синтетических actor messages.
+Admitted queues имеют по4 слота, application delivery channel вмещает весь
+ограниченный burst и не добавляет свои drops.
+
+Тест сверяет доставку+DATA queue drops=8192, отсутствие drops других классов,
+целостность содержимого и возрастающий sequence отдельно для каждого peer.
+Оба peers должны продвинуться. Параллельные GetInboundQueueStats ограничены
+deadline1s, включая admission в control channel; наблюдаемые heights<=capacities.
+После разгрузки два последовательных marker-пакета проходят по прежним TCP
+соединениям без новых drops. Shutdown actor завершает тест; общий deadline45s
+оставляет время для policy hold/release, task guard отменяет фоновые задачи.
+Конкретное срабатывание adaptive gate не является обязательным assertion.
+
+Запуск: `cargo test -p rns-runtime --test backbone_ingress_load -- --nocapture`.
+Повторный default/full прогон: delivered3811+3843, DATA drops538, сумма8192;
+170 control queries, max1.560ms, тест12.30s. Первый прогон: delivered3797+3818,
+drops577, max control3.038ms. Разброс drops зависит от Tokio scheduling;
+это проверка учёта/восстановления, не throughput или fairness benchmark.
+
+Backbone отсутствует в client-only, поэтому файл ограничен cfg(full).
+Client-only tests check успешен, workspace all-targets check успешен;
+transport lib — 460 passed, 4 ignored; fmt/diff checks чистые. Прежние warnings
+без изменений. Эталон Python ea98db4f не изменён.
+
+Расширена проверка actor/ingress под конкурентной нагрузкой. Сопоставимый
+before/after baseline, sustained/many-peer fairness и peak/RSS измерения
+по-прежнему остаются; этап 5 открыт, версия 1.0.1.
