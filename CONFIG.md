@@ -665,6 +665,20 @@ and the offline transition. This depends on platform socket
 readiness support and has been verified on Linux loopback. Multi-peer overload
 benchmarks and ingress diagnostics in RPC/UI are still under validation.
 
+An opt-in two-peer Backbone TX measurement is available with
+`cargo test -p rns-interface backbone::tx_tests::measure_two_peer_tcp_isolation_and_recovery -- --ignored --exact --nocapture`.
+Run it alone: one real TCP receiver stops reading until egress gates, while
+another receives 256 x 4096-byte frames without drops. The stopped peer receives
+a burst of 4096 x 16384-byte admission attempts, with excess rejected at the
+bounded TX queue. After reading resumes, all admitted frames must arrive in
+order, the gate must release, and new admission/delivery must work.
+Output reports payload throughput, enqueue-to-receive p50/p99 latency, rejected
+admissions, observed buffered bytes and process-wide Linux RSS checkpoints.
+These checkpoints are neither peak RSS nor a memory bound. This is a current
+driver baseline, not a before/after speedup comparison, production capacity
+estimate or transport-actor ingress/fairness benchmark; build profile, kernel
+buffers and host scheduling affect the results.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |

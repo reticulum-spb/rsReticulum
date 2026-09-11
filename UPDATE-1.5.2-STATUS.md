@@ -2299,3 +2299,41 @@ task guard отменяет actor/driver при выходе/ошибке.
 shared-client session opening, active path requests и сопоставимые измерения
 throughput/latency/drops/RSS остаются. Следующий шаг — конкурирующие peers и
 нагрузочные измерения. Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: два Backbone peers, остановка чтения и замеры TX
+
+Добавлен ignored `backbone::tx_tests::measure_two_peer_tcp_isolation_and_recovery`.
+Два настоящих BackboneClient TCP-соединения в одном Tokio runtime, два worker
+threads. Первый получатель не читает до срабатывания egress gate; второй затем
+принимает 256×4096 байт, пока первый остаётся gated. Для первого — burst4096
+попыток по16384 байт; отклонённые admission считаются drops, не повторяются.
+На каждой попытке проверяется buffered<=4194304; все принятые кадры после
+возобновления чтения должны прийти в исходном порядке без повреждений. После
+drain gate освобождается, новый кадр успешно принимается и доставляется.
+
+Запуск отдельно:
+`cargo test -p rns-interface backbone::tx_tests::measure_two_peer_tcp_isolation_and_recovery -- --ignored --exact --nocapture`.
+Общий deadline20s; ожидание gate6s, fast delivery3s, release3s. TCP receive
+buffer медленного peer сначала4096, при восстановлении запрашивается4MiB.
+SO_* значения ОС может корректировать. Transport actor/ingress под нагрузкой
+в этот сценарий не входят: измеряется драйверный TX и независимость peers.
+
+Два последовательных прогона окончательного теста (debug/test profile,
+rustc1.97.1, Linux6.4.0-150600.23.84-default):
+- fast payload throughput42.684/43.214 MiB/s, p50 enqueue-to-receive
+  10.293/10.056ms, p99 14.029/13.780ms, fast drops0;
+- slow accepted282 из4096, rejected3814; наблюдаемый max buffered
+  4178844/4178845 байт при лимите4194304;
+- slow drain после возобновления чтения2694.257/2786.340ms;
+- process RSS start10632/10500 KiB, gated14856/14724, end15496/15364.
+RSS — отдельные контрольные точки всего тестового процесса, не peak и не
+доказательство ограничения памяти. Это текущая точка отсчёта, не before/after
+ускорение и не оценка production capacity. Задержка включает enqueue и очередь.
+
+Проверки: новый тест повторно успешен; interface lib — 228 passed, 6 ignored;
+workspace all-targets, fmt/diff checks успешны. Прежние warnings сохраняются;
+Python-эталон ea98db4f не изменён.
+
+Остаются сопоставимый baseline старой реализации, расширенная конкуренция
+peers через actor/ingress, peak/RSS измерения и прочие незавершённые сценарии
+этапа 5. Этап открыт, версия остаётся 1.0.1.

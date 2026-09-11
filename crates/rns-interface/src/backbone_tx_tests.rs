@@ -1129,6 +1129,151 @@ async fn compare_coalesced_and_legacy_writes() {
     );
 }
 
+/// Run alone with --ignored --exact --nocapture for meaningful process RSS.
+/// This measures the current driver; it is not a historical before/after result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local two-peer TCP load measurement; holds one reader until egress gates"]
+async fn measure_two_peer_tcp_isolation_and_recovery() {
+    struct Tasks(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for Tasks {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    fn rss_kib() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+    async fn drain(
+        peer: &mut TcpStream,
+        sequences: &[u64],
+        size: usize,
+        origin: std::time::Instant,
+    ) -> Vec<u128> {
+        let mut decoder = hdlc::HdlcDeframer::with_max_decoded_size(size);
+        let mut received = 0;
+        let mut latency = Vec::with_capacity(sequences.len());
+        let mut buffer = [0; 65536];
+        while received < sequences.len() {
+            let count = peer.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0, "peer closed before accepted frames drained");
+            for frame in decoder.feed(&buffer[..count]) {
+                assert!(received < sequences.len(), "unexpected extra frame");
+                assert_eq!(frame.len(), size);
+                assert_eq!(
+                    u64::from_be_bytes(frame[..8].try_into().unwrap()),
+                    sequences[received]
+                );
+                assert!(frame[16..].iter().all(|byte| *byte == 0x55));
+                let sent_ns = u64::from_be_bytes(frame[8..16].try_into().unwrap());
+                latency.push(
+                    origin
+                        .elapsed()
+                        .as_nanos()
+                        .saturating_sub(u128::from(sent_ns)),
+                );
+                received += 1;
+            }
+        }
+        latency
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut tasks = Tasks(Vec::new());
+        let mut handles = Vec::new();
+        let mut peers = Vec::new();
+        let (transport_tx, _events) = mpsc::channel(16);
+        for id in 1..=2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = BackboneClientConfig::new("two-peer-load", "127.0.0.1", listener.local_addr().unwrap().port());
+            config.max_reconnect_tries = Some(1);
+            config.receive_ifac_size = Some(0);
+            let handle = spawn_backbone_client(config, id, transport_tx.clone()).await.unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            while !handle.online.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+            tasks.0.push(handle.read_task);
+            handles.push((handle.tx, handle.online));
+            peers.push(peer);
+        }
+        let mut slow = peers.remove(0);
+        let mut fast = peers.remove(0);
+        socket2::SockRef::from(&slow).set_recv_buffer_size(4096).unwrap();
+        let slow_accounting = handles[0].0.accounting().unwrap();
+        let fast_accounting = handles[1].0.accounting().unwrap();
+        let origin = std::time::Instant::now();
+        let rss_start = rss_kib();
+        let mut accepted = Vec::new();
+        let mut rejected = 0u64;
+        let mut high_buffered = 0;
+        const SLOW_SIZE: usize = 16384;
+        const ATTEMPTS: u64 = 4096;
+        for sequence in 0..ATTEMPTS {
+            let mut payload = vec![0x55; SLOW_SIZE];
+            payload[..8].copy_from_slice(&sequence.to_be_bytes());
+            payload[8..16].copy_from_slice(&(origin.elapsed().as_nanos() as u64).to_be_bytes());
+            match handles[0].0.try_send(payload.into()) {
+                Ok(()) => accepted.push(sequence),
+                Err(mpsc::error::TrySendError::Full(_)) => rejected += 1,
+                Err(error) => panic!("slow peer disconnected: {error}"),
+            }
+            let snapshot = slow_accounting.snapshot();
+            high_buffered = high_buffered.max(snapshot.buffered);
+            assert!(snapshot.buffered <= HIGH_WATERMARK);
+        }
+        assert!(rejected > 0 && !accepted.is_empty());
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while !slow_accounting.snapshot().gated {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("stopped reader did not trigger egress gate");
+        assert!(slow_accounting.snapshot().buffered > 0);
+        let rss_gated = rss_kib();
+        const FAST_SIZE: usize = 4096;
+        const FAST_COUNT: u64 = 256;
+        let fast_start = std::time::Instant::now();
+        for sequence in 0..FAST_COUNT {
+            let mut payload = vec![0x55; FAST_SIZE];
+            payload[..8].copy_from_slice(&sequence.to_be_bytes());
+            payload[8..16].copy_from_slice(&(origin.elapsed().as_nanos() as u64).to_be_bytes());
+            handles[1].0.try_send(payload.into()).unwrap();
+        }
+        let mut latency = tokio::time::timeout(Duration::from_secs(3),
+            drain(&mut fast, &(0..FAST_COUNT).collect::<Vec<_>>(), FAST_SIZE, origin)).await.unwrap();
+        let fast_elapsed = fast_start.elapsed();
+        assert!(slow_accounting.snapshot().gated, "slow peer remains unread");
+        assert_eq!(fast_accounting.snapshot().dropped_frames, 0);
+        assert!(handles.iter().all(|(_, online)| online.load(Ordering::SeqCst)));
+        // Resume the slow peer and require every admitted frame, in order.
+        socket2::SockRef::from(&slow).set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+        let recovery_start = std::time::Instant::now();
+        let slow_latency = drain(&mut slow, &accepted, SLOW_SIZE, origin).await;
+        let recovery = recovery_start.elapsed();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while slow_accounting.snapshot().gated || slow_accounting.snapshot().buffered != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("egress gate did not release after drain");
+        let slow_snapshot = slow_accounting.snapshot();
+        assert_eq!(slow_snapshot.dropped_frames, rejected);
+        assert_eq!(accepted.len() as u64 + rejected, ATTEMPTS);
+        let mut probe = vec![0x55; SLOW_SIZE];
+        probe[..8].copy_from_slice(&ATTEMPTS.to_be_bytes());
+        probe[8..16].copy_from_slice(&(origin.elapsed().as_nanos() as u64).to_be_bytes());
+        handles[0].0.try_send(probe.into()).expect("admission must resume after gate release");
+        drain(&mut slow, &[ATTEMPTS], SLOW_SIZE, origin).await;
+        assert_eq!(slow_accounting.snapshot().dropped_frames, rejected);
+        latency.sort_unstable();
+        eprintln!("two_peer_tcp: slow_attempts={ATTEMPTS} slow_accepted={} slow_dropped={rejected} slow_high_buffered={high_buffered} limit={HIGH_WATERMARK} slow_recovery_ms={:.3} slow_max_latency_ms={:.3} fast_frames={FAST_COUNT} fast_payload_MiB_s={:.3} fast_p50_ms={:.3} fast_p99_ms={:.3} fast_dropped=0 rss_start_kib={rss_start:?} rss_gated_kib={rss_gated:?} rss_end_kib={:?}; RSS checkpoints are process-wide, not peak or a memory bound", accepted.len(), recovery.as_secs_f64()*1000.0, *slow_latency.iter().max().unwrap() as f64/1e6, (FAST_COUNT as f64*FAST_SIZE as f64/1048576.0)/fast_elapsed.as_secs_f64(), latency[latency.len()/2] as f64/1e6, latency[(latency.len()-1)*99/100] as f64/1e6, rss_kib());
+    }).await.expect("two-peer load test timed out");
+}
+
 #[tokio::test]
 async fn partial_writes_errors_and_zero_count_only_accepted_bytes() {
     for zero in [false, true] {
