@@ -242,6 +242,156 @@ async fn repeated_pressure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "independent asymmetric Backbone streams; backpressure can extend runtime"]
+async fn asymmetric_backbone_streams_accounting_and_recovery() {
+    timeout(Duration::from_secs(120), asymmetric_streams())
+        .await
+        .expect("asymmetric Backbone load timed out");
+}
+
+async fn asymmetric_streams() {
+    const BATCHES: u64 = 500;
+    const SIZES: [u64; 4] = [64, 16, 4, 1];
+    const TOTAL: u64 = BATCHES * (64 + 16 + 4 + 1);
+    let dest = [0xCD; 16];
+    let (mut actor, input, control) = TransportActor::new_with_control_channel_and_queue_limits(
+        InboundQueueLimits::new([4; 4]).unwrap(),
+    );
+    // The fixture cannot add application-channel loss even if delivery reading
+    // pauses during a control query. This is a finite workload, not unbounded RAM.
+    let (delivery_tx, mut deliveries) = mpsc::channel(TOTAL as usize + SIZES.len());
+    actor.local_destinations.insert(dest);
+    actor.destination_channels.insert(dest, delivery_tx);
+    let mut tasks = Tasks(Vec::new());
+    let mut sockets = Vec::new();
+    for id in 1..=SIZES.len() as u64 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = BackboneClientConfig::new(
+            "asymmetric-ingress",
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+        );
+        config.receive_ifac_size = Some(0);
+        config.max_reconnect_tries = Some(1);
+        let handle = spawn_backbone_client(config, id, input.clone())
+            .await
+            .unwrap();
+        tasks.0.push(handle.read_task);
+        sockets.push(listener.accept().await.unwrap().0);
+        let mut entry = InterfaceEntry::new(
+            handle.name,
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            handle.bitrate,
+            handle.mtu,
+            handle.tx,
+        );
+        entry.online = Some(handle.online);
+        entry.diagnostics = handle.diagnostics;
+        actor.interfaces.insert(id, entry);
+    }
+    tasks.0.push(tokio::spawn(actor.run()));
+    let started = std::time::Instant::now();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(SIZES.len()));
+    let mut producers = tokio::task::JoinSet::new();
+    for (index, mut socket) in sockets.into_iter().enumerate() {
+        let barrier = barrier.clone();
+        producers.spawn(async move {
+            barrier.wait().await;
+            let mut timer = tokio::time::interval(Duration::from_millis(20));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            for batch in 0..BATCHES {
+                timer.tick().await;
+                let mut wire = Vec::new();
+                for sequence in batch * SIZES[index]..(batch + 1) * SIZES[index] {
+                    wire.extend(hdlc::frame(&packet(dest, index as u64 + 1, sequence)));
+                }
+                socket.write_all(&wire).await.unwrap();
+            }
+            (index, socket, started.elapsed())
+        });
+    }
+    let mut returned = Vec::new();
+    let mut last = [None; 4];
+    let mut counts = [0u64; 4];
+    let mut progress_at = [Duration::ZERO; 4];
+    let mut max_gap = [Duration::ZERO; 4];
+    let mut query_max = Duration::ZERO;
+    let mut queries = 0;
+    let mut drops = 0;
+    let mut next_report = Duration::from_secs(5);
+    loop {
+        // Bound work between control probes even when the delivery queue is full.
+        for _ in 0..512 {
+            let Ok(event) = deliveries.try_recv() else {
+                break;
+            };
+            let (peer, sequence) = delivered(event, &mut last);
+            let index = peer as usize - 1;
+            assert!(sequence < BATCHES * SIZES[index]);
+            counts[index] += 1;
+            let now = started.elapsed();
+            max_gap[index] = max_gap[index].max(now - progress_at[index]);
+            progress_at[index] = now;
+        }
+        while let Some(result) = producers.try_join_next() {
+            returned.push(result.unwrap());
+        }
+        let query_started = std::time::Instant::now();
+        let state = stats(&control).await;
+        query_max = query_max.max(query_started.elapsed());
+        queries += 1;
+        assert_eq!(&state.snapshot.dropped[1..], &[0; 3]);
+        assert!(state.snapshot.dropped[0] >= drops);
+        drops = state.snapshot.dropped[0];
+        let accounted = counts.iter().sum::<u64>() + drops;
+        assert!(accounted <= TOTAL);
+        if producers.is_empty() && accounted == TOTAL {
+            assert_eq!(state.snapshot.total, 0);
+            break;
+        }
+        if started.elapsed() >= next_report {
+            eprintln!(
+                "backbone_asymmetric: delivered={counts:?} drops={drops} producers_remaining={} elapsed_s={:.3}",
+                producers.len(),
+                started.elapsed().as_secs_f64()
+            );
+            next_report = started.elapsed() + Duration::from_secs(5);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(counts.iter().all(|count| *count > 0));
+    // Report starvation symptoms without treating policy hold durations as bugs
+    // or claiming equal-share fairness for deliberately unequal offered rates.
+    returned.sort_by_key(|(index, _, _)| *index);
+    let sender_elapsed: Vec<_> = returned
+        .iter()
+        .map(|(_, _, elapsed)| elapsed.as_secs_f64())
+        .collect();
+    for (index, mut socket, _) in returned {
+        let sequence = BATCHES * SIZES[index];
+        socket
+            .write_all(&hdlc::frame(&packet(dest, index as u64 + 1, sequence)))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered(deliveries.recv().await.unwrap(), &mut last),
+            (index as u64 + 1, sequence)
+        );
+    }
+    assert_eq!(stats(&control).await.snapshot.dropped[0], drops);
+    eprintln!(
+        "backbone_asymmetric_complete: offered={:?} delivered={counts:?} drops={drops} observed_delivery_gap_s={:?} sender_elapsed_s={sender_elapsed:?} control_queries={queries} max_control_ms={:.3} elapsed_s={:.3}; independent paced streams, not equal-share fairness or guaranteed line-rate saturation",
+        SIZES.map(|size| size * BATCHES),
+        max_gap.map(|gap| gap.as_secs_f64()),
+        query_max.as_secs_f64() * 1000.0,
+        started.elapsed().as_secs_f64()
+    );
+    control.send(TransportMessage::Shutdown).await.unwrap();
+    control.closed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_backbone_peers_queue_pressure_control_and_recovery() {
     // The policy may retain gates for multiple seconds after the short burst.
     timeout(Duration::from_secs(45), exercise())

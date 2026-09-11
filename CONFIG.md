@@ -723,6 +723,20 @@ saturation, a proof of general fairness, or an hours-long soak. Reports include
 per-peer counts, minimum round progress, drops and maximum control-query latency;
 the overall 180-second deadline allows for adaptive policy hold times.
 
+An independent-stream variant is available with
+`cargo test -p rns-runtime --test backbone_ingress_load asymmetric_backbone -- --ignored --nocapture`.
+Four persistent peers each send 500 batches every 20 ms, with batch sizes
+64/16/4/1 (42500 total packets). There is only an initial start barrier: producers
+do not wait for one another or for delivery reconciliation between batches.
+Socket backpressure can extend individual producer runtimes; missed timer ticks
+are skipped rather than replayed as catch-up bursts. The test reconciles every
+delivery/drop, validates sequences, probes control responsiveness and sends
+recovery markers. It reports producer completion times and observed delivery
+gaps, including initial wait but excluding idle time after the final delivery.
+These are independent paced streams, not guaranteed line-rate saturation or
+equal-share fairness. The application queue is bounded by the finite workload
+to avoid hiding ingress drops behind application-channel drops; deadline is120s.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |

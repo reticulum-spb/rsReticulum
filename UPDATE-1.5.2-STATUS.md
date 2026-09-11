@@ -2477,3 +2477,40 @@ CONFIG описывает запуск и границы сценария.
 Проверка повторного давления четырёх peers выполнена. Whole-pipeline
 before/after сравнение, непрерывная/неравномерная нагрузка и масштабирование
 памяти при росте числа peers остаются. Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: независимые Backbone потоки с темпами64:16:4:1
+
+Добавлен full-only ignored `asymmetric_backbone_streams_accounting_and_recovery`.
+Четыре producers имеют только начальный barrier, затем независимо отправляют
+по500 batches с периодом20ms и размерами64/16/4/1. Между batches нет ожидания
+других peers или сверки доставки; при socket backpressure producer ждёт write,
+а timer пропускает пропущенные ticks. Всего42500 DATA-пакетов по256 bytes,
+существующие raw/control каналы, class queues по4, application queue ограничена
+полным конечным workload+markers, чтобы не добавлять app-channel drops.
+
+Проверяются content/order каждого peer, delivery+DATA drops=42500,
+отсутствие drops других классов, control queries с deadline1s и markers на
+всех соединениях после drain. Работа по доставке ограничена512 событиями
+между control probes. JoinSet и task guard отменяют producers/actor/drivers
+при выходе или deadline120s. Нагрузка paced, не гарантированное насыщение
+line rate; равные доли полосы для неравных источников не утверждаются.
+
+Команда:
+`cargo test -p rns-runtime --test backbone_ingress_load asymmetric_backbone -- --ignored --nocapture`.
+Прогон37.816s: offered[32000,8000,2000,500], delivered
+[29617,7526,1962,492], DATA drops2903, полная сверка и markers успешны.
+Producer completion times:[28.022,9.982,9.982,9.982]s;
+наблюдаемые max gaps доставки:[12.113,0.051,0.054,0.045]s.
+Gaps включают ожидание первого пакета, но не тишину после последнего;
+это наблюдение, не доказательство отсутствия starvation во всех условиях.
+Control queries5503, max9.870ms. Задержка быстрого потока не скрывается:
+он завершил передачу позже остальных, затем все принятые пакеты учтены.
+
+Workspace all-targets и client-only tests checks, fmt/diff checks успешны.
+Прежние warnings сохраняются. Python-эталон ea98db4f не изменён.
+CONFIG описывает команду и ограничения.
+
+Неигнорируемый ingress target: 1 passed, 2 ignored.
+Независимая неравномерная нагрузка проверена. Whole-pipeline before/after,
+масштабирование RSS при росте числа peers, churn/длительный soak остаются.
+Этап 5 открыт, версия 1.0.1.
