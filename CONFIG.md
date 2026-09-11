@@ -496,7 +496,12 @@ so fully escaped valid frames also survive fragmented reads. Oversized frames
 are discarded and framing resumes at the next delimiter. These driver drops
 are debug-logged, but do not reach the actor's protocol-violation counters or
 RPC/UI diagnostics. Other drivers retain their existing deframer limits.
-Minimum/service-frame handling remains incomplete.
+Backbone ignores empty HDLC frames and rejects decoded frames of 1..=19 bytes
+before transport admission and dataplane ingress packet accounting, matching
+Python's strict `frame_len > HEADER_MINSIZE` check before IFAC removal. Physical
+RX bytes still include these frames; short-frame drops are debug-logged and do
+not reach actor violation counters. This is not header or IFAC authentication.
+I2P keepalive/watchdog parity is a separate, unfinished task.
 
 TX combines already queued HDLC frames into encoded batches of at most 64 KiB,
 processing at most 64 frames per batch. It does not wait for more traffic to

@@ -5,6 +5,56 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
 #[tokio::test]
+async fn short_frames_do_not_reach_transport_or_ingress_packet_counts() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let (reader, _writer) = socket.into_split();
+    let (tx, mut events) = mpsc::channel(1);
+    let ingress = IngressControl::new();
+    let rxb = Arc::new(AtomicU64::new(0));
+    let mut task = tokio::spawn(backbone_read_loop(
+        reader,
+        7,
+        tx,
+        Arc::new(AtomicBool::new(true)),
+        rxb.clone(),
+        ingress.clone(),
+        564,
+    ));
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut wire = Vec::new();
+        for size in 0..=rns_wire::constants::HEADER_MINSIZE {
+            wire.extend(hdlc::frame(&vec![hdlc::FLAG; size]));
+        }
+        // Short frames cannot occupy the single transport slot before this
+        // boundary frame, including under fragmented HDLC input.
+        let valid = vec![hdlc::ESC; rns_wire::constants::HEADER_MINSIZE + 1];
+        wire.extend(hdlc::frame(&valid));
+        for chunk in wire.chunks(7) {
+            peer.write_all(chunk).await.unwrap();
+        }
+        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+            panic!("expected the first frame above the strict minimum")
+        };
+        assert_eq!(packet.raw.as_ref(), valid);
+        assert_eq!(ingress.snapshot(7, false).packets, 1);
+        assert_eq!(rxb.load(Ordering::Relaxed), wire.len() as u64);
+        peer.shutdown().await.unwrap();
+        (&mut task).await.unwrap();
+        assert!(events.recv().await.is_none());
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn reader_mtu_allowance_accepts_boundary_rejects_overflow_and_resyncs() {
     for ifac_size in [None, Some(0), Some(1), Some(16), Some(64)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -31,13 +81,13 @@ async fn reader_mtu_allowance_accepts_boundary_rejects_overflow_and_resyncs() {
             peer.write_all(&hdlc::frame(&vec![hdlc::ESC; limit + 1]))
                 .await
                 .unwrap();
-            peer.write_all(&hdlc::frame(b"resynchronised"))
+            peer.write_all(&hdlc::frame(b"resynchronised payload"))
                 .await
                 .unwrap();
             let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
                 panic!("resynchronised frame")
             };
-            assert_eq!(packet.raw.as_ref(), b"resynchronised");
+            assert_eq!(packet.raw.as_ref(), b"resynchronised payload");
             peer.shutdown().await.unwrap();
             assert!(matches!(
                 events.recv().await,
@@ -156,7 +206,9 @@ async fn full_transport_fin_and_reset_cancel_unsent_frame() {
             HW_MTU,
         ));
         let result = tokio::time::timeout(Duration::from_secs(3), async {
-            peer.write_all(&hdlc::frame(b"unsent~}")).await.unwrap();
+            peer.write_all(&hdlc::frame(b"unsent payload padding~}"))
+                .await
+                .unwrap();
             while ingress.snapshot(7, false).packets == 0 {
                 tokio::task::yield_now().await;
             }
@@ -212,8 +264,8 @@ async fn full_transport_recovers_without_losing_live_peer_frames() {
         HW_MTU,
     ));
     let result = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut wire = hdlc::frame(b"first~}");
-        wire.extend(hdlc::frame(b"second"));
+        let mut wire = hdlc::frame(b"first payload padding~}");
+        wire.extend(hdlc::frame(b"second payload padding"));
         peer.write_all(&wire).await.unwrap();
         while ingress.snapshot(7, false).packets == 0 {
             tokio::task::yield_now().await;
@@ -227,7 +279,10 @@ async fn full_transport_recovers_without_losing_live_peer_frames() {
             events.recv().await,
             Some(TransportMessage::Shutdown)
         ));
-        for payload in [b"first~}".as_slice(), b"second".as_slice()] {
+        for payload in [
+            b"first payload padding~}".as_slice(),
+            b"second payload padding".as_slice(),
+        ] {
             let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
                 panic!("expected frame")
             };
@@ -263,7 +318,9 @@ async fn full_transport_client_closes_before_deregistration_can_enqueue() {
         while !handle.online.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
-        peer.write_all(&hdlc::frame(b"blocked")).await.unwrap();
+        peer.write_all(&hdlc::frame(b"blocked payload padding"))
+            .await
+            .unwrap();
         let ingress = handle
             .diagnostics
             .as_ref()
@@ -316,7 +373,7 @@ async fn ungated_fin_still_delivers_buffered_complete_frames() {
         .unwrap();
     let (stream, _) = listener.accept().await.unwrap();
     let (reader, _writer) = stream.into_split();
-    let wire = hdlc::frame(b"before FIN~}");
+    let wire = hdlc::frame(b"before FIN payload padding~}");
     peer.write_all(&wire).await.unwrap();
     peer.shutdown().await.unwrap();
     let (tx, mut events) = mpsc::channel(8);
@@ -338,7 +395,7 @@ async fn ungated_fin_still_delivers_buffered_complete_frames() {
     let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
         panic!("expected buffered frame")
     };
-    assert_eq!(packet.raw.as_ref(), b"before FIN~}");
+    assert_eq!(packet.raw.as_ref(), b"before FIN payload padding~}");
     assert_eq!(rxb.load(Ordering::Relaxed), wire.len() as u64);
     assert!(events.recv().await.is_none());
 }
@@ -373,14 +430,20 @@ async fn gated_peer_keeps_tx_and_other_peer_rx_live() {
             .dataplane_ingress()
             .unwrap()
             .gate(Duration::from_secs(3600));
-        peers[0].write_all(&hdlc::frame(b"blocked")).await.unwrap();
-        peers[1].write_all(&hdlc::frame(b"active")).await.unwrap();
+        peers[0]
+            .write_all(&hdlc::frame(b"blocked payload padding"))
+            .await
+            .unwrap();
+        peers[1]
+            .write_all(&hdlc::frame(b"active payload padding"))
+            .await
+            .unwrap();
         let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
             panic!("expected active peer data")
         };
         assert_eq!(
             (packet.interface_id, packet.raw.as_ref()),
-            (76, b"active".as_slice())
+            (76, b"active payload padding".as_slice())
         );
         handles[0]
             .tx
@@ -397,7 +460,7 @@ async fn gated_peer_keeps_tx_and_other_peer_rx_live() {
             Some(TransportMessage::DeregisterInterface { id: 75 })
         ));
         peers[1]
-            .write_all(&hdlc::frame(b"still active"))
+            .write_all(&hdlc::frame(b"still active payload padding"))
             .await
             .unwrap();
         let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
@@ -405,7 +468,7 @@ async fn gated_peer_keeps_tx_and_other_peer_rx_live() {
         };
         assert_eq!(
             (packet.interface_id, packet.raw.as_ref()),
-            (76, b"still active".as_slice())
+            (76, b"still active payload padding".as_slice())
         );
         assert!(handles[1].online.load(Ordering::SeqCst));
     })
@@ -504,7 +567,9 @@ async fn gated_close_does_not_consume_kernel_buffered_payload() {
         ingress.clone(),
         HW_MTU,
     ));
-    peer.write_all(&hdlc::frame(b"unread~}")).await.unwrap();
+    peer.write_all(&hdlc::frame(b"unread payload padding~}"))
+        .await
+        .unwrap();
     peer.shutdown().await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
     if result.is_err() {
@@ -541,7 +606,9 @@ async fn ingress_gate_pauses_reader_and_release_preserves_frames() {
         HW_MTU,
     ));
     let result = tokio::time::timeout(Duration::from_secs(3), async {
-        peer.write_all(&hdlc::frame(b"first~}")).await.unwrap();
+        peer.write_all(&hdlc::frame(b"first payload padding~}"))
+            .await
+            .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(30), rx.recv())
                 .await
@@ -552,9 +619,11 @@ async fn ingress_gate_pauses_reader_and_release_preserves_frames() {
         let Some(TransportMessage::Inbound(packet)) = rx.recv().await else {
             panic!("expected frame")
         };
-        assert_eq!(packet.raw.as_ref(), b"first~}");
+        assert_eq!(packet.raw.as_ref(), b"first payload padding~}");
         ingress.gate(Duration::from_secs(24));
-        peer.write_all(&hdlc::frame(b"second")).await.unwrap();
+        peer.write_all(&hdlc::frame(b"second payload padding"))
+            .await
+            .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(30), rx.recv())
                 .await
@@ -564,7 +633,7 @@ async fn ingress_gate_pauses_reader_and_release_preserves_frames() {
         let Some(TransportMessage::Inbound(packet)) = rx.recv().await else {
             panic!("expected frame")
         };
-        assert_eq!(packet.raw.as_ref(), b"second");
+        assert_eq!(packet.raw.as_ref(), b"second payload padding");
         assert_eq!(ingress.snapshot(7, false).packets, 2);
         drop(peer);
         (&mut task).await.unwrap();

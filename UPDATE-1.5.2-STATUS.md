@@ -1744,3 +1744,30 @@ Workspace all-targets, client-only tests и fmt/diff checks успешны;
 Этап 5 не завершён: minimum/service frames, capabilities/Link clamp,
 shared_medium, диагностика и multi-peer нагрузочные сравнения ещё открыты.
 Пользовательский план и версия проекта не изменены.
+
+### Этап 5 — минимальная длина Backbone frames
+
+Backbone reader теперь отбрасывает decoded frames длиной 1..=HEADER_MINSIZE
+(19 bytes) до dataplane packet counter и transport channel. Это строгое
+сравнение Python 1.5.2 ReceiveBuffer: допустима длина >19, не >=19. Проверка
+идёт до снятия IFAC; допуск IFAC к минимуму не прибавляется. Пустые frames,
+включая последовательности FLAG, по-прежнему игнорирует общий deframer.
+Проверки header и IFAC в actor не заменены; другие драйверы не изменены.
+
+Physical rxb и ingress byte samples продолжают учитывать принятые socket
+bytes, включая rejected/empty frames; packet samples учитывают только кадры,
+прошедшие driver limits. Short drops debug-логируются и не доходят до actor
+protocol-violation counters. Полная унификация диагностик остаётся этапом 7.
+
+Новый loopback test подаёт escaped frames всех размеров 0..=19, затем 20 bytes
+частями по 7 encoded bytes в reader с transport capacity=1. Проверены единственная
+доставка (20 bytes), ingress packets=1, physical byte total и нормальное EOF.
+Старые reader fixtures удлинены выше минимума, сохраняя проверки backpressure,
+FIN/RST, gating, порядка и resynchronisation. TX-only framing не ограничен
+новой минимальной длиной.
+
+Проверки: interface lib — 213 passed, 5 ignored; workspace all-targets и
+runtime client-only tests checks успешны. Прежние warnings сохраняются.
+Python Backbone/HDLC source сверены статически. I2P использует отдельный
+read_watchdog с FLAG FLAG probes и process_incoming guard для empty payload;
+его watchdog/liveness parity этим изменением не заявляется. Этап 5 открыт.

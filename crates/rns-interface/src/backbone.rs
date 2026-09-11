@@ -217,7 +217,16 @@ async fn backbone_read_loop(
                     );
                 }
                 for frame in frames {
-                    if frame.is_empty() {
+                    // Python ReceiveBuffer uses a strict minimum on the wire
+                    // frame, before IFAC removal. Empty frames are already
+                    // ignored by the deframer. Do not charge invalid frames
+                    // to dataplane packet counts or transport admission.
+                    if frame.len() <= rns_wire::constants::HEADER_MINSIZE {
+                        tracing::debug!(
+                            interface_id,
+                            frame_len = frame.len(),
+                            "backbone undersized HDLC frame rejected"
+                        );
                         continue;
                     }
                     if !wait_ingress_or_closed(&reader, &ingress).await {
