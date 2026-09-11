@@ -457,6 +457,12 @@ the allowance is zero, even if `ifac_size` is set. Direct Rust callers may set
 KISS command bytes are excluded from the payload limit. This is not an RSS limit
 or permission to allocate arbitrarily large frames safely.
 
+TCP HDLC also rejects decoded frames of 1..=19 bytes before transport admission
+and RX accounting; empty frames are ignored by the deframer. The strict
+minimum is checked before IFAC removal and does not grow with IFAC size.
+Short-frame drops are debug-logged, not included in actor violation counters.
+KISS retains its separate nonempty-DATA rule below.
+
 In TCP KISS mode, only nonempty `CMD_DATA` frames reach transport and RX
 packet/byte counters. The TNC port nibble is ignored; control commands and
 empty frames are discarded. Serial/RNode deframer limits and command handling

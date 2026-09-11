@@ -276,7 +276,12 @@ async fn tcp_read_loop(
                         );
                     }
                     for frame in frames {
-                        if frame.is_empty() {
+                        if frame.len() <= rns_wire::constants::HEADER_MINSIZE {
+                            tracing::debug!(
+                                interface_id,
+                                frame_len = frame.len(),
+                                "TCP undersized HDLC frame rejected"
+                            );
                             continue;
                         }
                         tracing::debug!(
@@ -687,6 +692,41 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn hdlc_short_frames_do_not_reach_transport_or_rx_totals() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, _writer) = socket.into_split();
+        let (tx, mut events) = mpsc::channel(1);
+        let state = TcpInterfaceState::new();
+        state.online.store(true, Ordering::SeqCst);
+        let task = tokio::spawn(tcp_read_loop(reader, 7, tx, state.clone(), false, 500, 16));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut wire = Vec::new();
+            for size in 0..=20 {
+                wire.extend(hdlc::frame(&vec![hdlc::FLAG; size]));
+            }
+            for chunk in wire.chunks(3) {
+                peer.write_all(chunk).await.unwrap();
+            }
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("boundary")
+            };
+            assert_eq!(packet.raw.as_ref(), [hdlc::FLAG; 20]);
+            peer.shutdown().await.unwrap();
+            assert!(events.recv().await.is_none());
+            assert_eq!(state.rx_packets.load(Ordering::Relaxed), 1);
+            assert_eq!(state.rx_bytes.load(Ordering::Relaxed), 20);
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn kiss_control_frames_never_reach_transport_or_rx_totals() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap())
@@ -1007,7 +1047,7 @@ mod tests {
             .send(Bytes::from(vec![42; accepted.mtu as usize + 1]))
             .await
             .unwrap();
-        let payload = Bytes::from_static(b"hello from client");
+        let payload = Bytes::from_static(b"hello from client payload");
         client_handle.tx.send(payload.clone()).await.unwrap();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())
@@ -1023,7 +1063,7 @@ mod tests {
             other => panic!("unexpected message: {:?}", other),
         }
 
-        let reply = Bytes::from_static(b"hello from server");
+        let reply = Bytes::from_static(b"hello from server payload");
         accepted.tx.send(reply.clone()).await.unwrap();
 
         let msg2 = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())

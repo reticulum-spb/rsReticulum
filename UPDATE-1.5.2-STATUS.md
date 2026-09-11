@@ -2025,3 +2025,22 @@ client-only tests checks успешны; прежние warnings сохраня�
 
 Дополнительно: полный transport lib — 459 passed, 4 ignored; rns-wire lib —
 46 passed. Fmt/diff checks успешны. Этап 5 остаётся открытым; версия прежняя.
+
+### Этап 5 — минимальная длина TCP HDLC
+
+TCP HDLC reader теперь отбрасывает decoded frames 1..=19 bytes до transport
+channel и record_rx, как Python TCPInterface.check_frame_len. Пустые frames
+по-прежнему игнорирует deframer. Это strict >HEADER_MINSIZE до IFAC removal,
+без добавления IFAC size к минимуму. KISS branch не изменена: Python применяет
+этот check только в HDLC ветке. Short drops debug-логируются, но не доходят
+до actor protocol-violation counters; authentication остаётся в actor.
+
+Новый loopback test подаёт escaped frames размеров 0..=20 chunks по 3 bytes
+в очередь capacity=1 при IFAC allowance=16. Только 20-byte frame доставлен;
+rx_packets=1 и rx_bytes=20. Старые TCP roundtrip fixtures удлинены выше минимума,
+общие HDLC codec tests коротких payloads оставлены без изменений.
+Interface lib — 227 passed, 5 ignored. Этап 5 остаётся открытым; local Link
+cap 500, версия проекта и пользовательский план не изменены.
+
+Runtime API lib — 239 passed, 5 ignored; workspace all-targets, runtime
+client-only tests и fmt/diff checks успешны. Прежние warnings сохраняются.
