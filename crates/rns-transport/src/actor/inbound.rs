@@ -1133,6 +1133,13 @@ impl TransportActor {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
                     raw: raw.clone(),
                     interface_id,
+                    max_mtu: self
+                        .interfaces
+                        .get(&interface_id)
+                        .and_then(|entry| entry.diagnostics.as_ref())
+                        .and_then(|diagnostics| diagnostics.link_mtu())
+                        .filter(|mtu| *mtu >= 500)
+                        .unwrap_or(500),
                 }) {
                     self.channel_drops += 1;
                     error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,

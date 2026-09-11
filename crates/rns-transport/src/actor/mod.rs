@@ -3836,41 +3836,52 @@ mod tests {
 
     #[test]
     fn shared_instance_peer_delivers_header2_link_request_to_local_destination() {
-        let (mut actor, _tx) = TransportActor::new();
-        // Runtime sets this when attaching the SharedInstancePeer driver.
-        actor.shared_instance_client_mode = true;
-        actor.transport_identity_hash = Some([0xAA; 16]);
+        for (capability, expected) in [
+            (None, 500),
+            (Some(0), 500),
+            (Some(499), 500),
+            (Some(1196), 1196),
+            (Some(262144), 262144),
+        ] {
+            let (mut actor, _tx) = TransportActor::new();
+            // Runtime sets this when attaching the SharedInstancePeer driver.
+            actor.shared_instance_client_mode = true;
+            actor.transport_identity_hash = Some([0xAA; 16]);
 
-        let (mut shared_peer, _peer_rx) = make_test_interface("shared_peer");
-        shared_peer.role = InterfaceRole::SharedInstancePeer;
-        actor.interfaces.insert(1, shared_peer);
+            let (mut shared_peer, _peer_rx) = make_test_interface("shared_peer");
+            shared_peer.role = InterfaceRole::SharedInstancePeer;
+            shared_peer.mtu = 524288; // Raw MTU alone must not enable negotiation.
+            shared_peer.diagnostics =
+                Some(crate::messages::LinkMtuDiagnostics::new(capability, None));
+            actor.interfaces.insert(1, shared_peer);
 
-        let destination_hash = [0x55; 16];
-        let (destination_tx, mut destination_rx) = mpsc::channel(8);
-        actor.local_destinations.insert(destination_hash);
-        actor
-            .destination_channels
-            .insert(destination_hash, destination_tx);
+            let destination_hash = [0x55; 16];
+            let (destination_tx, mut destination_rx) = mpsc::channel(8);
+            actor.local_destinations.insert(destination_hash);
+            actor
+                .destination_channels
+                .insert(destination_hash, destination_tx);
 
-        let shared_daemon_identity = [0xBB; 16];
-        let raw = make_header2_link_request_packet(
-            shared_daemon_identity,
-            destination_hash,
-            0,
-            &[0x42; 64],
-        );
-        actor.on_inbound(InboundPacket {
-            raw,
-            interface_id: 1,
-            rssi: None,
-            snr: None,
-            q: None,
-        });
+            let shared_daemon_identity = [0xBB; 16];
+            let raw = make_header2_link_request_packet(
+                shared_daemon_identity,
+                destination_hash,
+                0,
+                &[0x42; 64],
+            );
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
 
-        assert!(matches!(
-            destination_rx.try_recv(),
-            Ok(crate::link_messages::DestinationEvent::LinkRequest { .. })
-        ));
+            assert!(matches!(
+                destination_rx.try_recv(),
+                Ok(crate::link_messages::DestinationEvent::LinkRequest { max_mtu, .. }) if max_mtu == expected
+            ));
+        }
     }
 
     fn make_lrproof_packet_with_payload(link_id: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {

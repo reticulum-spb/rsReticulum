@@ -476,8 +476,12 @@ impl LinkManager {
 
     fn handle_event(&mut self, event: DestinationEvent) {
         match event {
-            DestinationEvent::LinkRequest { raw, interface_id } => {
-                self.handle_link_request(&raw, interface_id);
+            DestinationEvent::LinkRequest {
+                raw,
+                interface_id,
+                max_mtu,
+            } => {
+                self.handle_link_request(&raw, interface_id, max_mtu);
             }
             DestinationEvent::InboundPacket { raw, interface_id } => {
                 self.handle_inbound_packet(&raw, interface_id);
@@ -568,7 +572,7 @@ impl LinkManager {
         }
     }
 
-    fn handle_link_request(&mut self, raw: &[u8], interface_id: u64) {
+    fn handle_link_request(&mut self, raw: &[u8], interface_id: u64, max_mtu: u32) {
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(h) => h,
             Err(_) => return,
@@ -590,16 +594,21 @@ impl LinkManager {
         }
 
         let responder = match (&self.identity_key, &self.identity) {
-            (Some(identity_key), _) => {
-                Link::new_responder(request_data, identity_key, self.destination_hash, hops)
-            }
+            (Some(identity_key), _) => Link::new_responder_with_mtu(
+                request_data,
+                identity_key,
+                self.destination_hash,
+                hops,
+                max_mtu,
+            ),
             (None, Some(identity)) => {
                 let identity_ed25519_pub = identity_ed25519_public_key(identity);
-                Link::new_responder_with(
+                Link::new_responder_with_signer_and_mtu(
                     request_data,
                     &identity_ed25519_pub,
                     self.destination_hash,
                     hops,
+                    max_mtu,
                     |signed_data| identity.sign(signed_data),
                 )
             }
@@ -3091,7 +3100,7 @@ mod tests {
         let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xAA; 67]);
 
-        lm.handle_link_request(&raw, 1);
+        lm.handle_link_request(&raw, 1, 500);
 
         assert_eq!(lm.active_link_count(), 0);
     }
@@ -3107,7 +3116,7 @@ mod tests {
         let (mut initiator, request_data) = Link::new_initiator(dest_hash, 1);
         let raw = link_request_raw(dest_hash, &request_data);
 
-        lm.handle_link_request(&raw, 1);
+        lm.handle_link_request(&raw, 1, 500);
 
         assert_eq!(lm.active_link_count(), 1);
         let outbound = rx.try_recv().expect("link proof should be queued");
@@ -3133,6 +3142,75 @@ mod tests {
     }
 
     #[test]
+    fn incoming_interface_mtu_reaches_signed_proof_and_link_state() {
+        for external_signer in [false, true] {
+            for (offer, cap, expected) in [
+                (32768, 1196, 1196),
+                (1196, 262144, 1196),
+                (524288, 262144, 262144),
+                (32768, 500, 500),
+                (500, 262144, 500),
+            ] {
+                let (tx, mut rx) = mpsc::channel(16);
+                let (event_tx, event_rx) = mpsc::channel(16);
+                let identity = if external_signer {
+                    backend_identity(true).0
+                } else {
+                    Identity::new()
+                };
+                let key = if external_signer {
+                    None
+                } else {
+                    identity.get_signing_key()
+                };
+                let identity_ed25519_pub = identity_ed25519_public_key(&identity);
+                let mut lm =
+                    LinkManager::with_destination(tx, event_rx, &identity, "test.mtu", key);
+                let (mut initiator, request_data) =
+                    Link::new_initiator_with_mtu(lm.destination_hash, 1, offer);
+                event_tx
+                    .try_send(DestinationEvent::LinkRequest {
+                        raw: Bytes::from(link_request_raw(lm.destination_hash, &request_data)),
+                        interface_id: 42,
+                        max_mtu: cap,
+                    })
+                    .unwrap();
+                assert!(lm.try_step());
+                let TransportMessage::Outbound(proof) = rx.try_recv().unwrap() else {
+                    panic!("expected signed Link proof");
+                };
+                let (_, offset) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
+                let public_key =
+                    rns_crypto::ed25519::Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
+                        .unwrap();
+                let rtt = initiator
+                    .validate_proof(&proof.raw[offset..], &public_key, &identity_ed25519_pub)
+                    .unwrap();
+                let active = lm.active_links.get_mut(&initiator.link_id).unwrap();
+                active.link.receive_rtt_packet(&rtt).unwrap();
+                assert_eq!(active._interface_id, 42);
+                assert_eq!(initiator.mtu, expected);
+                assert_eq!(active.link.mtu, expected);
+                assert_eq!(active.link.mdu, initiator.mdu);
+                let payload = vec![0x7e; initiator.mdu];
+                assert_eq!(
+                    active
+                        .link
+                        .decrypt(&initiator.encrypt(&payload).unwrap())
+                        .unwrap(),
+                    payload
+                );
+                assert_eq!(
+                    initiator
+                        .decrypt(&active.link.encrypt(&payload).unwrap())
+                        .unwrap(),
+                    payload
+                );
+            }
+        }
+    }
+
+    #[test]
     fn backend_identity_link_request_fails_closed_when_signer_unavailable() {
         let (tx, mut rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
@@ -3143,7 +3221,7 @@ mod tests {
         let (_initiator, request_data) = Link::new_initiator(dest_hash, 1);
         let raw = link_request_raw(dest_hash, &request_data);
 
-        lm.handle_link_request(&raw, 1);
+        lm.handle_link_request(&raw, 1, 500);
 
         assert_eq!(lm.active_link_count(), 0);
         assert!(rx.try_recv().is_err());
@@ -3443,7 +3521,7 @@ mod tests {
         let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&request_data);
 
-        lm.handle_link_request(&raw, 1);
+        lm.handle_link_request(&raw, 1, 500);
 
         assert_eq!(lm.active_link_count(), 0);
     }
@@ -4715,7 +4793,7 @@ mod tests {
         let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&request_data);
 
-        lm.handle_link_request(&raw, 1);
+        lm.handle_link_request(&raw, 1, 500);
 
         assert_eq!(lm.active_link_count(), 1);
         let link_id = initiator_link.link_id;

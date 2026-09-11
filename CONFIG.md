@@ -242,9 +242,11 @@ CLI and remote-management display are pending.
 
 ### Local Link MTU negotiation (partial)
 
-Runtime responders currently retain the base 500-byte MTU cap. The responder signs
+Runtime responders use the incoming interface's negotiable MTU capability,
+passed by the actor in `DestinationEvent::LinkRequest.max_mtu`; unknown or invalid
+capabilities fall back to 500. The responder signs
 the same effective MTU in LRPROOF that it stores locally: a missing or zero
-offer means 500, and a positive offer is capped at 500. Its MDU is computed
+offer means 500, and a positive offer is capped at the interface limit. Its MDU is computed
 before the proof is returned and agrees with the initiator after validation.
 Offers too small to fit an encrypted payload produce an MDU of zero, not an
 unsigned underflow or the default payload capacity. This is defensive arithmetic,
@@ -260,8 +262,10 @@ the next-hop capability before constructing the request. Unknown/invalid
 capabilities fall back to 500. The query, including channel admission, is
 bounded to one second and the caller's remaining budget. A legacy or zero-MTU
 proof reduces the initiator to at most 500. Synchronous preparation remains
-I/O-free and keeps its 500-byte offer. Runtime responder integration and full
-large-packet transport tests are still pending.
+I/O-free and keeps its 500-byte offer. Runtime responder tests cover both signer
+paths, authenticated MTU agreement and in-memory encrypted payloads up to MDU;
+full large-packet transport tests are still pending. Applications constructing
+LinkRequest events directly must now supply `max_mtu` (500 preserves the old cap).
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately
 from the raw receive limit. Transit Link Requests with exactly 64 key bytes plus
 3 signalling bytes retain at most the offered, incoming-interface and outgoing

@@ -2136,3 +2136,30 @@ Runtime API lib — 241 passed, 5 ignored; Link lib — 99 passed, 1 ignored;
 workspace all-targets и runtime client-only tests checks успешны. Прежние
 warnings сохраняются. Runtime responder ещё ограничен 500; полномасштабный
 large-packet transport interop не заявляется. Этап 5 открыт, версия прежняя.
+
+### Продолжение этапа 5: MTU входного интерфейса в runtime responder
+
+Actor передаёт capability входного интерфейса через новое поле
+`DestinationEvent::LinkRequest.max_mtu`. Отсутствующие/нулевые/меньшие 500
+capabilities дают 500; большой raw receive MTU сам по себе не разрешает upgrade.
+LinkManager использует explicit-MTU constructors для software key и external
+signer: эффективный MTU ограничен offer и интерфейсом до подписи LRPROOF,
+тот же MTU/MDU сохраняется в active Link. Raw request не переписывается.
+Приложения, создающие LinkRequest event напрямую, должны добавить max_mtu;
+значение 500 сохраняет прежний cap. Формат пакета и YAML не меняются.
+
+Actor test проверяет fallback None/0/499 и capabilities1196/262144 при доставке
+Header2 через shared instance. Runtime event-path matrix: два способа подписи
+× пять пар offer/cap, проверка подписи, RTT, interface_id и одинаковых MTU/MDU;
+шифрованный двусторонний обмен в памяти до полного MDU, включая MTU262144.
+Это не сетевой large-packet interop или нагрузочный benchmark.
+
+Python Transport.py local Link Request branch переписывает signalling до
+destination.receive; Rust ограничивает его при создании responder. Полная
+семантика nullable HW_MTU/удаления mode signalling и protocol_violation при
+недопустимом mode в локальной ветке пока не заявляется.
+
+Проверки: runtime API lib — 242 passed, 5 ignored; transport lib — 460 passed,
+4 ignored; workspace all-targets и runtime client-only tests checks успешны;
+fmt и diff check чистые. Прежние warnings без изменений. Далее — сетевые
+large-MTU проверки и измерения этапа 5. Этап открыт, версия остаётся 1.0.1.

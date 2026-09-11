@@ -36,6 +36,8 @@ pub enum DestinationEvent {
     LinkRequest {
         raw: Bytes,
         interface_id: InterfaceId,
+        /// Negotiable incoming-interface MTU; 500 when capability is unknown.
+        max_mtu: u32,
     },
     LinkEstablished {
         link_id: [u8; 16],
@@ -81,6 +83,7 @@ mod tests {
         let evt2 = DestinationEvent::LinkRequest {
             raw: Bytes::from_static(&[4, 5, 6]),
             interface_id: 99,
+            max_mtu: 500,
         };
         assert!(matches!(evt2, DestinationEvent::LinkRequest { .. }));
 
