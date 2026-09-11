@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::compression;
-use crate::stream_data::{STREAM_ID_MAX, StreamDataMessage};
+use crate::stream_data::{StreamDataMessage, StreamIdError, validate_stream_id};
 
 /// Upper bound on a single chunk before the writer splits (16 KiB).
 pub const MAX_CHUNK_LEN: usize = 16384;
@@ -21,7 +21,7 @@ pub struct StreamReader {
 impl StreamReader {
     pub fn new(stream_id: u16) -> Self {
         Self {
-            stream_id: stream_id & STREAM_ID_MAX,
+            stream_id,
             buffer: VecDeque::new(),
             eof: false,
         }
@@ -98,12 +98,14 @@ pub struct StreamWriter {
 }
 
 impl StreamWriter {
-    pub fn new(stream_id: u16, max_data_len: usize) -> Self {
-        Self {
-            stream_id: stream_id & STREAM_ID_MAX,
+    /// Validate the stream ID before any write or EOF frame can be emitted.
+    pub fn new(stream_id: u16, max_data_len: usize) -> Result<Self, StreamIdError> {
+        validate_stream_id(stream_id)?;
+        Ok(Self {
+            stream_id,
             max_data_len,
             closed: false,
-        }
+        })
     }
 
     /// Slice `data` into channel-sized frames. Each frame is sent compressed
@@ -129,7 +131,8 @@ impl StreamWriter {
 
             let (msg_data, consumed, compressed) = self.try_compress_chunk(chunk);
 
-            let mut msg = StreamDataMessage::new(self.stream_id, msg_data, false);
+            let mut msg =
+                StreamDataMessage::new(self.stream_id, msg_data, false).expect("valid stream ID");
             msg.compressed = compressed;
             messages.push(msg);
             offset += consumed;
@@ -171,7 +174,8 @@ impl StreamWriter {
     pub fn close(&mut self) -> DrainClose {
         self.closed = true;
         DrainClose {
-            eof_message: StreamDataMessage::new(self.stream_id, Vec::new(), true),
+            eof_message: StreamDataMessage::new(self.stream_id, Vec::new(), true)
+                .expect("valid stream ID"),
         }
     }
 
@@ -179,7 +183,7 @@ impl StreamWriter {
     /// already manages ordering with the underlying channel.
     pub fn close_simple(&mut self) -> StreamDataMessage {
         self.closed = true;
-        StreamDataMessage::new(self.stream_id, Vec::new(), true)
+        StreamDataMessage::new(self.stream_id, Vec::new(), true).expect("valid stream ID")
     }
 
     pub fn is_closed(&self) -> bool {
@@ -208,12 +212,12 @@ pub struct ChannelBuffer {
 }
 
 impl ChannelBuffer {
-    pub fn new(stream_id: u16, max_data_len: usize) -> Self {
-        Self {
-            writer: StreamWriter::new(stream_id, max_data_len),
+    pub fn new(stream_id: u16, max_data_len: usize) -> Result<Self, StreamIdError> {
+        Ok(Self {
+            writer: StreamWriter::new(stream_id, max_data_len)?,
             reader: StreamReader::new(stream_id),
             stream_id,
-        }
+        })
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<Vec<StreamDataMessage>, BufferError> {
@@ -271,7 +275,7 @@ mod tests {
         assert!(!reader.is_eof());
         assert!(reader.read(100).is_none());
 
-        let msg = StreamDataMessage::new(1, b"hello".to_vec(), false);
+        let msg = StreamDataMessage::new(1, b"hello".to_vec(), false).expect("valid stream ID");
         assert!(reader.feed(&msg));
         assert_eq!(reader.available(), 5);
 
@@ -284,10 +288,10 @@ mod tests {
     fn test_reader_eof() {
         let mut reader = StreamReader::new(1);
 
-        let msg1 = StreamDataMessage::new(1, b"data".to_vec(), false);
+        let msg1 = StreamDataMessage::new(1, b"data".to_vec(), false).expect("valid stream ID");
         reader.feed(&msg1);
 
-        let msg2 = StreamDataMessage::new(1, Vec::new(), true);
+        let msg2 = StreamDataMessage::new(1, Vec::new(), true).expect("valid stream ID");
         reader.feed(&msg2);
 
         assert!(reader.is_eof());
@@ -303,14 +307,14 @@ mod tests {
     #[test]
     fn test_reader_wrong_stream() {
         let mut reader = StreamReader::new(1);
-        let msg = StreamDataMessage::new(2, b"wrong".to_vec(), false);
+        let msg = StreamDataMessage::new(2, b"wrong".to_vec(), false).expect("valid stream ID");
         assert!(!reader.feed(&msg));
         assert_eq!(reader.available(), 0);
     }
 
     #[test]
     fn test_writer_basic() {
-        let mut writer = StreamWriter::new(1, 10);
+        let mut writer = StreamWriter::new(1, 10).expect("valid stream ID");
 
         let msgs = writer.write(b"hello world, this is a test").unwrap();
         // 27-byte input split at 10 bytes per frame must produce multiple messages.
@@ -324,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_writer_close() {
-        let mut writer = StreamWriter::new(1, 100);
+        let mut writer = StreamWriter::new(1, 100).expect("valid stream ID");
         let drain = writer.close();
         assert!(drain.eof_message.eof);
         assert!(drain.eof_message.data.is_empty());
@@ -334,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_writer_close_simple() {
-        let mut writer = StreamWriter::new(1, 100);
+        let mut writer = StreamWriter::new(1, 100).expect("valid stream ID");
         let eof_msg = writer.close_simple();
         assert!(eof_msg.eof);
         assert!(eof_msg.data.is_empty());
@@ -343,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip() {
-        let mut writer = StreamWriter::new(42, 50);
+        let mut writer = StreamWriter::new(42, 50).expect("valid stream ID");
         let mut reader = StreamReader::new(42);
 
         let data = b"Hello, this is a complete stream test with some data!";
@@ -366,7 +370,7 @@ mod tests {
         // go through pack/unpack — feeding the writer's output directly would skip it.
         use crate::channel_message::MessageBase;
 
-        let mut writer = StreamWriter::new(1, 500);
+        let mut writer = StreamWriter::new(1, 500).expect("valid stream ID");
         let mut reader = StreamReader::new(1);
 
         let data = b"AAAA".repeat(500);
@@ -377,7 +381,8 @@ mod tests {
 
         for msg in &msgs {
             let packed = msg.pack();
-            let mut received_msg = StreamDataMessage::new(0, Vec::new(), false);
+            let mut received_msg =
+                StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
             received_msg.unpack(&packed).unwrap();
             reader.feed(&received_msg);
         }
@@ -389,7 +394,7 @@ mod tests {
     #[test]
     fn test_writer_small_data_no_compression() {
         // bzip2 overhead dominates below 32 bytes, so short inputs must be sent raw.
-        let mut writer = StreamWriter::new(1, 500);
+        let mut writer = StreamWriter::new(1, 500).expect("valid stream ID");
 
         let data = b"tiny";
         let msgs = writer.write(data).unwrap();
@@ -400,14 +405,14 @@ mod tests {
 
     #[test]
     fn test_writer_empty_write() {
-        let mut writer = StreamWriter::new(1, 100);
+        let mut writer = StreamWriter::new(1, 100).expect("valid stream ID");
         let msgs = writer.write(b"").unwrap();
         assert!(msgs.is_empty());
     }
 
     #[test]
     fn test_drain_close_semantics() {
-        let mut writer = StreamWriter::new(1, 100);
+        let mut writer = StreamWriter::new(1, 100).expect("valid stream ID");
         let _msgs = writer.write(b"some data").unwrap();
         let drain = writer.close();
         assert!(drain.eof_message.eof);
@@ -417,7 +422,7 @@ mod tests {
     #[test]
     fn test_channel_buffer_write_read() {
         let stream_id = 7;
-        let mut buf = ChannelBuffer::new(stream_id, 100);
+        let mut buf = ChannelBuffer::new(stream_id, 100).expect("valid stream ID");
 
         assert_eq!(buf.stream_id(), 7);
         assert!(!buf.is_done());
@@ -438,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_channel_buffer_roundtrip() {
-        let mut buf = ChannelBuffer::new(99, 20);
+        let mut buf = ChannelBuffer::new(99, 20).expect("valid stream ID");
 
         let input = b"This is a channel buffer roundtrip test with enough data to split";
         let msgs = buf.write(input).unwrap();
@@ -457,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_channel_buffer_partial_read() {
-        let mut buf = ChannelBuffer::new(5, 100);
+        let mut buf = ChannelBuffer::new(5, 100).expect("valid stream ID");
 
         let msgs = buf.write(b"abcdefghij").unwrap();
         for msg in &msgs {
@@ -475,21 +480,21 @@ mod tests {
     #[test]
     fn test_channel_buffer_no_data() {
         // Reads before any frames arrive must distinguish "wait" (None) from EOF.
-        let mut buf = ChannelBuffer::new(1, 100);
+        let mut buf = ChannelBuffer::new(1, 100).expect("valid stream ID");
         assert!(buf.read(10).is_none());
         assert!(buf.read_all().is_none());
     }
 
     #[test]
     fn test_channel_buffer_close_then_write_fails() {
-        let mut buf = ChannelBuffer::new(1, 100);
+        let mut buf = ChannelBuffer::new(1, 100).expect("valid stream ID");
         buf.close_writer();
         assert!(buf.write(b"after close").is_err());
     }
 
     #[test]
     fn test_channel_buffer_drain_and_close() {
-        let mut buf = ChannelBuffer::new(1, 100);
+        let mut buf = ChannelBuffer::new(1, 100).expect("valid stream ID");
         let _msgs = buf.write(b"data to drain").unwrap();
         let drain = buf.drain_and_close_writer();
         assert!(drain.eof_message.eof);

@@ -28,7 +28,7 @@ async fn main() -> rns_examples::ExampleResult {
                 line = rns_examples::read_line() => {
                     let line = line?;
                     if line == "quit" { link.close().await?; return Ok(()); }
-                    let mut writer = StreamWriter::new(STREAM_ID, 400);
+                    let mut writer = StreamWriter::new(STREAM_ID, 400).expect("valid stream ID");
                     for frame in writer.write(line.as_bytes())? {
                         link.send_channel(&frame).await?;
                     }
@@ -37,7 +37,7 @@ async fn main() -> rns_examples::ExampleResult {
                 message = link.recv_channel() => {
                     let (kind, payload) = message?;
                     if kind == rns_protocol::channel_message::SMT_STREAM_DATA {
-                        let mut frame = StreamDataMessage::new(0, Vec::new(), false);
+                        let mut frame = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
                         frame.unpack(&payload)?;
                         reader.feed(&frame);
                         if reader.is_done() {
@@ -62,14 +62,14 @@ async fn main() -> rns_examples::ExampleResult {
             line = rns_examples::read_line() => { line?; listener.announce().await?; }
             Some(event) = listener.next() => if let LinkListenerEvent::Channel(message) = event {
                 if message.msg_type != rns_protocol::channel_message::SMT_STREAM_DATA { continue; }
-                let mut frame = StreamDataMessage::new(0, Vec::new(), false);
+                let mut frame = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
                 frame.unpack(&message.payload)?;
                 let reader = readers.entry(message.link_id).or_insert_with(|| StreamReader::new(STREAM_ID));
                 reader.feed(&frame);
                 if reader.is_done() {
                     let data = reader.read_all().unwrap_or_default();
                     println!("Received buffer: {}", String::from_utf8_lossy(&data));
-                    let mut writer = StreamWriter::new(STREAM_ID, 400);
+                    let mut writer = StreamWriter::new(STREAM_ID, 400).expect("valid stream ID");
                     for response in writer.write(b"Buffer received")? {
                         listener.send_channel(message.link_id, Box::new(response)).await?;
                     }

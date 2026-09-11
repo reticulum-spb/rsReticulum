@@ -5,6 +5,19 @@ use crate::compression;
 /// Maximum stream ID value (14 bits).
 pub const STREAM_ID_MAX: u16 = 0x3FFF;
 
+/// An application supplied a stream ID outside the 14-bit wire range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stream ID {0} exceeds 16383")]
+pub struct StreamIdError(pub u16);
+
+pub(crate) fn validate_stream_id(stream_id: u16) -> Result<(), StreamIdError> {
+    if stream_id > STREAM_ID_MAX {
+        Err(StreamIdError(stream_id))
+    } else {
+        Ok(())
+    }
+}
+
 /// StreamDataMessage overhead: 2-byte header + 6-byte channel envelope = 8 bytes.
 pub const OVERHEAD: usize = 8;
 
@@ -23,13 +36,15 @@ pub struct StreamDataMessage {
 }
 
 impl StreamDataMessage {
-    pub fn new(stream_id: u16, data: Vec<u8>, eof: bool) -> Self {
-        Self {
-            stream_id: stream_id & STREAM_ID_MAX,
+    /// Reject IDs outside 0..=16383 instead of addressing a different stream.
+    pub fn new(stream_id: u16, data: Vec<u8>, eof: bool) -> Result<Self, StreamIdError> {
+        validate_stream_id(stream_id)?;
+        Ok(Self {
+            stream_id,
             eof,
             compressed: false,
             data,
-        }
+        })
     }
 
     fn header_value(&self) -> u16 {
@@ -99,10 +114,11 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_roundtrip() {
-        let msg = StreamDataMessage::new(42, b"hello stream".to_vec(), false);
+        let msg =
+            StreamDataMessage::new(42, b"hello stream".to_vec(), false).expect("valid stream ID");
         let packed = msg.pack();
 
-        let mut msg2 = StreamDataMessage::new(0, Vec::new(), false);
+        let mut msg2 = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
         msg2.unpack(&packed).unwrap();
 
         assert_eq!(msg2.stream_id, 42);
@@ -113,10 +129,10 @@ mod tests {
 
     #[test]
     fn test_eof_flag() {
-        let msg = StreamDataMessage::new(1, Vec::new(), true);
+        let msg = StreamDataMessage::new(1, Vec::new(), true).expect("valid stream ID");
         let packed = msg.pack();
 
-        let mut msg2 = StreamDataMessage::new(0, Vec::new(), false);
+        let mut msg2 = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
         msg2.unpack(&packed).unwrap();
 
         assert!(msg2.eof);
@@ -124,10 +140,11 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_id_mask() {
-        // IDs above 14 bits must wrap, not overflow into the flag bits.
-        let msg = StreamDataMessage::new(0xFFFF, b"test".to_vec(), false);
-        assert_eq!(msg.stream_id, STREAM_ID_MAX);
+    fn test_stream_id_out_of_range() {
+        assert_eq!(
+            StreamDataMessage::new(0xFFFF, b"test".to_vec(), false).unwrap_err(),
+            StreamIdError(0xFFFF)
+        );
     }
 
     #[test]
@@ -147,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_too_short() {
-        let mut msg = StreamDataMessage::new(0, Vec::new(), false);
+        let mut msg = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
         assert!(msg.unpack(&[0x00]).is_err());
     }
 
@@ -171,7 +188,7 @@ mod tests {
         packed.extend_from_slice(&header_val.to_be_bytes());
         packed.extend_from_slice(&compressed);
 
-        let mut msg = StreamDataMessage::new(0, Vec::new(), false);
+        let mut msg = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
         let result = msg.unpack(&packed);
         assert!(
             result.is_err(),
@@ -191,7 +208,7 @@ mod tests {
         packed.extend_from_slice(&header_val.to_be_bytes());
         packed.extend_from_slice(&compressed);
 
-        let mut msg = StreamDataMessage::new(0, Vec::new(), false);
+        let mut msg = StreamDataMessage::new(0, Vec::new(), false).expect("valid stream ID");
         msg.unpack(&packed)
             .expect("payload within bound must decode");
         assert_eq!(msg.data.len(), small.len());

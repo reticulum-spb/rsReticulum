@@ -130,8 +130,8 @@ fn channel_demo() -> ExampleResult {
 }
 
 fn buffer_demo() -> ExampleResult {
-    let mut tx = ChannelBuffer::new(7, 64);
-    let mut rx = ChannelBuffer::new(7, 64);
+    let mut tx = ChannelBuffer::new(7, 64).expect("valid stream ID");
+    let mut rx = ChannelBuffer::new(7, 64).expect("valid stream ID");
     for frame in tx.write(b"Hello through a Reticulum Buffer")? {
         rx.feed_reader(&frame);
     }
