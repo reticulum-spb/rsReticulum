@@ -2684,3 +2684,60 @@ fmt/diff checks успешны. Прежние warnings сохраняются, 
 Сравнение старой/текущей connected TX-цепочки выполнено. Сравнение всей
 цепочки с transport actor, длительный soak и transport-level churn остаются.
 Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: смена Backbone peers при работающем transport actor
+
+Добавлен full-only ignored `backbone_actor_churn_preserves_progress_and_control`
+в `backbone_ingress_load`. Один actor работает на протяжении64 раундов;
+в каждом регистрируются4 новых настоящих BackboneClient на loopback/свободных
+портах. Используются повторно ID1..4 через RegisterInterface в control channel,
+а не прямое изменение таблицы запущенного actor. Все DATA/class queues по4,
+application channel ограничен516 событиями и не растёт с числом раундов.
+
+В первой фазе четыре независимых producer со стартовым barrier отправляют
+по128 DATA-пакетов256 bytes. После полной сверки доставки/drop два peers
+отправляют FIN с сохранением read halves; другие два отправляют ещё по128,
+пока actor может обрабатывать DeregisterInterface от отключившихся драйверов.
+JoinSet producers опрашивается вместе с bounded delivery batches≤512 и RPC
+queue stats. Проверяются порядок/content/ID, положительная доставка у каждого
+активного peer в каждой фазе, monotonic DATA drops и отсутствие drops других
+классов. Весь offered workload равен delivery+DATA drops; потерю ещё не
+прочитанных байтов при разрыве этот сценарий намеренно не моделирует.
+
+GetInterfaceStats должен показать только survivors3/4; serial markers на них
+проверяют восстановление доставки без дополнительных drops. После их FIN
+требуются завершение всех read_task и пустая таблица интерфейсов до нового
+раунда/повторного использования ID. Control queries имеют deadline1s,
+ожидания cleanup и финального shutdown actor —3s. Guards отменяют actor,
+драйверы/producers при ошибке или внешнем таймауте.
+
+Команда:
+`cargo test -p rns-runtime --test backbone_ingress_load backbone_actor_churn -- --ignored --nocapture`.
+Для более продолжительного прогона RNS_BACKBONE_CHURN_ROUNDS принимает1..10000,
+default64; общий deadline rounds*20+30s, между раундами pause1s. Это смена
+handles/регистраций, не автоматический reconnect того же handle и не
+listener-side flap protection. Не гарантируется конкретный момент gating,
+непрерывное насыщение или отсутствие starvation во всех условиях.
+
+Default debug-прогон64 раундов успешен за90.66s:256 подключений и их
+удалений,49152 DATA workload, per-peer delivered[7516,7610,15218,15219],
+сумма45563, DATA drops3589. Дополнительно все128 survivor markers доставлены
+без увеличения drops. RPC queue probes2344, max11.997ms; очереди≤4,
+GetInterfaceStats подтверждает survivors и пустую таблицу после каждого
+раунда. Все drivers завершились; финальный actor shutdown успешен.
+Время включает63 паузы по1s и адаптивные задержки. Это90-секундная проверка
+с повторным churn, не выполненный многочасовой soak и не доказательство
+отсутствия утечек памяти при произвольной длительности.
+
+Проверен и override `RNS_BACKBONE_CHURN_ROUNDS=1`:1 раунд успешен за0.04s,
+768 offered,727 delivered,41 DATA drops,8 queue probes/max0.803ms;
+survivor markers, удаление интерфейсов и shutdown также успешны.
+
+Неигнорируемый ingress target:1 passed,3 ignored. Workspace all-targets,
+client-only tests check, fmt/diff checks успешны. Прежние warnings сохраняются;
+Python ea98db4f не изменён. CONFIG содержит команду, настройку длительности
+и границы сценария.
+
+Transport-level churn с восстановлением проверен на64 раундах. Сравнение
+старой/текущей цепочки с transport actor и многочасовой soak остаются.
+Этап 5 открыт, версия 1.0.1.

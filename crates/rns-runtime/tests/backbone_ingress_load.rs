@@ -1,4 +1,4 @@
-//! Bounded two-peer TCP load through Backbone drivers and the transport actor.
+//! Bounded multi-peer TCP load through Backbone drivers and the transport actor.
 //! Deliberately tiny DATA queue: drops are expected and reconciled, not hidden.
 #![cfg(feature = "full")]
 
@@ -104,6 +104,221 @@ async fn four_backbone_peers_repeated_pressure_and_progress() {
     timeout(Duration::from_secs(180), repeated_pressure())
         .await
         .expect("repeated Backbone pressure timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "transport actor churn/soak; defaults to 64 rounds with one-second pauses"]
+async fn backbone_actor_churn_preserves_progress_and_control() {
+    let rounds: u64 = std::env::var("RNS_BACKBONE_CHURN_ROUNDS")
+        .map(|value| {
+            value
+                .parse()
+                .expect("RNS_BACKBONE_CHURN_ROUNDS must be an integer")
+        })
+        .unwrap_or(64);
+    assert!((1..=10000).contains(&rounds));
+    timeout(Duration::from_secs(rounds * 20 + 30), actor_churn(rounds))
+        .await
+        .expect("Backbone actor churn timed out");
+}
+
+async fn interface_ids(control: &mpsc::Sender<TransportMessage>) -> Vec<u64> {
+    timeout(Duration::from_secs(1), async {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        control
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::GetInterfaceStats,
+                response_tx,
+            })
+            .await
+            .unwrap();
+        let TransportQueryResponse::InterfaceStats(entries) = response_rx.await.unwrap() else {
+            panic!("interface statistics unavailable");
+        };
+        let mut ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
+        ids.sort_unstable();
+        ids
+    })
+    .await
+    .expect("interface query starved during churn")
+}
+
+async fn actor_churn(rounds: u64) {
+    const PEERS: usize = 4;
+    const BURST: u64 = 128;
+    let dest = [0xCD; 16];
+    let (mut actor, input, control) = TransportActor::new_with_control_channel_and_queue_limits(
+        InboundQueueLimits::new([4; 4]).unwrap(),
+    );
+    let (delivery_tx, mut deliveries) = mpsc::channel(PEERS * BURST as usize + PEERS);
+    actor.local_destinations.insert(dest);
+    actor.destination_channels.insert(dest, delivery_tx);
+    let mut actor_task = Tasks(vec![tokio::spawn(actor.run())]);
+    let started = std::time::Instant::now();
+    let mut last = [None; PEERS];
+    let mut counts = [0u64; PEERS];
+    let mut offered = 0u64;
+    let mut drops = 0u64;
+    let mut queries = 0u64;
+    let mut max_query = Duration::ZERO;
+    for round in 0..rounds {
+        let mut drivers = Tasks(Vec::new());
+        let mut peers = Vec::new();
+        for id in 1..=PEERS as u64 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = BackboneClientConfig::new(
+                "actor-churn",
+                "127.0.0.1",
+                listener.local_addr().unwrap().port(),
+            );
+            config.receive_ifac_size = Some(0);
+            config.max_reconnect_tries = Some(1);
+            let handle = spawn_backbone_client(config, id, input.clone())
+                .await
+                .unwrap();
+            drivers.0.push(handle.read_task);
+            peers.push(listener.accept().await.unwrap().0);
+            while !handle.online.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let mut entry = InterfaceEntry::new(
+                handle.name,
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                handle.bitrate,
+                handle.mtu,
+                handle.tx,
+            );
+            entry.online = Some(handle.online);
+            entry.diagnostics = handle.diagnostics;
+            control
+                .send(TransportMessage::RegisterInterface { id, entry })
+                .await
+                .unwrap();
+        }
+        assert_eq!(interface_ids(&control).await, [1, 2, 3, 4]);
+        let base = round * (2 * BURST + 1);
+        for phase in 0..2 {
+            let before = counts;
+            let active = if phase == 0 { PEERS } else { 2 };
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(active));
+            let mut producers = tokio::task::JoinSet::new();
+            for (index, mut peer) in peers.drain(..).enumerate() {
+                let barrier = barrier.clone();
+                producers.spawn(async move {
+                    if phase == 0 || index >= 2 {
+                        let mut wire = Vec::new();
+                        for sequence in base + phase * BURST..base + (phase + 1) * BURST {
+                            wire.extend(hdlc::frame(&packet(dest, index as u64 + 1, sequence)));
+                        }
+                        barrier.wait().await;
+                        peer.write_all(&wire).await.unwrap();
+                    }
+                    (index, peer)
+                });
+            }
+            offered += active as u64 * BURST;
+            let mut returned = Vec::new();
+            // Interleave joining producers, bounded delivery work and RPC probes.
+            loop {
+                while let Some(result) = producers.try_join_next() {
+                    returned.push(result.unwrap());
+                }
+                for _ in 0..512 {
+                    let Ok(event) = deliveries.try_recv() else {
+                        break;
+                    };
+                    let (id, sequence) = delivered(event, &mut last);
+                    assert!((base + phase * BURST..base + (phase + 1) * BURST).contains(&sequence));
+                    assert!(phase == 0 || id >= 3);
+                    counts[id as usize - 1] += 1;
+                }
+                let probe = std::time::Instant::now();
+                let state = stats(&control).await;
+                queries += 1;
+                max_query = max_query.max(probe.elapsed());
+                assert_eq!(&state.snapshot.dropped[1..], &[0; 3]);
+                assert!(state.snapshot.dropped[0] >= drops);
+                drops = state.snapshot.dropped[0];
+                let accounted = counts.iter().sum::<u64>() + drops;
+                assert!(accounted <= offered);
+                if producers.is_empty() && accounted == offered {
+                    assert_eq!(state.snapshot.total, 0);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            returned.sort_by_key(|(index, _)| *index);
+            peers = returned.into_iter().map(|(_, peer)| peer).collect();
+            for index in if phase == 0 { 0..PEERS } else { 2..PEERS } {
+                assert!(
+                    counts[index] > before[index],
+                    "peer made no progress in round {round}, phase {phase}"
+                );
+            }
+            if phase == 0 {
+                // Account all earlier input before FIN: no unobservable in-flight loss
+                // is mislabelled as an inbound class-queue drop. Driver deregistration
+                // now races the surviving peers' next burst on the running actor.
+                for peer in &mut peers[..2] {
+                    peer.shutdown().await.unwrap();
+                }
+            }
+        }
+        timeout(Duration::from_secs(3), async {
+            while interface_ids(&control).await != [3, 4] {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("departed interfaces retained during survivor traffic");
+        for (index, peer) in peers.iter_mut().enumerate().skip(2) {
+            let id = index as u64 + 1;
+            peer.write_all(&hdlc::frame(&packet(dest, id, base + 2 * BURST)))
+                .await
+                .unwrap();
+            assert_eq!(
+                delivered(deliveries.recv().await.unwrap(), &mut last),
+                (id, base + 2 * BURST)
+            );
+        }
+        assert_eq!(stats(&control).await.snapshot.dropped[0], drops);
+        for peer in &mut peers[2..] {
+            peer.shutdown().await.unwrap();
+        }
+        timeout(Duration::from_secs(3), async {
+            for task in &mut drivers.0 {
+                task.await.unwrap();
+            }
+            while !interface_ids(&control).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("drivers/interfaces survived end of churn round");
+        assert!(deliveries.try_recv().is_err());
+        drop(peers);
+        drop(drivers);
+        if round % 8 == 7 || round + 1 == rounds {
+            eprintln!(
+                "backbone_actor_churn: rounds={} offered={offered} delivered={counts:?} drops={drops} queries={queries} max_control_ms={:.3} elapsed_s={:.3}; all four interfaces removed before ID reuse",
+                round + 1,
+                max_query.as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        if round + 1 < rounds {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    assert_eq!(counts.iter().sum::<u64>() + drops, rounds * 6 * BURST);
+    timeout(Duration::from_secs(3), async {
+        control.send(TransportMessage::Shutdown).await.unwrap();
+        control.closed().await;
+        (&mut actor_task.0[0]).await.unwrap();
+    })
+    .await
+    .expect("actor shutdown stalled after churn");
 }
 
 async fn repeated_pressure() {

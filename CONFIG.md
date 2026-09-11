@@ -787,6 +787,27 @@ These are independent paced streams, not guaranteed line-rate saturation or
 equal-share fairness. The application queue is bounded by the finite workload
 to avoid hiding ingress drops behind application-channel drops; deadline is120s.
 
+For connection churn with one long-lived transport actor, run
+`cargo test -p rns-runtime --test backbone_ingress_load backbone_actor_churn -- --ignored --nocapture`.
+By default 64 rounds register four new Backbone clients using the same four IDs.
+Each peer sends 128 DATA packets. After delivery/drop reconciliation, two peers
+send FIN while retaining their read halves; the other two send another 128
+packets each while driver deregistrations can reach the actor. Every active peer
+must make progress, survivor markers must arrive, departed IDs must disappear
+from interface statistics, and all drivers/interfaces must be removed before the
+next round reuses IDs. Queue statistics are probed while producers and delivery
+run, with a one-second RPC deadline and bounded application queues. End-of-round
+cleanup and final actor shutdown each have three-second deadlines.
+`RNS_BACKBONE_CHURN_ROUNDS` accepts 1..10000 (default 64); the overall deadline is
+20 seconds per round plus 30 seconds, allowing adaptive holds. Rounds pause one
+second after cleanup. This is repeated registration/disposal, not automatic
+reconnect of a surviving handle or listener-side flap protection. Earlier input
+is reconciled before FIN, so unobservable in-flight disconnect loss is not
+misreported as class-queue drops. It does not test abrupt loss of unread DATA,
+guarantee a particular gate timing, sustained saturation or hours-long stability.
+Reported workload counts exclude the two survivor markers per round; the test
+reports offered/delivered/drop counts, not a throughput-rate benchmark.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |
