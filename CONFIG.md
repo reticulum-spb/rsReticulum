@@ -674,7 +674,14 @@ bounded TX queue. After reading resumes, all admitted frames must arrive in
 order, the gate must release, and new admission/delivery must work.
 Output reports payload throughput, enqueue-to-receive p50/p99 latency, rejected
 admissions, observed buffered bytes and process-wide Linux RSS checkpoints.
-These checkpoints are neither peak RSS nor a memory bound. This is a current
+A sampler requests a reading every 5 ms during admission, gating and recovery;
+output includes its observed maximum RSS, successful/unavailable reads and
+largest actual interval. Scheduling gaps can miss short-lived peaks. `VmHWM`
+is reported before and after the workload as the kernel-reported process-lifetime
+high-water mark, including pre-test allocations. Both metrics include the test
+harness and both peers, not just driver queues. Missing procfs/fields produce
+unavailable readings, not zero memory. Sampling adds overhead; neither metric
+is a driver memory bound or a substitute for the encoded TX quota. This is a current
 driver baseline, not a before/after speedup comparison, production capacity
 estimate or transport-actor ingress/fairness benchmark; build profile, kernel
 buffers and host scheduling affect the results.

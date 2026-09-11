@@ -2370,3 +2370,37 @@ transport lib — 460 passed, 4 ignored; fmt/diff checks чистые. Преж�
 Расширена проверка actor/ingress под конкурентной нагрузкой. Сопоставимый
 before/after baseline, sustained/many-peer fairness и peak/RSS измерения
 по-прежнему остаются; этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: sampled RSS peak и process VmHWM под Backbone нагрузкой
+
+Двух-peer TX benchmark теперь наблюдает RSS во время admission, gate и recovery:
+Tokio sampler запрашивает /proc/self/status каждые5ms, пропускает пропущенные
+ticks и сообщает max фактического интервала. Отдельно читаются VmRSS и VmHWM
+до/после нагрузки. Sampler отменяется и ожидается перед финальным отчётом;
+при panic/timeout его также отменяет существующий task guard.
+
+Вывод дополнен sampled_peak_kib, valid/unavailable sample counts,
+requested_period_ms, observed_max_gap_ms и lifetime_hwm_start/end_kib.
+Отсутствие procfs/поля/корректной единицы даёт None, не нулевую память.
+Parser unit test проверяет независимые RSS/HWM, пропуски, неверные значения
+и единицы; накопитель сохраняет максимум и считает недоступные наблюдения.
+
+Два отдельных debug-прогона штатной команды benchmark:
+- sampled peak15744/15488 KiB, valid samples1406/1407, unavailable0;
+- actual max sampling gap6.010/6.068ms при запросе5ms;
+- lifetime VmHWM start10624/10368 KiB, end15744/15488 KiB;
+- fast payload throughput42.754/43.596 MiB/s, p99 13.771/13.550ms,
+  fast drops0; slow accepted282, rejected3814 в обоих прогонах.
+
+Sampled peak может пропустить короткие всплески. VmHWM — сообщаемый ядром
+максимум за жизнь всего процесса, включая время до нагрузки. Оба значения
+включают harness/peers/sampler и не доказывают bound драйвера; sampling добавляет
+overhead. Лимит encoded TX bytes4MiB проверяется независимо. CONFIG уточнён.
+
+Проверки: interface lib — 229 passed, 6 ignored; benchmark дважды успешен;
+workspace all-targets, fmt/diff checks успешны. Прежние warnings сохраняются.
+Эталон Python ea98db4f не изменён.
+
+Память текущего ограниченного двух-peer сценария измерена. Сопоставимый
+before/after baseline, sustained/many-peer fairness и масштабирование памяти
+при росте нагрузки ещё остаются. Этап 5 открыт, версия 1.0.1.

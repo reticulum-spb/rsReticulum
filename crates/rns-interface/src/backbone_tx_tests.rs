@@ -1129,8 +1129,95 @@ async fn compare_coalesced_and_legacy_writes() {
     );
 }
 
-/// Run alone with --ignored --exact --nocapture for meaningful process RSS.
-/// This measures the current driver; it is not a historical before/after result.
+/// Linux process readings, unavailable on platforms without procfs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProcessMemory {
+    rss_kib: Option<u64>,
+    high_water_kib: Option<u64>,
+}
+
+impl ProcessMemory {
+    fn parse(status: &str) -> Self {
+        fn field(status: &str, key: &str) -> Option<u64> {
+            let mut values = status
+                .lines()
+                .find_map(|line| line.strip_prefix(key))?
+                .split_whitespace();
+            let value = values.next()?.parse().ok()?;
+            (values.next()? == "kB").then_some(value)
+        }
+        Self {
+            rss_kib: field(status, "VmRSS:"),
+            high_water_kib: field(status, "VmHWM:"),
+        }
+    }
+
+    fn read() -> Self {
+        std::fs::read_to_string("/proc/self/status")
+            .map(|status| Self::parse(&status))
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+struct MemorySamples {
+    peak_kib: Option<u64>,
+    valid: u64,
+    unavailable: u64,
+    previous: Option<std::time::Instant>,
+    max_gap: Duration,
+}
+
+impl MemorySamples {
+    fn observe(&mut self, memory: &ProcessMemory) {
+        let now = std::time::Instant::now();
+        if let Some(previous) = self.previous.replace(now) {
+            self.max_gap = self.max_gap.max(now.duration_since(previous));
+        }
+        if let Some(rss) = memory.rss_kib {
+            self.peak_kib = Some(self.peak_kib.unwrap_or(0).max(rss));
+            self.valid += 1;
+        } else {
+            self.unavailable += 1;
+        }
+    }
+}
+
+#[test]
+fn process_memory_parser_keeps_rss_and_lifetime_high_water_separate() {
+    assert_eq!(
+        ProcessMemory::parse("Name:\ttest\nVmHWM:\t 2048 kB\nVmRSS:\t1024 kB\n"),
+        ProcessMemory {
+            rss_kib: Some(1024),
+            high_water_kib: Some(2048)
+        }
+    );
+    assert_eq!(
+        ProcessMemory::parse("VmRSS:\tbroken kB\nVmHWM:\t42 MB\n"),
+        ProcessMemory::default()
+    );
+    assert_eq!(
+        ProcessMemory::parse("VmRSS: 512 kB\n"),
+        ProcessMemory {
+            rss_kib: Some(512),
+            high_water_kib: None
+        }
+    );
+    assert_eq!(
+        ProcessMemory::parse("unavailable"),
+        ProcessMemory::default()
+    );
+    let mut samples = MemorySamples::default();
+    samples.observe(&ProcessMemory::parse("VmRSS: 512 kB"));
+    samples.observe(&ProcessMemory::default());
+    samples.observe(&ProcessMemory::parse("VmRSS: 256 kB"));
+    assert_eq!(
+        (samples.peak_kib, samples.valid, samples.unavailable),
+        (Some(512), 2, 1)
+    );
+}
+
+/// Run alone: memory readings include both peers and the test harness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "local two-peer TCP load measurement; holds one reader until egress gates"]
 async fn measure_two_peer_tcp_isolation_and_recovery() {
@@ -1141,16 +1228,6 @@ async fn measure_two_peer_tcp_isolation_and_recovery() {
                 task.abort();
             }
         }
-    }
-    fn rss_kib() -> Option<u64> {
-        std::fs::read_to_string("/proc/self/status")
-            .ok()?
-            .lines()
-            .find(|line| line.starts_with("VmRSS:"))?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()
     }
     async fn drain(
         peer: &mut TcpStream,
@@ -1208,7 +1285,21 @@ async fn measure_two_peer_tcp_isolation_and_recovery() {
         let slow_accounting = handles[0].0.accounting().unwrap();
         let fast_accounting = handles[1].0.accounting().unwrap();
         let origin = std::time::Instant::now();
-        let rss_start = rss_kib();
+        let memory_start = ProcessMemory::read();
+        let rss_start = memory_start.rss_kib;
+        let memory_samples = Arc::new(std::sync::Mutex::new(MemorySamples::default()));
+        memory_samples.lock().unwrap().observe(&memory_start);
+        let samples = memory_samples.clone();
+        let sampler = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_millis(5));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                let reading = ProcessMemory::read();
+                samples.lock().unwrap().observe(&reading);
+            }
+        });
+        tasks.0.push(sampler);
         let mut accepted = Vec::new();
         let mut rejected = 0u64;
         let mut high_buffered = 0;
@@ -1234,7 +1325,9 @@ async fn measure_two_peer_tcp_isolation_and_recovery() {
             }
         }).await.expect("stopped reader did not trigger egress gate");
         assert!(slow_accounting.snapshot().buffered > 0);
-        let rss_gated = rss_kib();
+        let memory_gated = ProcessMemory::read();
+        let rss_gated = memory_gated.rss_kib;
+        memory_samples.lock().unwrap().observe(&memory_gated);
         const FAST_SIZE: usize = 4096;
         const FAST_COUNT: u64 = 256;
         let fast_start = std::time::Instant::now();
@@ -1270,7 +1363,15 @@ async fn measure_two_peer_tcp_isolation_and_recovery() {
         drain(&mut slow, &[ATTEMPTS], SLOW_SIZE, origin).await;
         assert_eq!(slow_accounting.snapshot().dropped_frames, rejected);
         latency.sort_unstable();
-        eprintln!("two_peer_tcp: slow_attempts={ATTEMPTS} slow_accepted={} slow_dropped={rejected} slow_high_buffered={high_buffered} limit={HIGH_WATERMARK} slow_recovery_ms={:.3} slow_max_latency_ms={:.3} fast_frames={FAST_COUNT} fast_payload_MiB_s={:.3} fast_p50_ms={:.3} fast_p99_ms={:.3} fast_dropped=0 rss_start_kib={rss_start:?} rss_gated_kib={rss_gated:?} rss_end_kib={:?}; RSS checkpoints are process-wide, not peak or a memory bound", accepted.len(), recovery.as_secs_f64()*1000.0, *slow_latency.iter().max().unwrap() as f64/1e6, (FAST_COUNT as f64*FAST_SIZE as f64/1048576.0)/fast_elapsed.as_secs_f64(), latency[latency.len()/2] as f64/1e6, latency[(latency.len()-1)*99/100] as f64/1e6, rss_kib());
+        // No sample may race the final report or outlive the measured workload.
+        let sampler = tasks.0.pop().unwrap();
+        sampler.abort();
+        let _ = sampler.await;
+        let memory_end = ProcessMemory::read();
+        let mut samples = memory_samples.lock().unwrap();
+        samples.observe(&memory_end);
+        eprintln!("two_peer_tcp: slow_attempts={ATTEMPTS} slow_accepted={} slow_dropped={rejected} slow_high_buffered={high_buffered} limit={HIGH_WATERMARK} slow_recovery_ms={:.3} slow_max_latency_ms={:.3} fast_frames={FAST_COUNT} fast_payload_MiB_s={:.3} fast_p50_ms={:.3} fast_p99_ms={:.3} fast_dropped=0 rss_start_kib={rss_start:?} rss_gated_kib={rss_gated:?} rss_end_kib={:?}", accepted.len(), recovery.as_secs_f64()*1000.0, *slow_latency.iter().max().unwrap() as f64/1e6, (FAST_COUNT as f64*FAST_SIZE as f64/1048576.0)/fast_elapsed.as_secs_f64(), latency[latency.len()/2] as f64/1e6, latency[(latency.len()-1)*99/100] as f64/1e6, memory_end.rss_kib);
+        eprintln!("two_peer_memory: sampled_peak_kib={:?} valid_samples={} unavailable_samples={} requested_period_ms=5 observed_max_gap_ms={:.3} lifetime_hwm_start_kib={:?} lifetime_hwm_end_kib={:?}; process-wide, sampled peak can miss spikes, VmHWM includes pre-test lifetime, neither is a driver memory bound", samples.peak_kib, samples.valid, samples.unavailable, samples.max_gap.as_secs_f64()*1000.0, memory_start.high_water_kib, memory_end.high_water_kib);
     }).await.expect("two-peer load test timed out");
 }
 
