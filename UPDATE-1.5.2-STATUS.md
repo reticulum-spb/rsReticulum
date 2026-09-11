@@ -1112,3 +1112,50 @@ signalling_bytes отказать для недопустимого mode. В Rus
 Это локальная prerequisite-починка, не завершение этапов 4/5/6: transit clamp,
 увеличенный local MTU, dataplane control и прежние ограничения остаются.
 Обновлены границы в CONFIG.md; версия и пользовательский план не изменены.
+
+## Этап 4 — точная длина tunnel synthesis и exception-counter границы
+
+При сверке Python `tunnel_synthesize_handler` найдено реальное расхождение:
+Python обрабатывает только ровно 176 байт, Rust `TunnelSynthesisData::unpack`
+принимал любую длину >=176, игнорируя хвост. Подписанный prefix с лишним байтом
+мог создать/обновить туннель. Regression test сначала воспроизвёл создание
+туннеля при длине 177, затем проверка исправлена на строгое равенство.
+
+Дополнены parser/actor tests: длины 0/1/64/175/176/177/200/300; отказ не
+меняет binding и expires существующего туннеля. В пределах допустимого frame
+MTU эти отказы не увеличивают protocol_violations: Python просто не входит
+в handler body при неверной длине. Bad signature тоже остаётся обычным False.
+
+Добавлен AST oracle для реального Python tunnel handler: 11 вариантов длины,
+подписи и signing key, сравниваются installation count и protocol violations
+с Rust actor. Используются реальные RNS.Identity/crypto, установка туннеля
+подменена локальной записью вызова; RNS runtime/сокеты не запускаются.
+Эталонный checkout остался неизменным на ea98db4f.
+
+Уточнены границы оставшихся exception sites:
+
+- Missing random blob: не отдельное состояние Rust AnnounceData, поле `[u8;10]`;
+  короткий announce отвергается при parse с уже существующим counter.
+- Tunnel exception branch: неверная длина/подпись/рассмотренные некорректные
+  ключи не требуют нового exception counter; это подтверждено oracle.
+- Generic Python `inbound_job` catch: не переносится как catch_unwind вокруг
+  actor. Result/Option failures уже имеют явные rejection paths; нарушение
+  внутренних инвариантов не объявляется ошибкой протокола peer. Это граница
+  архитектурного соответствия, а не доказательство отсутствия любых panic.
+- MTU signalling exceptions: по-прежнему зависят от реального transit/local
+  clamp и передачи MTU capabilities (этап 5), фиктивный счётчик не добавлен.
+
+Проверки:
+
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  464 passed, 5 ignored.
+- `cargo test -p rns-transport --features sqlite-bundled --lib tunnel_rejection_and_counters_match_python -- --ignored`:
+  1 passed (11 cases).
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  5 ignored; workspace all-targets собирается, новых warnings нет.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно.
+
+Для этапа 4 остаются межпроцессная проверка смешанной нагрузки/активного
+disconnect и итоговая фиксация границ. MTU-dependent diagnostics остаются
+явной зависимостью от этапа 5; глобальные flow totals/composition/PPS — этап 7.
+Полное обновление не завершено, версия и пользовательский план не менялись.

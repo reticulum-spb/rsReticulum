@@ -8850,6 +8850,141 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Python reference checkout"]
+    fn tunnel_rejection_and_counters_match_python() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let identity = rns_identity::identity::Identity::from_private_key(&[0x37; 64]).unwrap();
+        let raw = crate::tunnel::build_tunnel_synthesis_packet(&identity, [0x42; 32]).unwrap();
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let original = &raw[offset..];
+        let mut cases = Vec::new();
+        for length in [0, 1, 64, 175, 176, 177, 200, 300] {
+            let mut payload = original.to_vec();
+            payload.resize(length, 0x55);
+            cases.push(payload);
+        }
+        let mut bad_signature = original.to_vec();
+        bad_signature[175] ^= 1;
+        cases.push(bad_signature);
+        for byte in [0, 0xFF] {
+            let mut bad_key = original.to_vec();
+            bad_key[32..64].fill(byte);
+            cases.push(bad_key);
+        }
+        let mut input = String::new();
+        let mut expected = String::new();
+        for payload in cases {
+            input.push_str(&if payload.is_empty() {
+                "-".into()
+            } else {
+                hex::encode(&payload)
+            });
+            input.push('\n');
+            let (mut actor, _tx) = TransportActor::new();
+            let (interface, _rx) = make_test_interface("tunnel-oracle");
+            actor.interfaces.insert(1, interface);
+            let mut packet = raw[..offset].to_vec();
+            packet.extend_from_slice(&payload);
+            actor.on_inbound(InboundPacket {
+                raw: packet.into(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            expected.push_str(&format!(
+                "{} {}\n",
+                actor.tunnel_table.len(),
+                actor.interfaces[&1].inbound_diagnostics.protocol_violations
+            ));
+        }
+        let mut child = Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .args([
+            "-B",
+            "-c",
+            include_str!("../../tests/tunnel_handler_reference.py"),
+        ])
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output().unwrap();
+        let written = writer.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+
+    #[test]
+    fn tunnel_synthesis_trailing_bytes_cannot_refresh_existing_binding() {
+        let identity = rns_identity::identity::Identity::from_private_key(&[0x37; 64]).unwrap();
+        let mut raw = crate::tunnel::build_tunnel_synthesis_packet(&identity, [0x42; 32]).unwrap();
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let tunnel_id = crate::tunnel::TunnelSynthesisData::unpack(&raw[offset..])
+            .unwrap()
+            .tunnel_id();
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, _rx) = make_test_interface("tunnel-rebind");
+        actor.interfaces.insert(1, interface);
+        crate::tunnel::handle_tunnel(&mut actor.tunnel_table, tunnel_id, 2, 60.0);
+        actor.tunnel_table.get_mut(&tunnel_id).unwrap().expires = 12345.0;
+        raw.push(0xFF);
+        actor.on_inbound(InboundPacket {
+            raw: raw.into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        let tunnel = actor.tunnel_table.get(&tunnel_id).unwrap();
+        assert_eq!(tunnel.interface_id, 2);
+        assert_eq!(tunnel.expires, 12345.0);
+        assert_eq!(actor.interfaces[&1].inbound_diagnostics, Default::default());
+    }
+
+    #[test]
+    fn tunnel_synthesis_requires_exact_payload_length() {
+        let identity = rns_identity::identity::Identity::from_private_key(&[0x37; 64]).unwrap();
+        let raw = crate::tunnel::build_tunnel_synthesis_packet(&identity, [0x42; 32]).unwrap();
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        for length in [0, 1, 64, 175, 176, 177, 200, 300] {
+            let (mut actor, _tx) = TransportActor::new();
+            let (interface, _rx) = make_test_interface("tunnel-length");
+            actor.interfaces.insert(1, interface);
+            let mut packet = raw.clone();
+            packet.resize(offset + length, 0x55);
+            actor.on_inbound(InboundPacket {
+                raw: packet.into(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            assert_eq!(
+                actor.tunnel_table.len(),
+                usize::from(length == 176),
+                "payload length {length}"
+            );
+            assert_eq!(
+                actor.interfaces[&1].inbound_diagnostics,
+                Default::default(),
+                "length rejection is not a Python handler exception"
+            );
+        }
+    }
+
+    #[test]
     fn tunnel_synthesis_validates_identity_signing_key() {
         let identity = rns_identity::identity::Identity::from_private_key(&[0x37; 64]).unwrap();
         let raw = crate::tunnel::build_tunnel_synthesis_packet(&identity, [0x42; 32]).unwrap();

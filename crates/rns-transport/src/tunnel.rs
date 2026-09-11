@@ -140,8 +140,10 @@ impl TunnelSynthesisData {
         data
     }
 
+    /// Parse the exact signed payload. Python rejects trailing bytes rather
+    /// than treating a valid prefix as a complete synthesis request.
     pub fn unpack(data: &[u8]) -> Option<Self> {
-        if data.len() < 176 {
+        if data.len() != 176 {
             return None;
         }
         let mut public_key = [0u8; 64];
@@ -292,6 +294,11 @@ mod tests {
         assert_eq!(unpacked.interface_hash, data.interface_hash);
         assert_eq!(unpacked.random_hash, data.random_hash);
         assert_eq!(unpacked.signature, data.signature);
+        for length in [0, 1, 64, 175, 177, 200] {
+            let mut malformed = packed.clone();
+            malformed.resize(length, 0);
+            assert!(TunnelSynthesisData::unpack(&malformed).is_none());
+        }
     }
 
     #[test]

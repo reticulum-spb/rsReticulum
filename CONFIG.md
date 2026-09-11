@@ -228,8 +228,17 @@ signature, matching Python's distinction between these paths. Ordinary tunnel
 signature rejection likewise does not count: the Python tunnel handler counts
 exceptions, not a false signature-validation result.
 
-Exception-only diagnostics and path-MTU signalling still require further
-compatibility review. CLI and remote-management display are pending.
+Tunnel synthesis requires an exact 176-byte payload. Truncated or extended
+payloads cannot install, refresh or rebind a tunnel, even if their first
+176 bytes contain a valid signature. These length rejections do not increment
+protocol violations, matching Python's handler rather than its exception branch.
+
+Python's generic processing-exception counter is not implemented as a Rust
+panic catcher: expected parse/validation failures use explicit rejection paths,
+while actor invariant failures are programming errors, not automatically blamed
+on the peer. This is not a claim that every processing path is panic-free.
+Path-MTU signalling diagnostics still depend on pending transport clamping.
+CLI and remote-management display are pending.
 
 ### Local Link MTU negotiation (partial)
 
