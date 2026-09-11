@@ -1373,6 +1373,126 @@ fn process_memory_parser_keeps_rss_and_lifetime_high_water_separate() {
     );
 }
 
+/// Run alone so process-wide resource checkpoints are interpretable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "12 rounds of four pressured TCP client lifecycles with FIN/RST teardown"]
+async fn repeated_pressured_client_lifecycles_release_reservations() {
+    fn descriptors() -> Option<usize> {
+        std::fs::read_dir("/proc/self/fd")
+            .ok()?
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+            .map(|entries| entries.len())
+    }
+    struct Tasks(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for Tasks {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(120), async {
+        const PEERS: usize = 4;
+        const ROUNDS: usize = 12;
+        const ATTEMPTS: usize = 512;
+        eprintln!("client_lifecycles: baseline={:?} fds={:?}", ProcessMemory::read(), descriptors());
+        for round in 0..ROUNDS {
+            let mut tasks = Tasks(Vec::new());
+            let mut handles = Vec::new();
+            let mut peers = Vec::new();
+            let (transport_tx, mut events) = mpsc::channel(PEERS);
+            for id in 0..PEERS {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut config = BackboneClientConfig::new(
+                    "lifecycle-pressure", "127.0.0.1", listener.local_addr().unwrap().port());
+                // Test full handle disposal, not the reconnect delay or listener flap policy.
+                config.max_reconnect_tries = Some(1);
+                let handle = spawn_backbone_client(config, id as u64, transport_tx.clone()).await.unwrap();
+                tasks.0.push(handle.read_task);
+                let (mut peer, _) = listener.accept().await.unwrap();
+                while !handle.online.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                // Each replacement connection must work before it is stressed.
+                let marker = format!("round-{round}-peer-{id}~}}");
+                handle.tx.try_send(Bytes::copy_from_slice(marker.as_bytes())).unwrap();
+                let expected = hdlc::frame(marker.as_bytes());
+                let mut received = vec![0; expected.len()];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, expected);
+                handles.push((handle.tx, handle.online));
+                peers.push(peer);
+            }
+            let mut rejected = vec![0u64; PEERS];
+            for _ in 0..ATTEMPTS {
+                for (id, (tx, _)) in handles.iter().enumerate() {
+                    // Separate allocations exercise payload disposal, not shared Bytes clones.
+                    match tx.try_send(vec![0x55; 16384].into()) {
+                        Ok(()) => {},
+                        Err(mpsc::error::TrySendError::Full(_)) => rejected[id] += 1,
+                        Err(error) => panic!("early disconnect: {error}"),
+                    }
+                    assert!(tx.accounting().unwrap().snapshot().buffered <= HIGH_WATERMARK);
+                }
+            }
+            assert!(rejected.iter().all(|count| *count > 0 && *count < ATTEMPTS as u64));
+            tokio::time::timeout(Duration::from_secs(6), async {
+                while !handles.iter().all(|(tx, _)| tx.accounting().unwrap().snapshot().gated) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("all lifecycle peers must gate under pressure");
+            let retained: Vec<_> = handles.iter().map(|(tx, _)| {
+                let accounting = tx.accounting().unwrap();
+                assert!(accounting.snapshot().buffered > 0);
+                Arc::downgrade(&accounting)
+            }).collect();
+            let mut half_closed = Vec::new();
+            for (id, mut peer) in peers.into_iter().enumerate() {
+                if (round + id) % 2 == 0 {
+                    peer.shutdown().await.unwrap();
+                    // Retain the read half: receiving FIN must terminate the driver.
+                    half_closed.push(peer);
+                } else {
+                    socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
+                    drop(peer);
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let mut deregistered = [false; PEERS];
+                for _ in 0..PEERS {
+                    let Some(TransportMessage::DeregisterInterface { id }) = events.recv().await else {
+                        panic!("expected lifecycle deregistration");
+                    };
+                    let id = id as usize;
+                    assert!(id < PEERS && !deregistered[id]);
+                    deregistered[id] = true;
+                }
+                for task in &mut tasks.0 {
+                    task.await.unwrap();
+                }
+            }).await.expect("disconnect must release pressured drivers promptly");
+            for (id, (tx, online)) in handles.iter().enumerate() {
+                assert!(!online.load(Ordering::SeqCst));
+                assert!(tx.is_closed());
+                let snapshot = tx.accounting().unwrap().snapshot();
+                assert_eq!(snapshot.buffered, 0);
+                assert!(!snapshot.gated);
+                assert_eq!(snapshot.dropped_frames, rejected[id]);
+            }
+            assert!(events.try_recv().is_err());
+            drop(handles);
+            assert!(retained.iter().all(|accounting| accounting.upgrade().is_none()),
+                "no driver or orphan forwarding task may retain TX accounting");
+            drop(half_closed);
+            drop(tasks);
+            drop(events);
+            drop(transport_tx);
+            eprintln!("client_lifecycles: round={} rejected={rejected:?} memory={:?} fds={:?}; all TX reservations and accounting released", round + 1, ProcessMemory::read(), descriptors());
+        }
+    }).await.expect("client lifecycle measurement timed out");
+}
+
 /// Each case gets a fresh allocator and process-lifetime VmHWM.
 #[tokio::test]
 #[ignore = "isolated local TCP memory scaling measurement"]

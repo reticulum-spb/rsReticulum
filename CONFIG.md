@@ -703,6 +703,20 @@ readings remain unavailable. This finite measurement does not establish a
 linear memory formula, production peer capacity or leak freedom under churn.
 The ignored `memory_scaling_child` fixture is internal; invoke the parent above.
 
+For repeated pressured client creation and disposal, run alone:
+`cargo test -p rns-interface backbone::tx_tests::repeated_pressured_client_lifecycles_release_reservations -- --ignored --exact --nocapture`.
+Twelve rounds create four real TCP clients each, verify a marker on every new
+connection, then attempt 512 separate 16384-byte allocations per peer without
+reading. Once all TX gates engage, two peers send FIN while retaining their read
+halves and two reset their sockets (roles alternate by round). Every driver must
+deregister and finish within three seconds, close admission, release all TX
+reservations and gates, and leave no owner of TX accounting after handle disposal.
+Post-round Linux RSS/VmHWM and process descriptor counts are reported, not used
+as portable hard limits. Allocator retention is not itself a leak. Reported drops
+count rejected admissions, not accepted data discarded on intentional teardown.
+This is 48 client lifecycles, not automatic reconnect on a surviving handle,
+server-side flap protection, a transport-actor test or a long-duration soak.
+
 For an isolated TCP writer comparison, run
 `cargo test -p rns-interface backbone::tx_tests::compare_legacy_and_coalesced_tcp_writers -- --ignored --exact --nocapture`.
 It recreates the per-frame `write_all` loop from `7a5747c^` alongside the current

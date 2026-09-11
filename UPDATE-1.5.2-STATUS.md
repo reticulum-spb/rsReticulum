@@ -2571,3 +2571,50 @@ fmt/diff checks успешны, прежние warnings сохраняются. 
 Масштабирование памяти на конечной нагрузке до8 peers проверено.
 Whole-pipeline before/after, churn/длительный soak остаются.
 Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: повторное создание и освобождение нагруженных клиентов
+
+Добавлен ignored `repeated_pressured_client_lifecycles_release_reservations`:
+12 раундов по4 новых BackboneClient/raw TCP peers, каждый на свободном
+loopback-порту. На каждом соединении сначала проверяется доставка уникального
+HDLC marker, затем512 попыток отправить отдельно выделенные16384 bytes.
+При остановленном чтении все четыре TX должны перейти в gated за6s;
+учтённый encoded backlog проверяется против4MiB на каждом шаге admission.
+
+После gating два peers отправляют FIN с сохранением read half, два — RST;
+роли чередуются по раундам. За3s требуется ровно одна deregistration на id
+и завершение всех драйверов. Проверяются offline, закрытый TX sender,
+buffered=0, gated=false, соответствие dropped_frames отказам admission.
+После удаления handles слабые ссылки на TX accounting должны перестать
+upgrade: forwarding/writer не удерживают учёт очереди. Guard отменяет
+драйверы при ошибке/таймауте; внешний deadline120s.
+
+Это полный dispose с max_reconnect_tries=1 и последующим созданием новых
+handles, не автоматический reconnect того же handle, не listener flap policy
+и не transport-actor churn. Доставка нагрузки после преднамеренного разрыва
+не ожидается: accepted data может быть потеряна, drops здесь только admission.
+Тест не меняет runtime-политику и не добавляет гарантии доставки при разрыве.
+
+Команда (запускать отдельно от других тестов того же процесса):
+`cargo test -p rns-interface backbone::tx_tests::repeated_pressured_client_lifecycles_release_reservations -- --ignored --exact --nocapture`.
+
+Debug-прогон успешен за48.26s:48 жизненных циклов,24 FIN/24 RST.
+На каждом peer приняты285 и отклонены227 из512 попыток (marker отдельно).
+Всего24576 попыток,13680 accepted,10896 rejected; тест сверяет фактические
+счётчики и не требует именно такого scheduling-dependent распределения.
+После каждого раунда все TX reservations/accounting освобождены;
+число process descriptors10 до нагрузки и после каждого из12 раундов.
+RSS baseline8204KiB; после раундов:
+27532,27788,27788,27788,27916,27916,27916,27916,28044,28044,28044,28044KiB.
+Конечный VmHWM28044KiB. Метрики process-wide, checkpoints не ловят все пики,
+allocator retention не равен утечке; строгих RSS/FD порогов в тесте нет.
+Отсутствующий procfs даёт unavailable. Короткий прогон не доказывает отсутствие
+утечек на часах работы или во всех сценариях reconnect.
+
+Регрессии интерфейсов:229 passed,10 ignored. Workspace all-targets,
+fmt/diff checks успешны; прежние warnings database_path/tracing prelude
+сохраняются. Python ea98db4f не изменён. CONFIG дополнен командой и границами.
+
+Повторный pressured client lifecycle проверен. Whole-pipeline before/after,
+длительный soak и churn на уровне transport остаются.
+Этап 5 открыт, версия 1.0.1.
