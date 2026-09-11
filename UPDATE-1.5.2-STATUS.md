@@ -1159,3 +1159,70 @@ MTU эти отказы не увеличивают protocol_violations: Python 
 disconnect и итоговая фиксация границ. MTU-dependent diagnostics остаются
 явной зависимостью от этапа 5; глобальные flow totals/composition/PPS — этап 7.
 Полное обновление не завершено, версия и пользовательский план не менялись.
+
+## Этап 4 — межпроцессный TCP-тест и фиксация итогов
+
+Добавлен `rns-runtime/tests/mixed_tcp_python.rs` с Python peer
+`mixed_tcp_peer.py`: отдельный процесс слушает свободный loopback TCP-порт,
+два настоящих Rust TcpClient driver подключаются к нему. Пакеты формируются
+Python RNS, announce подписан реальной Identity, framing использует Python
+HDLC.escape. Полный Reticulum daemon Python не запускается, внешние адреса
+и действующие порты не используются. Actor запускается с class limits `[4;4]`,
+на memory и SQLite backend; интерфейсы регистрируются тестовым harness,
+это не повторная проверка YAML/runtime factory.
+
+Проверяется:
+
+- DATA/announce/PR приходят по первому соединению, ingress-limited PR — по
+  второму. RX bytes и counters растут, pr_burst_active подтверждён.
+- DATA с байтами `~}` проходит реальный HDLC escaping/deframing и доставку
+  destination; announce проходит проверку и создаёт маршрут через первый peer.
+- Восемь запросов статистики под нагрузкой отвечают; class heights не
+  превышают limits, total совпадает с суммой heights.
+- Python закрывает оба активных TCP-соединения; реальные read tasks завершаются
+  и отправляют deregistration. Actor удаляет интерфейсы, class backlog и
+  маршруты через них. После этого shutdown успешно завершает actor/SQLite.
+
+Генератор ограничен 256 batches на соединение с паузой до 1 ms между batches:
+это воспроизводимый lifecycle/interop test, а не максимальный throughput или
+гарантия drops. Первоначальный неограниченный вариант на SQLite не успевал
+прочитать до EOF накопленные TCP-байты за 15 s; это зафиксированная граница
+тестовой нагрузки, не доказательство зависания actor. Предельный backpressure
+остаётся предметом этапа 5.
+Неограниченная actor-level нагрузка и детерминированные overflows всех классов
+проверяются отдельными тестами предыдущего коммита. Обратная передача PR
+ответов и peer re-connect не заявляются покрытыми этим новым сценарием.
+
+Проверки:
+
+- `cargo test -p rns-runtime --features api,sqlite-bundled --test mixed_tcp_python -- --ignored`:
+  2 passed, повторный запуск 2 passed. Требуется loopback-разрешение; после
+  sandbox EPERM выполнен разрешённый повтор. Успешные SQLite runs удаляют
+  собственные временные DB directories; Python завершает соединения и threads.
+- `cargo test -p rns-transport --features sqlite-bundled --quiet -- --include-ignored --skip sqlite_crash_fixture`:
+  468 unit tests и 1 integration oracle passed, включая Python filter/tags/
+  traffic/tunnel/queue проверки. Внутренний sqlite_crash_fixture не запускается
+  отдельно: он требует directory env и вызывается своим parent crash test.
+  Первоначальный include-ignored без skip закономерно упал именно на fixture.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  5 ignored; повтор с loopback-разрешением после EPERM.
+- `cargo check --workspace --all-targets`: успешно.
+- Расширенная `cargo check -p rns-runtime --no-default-features --features client --tests`
+  обнаружила прежний gravity test, обращавшийся к full-only runtime полям.
+  Его full-only assertions теперь gated; YAML/normalization проверяются и
+  в client-only. Check и целевой gravity test в client-only теперь проходят.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно.
+
+Итог этапа 4: его основная область реализована и проверена — четыре класса и
+приоритеты, YAML limits, отдельное управление, ранняя фильтрация и явные
+violation counters, inflight PR/объединение/очистка, queue и per-interface
+traffic counters/rates, actor/storage и ограниченная межпроцессная нагрузка.
+Фиксируем этап с двумя межэтапными оговорками, не выдавая их за готовность:
+
+- MTU-dependent clamp/diagnostics требуют capabilities и MTU-семантики этапа 5.
+- Глобальные totals/parent aggregation/composition/PPS и CLI/remote вывод —
+  диагностика этапа 7.
+
+Это позволяет продолжить этап 5 без дальнейшего расширения входящих очередей
+задачами глобальной диагностики. Полный паритет 1.5.2 и финальная интеграция
+не заявляются; версия и пользовательский план остаются неизменными.

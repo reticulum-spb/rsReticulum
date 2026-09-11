@@ -2219,14 +2219,18 @@ mod tests {
         );
         let runtime = config.to_runtime_config().unwrap();
         let globals = runtime.section("reticulum").unwrap();
-        let runtime_config = crate::reticulum::ReticulumConfig::try_from_config(&runtime).unwrap();
-        assert_eq!(runtime_config.default_gravity, -17);
-        assert_eq!(runtime_config.autoconnect_interface_gravity, Some(-9));
-        assert_eq!(
-            runtime_config.autoconnect_interface_mode,
-            Some(rns_interface::traits::InterfaceMode::Internal)
-        );
-        assert!(runtime_config.autoconnect_announces_to_internal);
+        #[cfg(feature = "full")]
+        {
+            let runtime_config =
+                crate::reticulum::ReticulumConfig::try_from_config(&runtime).unwrap();
+            assert_eq!(runtime_config.default_gravity, -17);
+            assert_eq!(runtime_config.autoconnect_interface_gravity, Some(-9));
+            assert_eq!(
+                runtime_config.autoconnect_interface_mode,
+                Some(rns_interface::traits::InterfaceMode::Internal)
+            );
+            assert!(runtime_config.autoconnect_announces_to_internal);
+        }
         assert_eq!(globals.get_int("default_gravity"), Some(-17));
         assert_eq!(globals.get_int("autoconnect_interface_gravity"), Some(-9));
         assert_eq!(globals.get("autoconnect_interface_mode"), Some("internal"));
@@ -2239,9 +2243,14 @@ mod tests {
             (1, "inherited", None, None),
         ] {
             let section = runtime.subsection("interfaces", name).unwrap();
-            let post = crate::interface_factory::InterfacePostInit::from_section(section);
-            assert_eq!(post.gravity, gravity);
-            assert_eq!(post.announces_to_internal, internal);
+            assert_eq!(section.get_int("gravity"), gravity);
+            assert_eq!(section.get_bool("announces_to_internal"), internal);
+            #[cfg(feature = "full")]
+            {
+                let post = crate::interface_factory::InterfacePostInit::from_section(section);
+                assert_eq!(post.gravity, gravity);
+                assert_eq!(post.announces_to_internal, internal);
+            }
             #[cfg(feature = "api")]
             assert_eq!(
                 interface_from_normalized_section(name, section).unwrap(),
