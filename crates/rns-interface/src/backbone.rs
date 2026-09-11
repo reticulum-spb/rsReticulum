@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use crate::backbone_flap::{FastFlapConfig, FastFlapProtection, FastFlapTable};
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
@@ -41,6 +42,9 @@ const TX_CHANNEL_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct BackboneServerConfig {
+    pub fast_flap: FastFlapConfig,
+    /// None selects Python-compatible process-wide IP history.
+    pub fast_flap_table: Option<Arc<FastFlapTable>>,
     pub name: String,
     pub listen_ip: String,
     pub listen_port: u16,
@@ -53,6 +57,8 @@ pub struct BackboneServerConfig {
 impl BackboneServerConfig {
     pub fn new(name: &str, ip: &str, port: u16) -> Self {
         Self {
+            fast_flap: FastFlapConfig::default(),
+            fast_flap_table: None,
             name: name.to_string(),
             listen_ip: ip.to_string(),
             listen_port: port,
@@ -221,6 +227,15 @@ pub async fn spawn_backbone_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    config
+        .fast_flap
+        .validate()
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let protection = Arc::new(match config.fast_flap_table.clone() {
+        Some(table) => FastFlapProtection::with_table(config.fast_flap.clone(), table),
+        None => FastFlapProtection::new(config.fast_flap.clone()),
+    });
+    let diagnostics = protection.clone();
     let listen_ip = resolve_listen_addr(&config);
     let bind_addr = if listen_ip.starts_with('[') {
         format!("{}:{}", listen_ip, config.listen_port)
@@ -254,6 +269,12 @@ pub async fn spawn_backbone_server(
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    if protection.is_blocked_at(peer.ip(), std::time::Instant::now()) {
+                        tracing::debug!(%peer, "rejecting fast-flapping Backbone IP");
+                        drop(stream);
+                        continue;
+                    }
+                    let connected_at = std::time::Instant::now();
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
                     tracing::info!(
@@ -272,16 +293,27 @@ pub async fn spawn_backbone_server(
 
                     let c_online_w = c_online.clone();
                     let c_txb_w = c_txb.clone();
-                    tokio::spawn(backbone_write_loop(writer, c_rx, c_online_w, c_txb_w));
 
                     let c_online_r = c_online.clone();
                     let c_rxb_r = c_rxb.clone();
                     let transport_tx2 = transport_tx.clone();
                     let dereg_tx = transport_tx.clone();
                     let cname = client_name.clone();
+                    let connection_online = c_online.clone();
+                    let disconnected = FlapDisconnectGuard {
+                        protection: protection.clone(),
+                        ip: peer.ip(),
+                        connected_at,
+                    };
                     let read_handle = tokio::spawn(async move {
-                        backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r)
-                            .await;
+                        tokio::select! {
+                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r) => {},
+                            _ = backbone_write_loop(writer, c_rx, c_online_w, c_txb_w) => {},
+                        }
+                        connection_online.store(false, Ordering::SeqCst);
+                        // Record before notifying the runtime, so an immediate
+                        // reconnect observes the new block. Guard also covers abort.
+                        drop(disconnected);
                         tracing::info!(name = %cname, "backbone client disconnected");
                         // Proactive notify so broadcasts don't target dead tx.
                         let _ = dereg_tx
@@ -292,6 +324,7 @@ pub async fn spawn_backbone_server(
                     let handle = InterfaceHandle {
                         id: client_id,
                         parent_id: Some(id),
+                        diagnostics: None,
                         name: client_name,
                         mode,
                         direction: InterfaceDirection {
@@ -325,6 +358,7 @@ pub async fn spawn_backbone_server(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: Some(diagnostics),
         name,
         mode,
         direction: InterfaceDirection {
@@ -341,6 +375,19 @@ pub async fn spawn_backbone_server(
         tx,
         read_task,
     })
+}
+
+struct FlapDisconnectGuard {
+    protection: Arc<FastFlapProtection>,
+    ip: IpAddr,
+    connected_at: std::time::Instant,
+}
+
+impl Drop for FlapDisconnectGuard {
+    fn drop(&mut self) {
+        self.protection
+            .disconnected_at(self.ip, self.connected_at, std::time::Instant::now());
+    }
 }
 
 pub async fn spawn_backbone_client(
@@ -493,6 +540,7 @@ pub async fn spawn_backbone_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -514,6 +562,84 @@ pub async fn spawn_backbone_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fast_flapping_loopback_grace_rejection_and_disabled() {
+        for enabled in [true, false] {
+            let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let mut config = BackboneServerConfig::new("flap-test", "127.0.0.1", port);
+            config.fast_flap = FastFlapConfig {
+                enabled,
+                grace: 1,
+                ..Default::default()
+            };
+            config.fast_flap_table = Some(Arc::default());
+            let (transport_tx, mut events) = mpsc::channel(16);
+            let (handle_tx, mut children) = mpsc::channel(16);
+            let parent = spawn_backbone_server(
+                config,
+                1,
+                Arc::new(AtomicU64::new(2)),
+                transport_tx,
+                handle_tx,
+            )
+            .await
+            .unwrap();
+            let diagnostics = parent.diagnostics.as_ref().unwrap();
+            for count in 1..=2 {
+                let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let child = tokio::time::timeout(Duration::from_secs(2), children.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(child.parent_id, Some(1));
+                drop(stream);
+                let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(event, TransportMessage::DeregisterInterface { id } if id == child.id)
+                );
+                assert_eq!(
+                    diagnostics.blocked_ip_list().unwrap(),
+                    if enabled && count == 2 {
+                        vec!["127.0.0.1".to_owned()]
+                    } else {
+                        vec![]
+                    }
+                );
+                child.read_task.await.unwrap();
+            }
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            if enabled {
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                assert!(children.try_recv().is_err());
+            } else {
+                let child = tokio::time::timeout(Duration::from_secs(2), children.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(stream);
+                tokio::time::timeout(Duration::from_secs(2), child.read_task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(diagnostics.blocked_ip_list().unwrap().is_empty());
+            }
+            parent.read_task.abort();
+            let _ = parent.read_task.await;
+        }
+    }
 
     #[test]
     fn test_backbone_server_config() {

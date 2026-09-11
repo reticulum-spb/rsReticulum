@@ -876,6 +876,7 @@ pub async fn spawn_rnode_interface(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {

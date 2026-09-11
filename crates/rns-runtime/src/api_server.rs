@@ -480,6 +480,10 @@ struct InterfaceRequest {
     announces_from_internal: Option<bool>,
     announces_to_internal: Option<bool>,
     gravity: Option<i64>,
+    block_fast_flapping: Option<bool>,
+    fast_flapping_threshold: Option<f64>,
+    fast_flapping_grace: Option<u64>,
+    fast_flapping_block_time: Option<f64>,
     bootstrap_only: Option<bool>,
     ignore_config_warnings: Option<bool>,
     discoverable: Option<bool>,
@@ -620,6 +624,7 @@ impl InterfaceRequest {
             ("recursive_prs", self.recursive_prs),
             ("announces_from_internal", self.announces_from_internal),
             ("announces_to_internal", self.announces_to_internal),
+            ("block_fast_flapping", self.block_fast_flapping),
             ("bootstrap_only", self.bootstrap_only),
             ("ignore_config_warnings", self.ignore_config_warnings),
             ("discoverable", self.discoverable),
@@ -632,6 +637,7 @@ impl InterfaceRequest {
         }
         for (key, value) in [
             ("bitrate", self.bitrate),
+            ("fast_flapping_grace", self.fast_flapping_grace),
             ("announce_rate_target", self.announce_rate_target),
             ("announce_rate_penalty", self.announce_rate_penalty),
             ("ic_max_held_announces", self.ic_max_held_announces),
@@ -652,6 +658,8 @@ impl InterfaceRequest {
         }
         for (key, value) in [
             ("announce_cap", self.announce_cap),
+            ("fast_flapping_threshold", self.fast_flapping_threshold),
+            ("fast_flapping_block_time", self.fast_flapping_block_time),
             ("ic_burst_freq_new", self.ic_burst_freq_new),
             ("ic_burst_freq", self.ic_burst_freq),
             ("ic_pr_burst_freq_new", self.ic_pr_burst_freq_new),
@@ -1789,6 +1797,8 @@ fn merge_iface_json(
         // ── runtime status ────────────────────────────────────────────
         "online":                       e.online,
         "mode":                         e.mode,
+        "blocked_ips":                  e.blocked_ips,
+        "blocked_ip_list":              e.blocked_ip_list,
         "gravity":                      e.gravity,
         "announces_to_internal":         e.announces_to_internal,
         "role":                         e.role,
@@ -1946,6 +1956,22 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
     ]);
     let object = value.as_object_mut().unwrap();
     object.insert("gravity".into(), json!(section.get_int("gravity")));
+    object.insert(
+        "block_fast_flapping".into(),
+        json!(section.get_bool("block_fast_flapping")),
+    );
+    object.insert(
+        "fast_flapping_threshold".into(),
+        json!(section.get_float("fast_flapping_threshold")),
+    );
+    object.insert(
+        "fast_flapping_grace".into(),
+        json!(section.get_uint("fast_flapping_grace")),
+    );
+    object.insert(
+        "fast_flapping_block_time".into(),
+        json!(section.get_float("fast_flapping_block_time")),
+    );
     for key in [
         "outgoing",
         "ingress_control",
@@ -2058,6 +2084,10 @@ fn iface_config_json(cfg: &InterfaceConfig) -> Value {
             "interface_mode":         mode_to_str(c.mode),
         }),
         InterfaceConfig::Backbone(c) => json!({
+            "block_fast_flapping": c.fast_flap.enabled,
+            "fast_flapping_threshold": c.fast_flap.threshold_secs,
+            "fast_flapping_grace": c.fast_flap.grace,
+            "fast_flapping_block_time": c.fast_flap.block_time_secs / 60.0,
             "type":                  "BackboneInterface",
             "listen_on":             c.listen_on,
             "target_host":           c.target_host,
@@ -2460,6 +2490,10 @@ mod tests {
     fn backbone_request_validates_and_serializes() {
         let request: InterfaceRequest = serde_json::from_value(json!({
             "name": "Test Backbone",
+            "block_fast_flapping": false,
+            "fast_flapping_threshold": 1.5,
+            "fast_flapping_grace": 0,
+            "fast_flapping_block_time": 2.5,
             "type": "BackboneInterface",
             "target_host": "backbone.example",
             "target_port": 4242,
@@ -2472,6 +2506,13 @@ mod tests {
         let value = iface_config_json(&request.synthesize().unwrap());
         assert_eq!(value["type"], "BackboneInterface");
         assert_eq!(value["target_host"], "backbone.example");
+        assert_eq!(value["block_fast_flapping"], false);
+        assert_eq!(value["fast_flapping_threshold"], 1.5);
+        assert_eq!(value["fast_flapping_grace"], 0);
+        assert_eq!(value["fast_flapping_block_time"], 2.5);
+        let section = request.to_config_section();
+        let serialized = iface_section_json(&section);
+        assert_eq!(serialized["fast_flapping_block_time"], 2.5);
         assert_eq!(value["port"], 4242);
         assert_eq!(value["prefer_ipv6"], true);
         assert_eq!(value["connect_timeout"], 7);

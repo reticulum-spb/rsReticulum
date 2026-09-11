@@ -11,6 +11,8 @@ pub mod auto;
 pub mod ax25kiss;
 #[cfg(feature = "full")]
 pub mod backbone;
+#[cfg(feature = "full")]
+pub mod backbone_flap;
 #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]
 pub mod ble_central_apple;
 #[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos")))]

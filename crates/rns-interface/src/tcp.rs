@@ -423,6 +423,7 @@ pub async fn spawn_tcp_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -492,6 +493,7 @@ async fn spawn_tcp_accepted(
     InterfaceHandle {
         id,
         parent_id: Some(parent_id),
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -578,6 +580,7 @@ pub async fn spawn_tcp_server(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {

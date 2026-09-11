@@ -718,6 +718,7 @@ async fn spawn_plugin_interface_with_library(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name: config.name,
         mode: config.mode,
         direction: InterfaceDirection {

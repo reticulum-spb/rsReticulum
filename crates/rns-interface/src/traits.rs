@@ -8,6 +8,7 @@ pub type InterfaceId = u64;
 
 /// Handle returned by every `spawn_*`: write channel, status flag, and read task.
 pub struct InterfaceHandle {
+    pub diagnostics: Option<Arc<dyn rns_transport::messages::InterfaceDiagnostics>>,
     pub id: InterfaceId,
     /// Parent interface for dynamically spawned children such as accepted TCP,
     /// Backbone or I2P peers.

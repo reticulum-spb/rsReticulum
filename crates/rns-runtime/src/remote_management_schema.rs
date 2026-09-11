@@ -25,6 +25,10 @@ pub(crate) mod bytes_opt {
 #[derive(Debug, Clone, Serialize)]
 pub struct InterfaceStats {
     #[serde(default)]
+    pub blocked_ips: u64,
+    #[serde(default)]
+    pub blocked_ip_list: Vec<String>,
+    #[serde(default)]
     pub gravity: i64,
     #[serde(default)]
     pub announces_to_internal: Option<bool>,

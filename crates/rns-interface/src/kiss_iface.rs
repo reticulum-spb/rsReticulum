@@ -377,6 +377,7 @@ pub async fn spawn_kiss_interface(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {

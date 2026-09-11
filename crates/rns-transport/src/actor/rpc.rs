@@ -62,7 +62,14 @@ impl TransportActor {
                             .as_ref()
                             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(0);
+                        let blocked_ip_list = entry
+                            .diagnostics
+                            .as_ref()
+                            .and_then(|diagnostics| diagnostics.blocked_ip_list())
+                            .unwrap_or_default();
                         InterfaceStatRpcEntry {
+                            blocked_ips: blocked_ip_list.len() as u64,
+                            blocked_ip_list,
                             gravity: entry.gravity,
                             announces_to_internal: entry.announces_to_internal,
                             id: iface_id,

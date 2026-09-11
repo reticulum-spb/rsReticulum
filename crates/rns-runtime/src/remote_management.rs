@@ -244,6 +244,8 @@ fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats 
         None
     };
     schema::InterfaceStats {
+        blocked_ips: e.blocked_ips,
+        blocked_ip_list: e.blocked_ip_list,
         gravity: e.gravity,
         announces_to_internal: e.announces_to_internal,
         name: e.name.clone(),
@@ -330,6 +332,8 @@ mod tests {
     fn status_response_is_python_compatible_list() {
         let stats = schema::TransportStats {
             interfaces: vec![schema::InterfaceStats {
+                blocked_ips: 0,
+                blocked_ip_list: Vec::new(),
                 gravity: 0,
                 announces_to_internal: None,
                 name: "TestIf".to_string(),
@@ -466,6 +470,8 @@ mod tests {
                     let resp = match query {
                         TransportQuery::GetInterfaceStats => {
                             let stats = vec![InterfaceStatRpcEntry {
+                                blocked_ips: 1,
+                                blocked_ip_list: vec!["127.0.0.1".into()],
                                 gravity: -42,
                                 announces_to_internal: Some(true),
                                 id: 1,

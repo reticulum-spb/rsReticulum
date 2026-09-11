@@ -469,6 +469,7 @@ pub async fn spawn_rnode_multi_interface(
         handles.push(InterfaceHandle {
             id: ids[i],
             parent_id: None,
+            diagnostics: None,
             name: sub_name,
             mode: sub_cfg.mode,
             direction: InterfaceDirection {

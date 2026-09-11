@@ -54,6 +54,9 @@ struct Args {
     /// Only show interfaces with active announce or path request bursts.
     #[arg(short = 'B', long)]
     burst: bool,
+    /// Show addresses blocked by Backbone fast-flapping protection.
+    #[arg(long = "blocked-ips")]
+    blocked_ips: bool,
 
     /// Display traffic totals.
     #[arg(short, long)]
@@ -586,6 +589,7 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
             if entry.tx_drops > 0 {
                 println!("    TX drops : {}", entry.tx_drops);
             }
+            print_blocked_ips(entry.blocked_ips, &entry.blocked_ip_list, args.blocked_ips);
             println!();
         }
     }
@@ -617,7 +621,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{}}}",
+            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{},\"blocked_ips\":{},\"blocked_ip_list\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -645,6 +649,8 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
             opt_u32_json(e.announce_rate_grace),
             opt_f64_json(e.announce_rate_penalty),
             e.tx_drops,
+            e.blocked_ips,
+            serde_json::to_string(&e.blocked_ip_list).expect("IP list serializes"),
         );
     }
     print!("]");
@@ -1021,6 +1027,8 @@ impl RemoteSession {
 
 #[derive(Debug, Clone)]
 struct RemoteInterface {
+    blocked_ips: u64,
+    blocked_ip_list: Vec<String>,
     name: String,
     online: bool,
     mode: u64,
@@ -1140,7 +1148,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{}}}",
+                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"blocked_ips\":{},\"blocked_ip_list\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1166,6 +1174,8 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 opt_f64_json(iface.announce_rate_target),
                 opt_u32_json(iface.announce_rate_grace),
                 opt_f64_json(iface.announce_rate_penalty),
+                iface.blocked_ips,
+                serde_json::to_string(&iface.blocked_ip_list).expect("IP list serializes"),
             );
         }
         print!("]");
@@ -1243,6 +1253,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                     format::pretty_speed(iface.txs)
                 );
             }
+            print_blocked_ips(iface.blocked_ips, &iface.blocked_ip_list, args.blocked_ips);
             println!();
         }
     } else {
@@ -1264,6 +1275,18 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
 
 fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterface {
     RemoteInterface {
+        blocked_ips: map_u64(m, "blocked_ips").unwrap_or(0),
+        blocked_ip_list: m
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("blocked_ip_list"))
+            .and_then(|(_, value)| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
         name: map_str(m, "name").unwrap_or_else(|| "(unnamed)".to_string()),
         online: map_bool(m, "status")
             .or_else(|| map_bool(m, "online"))
@@ -1291,6 +1314,17 @@ fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterfac
         announce_rate_grace: map_u64(m, "announce_rate_grace")
             .map(|v| v.min(u32::MAX as u64) as u32),
         announce_rate_penalty: map_f64_or_u64(m, "announce_rate_penalty"),
+    }
+}
+
+fn print_blocked_ips(count: u64, ips: &[String], show_list: bool) {
+    if count > 0 {
+        println!("    Blocked  : {count} IPs");
+        if show_list {
+            for ip in ips {
+                println!("               {ip}");
+            }
+        }
     }
 }
 
@@ -1453,6 +1487,7 @@ mod tests {
             pr_stats: false,
             link_stats: false,
             burst: false,
+            blocked_ips: false,
             totals: false,
             sort: None,
             reverse: false,
@@ -1478,6 +1513,8 @@ mod tests {
         pr_burst_active: bool,
     ) -> rpc::InterfaceStatEntry {
         rpc::InterfaceStatEntry {
+            blocked_ips: 0,
+            blocked_ip_list: Vec::new(),
             gravity: 0,
             announces_to_internal: None,
             id: 1,
@@ -1571,6 +1608,26 @@ mod tests {
         assert_eq!(iface.burst_activated, 0.0);
         assert!(!iface.pr_burst_active);
         assert_eq!(iface.pr_burst_activated, 0.0);
+        assert_eq!(iface.blocked_ips, 0);
+        assert!(iface.blocked_ip_list.is_empty());
+    }
+
+    #[test]
+    fn backbone_blocked_ips_parse_flag_and_remote_snapshot() {
+        assert!(
+            Args::try_parse_from(["rnstatus-rs", "--blocked-ips"])
+                .unwrap()
+                .blocked_ips
+        );
+        let iface = remote_interface_from_map(&[
+            ("blocked_ips".into(), 2.into()),
+            (
+                "blocked_ip_list".into(),
+                rmpv::Value::Array(vec!["127.0.0.1".into(), "::1".into()]),
+            ),
+        ]);
+        assert_eq!(iface.blocked_ips, 2);
+        assert_eq!(iface.blocked_ip_list, ["127.0.0.1", "::1"]);
     }
 
     #[test]

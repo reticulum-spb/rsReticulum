@@ -1922,6 +1922,7 @@ mod tests {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            diagnostics: None,
             announces_to_internal: None,
             gravity: 0,
             ingress: crate::ingress::IngressController::new(),

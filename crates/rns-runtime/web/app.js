@@ -419,6 +419,8 @@ function interfaceDetails(item) {
     detailItem("Bitrate", item.bitrate ? `${formatNumber(item.bitrate)} bit/s` : "—"),
     detailItem("Clients", formatNumber(item.clients)),
     detailItem("TX drops", formatNumber(item.tx_drops)),
+    detailItem("Blocked IPs", formatNumber(item.blocked_ips || 0)),
+    detailItem("Blocked IP list", (item.blocked_ip_list || []).join(", ") || "—"),
     detailItem("IFAC size", item.ifac_size ? `${formatNumber(item.ifac_size)} B` : "None"),
     detailItem("Announce queue", formatNumber(item.announce_queue)),
     detailItem("Held announces", formatNumber(item.held_announces)),
@@ -1008,6 +1010,10 @@ async function openInterfaceDialog(item = null) {
   setField("#auto-configured-bitrate", config.configured_bitrate);
   const backboneRole = config.target_host ? "client" : "listener";
   setField("#backbone-role", backboneRole);
+  document.querySelector("#backbone-block-fast-flapping").checked = config.block_fast_flapping !== false;
+  setField("#backbone-flapping-threshold", config.fast_flapping_threshold, 20);
+  setField("#backbone-flapping-grace", config.fast_flapping_grace, 5);
+  setField("#backbone-flapping-block-time", config.fast_flapping_block_time, 720);
   setField("#backbone-port", config.port);
   setField("#backbone-target-host", config.target_host);
   setField("#backbone-listen-on", config.listen_on);
@@ -1357,6 +1363,10 @@ function interfacePayload() {
     }
   } else if (type === "BackboneInterface") {
     payload.target_port = Number(document.querySelector("#backbone-port").value);
+    payload.block_fast_flapping = document.querySelector("#backbone-block-fast-flapping").checked;
+    payload.fast_flapping_threshold = Number(document.querySelector("#backbone-flapping-threshold").value);
+    payload.fast_flapping_grace = Number(document.querySelector("#backbone-flapping-grace").value);
+    payload.fast_flapping_block_time = Number(document.querySelector("#backbone-flapping-block-time").value);
     payload.prefer_ipv6 =
       document.querySelector("#backbone-prefer-ipv6").checked;
     payload.i2p_tunneled =

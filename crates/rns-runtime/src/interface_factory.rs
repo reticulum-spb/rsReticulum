@@ -234,6 +234,7 @@ pub struct AX25KISSInterfaceConfig {
 /// `TCP_USER_TIMEOUT` tuning matches Python `set_timeouts_linux()`.
 #[derive(Debug, Clone)]
 pub struct BackboneInterfaceConfig {
+    pub fast_flap: rns_interface::backbone_flap::FastFlapConfig,
     pub name: String,
     pub listen_on: Option<String>,
     pub target_host: Option<String>,
@@ -1195,6 +1196,24 @@ fn synthesize_backbone(
     let i2p_tunneled = section.get_bool("i2p_tunneled").unwrap_or(false);
 
     Ok(InterfaceConfig::Backbone(BackboneInterfaceConfig {
+        fast_flap: {
+            let config = rns_interface::backbone_flap::FastFlapConfig {
+                enabled: section.get_bool("block_fast_flapping").unwrap_or(true),
+                threshold_secs: section.get_float("fast_flapping_threshold").unwrap_or(20.0),
+                grace: section.get_uint("fast_flapping_grace").unwrap_or(5),
+                block_time_secs: section
+                    .get_float("fast_flapping_block_time")
+                    .unwrap_or(720.0)
+                    * 60.0,
+            };
+            config
+                .validate()
+                .map_err(|message| InterfaceFactoryError::InvalidValue {
+                    field: format!("{name}.fast_flapping"),
+                    message: message.into(),
+                })?;
+            config
+        },
         name: name.to_string(),
         listen_on,
         target_host,
@@ -2351,6 +2370,36 @@ mod tests {
                 assert!(c.listen_on.is_none());
             }
             _ => panic!("expected Backbone"),
+        }
+    }
+
+    #[test]
+    fn backbone_fast_flapping_minutes_reach_driver_seconds() {
+        let mut section = NormalizedSection::new();
+        section.set("type", "BackboneInterface");
+        section.set("port", "4242");
+        for custom in [false, true] {
+            if custom {
+                section.set("block_fast_flapping", "false");
+                section.set("fast_flapping_threshold", "1.5");
+                section.set("fast_flapping_grace", "0");
+                section.set("fast_flapping_block_time", "2.5");
+            }
+            let InterfaceConfig::Backbone(config) =
+                synthesize_interface("relay", &section).unwrap()
+            else {
+                panic!("expected Backbone")
+            };
+            assert_eq!(config.fast_flap.enabled, !custom);
+            assert_eq!(
+                config.fast_flap.threshold_secs,
+                if custom { 1.5 } else { 20.0 }
+            );
+            assert_eq!(config.fast_flap.grace, if custom { 0 } else { 5 });
+            assert_eq!(
+                config.fast_flap.block_time_secs,
+                if custom { 150.0 } else { 43200.0 }
+            );
         }
     }
 

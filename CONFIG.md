@@ -210,6 +210,10 @@ of falling back to plaintext.
 interfaces:
   - type: backbone
     name: Public relay
+    block_fast_flapping: true
+    fast_flapping_threshold: 20       # seconds
+    fast_flapping_grace: 5
+    fast_flapping_block_time: 720     # minutes
     listen_on: 0.0.0.0
     port: 4242
     mode: internal
@@ -299,6 +303,24 @@ At least one of `listen_port` and `forward_port` is required.
 | `connect_timeout` | integer | `5` | Initial connection timeout in seconds. |
 | `max_reconnect_tries` | integer or null | `null` | Retry limit; `null` retries indefinitely. |
 | `i2p_tunneled` | boolean | `false` | Advisory I2P-tunnel marker. |
+| `block_fast_flapping` | boolean | `true` | Enable listener-side protection against short-lived connections. |
+| `fast_flapping_threshold` | number | `20` | Non-negative finite seconds; only shorter connections count. |
+| `fast_flapping_grace` | integer | `5` | Non-negative number of short disconnects tolerated per IP. |
+| `fast_flapping_block_time` | number | `720` | Non-negative finite **minutes**, converted to seconds in the driver. |
+
+Fast-flapping settings match Python names and units. A block starts when the
+short-disconnect count is **greater than** grace (the sixth by default).
+History is shared across Backbone listeners in the process; each listener uses
+its own policy. Long connections do not reset history. Entries expire strictly
+after the block interval since the last short disconnect; rejected attempts do
+not extend it. Rust uses monotonic elapsed time. Disabling protection bypasses
+both recording and rejection for that listener. Client interfaces retain these
+settings but do not apply the listener policy.
+
+RPC and local/remote `rnstatus-rs --json` report `blocked_ips` (count) and
+`blocked_ip_list`; expired entries and IPs still within grace are excluded.
+Text status shows nonzero counts; `--blocked-ips` also shows addresses. The Web
+interface exposes the settings and live blocked IP diagnostics.
 
 ## Serial field set
 

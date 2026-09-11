@@ -192,6 +192,7 @@ where
     InterfaceHandle {
         id,
         parent_id,
+        diagnostics: None,
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {
@@ -221,6 +222,7 @@ fn server_listener_handle(
     InterfaceHandle {
         id: 0,
         parent_id: None,
+        diagnostics: None,
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {
@@ -559,6 +561,7 @@ pub async fn spawn_reconnecting_local_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {

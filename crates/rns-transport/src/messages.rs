@@ -64,9 +64,18 @@ pub struct TimerTick {
     pub timestamp: f64,
 }
 
+/// Live diagnostics owned by an interface driver.
+pub trait InterfaceDiagnostics: Send + Sync {
+    /// Snapshot with expired entries removed. Non-Backbone drivers return None.
+    fn blocked_ip_list(&self) -> Option<Vec<String>> {
+        None
+    }
+}
+
 /// Metadata and TX handle for one registered interface. The actor owns the
 /// sender; driver code holds only the matching receiver.
 pub struct InterfaceEntry {
+    pub diagnostics: Option<std::sync::Arc<dyn InterfaceDiagnostics>>,
     pub name: String,
     pub mode: InterfaceMode,
     pub role: InterfaceRole,
@@ -128,6 +137,7 @@ impl InterfaceEntry {
         tx: mpsc::Sender<Bytes>,
     ) -> Self {
         Self {
+            diagnostics: None,
             name,
             mode,
             role: InterfaceRole::Normal,
@@ -617,6 +627,8 @@ pub struct PathTableRpcEntry {
 
 #[derive(Debug, Clone)]
 pub struct InterfaceStatRpcEntry {
+    pub blocked_ips: u64,
+    pub blocked_ip_list: Vec<String>,
     pub gravity: i64,
     pub announces_to_internal: Option<bool>,
     pub id: InterfaceId,

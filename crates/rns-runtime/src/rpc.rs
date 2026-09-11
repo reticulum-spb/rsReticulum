@@ -144,6 +144,10 @@ pub struct PathTableEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceStatEntry {
     #[serde(default)]
+    pub blocked_ips: u64,
+    #[serde(default)]
+    pub blocked_ip_list: Vec<String>,
+    #[serde(default)]
     pub gravity: i64,
     #[serde(default)]
     pub announces_to_internal: Option<bool>,
@@ -519,6 +523,17 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 .map(|e| {
                     py_dict(vec![
                         ("id", PyValue::Int(i128::from(e.id))),
+                        ("blocked_ips", PyValue::Int(i128::from(e.blocked_ips))),
+                        (
+                            "blocked_ip_list",
+                            PyValue::List(
+                                e.blocked_ip_list
+                                    .iter()
+                                    .cloned()
+                                    .map(PyValue::String)
+                                    .collect(),
+                            ),
+                        ),
                         ("gravity", PyValue::Int(i128::from(e.gravity))),
                         (
                             "announces_to_internal",
@@ -787,6 +802,11 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
         .map(|(idx, entry)| {
             let m = as_dict(entry)?;
             Ok(InterfaceStatEntry {
+                blocked_ips: dict_get(m, "blocked_ips").and_then(py_u64).unwrap_or(0),
+                blocked_ip_list: match dict_get(m, "blocked_ip_list") {
+                    Some(PyValue::List(values)) => values.iter().filter_map(py_string).collect(),
+                    _ => Vec::new(),
+                },
                 gravity: dict_get(m, "gravity")
                     .and_then(|value| match value {
                         PyValue::Int(value) => i64::try_from(*value).ok(),
@@ -1748,6 +1768,8 @@ mod tests {
 
     fn interface_stat_entry() -> InterfaceStatEntry {
         InterfaceStatEntry {
+            blocked_ips: 1,
+            blocked_ip_list: vec!["127.0.0.1".into()],
             gravity: -42,
             announces_to_internal: Some(true),
             id: 7,
@@ -1792,6 +1814,8 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
                 assert_eq!(entry.gravity, -42);
+                assert_eq!(entry.blocked_ips, 1);
+                assert_eq!(entry.blocked_ip_list, ["127.0.0.1"]);
                 assert_eq!(entry.announces_to_internal, Some(true));
                 assert_eq!(entry.incoming_pr_frequency, 6.0);
                 assert_eq!(entry.outgoing_pr_frequency, 7.0);
@@ -1824,6 +1848,8 @@ mod tests {
                 let entry = &entries[0];
                 assert_eq!(entry.incoming_pr_frequency, 0.0);
                 assert_eq!(entry.gravity, 0);
+                assert_eq!(entry.blocked_ips, 0);
+                assert!(entry.blocked_ip_list.is_empty());
                 assert_eq!(entry.announces_to_internal, None);
                 assert_eq!(entry.outgoing_pr_frequency, 0.0);
                 assert!(!entry.burst_active);

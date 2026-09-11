@@ -266,6 +266,11 @@ disabled, or removed even when they do not have a runtime ID. The current forms
 support TCP Client, TCP Server, UDP, Auto, Backbone, Serial, KISS, RNode, and
 AX.25 KISS interfaces.
 
+Backbone listeners support configurable fast-flapping protection with shared
+per-IP history. The Web UI exposes its settings and blocked IP diagnostics;
+`rnstatus-rs --blocked-ips` displays addresses locally or remotely. See
+[CONFIG.md](CONFIG.md#type-backbone) for thresholds, defaults, and time units.
+
 The Logs view shows the latest 1,000 structured `tracing` events and follows
 new events in real time over an authenticated SSE stream. Sensitive structured
 fields are redacted before entering the Web log buffer.

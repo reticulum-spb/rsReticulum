@@ -1525,6 +1525,7 @@ pub async fn spawn_ble_rnode_interface(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {
@@ -1840,6 +1841,7 @@ pub async fn spawn_ble_rnode_interface_native(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
+        diagnostics: None,
         name,
         mode,
         direction: InterfaceDirection {

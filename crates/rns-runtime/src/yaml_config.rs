@@ -649,6 +649,17 @@ impl InterfaceConfig {
                 "interface {:?}: port must be in 1..=65535",
                 v.common.name
             ))),
+            Self::Backbone(v)
+                if !v.fast_flapping_threshold.is_finite()
+                    || v.fast_flapping_threshold < 0.0
+                    || !(v.fast_flapping_block_time * 60.0).is_finite()
+                    || v.fast_flapping_block_time < 0.0 =>
+            {
+                Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: fast-flapping durations must be finite and non-negative",
+                    v.common.name
+                )))
+            }
             Self::Serial(v) if v.port.trim().is_empty() => Err(YamlConfigError::Validation(
                 format!("interface {:?}: port must not be empty", v.common.name),
             )),
@@ -792,6 +803,18 @@ impl InterfaceConfig {
             }
             Self::Backbone(v) => {
                 section.set("type", "BackboneInterface");
+                set_bool(section, "block_fast_flapping", v.block_fast_flapping);
+                set_num(
+                    section,
+                    "fast_flapping_threshold",
+                    v.fast_flapping_threshold,
+                );
+                set_num(section, "fast_flapping_grace", v.fast_flapping_grace);
+                set_num(
+                    section,
+                    "fast_flapping_block_time",
+                    v.fast_flapping_block_time,
+                );
                 set_opt(section, "listen_on", v.listen_on.as_deref());
                 set_opt(section, "target_host", v.target_host.as_deref());
                 set_num(section, "port", v.port);
@@ -1184,6 +1207,12 @@ impl Default for PipeInterfaceConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackboneInterfaceConfig {
+    pub block_fast_flapping: bool,
+    /// Seconds; connections shorter than this count as a flap.
+    pub fast_flapping_threshold: f64,
+    pub fast_flapping_grace: u64,
+    /// Minutes, matching Python configuration units.
+    pub fast_flapping_block_time: f64,
     #[serde(flatten)]
     pub common: InterfaceCommonConfig,
     pub listen_on: Option<String>,
@@ -1198,6 +1227,10 @@ pub struct BackboneInterfaceConfig {
 impl Default for BackboneInterfaceConfig {
     fn default() -> Self {
         Self {
+            block_fast_flapping: true,
+            fast_flapping_threshold: 20.0,
+            fast_flapping_grace: 5,
+            fast_flapping_block_time: 720.0,
             common: Default::default(),
             listen_on: None,
             target_host: None,
@@ -1810,6 +1843,10 @@ pub fn interface_from_normalized_section(
             respawn_delay: v.respawn_delay,
         }),
         Runtime::Backbone(v) => InterfaceConfig::Backbone(BackboneInterfaceConfig {
+            block_fast_flapping: v.fast_flap.enabled,
+            fast_flapping_threshold: v.fast_flap.threshold_secs,
+            fast_flapping_grace: v.fast_flap.grace,
+            fast_flapping_block_time: v.fast_flap.block_time_secs / 60.0,
             common,
             listen_on: v.listen_on,
             target_host: v.target_host,
@@ -2088,6 +2125,58 @@ fn validate_radio(name: &str, radio: &RadioConfig) -> Result<(), YamlConfigError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backbone_fast_flapping_yaml_roundtrip_and_units() {
+        for extra in [
+            "",
+            "    block_fast_flapping: false\n    fast_flapping_threshold: 1.5\n    fast_flapping_grace: 0\n    fast_flapping_block_time: 2.5\n",
+        ] {
+            let yaml = format!(
+                "interfaces:\n  - type: backbone\n    name: Relay\n    port: 4242\n{extra}"
+            );
+            let config = Config::parse(&yaml, "config.yaml").unwrap();
+            assert_eq!(
+                Config::parse(&config.to_yaml().unwrap(), "config.yaml").unwrap(),
+                config
+            );
+            let normalized = config.to_runtime_config().unwrap();
+            let section = normalized.subsection("interfaces", "Relay").unwrap();
+            assert_eq!(
+                section.get_bool("block_fast_flapping"),
+                Some(extra.is_empty())
+            );
+            assert_eq!(
+                section.get_float("fast_flapping_block_time"),
+                Some(if extra.is_empty() { 720.0 } else { 2.5 })
+            );
+            #[cfg(feature = "api")]
+            assert_eq!(
+                interface_from_normalized_section("Relay", section).unwrap(),
+                config.interfaces[0]
+            );
+        }
+    }
+
+    #[test]
+    fn backbone_fast_flapping_rejects_invalid_durations_and_grace() {
+        for extra in [
+            "fast_flapping_threshold: -1",
+            "fast_flapping_threshold: .nan",
+            "fast_flapping_block_time: .inf",
+            "fast_flapping_block_time: -1",
+            "fast_flapping_block_time: 1e308",
+            "fast_flapping_grace: -1",
+        ] {
+            let yaml = format!(
+                "interfaces:\n  - type: backbone\n    name: Relay\n    port: 4242\n    {extra}\n"
+            );
+            assert!(
+                Config::parse(&yaml, "config.yaml").is_err(),
+                "accepted {extra}"
+            );
+        }
+    }
 
     #[test]
     fn gravity_yaml_roundtrip_and_normalization() {

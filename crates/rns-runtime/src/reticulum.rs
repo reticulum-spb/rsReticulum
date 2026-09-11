@@ -419,6 +419,8 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .map(|entry| InterfaceStatRpcEntry {
+                    blocked_ips: entry.blocked_ips,
+                    blocked_ip_list: entry.blocked_ip_list,
                     gravity: entry.gravity,
                     announces_to_internal: entry.announces_to_internal,
                     id: entry.id,
@@ -1983,6 +1985,7 @@ async fn register_interface_handle_with_role_and_overrides(
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
+        diagnostics: handle.diagnostics,
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
         role,
@@ -2064,6 +2067,7 @@ async fn register_interface_with_post_init(
         );
     let entry = rns_transport::messages::InterfaceEntry {
         name: handle.name.clone(),
+        diagnostics: handle.diagnostics,
         mode: convert_mode(handle.mode),
         role: rns_transport::messages::InterfaceRole::Normal,
         direction,
@@ -4311,6 +4315,7 @@ async fn spawn_interface(
                 let listen_ip = c.listen_on.as_deref().unwrap_or("0.0.0.0");
                 let mut config =
                     rns_interface::backbone::BackboneServerConfig::new(&c.name, listen_ip, c.port);
+                config.fast_flap = c.fast_flap.clone();
                 config.mode = c.mode;
                 config.prefer_ipv6 = c.prefer_ipv6;
                 config.device = c.device.clone();
@@ -4994,6 +4999,7 @@ mod tests {
         rns_interface::traits::InterfaceHandle {
             id,
             parent_id,
+            diagnostics: None,
             name: name.to_string(),
             mode: rns_interface::traits::InterfaceMode::Gateway,
             direction: rns_interface::traits::InterfaceDirection {

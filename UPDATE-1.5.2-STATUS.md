@@ -125,7 +125,8 @@ Discovery publication отдельно строится в `discovery_config_for
 - [ ] Уточнить все строки «воспроизвести» целевыми проверками соответствующих этапов.
 - [x] Этап 1: YAML/runtime publication, internal mode, location_cmd, API/UI.
 - [x] Этап 2: gravity/internal, transit/local Link rebalance, interface binding; границы interop ниже.
-- [ ] Этапы 3–7 и финальная интеграция.
+- [x] Этап 3: Backbone fast-flapping, YAML/API/UI, RPC и локальный/удалённый статус.
+- [ ] Этапы 4–7 и финальная интеграция.
 
 Уже выполненные команды:
 
@@ -285,3 +286,54 @@ Python идёт по stdin/stdout без сетевых сокетов. Это �
 
 Следующий этап — Backbone fast-flapping (этап 3). Версия и полная заявленная
 совместимость 1.5.2 пока не меняются.
+
+## Этап 3 — Backbone fast-flapping
+
+Перенесена семантика `BackboneInterface.py`: defaults true / 20 секунд /
+grace 5 / 720 минут; короткое соединение определяется строгим `< threshold`,
+блокировка — `count > grace`, истечение — строго после block time с последнего
+короткого disconnect. Обычный долгий сеанс не сбрасывает историю; отвергнутое
+подключение не продлевает блокировку. История IP общая для listeners процесса,
+политика каждого listener своя. В Rust используется монотонное время; YAML
+отклоняет отрицательные и неограниченные длительности, включая overflow при
+переводе минут в секунды. IPv4 и IPv6 представлены типизированным IpAddr.
+
+Настройки проходят YAML → normalized → factory → driver, round-trip API и
+форму Web UI. Client сохраняет параметры, но защита применяется только к
+listener. Accepted backend завершает read/write совместно; Drop guard учитывает
+разрыв и отмену задачи. При отказе соединения дочерний интерфейс не создаётся.
+
+Driver diagnostics предоставляют живой снимок после очистки истёкших записей;
+transport/RPC получают count и list из одного снимка. `blocked_ips` и
+`blocked_ip_list` доступны через локальный RPC, remote management, Web API/UI,
+локальный и удалённый `rnstatus-rs`, включая JSON. Текстовый статус показывает
+ненулевое число, `--blocked-ips` добавляет адреса. Старые ответы без полей
+разбираются как 0 / пустой список. Другие драйверы не ведут такую диагностику.
+
+Проверки:
+
+- `cargo test -p rns-interface --lib --quiet`: 179 passed. Новый loopback-тест
+  проверяет grace, реальный EOF при блокировке, отсутствие регистрации
+  отвергнутого peer и выключенную защиту. Три теста с управляемым Instant
+  проверяют точные границы threshold/expiry, долгие соединения, общую таблицу,
+  выключенную защиту и отсутствие продления при rejected attempts.
+- `cargo test -p rns-transport --lib --quiet`: 403 passed.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 230 passed,
+  4 ignored; после расширения API assertions повторно выполнен фильтр
+  `backbone`: 13 passed. Проверены YAML defaults/round-trip/валидация,
+  factory minutes→seconds, API и RPC сериализация новых полей.
+- `cargo test -p rns-tools --bin rnstatus-rs --quiet`: 9 passed; проверены
+  новый CLI flag, remote snapshot и fallback для старых peers.
+- `cargo check --workspace --all-targets` и client-only build: успешно.
+- `cargo check -p rns-runtime --features api,serial,rnode-tcp,sqlite-bundled`:
+  успешно.
+- `cargo fmt --all -- --check`, `git diff --check`,
+  `node --test crates/rns-runtime/web/app.test.js`: успешно.
+
+Ограничения: Web-тесты проверяют существующие JS helpers, а не интерактивный
+браузерный сценарий. Отдельный многопроцессный Python↔Rust тест блокировок
+не запускался: policy сверена с локальными исходниками Python, сокетное
+поведение проверено Rust loopback-тестом. Эталон ea98db4f остался чистым.
+
+Следующий этап — приоритетные входящие очереди и path requests (этап 4).
+Версия и полная заявленная совместимость 1.5.2 пока не меняются.

@@ -439,6 +439,16 @@
 
       <fieldset class="form-grid" id="backbone-fields" hidden disabled>
         <legend>Backbone</legend>
+        <label class="check-field"><input id="backbone-block-fast-flapping" type="checkbox" checked><span>Block fast flapping (listener)</span></label>
+        <label>Fast-flapping threshold (seconds)
+          <input id="backbone-flapping-threshold" type="number" min="0" step="any" value="20" required>
+        </label>
+        <label>Fast-flapping grace (disconnects)
+          <input id="backbone-flapping-grace" type="number" min="0" step="1" value="5" required>
+        </label>
+        <label>Fast-flapping block time (minutes)
+          <input id="backbone-flapping-block-time" type="number" min="0" step="any" value="720" required>
+        </label>
         <label>Role
           <select id="backbone-role">
             <option value="listener">Listener</option>
