@@ -6924,6 +6924,7 @@ mod tests {
 
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true; // cache request broadcast requires transport
+        actor.transport_identity_hash = Some([0x64; 16]);
         actor.storage_dir = Some(dir.clone()); // announce receive writes the disk cache
 
         // Register an outbound interface to receive the replayed announce
@@ -6995,7 +6996,21 @@ mod tests {
             replayed.is_ok(),
             "expected replayed announce on output interface"
         );
-        assert_eq!(replayed.unwrap(), announce_raw);
+        let replayed = replayed.unwrap();
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&replayed).unwrap();
+        let (_, original_offset) = rns_wire::header::PacketHeader::unpack(&announce_raw).unwrap();
+        assert_eq!(
+            header.flags.header_type,
+            rns_wire::flags::HeaderType::Header2
+        );
+        assert_eq!(header.transport_id, actor.transport_identity_hash);
+        assert_eq!(header.hops, 1);
+        assert_eq!(header.destination_hash, dest_hash);
+        assert_eq!(&replayed[offset..], &announce_raw[original_offset..]);
+        assert_eq!(
+            rns_wire::hash::packet_hash(&replayed, header.flags.header_type),
+            packet_hash
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

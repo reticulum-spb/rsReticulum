@@ -265,8 +265,19 @@ impl TransportActor {
             hash = %hex::encode(requested_hash),
             "cache request hit — replaying cached announce"
         );
-        if self.is_transport_enabled {
-            self.broadcast_announce_on_interfaces(&cached_raw, None);
+        if self.is_transport_enabled && self.transport_identity_hash.is_some() {
+            // The cache holds the received frame, before transport header/hop
+            // rewriting. Replaying it verbatim advertises the origin as a direct
+            // neighbour and makes the learned route unusable beyond this router.
+            let (cached_header, _) = rns_wire::header::PacketHeader::unpack(&cached_raw)
+                .expect("cached announce validated above");
+            let replay = self.transport_announce_from_raw(
+                &cached_raw,
+                dest,
+                cached_hops,
+                cached_header.context,
+            );
+            self.broadcast_announce_on_interfaces(&replay, None);
         }
     }
 
