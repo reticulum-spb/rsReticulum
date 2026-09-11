@@ -1437,3 +1437,57 @@ fmt/diff check успешны. Сетевые проверки выполнен�
 Этап 5 не закрыт: ingress dataplane control, MTU/capabilities/служебные кадры,
 расширенные drop diagnostics и multi-peer throughput/latency/RSS сравнение
 на одинаковой нагрузке ещё требуют работы.
+
+### Этап 5 — модель dataplane ingress и проверка арифметики Python
+
+Добавлен самостоятельный `rns_transport::backbone_ingress::IngressPolicy`.
+Он пока НЕ подключён к actor/Backbone reader: существующий ingress.rs для
+announces/path requests не заменён, фактическая приостановка socket reads
+этим коммитом не включается.
+
+Модель принимает depth только DATA queue и упорядоченные snapshots применимых
+Backbone peers. Frame counters учитывают все классы доставленных driver frames,
+byte counters — прочитанные socket bytes с framing. Порядок входного списка
+должен соответствовать регистрации, а не случайному HashMap iteration.
+
+- Пороги из Reticulum.py: high=max(4,int(90%*capacity)), mid=max(2,int(68%)),
+  low=int(10%). Immediate trigger InboundQueues имеет отдельный минимум 128,
+  проверяется по depth ДО append, в том числе перед rejected append.
+- Период 250 ms. При depth >mid выбирается первый peer с максимальным
+  ненулевым packet count. Уже gated лидер не заменяется следующим producer.
+  При depth <low освобождается только первый gated peer с истёкшим hold.
+  Равенство mid/low ничего не делает. Periodic сбрасывает counters, immediate — нет.
+- Hold использует headroom max(peer_count,32) и penalty 1.5. Periodic делит
+  доступный byte rate на max(allocated_rate,1), immediate — без этого clamp.
+  Поэтому при низком byte rate нельзя просто заменить обе формулы на span*48.
+- Модель возвращает действие; caller должен менять gate/hold только после
+  успешного применения к reader. Snapshot time — monotonic Duration.
+  Zero span/bytes immediate безопасно откладывается вместо Python division
+  error; непредставимый Duration также не вызывает panic.
+
+Обнаруженная граница, которую необходимо решить до включения: при DATA
+capacity <10 lower watermark равен 0, поэтому буквальное `depth <low` никогда
+не снимет gate. В модели сохранено и протестировано поведение reference;
+рабочие сокеты пока не подвергаются этому риску. Существующие малые YAML queue
+limits не изменены и не запрещены.
+
+Пять unit tests покрывают выбор/тай-брейк, strict boundaries, hold expiry,
+одиночный release, sample reset, gated leader, immediate threshold и малые
+очереди. Новый ignored oracle AST-извлекает именно исходные выражения порогов,
+allocation и hold из локального Python 1.5.2: совпали 2048 наборов watermark
+и 120 hold calculations (допуск 1e-7 s для Duration rounding).
+Это проверка арифметики, НЕ запуск полного Python ingress job или interop
+socket throttle. Eligible-peer filtering задаётся контрактом входного списка;
+не заявляется буквальное воспроизведение Python comprehension, где periodic
+job использует имя `interface` в LocalClient check вместо `iface`.
+
+Следующее подключение должно добавить shared driver counters/gate, wakeup
+reader, 250 ms evaluation для memory/SQLite actor, immediate DATA pressure
+hook и deregistration cleanup, с отдельными тестами маленьких очередей и
+конкурирующих peers. SO_RCVBUF=32768 зафиксирован константой, но socket tuning
+в этом изменении не менялся.
+
+Итоговые проверки: transport с SQLite и include-ignored (кроме прямого запуска
+sqlite_crash_fixture) — 477 unit + 2 Python integration tests passed;
+workspace all-targets check и fmt/diff checks успешны. Прежние warnings
+database_path и tracing_subscriber::prelude сохраняются.
