@@ -87,10 +87,12 @@ impl LinkRequestData {
 
         let signalling = if data.len() == ECPUBSIZE + LINK_MTU_SIZE {
             SignallingData::unpack(&data[ECPUBSIZE..ECPUBSIZE + LINK_MTU_SIZE]).unwrap_or(
-                SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32),
+                SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32)
+                    .expect("enabled signalling mode"),
             )
         } else {
             SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32)
+                .expect("enabled signalling mode")
         };
 
         Ok(Self {
@@ -224,12 +226,13 @@ impl LinkProofData {
         responder_pub.copy_from_slice(&data[64..96]);
 
         let signalling = if data.len() == 96 + LINK_MTU_SIZE {
-            SignallingData::unpack(&data[96..96 + LINK_MTU_SIZE]).unwrap_or(SignallingData::new(
-                DEFAULT_MODE,
-                rns_wire::constants::MTU as u32,
-            ))
+            SignallingData::unpack(&data[96..96 + LINK_MTU_SIZE]).unwrap_or(
+                SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32)
+                    .expect("enabled signalling mode"),
+            )
         } else {
             SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32)
+                .expect("enabled signalling mode")
         };
 
         Ok(Self {
@@ -291,7 +294,7 @@ mod tests {
     #[test]
     fn test_link_request_pack_unpack() {
         let keys = EphemeralKeys::generate();
-        let sig = SignallingData::new(1, 500);
+        let sig = SignallingData::new(1, 500).expect("enabled signalling mode");
         let packed = LinkRequestData::pack(&keys, sig);
         assert_eq!(packed.len(), ECPUBSIZE + LINK_MTU_SIZE);
 
@@ -305,7 +308,7 @@ mod tests {
     #[test]
     fn test_link_request_unpack_accepts_only_python_lengths() {
         let keys = EphemeralKeys::generate();
-        let sig = SignallingData::new(1, 500);
+        let sig = SignallingData::new(1, 500).expect("enabled signalling mode");
         let modern = LinkRequestData::pack(&keys, sig);
 
         let legacy = &modern[..ECPUBSIZE];
@@ -336,7 +339,7 @@ mod tests {
     #[test]
     fn test_link_id_computation() {
         let keys = EphemeralKeys::generate();
-        let sig = SignallingData::new(1, 500);
+        let sig = SignallingData::new(1, 500).expect("enabled signalling mode");
         let packed = LinkRequestData::pack(&keys, sig);
         let dest_hash = [0xAA; 16];
 
@@ -352,10 +355,10 @@ mod tests {
         let keys = EphemeralKeys::generate();
         let dest_hash = [0xBB; 16];
 
-        let sig1 = SignallingData::new(1, 500);
+        let sig1 = SignallingData::new(1, 500).expect("enabled signalling mode");
         let packed1 = LinkRequestData::pack(&keys, sig1);
 
-        let sig2 = SignallingData::new(2, 1000);
+        let sig2 = SignallingData { mode: 2, mtu: 1000 };
         let packed2 = LinkRequestData::pack(&keys, sig2);
 
         // Different signalling, same keys -> same link_id.
@@ -367,7 +370,7 @@ mod tests {
     #[test]
     fn test_link_id_includes_dest_hash() {
         let keys = EphemeralKeys::generate();
-        let sig = SignallingData::new(1, 500);
+        let sig = SignallingData::new(1, 500).expect("enabled signalling mode");
         let packed = LinkRequestData::pack(&keys, sig);
 
         let id1 = compute_link_id(&[0xAA; 16], &packed);
@@ -378,7 +381,7 @@ mod tests {
     #[test]
     fn test_link_id_from_raw_matches_components() {
         let keys = EphemeralKeys::generate();
-        let sig = SignallingData::new(1, 500);
+        let sig = SignallingData::new(1, 500).expect("enabled signalling mode");
         let request_data = LinkRequestData::pack(&keys, sig);
         let dest_hash = [0xCC; 16];
 
@@ -406,7 +409,7 @@ mod tests {
 
         let responder_keys = EphemeralKeys::generate();
         let link_id = [0xAB; 16];
-        let signalling = SignallingData::new(1, 500);
+        let signalling = SignallingData::new(1, 500).expect("enabled signalling mode");
 
         let proof = LinkProofData::create(
             &identity_key,
@@ -429,7 +432,7 @@ mod tests {
         let proof = LinkProofData {
             signature: [0xAA; 64],
             responder_x25519_pub: [0xBB; 32],
-            signalling: SignallingData::new(1, 500),
+            signalling: SignallingData::new(1, 500).expect("enabled signalling mode"),
         };
         let modern = proof.pack();
 
@@ -466,7 +469,7 @@ mod tests {
         let responder_keys = EphemeralKeys::generate();
         let identity_ed25519_pub = identity_key.public_key().to_bytes();
         let link_id = [0xAB; 16];
-        let signalling = SignallingData::new(1, 500);
+        let signalling = SignallingData::new(1, 500).expect("enabled signalling mode");
 
         let proof = LinkProofData::create(
             &identity_key,
@@ -482,7 +485,7 @@ mod tests {
     #[test]
     fn test_full_handshake_key_agreement() {
         let initiator_keys = EphemeralKeys::generate();
-        let signalling = SignallingData::new(1, 500);
+        let signalling = SignallingData::new(1, 500).expect("enabled signalling mode");
         let request_data = LinkRequestData::pack(&initiator_keys, signalling);
         let dest_hash = [0xDD; 16];
 
@@ -529,7 +532,7 @@ mod tests {
             mode in 0u8..=7,
             mtu in 0u32..=crate::constants::MTU_BYTEMASK,
         ) {
-            let signalling = SignallingData::new(mode, mtu);
+            let signalling = SignallingData { mode, mtu };
             // EphemeralKeys is the higher-level wrapper; we pack the
             // bytes directly here to avoid generating live ECDH keys in
             // the property loop.
@@ -555,7 +558,7 @@ mod tests {
             mode in 0u8..=7,
             mtu in 0u32..=crate::constants::MTU_BYTEMASK,
         ) {
-            let signalling = SignallingData::new(mode, mtu);
+            let signalling = SignallingData { mode, mtu };
             let proof = LinkProofData {
                 signature,
                 responder_x25519_pub,

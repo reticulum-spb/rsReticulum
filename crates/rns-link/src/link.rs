@@ -202,7 +202,8 @@ impl Link {
     )]
     pub fn new_initiator(destination_hash: [u8; 16], hops: u8) -> (Self, Vec<u8>) {
         let ephemeral_keys = EphemeralKeys::generate();
-        let signalling = SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32);
+        let signalling = SignallingData::new(DEFAULT_MODE, rns_wire::constants::MTU as u32)
+            .expect("enabled signalling mode");
         let request_data = LinkRequestData::pack(&ephemeral_keys, signalling);
         let link_id = compute_link_id(&destination_hash, &request_data);
 
@@ -435,10 +436,9 @@ impl Link {
         let request = LinkRequestData::unpack(request_data)?;
         let link_id = compute_link_id(&destination_hash, request_data);
 
-        if request.signalling.mode != MODE_AES128_CBC && request.signalling.mode != MODE_AES256_CBC
-        {
-            return Err(HandshakeError::UnsupportedMode(request.signalling.mode));
-        }
+        let signalling =
+            SignallingData::new(request.signalling.mode, rns_wire::constants::MTU as u32)
+                .map_err(|error| HandshakeError::UnsupportedMode(error.0))?;
 
         let responder_keys = EphemeralKeys::generate();
 
@@ -451,8 +451,6 @@ impl Link {
 
         // The proof binds the link to the responder's long-term identity key, not
         // its ephemeral one — that's what lets the initiator authenticate us.
-        let signalling =
-            SignallingData::new(request.signalling.mode, rns_wire::constants::MTU as u32);
         let responder_x25519_pub = responder_keys.x25519_pub.to_bytes();
         let sig_bytes = signalling.pack();
         let mut signed_data = Vec::with_capacity(16 + 32 + 32 + 3);
@@ -1583,39 +1581,22 @@ mod tests {
     }
 
     #[test]
-    fn test_responder_accepts_python_inbound_modes() {
+    fn test_responder_rejects_disabled_signalling_modes() {
         let dest_hash = [0xA2; 16];
         let identity_key = Ed25519PrivateKey::generate();
-        let (mut request_link, request_data) = Link::new_initiator(dest_hash, 1);
-
-        let mut aes128_request = request_data.clone();
-        aes128_request[64] = MODE_AES128_CBC << 5;
-        let (responder, proof) =
-            Link::new_responder(&aes128_request, &identity_key, dest_hash, 1).unwrap();
-        assert_eq!(responder.mode, MODE_AES128_CBC);
-        assert_eq!(
-            LinkProofData::unpack(&proof).unwrap().signalling.mode,
-            MODE_AES128_CBC
-        );
-
-        let identity_pub = identity_key.public_key();
-        assert!(
-            request_link
-                .validate_proof(&proof, &identity_pub, &identity_pub.to_bytes())
-                .is_err(),
-            "initiator requested AES256 and must reject an AES128 proof"
-        );
-        assert_eq!(request_link.state, LinkState::Closed);
-
-        let mut unsupported_request = request_data;
-        unsupported_request[64] = MODE_AES256_GCM << 5;
-        assert!(
-            matches!(
+        let (_, request_data) = Link::new_initiator(dest_hash, 1);
+        assert!(Link::new_responder(&request_data, &identity_key, dest_hash, 1).is_ok());
+        for mode in 0..=7 {
+            if ENABLED_MODES.contains(&mode) {
+                continue;
+            }
+            let mut unsupported_request = request_data.clone();
+            unsupported_request[64] = (unsupported_request[64] & 0x1f) | (mode << 5);
+            assert!(matches!(
                 Link::new_responder(&unsupported_request, &identity_key, dest_hash, 1),
-                Err(HandshakeError::UnsupportedMode(mode)) if mode == MODE_AES256_GCM
-            ),
-            "Python raises for unsupported inbound mode 2"
-        );
+                Err(HandshakeError::UnsupportedMode(rejected)) if rejected == mode
+            ));
+        }
     }
 
     #[test]

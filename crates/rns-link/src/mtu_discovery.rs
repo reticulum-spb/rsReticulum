@@ -1,4 +1,9 @@
-use crate::constants::{MODE_BYTEMASK, MTU_BYTEMASK};
+use crate::constants::{ENABLED_MODES, MODE_BYTEMASK, MTU_BYTEMASK};
+
+/// A mode that cannot be advertised by this implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("link signalling mode {0} is not enabled")]
+pub struct SignallingModeError(pub u8);
 
 /// MTU and encryption-mode signalling packed into 3 bytes (big-endian).
 ///
@@ -10,11 +15,15 @@ pub struct SignallingData {
 }
 
 impl SignallingData {
-    pub fn new(mode: u8, mtu: u32) -> Self {
-        Self {
-            mode: mode & 0x07,
-            mtu: mtu & MTU_BYTEMASK,
+    /// Validate the advertised mode before applying the wire MTU mask.
+    pub fn new(mode: u8, mtu: u32) -> Result<Self, SignallingModeError> {
+        if !ENABLED_MODES.contains(&mode) {
+            return Err(SignallingModeError(mode));
         }
+        Ok(Self {
+            mode,
+            mtu: mtu & MTU_BYTEMASK,
+        })
     }
 
     /// Pack into 3 big-endian bytes.
@@ -44,7 +53,7 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_roundtrip() {
-        let sd = SignallingData::new(MODE_AES256_CBC, 500);
+        let sd = SignallingData::new(MODE_AES256_CBC, 500).expect("enabled signalling mode");
         let packed = sd.pack();
         let unpacked = SignallingData::unpack(&packed).unwrap();
         assert_eq!(unpacked.mode, MODE_AES256_CBC);
@@ -52,18 +61,14 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_zero_mtu_500() {
-        let sd = SignallingData::new(0, 500);
-        let packed = sd.pack();
-        let unpacked = SignallingData::unpack(&packed).unwrap();
-        assert_eq!(unpacked.mode, 0);
-        assert_eq!(unpacked.mtu, 500);
+    fn test_mode_zero_is_disabled() {
+        assert_eq!(SignallingData::new(0, 500), Err(SignallingModeError(0)));
     }
 
     #[test]
     fn test_mode_bits_isolated() {
         // Setting the mode must not corrupt the MTU field.
-        let sd = SignallingData::new(1, 500);
+        let sd = SignallingData::new(1, 500).expect("enabled signalling mode");
         let packed = sd.pack();
         let unpacked = SignallingData::unpack(&packed).unwrap();
         assert_eq!(unpacked.mtu, 500);
@@ -73,16 +78,16 @@ mod tests {
     #[test]
     fn test_max_mtu_value() {
         let max_mtu = MTU_BYTEMASK;
-        let sd = SignallingData::new(7, max_mtu);
+        let sd = SignallingData::new(DEFAULT_MODE, max_mtu).expect("enabled signalling mode");
         let packed = sd.pack();
         let unpacked = SignallingData::unpack(&packed).unwrap();
         assert_eq!(unpacked.mtu, max_mtu);
-        assert_eq!(unpacked.mode, 7);
+        assert_eq!(unpacked.mode, DEFAULT_MODE);
     }
 
     #[test]
     fn test_default_mode() {
-        let sd = SignallingData::new(DEFAULT_MODE, 500);
+        let sd = SignallingData::new(DEFAULT_MODE, 500).expect("enabled signalling mode");
         assert_eq!(sd.mode, MODE_AES256_CBC);
     }
 
@@ -96,15 +101,20 @@ mod tests {
     proptest! {
         #[test]
         fn proptest_signalling_pack_unpack_roundtrip(
-            mode in 0u8..=7,
+            mode in any::<u8>(),
             mtu in 0u32..=MTU_BYTEMASK,
         ) {
-            let sd = SignallingData::new(mode, mtu);
-            let packed = sd.pack();
-            let unpacked = SignallingData::unpack(&packed).unwrap();
-            prop_assert_eq!(unpacked.mode, mode);
-            prop_assert_eq!(unpacked.mtu, mtu);
-            prop_assert_eq!(unpacked.pack(), packed);
+            let result = SignallingData::new(mode, mtu);
+            if ENABLED_MODES.contains(&mode) {
+                let sd = result.unwrap();
+                let packed = sd.pack();
+                let unpacked = SignallingData::unpack(&packed).unwrap();
+                prop_assert_eq!(unpacked.mode, mode);
+                prop_assert_eq!(unpacked.mtu, mtu);
+                prop_assert_eq!(unpacked.pack(), packed);
+            } else {
+                prop_assert_eq!(result, Err(SignallingModeError(mode)));
+            }
         }
 
         #[test]
