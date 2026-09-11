@@ -711,6 +711,18 @@ Only DATA drops are expected; the application delivery channel is sized to avoid
 adding unrelated application drops. This bounded burst is not a fairness or
 throughput benchmark, and does not require a particular adaptive-gate timing.
 
+The same target has an opt-in repeated-load test:
+`cargo test -p rns-runtime --test backbone_ingress_load four_backbone -- --ignored --nocapture`.
+Four persistent TCP peers run 100 rounds of 128 packets each, with a shared
+producer start barrier per round. Each round reconciles delivery/drop totals and
+requires progress from every peer; monotonic sequence checks cover the whole run.
+Control queries retain a one-second deadline and final marker packets verify all
+connections recover. Queue sizes and in-flight application data remain bounded.
+Rounds wait for reconciliation and pause 250 ms, so this is not continuous
+saturation, a proof of general fairness, or an hours-long soak. Reports include
+per-peer counts, minimum round progress, drops and maximum control-query latency;
+the overall 180-second deadline allows for adaptive policy hold times.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |

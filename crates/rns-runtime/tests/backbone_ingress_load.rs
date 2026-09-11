@@ -78,7 +78,7 @@ async fn stats(control: &mpsc::Sender<TransportMessage>) -> InboundQueueStats {
     .expect("control query starved behind incoming DATA")
 }
 
-fn delivered(event: DestinationEvent, last: &mut [Option<u64>; 2]) -> (u64, u64) {
+fn delivered(event: DestinationEvent, last: &mut [Option<u64>]) -> (u64, u64) {
     let DestinationEvent::InboundPacket { raw, interface_id } = event else {
         panic!("unexpected destination event");
     };
@@ -86,7 +86,7 @@ fn delivered(event: DestinationEvent, last: &mut [Option<u64>; 2]) -> (u64, u64)
     let peer = u64::from_be_bytes(raw[offset..offset + 8].try_into().unwrap());
     let sequence = u64::from_be_bytes(raw[offset + 8..offset + 16].try_into().unwrap());
     assert_eq!(peer, interface_id);
-    assert!((1..=2).contains(&peer));
+    assert!((1..=last.len() as u64).contains(&peer));
     assert_eq!(raw.len(), 256);
     assert!(raw[offset + 16..].iter().all(|byte| *byte == 0x55));
     let previous = &mut last[peer as usize - 1];
@@ -96,6 +96,149 @@ fn delivered(event: DestinationEvent, last: &mut [Option<u64>; 2]) -> (u64, u64)
     );
     *previous = Some(sequence);
     (peer, sequence)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "four-peer repeated ingress load; policy holds can take tens of seconds"]
+async fn four_backbone_peers_repeated_pressure_and_progress() {
+    timeout(Duration::from_secs(180), repeated_pressure())
+        .await
+        .expect("repeated Backbone pressure timed out");
+}
+
+async fn repeated_pressure() {
+    const PEERS: usize = 4;
+    const ROUNDS: u64 = 100;
+    const PER_ROUND: u64 = 128;
+    let dest = [0xBC; 16];
+    let (mut actor, input, control) = TransportActor::new_with_control_channel_and_queue_limits(
+        InboundQueueLimits::new([4; 4]).unwrap(),
+    );
+    let (delivery_tx, mut deliveries) = mpsc::channel(PEERS * PER_ROUND as usize + PEERS);
+    actor.local_destinations.insert(dest);
+    actor.destination_channels.insert(dest, delivery_tx);
+    let mut tasks = Tasks(Vec::new());
+    let mut peers = Vec::new();
+    for id in 1..=PEERS as u64 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = BackboneClientConfig::new(
+            "repeated-ingress",
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+        );
+        config.receive_ifac_size = Some(0);
+        config.max_reconnect_tries = Some(1);
+        let handle = spawn_backbone_client(config, id, input.clone())
+            .await
+            .unwrap();
+        tasks.0.push(handle.read_task);
+        peers.push(listener.accept().await.unwrap().0);
+        let mut entry = InterfaceEntry::new(
+            handle.name,
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            handle.bitrate,
+            handle.mtu,
+            handle.tx,
+        );
+        entry.online = Some(handle.online);
+        entry.diagnostics = handle.diagnostics;
+        actor.interfaces.insert(id, entry);
+    }
+    tasks.0.push(tokio::spawn(actor.run()));
+    let started = std::time::Instant::now();
+    let mut last = [None; PEERS];
+    let mut counts = [0u64; PEERS];
+    let mut min_round = [u64::MAX; PEERS];
+    let mut queries = 0;
+    let mut max_query = Duration::ZERO;
+    let mut drops = 0;
+    for round in 0..ROUNDS {
+        let before = counts;
+        // Independent producers share a start barrier. The bounded JoinSet is
+        // dropped/aborted on cancellation; sockets return after each burst.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(PEERS));
+        let mut producers = tokio::task::JoinSet::new();
+        for (index, mut peer) in peers.drain(..).enumerate() {
+            let barrier = barrier.clone();
+            producers.spawn(async move {
+                let mut wire = Vec::new();
+                for sequence in round * PER_ROUND..(round + 1) * PER_ROUND {
+                    wire.extend(hdlc::frame(&packet(dest, index as u64 + 1, sequence)));
+                }
+                barrier.wait().await;
+                peer.write_all(&wire).await.unwrap();
+                (index, peer)
+            });
+        }
+        let mut returned = Vec::new();
+        while let Some(result) = producers.join_next().await {
+            returned.push(result.unwrap());
+        }
+        returned.sort_by_key(|(index, _)| *index);
+        peers = returned.into_iter().map(|(_, peer)| peer).collect();
+        loop {
+            while let Ok(event) = deliveries.try_recv() {
+                let (peer, sequence) = delivered(event, &mut last);
+                assert!((round * PER_ROUND..(round + 1) * PER_ROUND).contains(&sequence));
+                counts[peer as usize - 1] += 1;
+            }
+            let start = std::time::Instant::now();
+            let state = stats(&control).await;
+            queries += 1;
+            max_query = max_query.max(start.elapsed());
+            assert_eq!(&state.snapshot.dropped[1..], &[0; 3]);
+            assert!(state.snapshot.dropped[0] >= drops);
+            drops = state.snapshot.dropped[0];
+            let total = counts.iter().sum::<u64>() + drops;
+            let expected = (round + 1) * PER_ROUND * PEERS as u64;
+            assert!(total <= expected);
+            if total == expected {
+                assert_eq!(state.snapshot.total, 0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for index in 0..PEERS {
+            let progress = counts[index] - before[index];
+            assert!(
+                progress > 0,
+                "peer {} made no progress in round {round}",
+                index + 1
+            );
+            min_round[index] = min_round[index].min(progress);
+        }
+        if round % 25 == 24 {
+            eprintln!(
+                "backbone_repeated: rounds={} delivered={counts:?} drops={drops} elapsed_s={:.3}",
+                round + 1,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        if round + 1 < ROUNDS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    assert!(drops > 0);
+    for (index, peer) in peers.iter_mut().enumerate() {
+        let id = index as u64 + 1;
+        peer.write_all(&hdlc::frame(&packet(dest, id, ROUNDS * PER_ROUND)))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered(deliveries.recv().await.unwrap(), &mut last),
+            (id, ROUNDS * PER_ROUND)
+        );
+    }
+    assert_eq!(stats(&control).await.snapshot.dropped[0], drops);
+    eprintln!(
+        "backbone_repeated_complete: peers={PEERS} rounds={ROUNDS} offered={} delivered={counts:?} min_round_delivered={min_round:?} drops={drops} control_queries={queries} max_control_ms={:.3} elapsed_s={:.3}; round barriers and 250ms pauses, not continuous saturation or a fairness guarantee",
+        PEERS as u64 * ROUNDS * PER_ROUND,
+        max_query.as_secs_f64() * 1000.0,
+        started.elapsed().as_secs_f64()
+    );
+    control.send(TransportMessage::Shutdown).await.unwrap();
+    control.closed().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

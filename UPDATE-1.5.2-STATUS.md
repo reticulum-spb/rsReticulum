@@ -2442,3 +2442,38 @@ fmt/diff checks успешны. Прежние warnings сохраняются, 
 Изолированное before/after TX writer сравнение выполнено. Whole-pipeline
 сравнение, sustained/many-peer fairness и масштабирование памяти остаются.
 Этап 5 открыт, версия остаётся 1.0.1.
+
+### Продолжение этапа 5: четыре Backbone peers, 100 раундов давления
+
+Добавлен full-only ignored
+`four_backbone_peers_repeated_pressure_and_progress` в `backbone_ingress_load`.
+Четыре неизменных TCP-соединения, 100 раундов по128 уникальных DATA-пакетов
+на peer; producers стартуют через barrier и работают отдельными задачами.
+JoinSet ограничен четырьмя задачами и отменяет их при выходе/ошибке. Между
+раундами — полная сверка доставки/drops и пауза250ms, без переподключений.
+
+В каждом раунде проверяются прогресс всех четырёх peers, возрастающая
+последовательность каждого peer, содержимое пакетов, отсутствие drops других
+классов и delivery+DATA drops=offered. Control queries имеют deadline1s;
+DATA/class capacities по4, application queue ограничена одним раундом+markers.
+Финальные marker-пакеты проходят через все прежние соединения без новых drops.
+Общий deadline180s допускает policy holds; actor/drivers имеют task guard.
+
+Команда:
+`cargo test -p rns-runtime --test backbone_ingress_load four_backbone -- --ignored --nocapture`.
+Полный прогон100 раундов занял75.516s: offered51200, delivered
+[11905,11939,11827,11816], DATA drops3713. Минимальная доставка за один раунд
+по peers:[103,108,105,106] из128; control queries18816, max10.957ms.
+Все assertions и конечные markers успешны. Ранний20-round проверочный прогон
+тоже прошёл. Эти результаты не являются общим доказательством fairness:
+раунды ждут reconciliation, канал не насыщается непрерывно, часы работы,
+неравные скорости producers и churn здесь не моделируются.
+Неигнорируемый ingress target после изменений: 1 passed, 1 ignored.
+
+Workspace all-targets и client-only tests checks успешны; fmt/diff checks
+чистые. Прежние warnings сохраняются, Python ea98db4f не изменён.
+CONFIG описывает запуск и границы сценария.
+
+Проверка повторного давления четырёх peers выполнена. Whole-pipeline
+before/after сравнение, непрерывная/неравномерная нагрузка и масштабирование
+памяти при росте числа peers остаются. Этап 5 открыт, версия 1.0.1.
