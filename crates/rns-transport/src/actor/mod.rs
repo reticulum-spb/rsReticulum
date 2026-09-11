@@ -51,6 +51,8 @@ pub struct TransportActor {
     rx: mpsc::Receiver<TransportMessage>,
     control_rx: Option<mpsc::Receiver<TransportMessage>>,
     inbound_queues: crate::inbound_queue::InboundQueues<inbound::PreparedInbound>,
+    dataplane_ingress: crate::backbone_ingress::IngressPolicy,
+    ingress_origin: tokio::time::Instant,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -349,6 +351,8 @@ impl TransportActor {
             rx,
             control_rx: None,
             inbound_queues: crate::inbound_queue::InboundQueues::new(Default::default()),
+            dataplane_ingress: crate::backbone_ingress::IngressPolicy::new(1024, Duration::ZERO),
+            ingress_origin: tokio::time::Instant::now(),
             path_table: PathTable::new(),
             link_table: LinkTable::new(),
             announce_table: AnnounceTable::new(),
@@ -453,12 +457,15 @@ impl TransportActor {
             return;
         }
         let mut tick_interval = tokio::time::interval(Duration::from_millis(JOB_INTERVAL_MS));
+        let mut ingress_tick = tokio::time::interval(crate::backbone_ingress::INTERVAL);
+        ingress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut was_foreground = true;
         let mut interface_open = true;
         let mut control_open = self.control_rx.is_some();
 
         loop {
             tokio::select! {
+                _ = ingress_tick.tick() => self.evaluate_dataplane_ingress(false),
                 _ = std::future::ready(()), if self.inbound_queues.snapshot().total > 0 => {
                     let packet = self.inbound_queues.pop().unwrap();
                     self.dispatch_inbound(packet);
@@ -510,8 +517,59 @@ impl TransportActor {
         }
     }
 
+    fn evaluate_dataplane_ingress(&mut self, immediate: bool) {
+        use crate::backbone_ingress::{IngressAction, Watermarks};
+        let stats = self.inbound_queues.stats();
+        self.dataplane_ingress.watermarks = Watermarks::for_data_capacity(stats.capacities[0]);
+        // Safety deviation: an empty tiny queue must be able to release peers.
+        self.dataplane_ingress.watermarks.low = self.dataplane_ingress.watermarks.low.max(1);
+        if immediate && stats.snapshot.heights[0] < self.dataplane_ingress.watermarks.immediate {
+            return;
+        }
+        let mut controls: Vec<_> = self
+            .interfaces
+            .iter()
+            .filter_map(|(&id, entry)| {
+                if entry.role == InterfaceRole::LocalClient {
+                    return None;
+                }
+                let control = entry.diagnostics.as_ref()?.dataplane_ingress()?;
+                Some((id, control))
+            })
+            .collect();
+        controls.sort_by_key(|(_, control)| control.order());
+        let mut samples: Vec<_> = controls
+            .iter()
+            .map(|(id, control)| control.snapshot(*id, !immediate))
+            .collect();
+        let now = self.ingress_origin.elapsed();
+        let action = if immediate {
+            self.dataplane_ingress
+                .immediate(stats.snapshot.heights[0], now, &samples)
+        } else {
+            self.dataplane_ingress
+                .periodic(stats.snapshot.heights[0], now, &mut samples)
+        };
+        match action {
+            Some(IngressAction::Gate { id, hold }) => {
+                if let Some((_, control)) = controls.iter().find(|(peer, _)| *peer == id) {
+                    control.gate(now.saturating_add(hold));
+                }
+            }
+            Some(IngressAction::Release { id }) => {
+                if let Some((_, control)) = controls.iter().find(|(peer, _)| *peer == id) {
+                    control.release();
+                }
+            }
+            None => {}
+        }
+    }
+
     fn enqueue_prepared_inbound(&mut self, prepared: inbound::PreparedInbound) {
         let class = prepared.traffic_class();
+        if class == crate::inbound_queue::TrafficClass::Data {
+            self.evaluate_dataplane_ingress(true);
+        }
         if self.inbound_queues.try_push(class, prepared).is_err() {
             self.channel_drops += 1;
         }
@@ -1180,6 +1238,14 @@ impl TransportActor {
     /// Drop `id` from the interface table and unwind tunnels + paths bound
     /// to it. Shared by `DeregisterInterface` and the `Closed`-tx auto-drop.
     fn deregister_interface(&mut self, id: InterfaceId) {
+        if let Some(control) = self
+            .interfaces
+            .get(&id)
+            .and_then(|e| e.diagnostics.as_ref())
+            .and_then(|d| d.dataplane_ingress())
+        {
+            control.reset();
+        }
         self.inbound_queues
             .retain(|packet| packet.interface_id != id);
         let role = self.interfaces.get(&id).map(|entry| entry.role);
@@ -2610,6 +2676,128 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().raw.as_ref(), &pr[..]);
         assert_eq!(actor.interfaces[&1].ingress.traffic.ptxc, 1);
         assert_eq!(accounting.snapshot().buffered, 0);
+    }
+
+    #[test]
+    fn dataplane_ingress_tiny_queue_releases_and_deregister_clears_gate() {
+        use crate::backbone_ingress::IngressControl;
+        let (mut actor, _) = TransportActor::new();
+        actor.inbound_queues = crate::inbound_queue::InboundQueues::new(
+            crate::inbound_queue::InboundQueueLimits::new([8, 8, 8, 8]).unwrap(),
+        );
+        let control = IngressControl::new();
+        let (mut entry, _rx) = make_test_interface("ingress");
+        entry.diagnostics = Some(control.clone());
+        actor.interfaces.insert(1, entry);
+        for index in 0..6 {
+            let prepared = actor
+                .prepare_inbound(InboundPacket {
+                    raw: make_data_packet([index; 16], 0),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                })
+                .unwrap();
+            actor.enqueue_prepared_inbound(prepared);
+        }
+        assert_eq!(actor.inbound_queues.snapshot().heights[0], 6);
+        control.received_bytes(600);
+        for _ in 0..6 {
+            control.received_frame();
+        }
+        actor.ingress_origin = tokio::time::Instant::now() - Duration::from_millis(250);
+        actor.evaluate_dataplane_ingress(false);
+        assert!(control.snapshot(1, false).gated);
+        actor.inbound_queues.retain(|_| false);
+        actor.evaluate_dataplane_ingress(false);
+        assert!(control.snapshot(1, false).gated, "hold still active");
+        actor.ingress_origin = tokio::time::Instant::now() - Duration::from_secs(30);
+        actor.evaluate_dataplane_ingress(false);
+        assert!(
+            !control.snapshot(1, false).gated,
+            "empty tiny queue releases after hold"
+        );
+        control.gate(Duration::from_secs(100));
+        actor.deregister_interface(1);
+        assert!(!control.snapshot(1, false).gated);
+    }
+
+    #[test]
+    fn dataplane_immediate_runs_before_data_append() {
+        let (mut actor, _) = TransportActor::new();
+        let control = crate::backbone_ingress::IngressControl::new();
+        let (mut entry, _rx) = make_test_interface("immediate");
+        entry.diagnostics = Some(control.clone());
+        actor.interfaces.insert(1, entry);
+        actor.ingress_origin = tokio::time::Instant::now() - Duration::from_millis(250);
+        control.received_bytes(1000);
+        control.received_frame();
+        for index in 0..922usize {
+            let mut hash = [0; 16];
+            hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let prepared = actor
+                .prepare_inbound(InboundPacket {
+                    raw: make_data_packet(hash, 0),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                })
+                .unwrap();
+            actor.enqueue_prepared_inbound(prepared);
+            assert_eq!(control.snapshot(1, false).gated, index == 921);
+        }
+        actor.on_shutdown();
+        assert!(!control.snapshot(1, false).gated);
+    }
+
+    #[tokio::test]
+    async fn dataplane_periodic_release_runs_in_actor_backends() {
+        let backends = [false, cfg!(feature = "sqlite")];
+        for (index, sqlite) in backends.into_iter().enumerate() {
+            if index == 1 && !sqlite {
+                continue;
+            }
+            let (mut actor, tx) = TransportActor::new();
+            #[cfg(feature = "sqlite")]
+            let directory = if sqlite {
+                let path = std::env::temp_dir().join(format!(
+                    "rns-ingress-timer-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                actor.initialize_sqlite_storage(path.clone()).await.unwrap();
+                Some(path)
+            } else {
+                None
+            };
+            let control = crate::backbone_ingress::IngressControl::new();
+            let (mut entry, _rx) = make_test_interface("timer");
+            entry.diagnostics = Some(control.clone());
+            actor.interfaces.insert(1, entry);
+            control.gate(actor.ingress_origin.elapsed() + Duration::from_millis(100));
+            let mut task = tokio::spawn(actor.run());
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                control.wait_open().await;
+                assert!(!control.snapshot(1, false).gated);
+                tx.send(TransportMessage::Shutdown).await.unwrap();
+                (&mut task).await.unwrap();
+            })
+            .await;
+            if result.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            result.unwrap();
+            #[cfg(feature = "sqlite")]
+            if let Some(directory) = directory {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
     }
 
     #[test]

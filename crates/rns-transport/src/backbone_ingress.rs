@@ -1,9 +1,100 @@
-//! Dataplane ingress policy for Backbone, not yet connected to socket readers.
+//! Dataplane ingress policy and shared Backbone reader controls.
 //! Input order is registration order (Python dict order), not hash-map order.
 //! Peers must contain only eligible Backbone connections, not local clients.
 //! Announce/path-request ingress control is a separate mechanism.
 
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
+use tokio::sync::Notify;
+
+/// One driver connection's counters and pause state; single reader waiter.
+pub struct IngressControl {
+    order: u64,
+    state: Mutex<PeerSample>,
+    wake: Notify,
+}
+
+impl IngressControl {
+    pub fn new() -> Arc<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Arc::new(Self {
+            order: NEXT.fetch_add(1, Ordering::Relaxed),
+            state: Mutex::new(PeerSample {
+                id: 0,
+                packets: 0,
+                bytes: 0,
+                gated: false,
+                hold_until: None,
+            }),
+            wake: Notify::new(),
+        })
+    }
+    pub fn order(&self) -> u64 {
+        self.order
+    }
+    pub fn received_bytes(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes = state.bytes.saturating_add(bytes as u64);
+    }
+    pub fn received_frame(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.packets = state.packets.saturating_add(1);
+    }
+    pub fn snapshot(&self, id: u64, reset_counters: bool) -> PeerSample {
+        let mut state = self.state.lock().unwrap();
+        let mut sample = state.clone();
+        sample.id = id;
+        if reset_counters {
+            state.packets = 0;
+            state.bytes = 0;
+        }
+        sample
+    }
+    pub fn gate(&self, until: Duration) {
+        let mut state = self.state.lock().unwrap();
+        if !state.gated {
+            state.gated = true;
+            state.hold_until = Some(until);
+        }
+    }
+    pub fn release(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.gated = false;
+            state.hold_until = None;
+        }
+        // notify_one retains a permit if release races with entering the wait.
+        self.wake.notify_one();
+    }
+    pub fn reset(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.packets = 0;
+            state.bytes = 0;
+            state.gated = false;
+            state.hold_until = None;
+        }
+        self.wake.notify_one();
+    }
+    pub async fn wait_open(&self) {
+        loop {
+            let notified = self.wake.notified();
+            if !self.state.lock().unwrap().gated {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl crate::messages::InterfaceDiagnostics for IngressControl {
+    fn dataplane_ingress(&self) -> Option<&IngressControl> {
+        Some(self)
+    }
+}
 
 pub const INTERVAL: Duration = Duration::from_millis(250);
 pub const RECEIVE_BUFFER: usize = 32768;
@@ -152,6 +243,37 @@ impl IngressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_gate_release_and_reset_do_not_lose_wakeups() {
+        let control = IngressControl::new();
+        control.received_bytes(100);
+        control.received_frame();
+        let sample = control.snapshot(7, true);
+        assert_eq!((sample.id, sample.bytes, sample.packets), (7, 100, 1));
+        assert_eq!(control.snapshot(7, false).bytes, 0);
+        for reset in [false, true] {
+            control.gate(Duration::from_secs(12));
+            let waiter = {
+                let control = control.clone();
+                tokio::spawn(async move { control.wait_open().await })
+            };
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished());
+            if reset {
+                control.reset();
+            } else {
+                control.release();
+            }
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap();
+            // Release before waiting must not require a second notification.
+            control.release();
+            control.wait_open().await;
+        }
+    }
     fn peer(id: u64, packets: u64, bytes: u64) -> PeerSample {
         PeerSample {
             id,

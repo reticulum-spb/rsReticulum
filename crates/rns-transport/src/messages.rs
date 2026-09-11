@@ -65,8 +65,12 @@ pub struct TimerTick {
     pub timestamp: f64,
 }
 
-/// Live diagnostics owned by an interface driver.
+/// Live diagnostics and optional flow controls owned by an interface driver.
 pub trait InterfaceDiagnostics: Send + Sync {
+    /// Optional Backbone dataplane control, independent of announce/PR limits.
+    fn dataplane_ingress(&self) -> Option<&crate::backbone_ingress::IngressControl> {
+        None
+    }
     /// Snapshot with expired entries removed. Non-Backbone drivers return None.
     fn blocked_ip_list(&self) -> Option<Vec<String>> {
         None

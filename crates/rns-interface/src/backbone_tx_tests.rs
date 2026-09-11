@@ -4,6 +4,66 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
+#[tokio::test]
+async fn ingress_gate_pauses_reader_and_release_preserves_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (reader, _writer) = stream.into_split();
+    let ingress = IngressControl::new();
+    ingress.gate(Duration::from_secs(12));
+    let online = Arc::new(AtomicBool::new(true));
+    let rxb = Arc::new(AtomicU64::new(0));
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut task = tokio::spawn(backbone_read_loop(
+        reader,
+        7,
+        tx,
+        online.clone(),
+        rxb.clone(),
+        ingress.clone(),
+    ));
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        peer.write_all(&hdlc::frame(b"first~}")).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(rxb.load(Ordering::Relaxed), 0);
+        ingress.release();
+        let Some(TransportMessage::Inbound(packet)) = rx.recv().await else {
+            panic!("expected frame")
+        };
+        assert_eq!(packet.raw.as_ref(), b"first~}");
+        ingress.gate(Duration::from_secs(24));
+        peer.write_all(&hdlc::frame(b"second")).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx.recv())
+                .await
+                .is_err()
+        );
+        ingress.release();
+        let Some(TransportMessage::Inbound(packet)) = rx.recv().await else {
+            panic!("expected frame")
+        };
+        assert_eq!(packet.raw.as_ref(), b"second");
+        assert_eq!(ingress.snapshot(7, false).packets, 2);
+        drop(peer);
+        (&mut task).await.unwrap();
+        assert!(!online.load(Ordering::SeqCst));
+        assert_eq!(ingress.snapshot(7, false).packets, 0);
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn abort_releases_all_reservations_and_gate() {
     let (tx, rx, accounting) = byte_channel(4, HIGH_WATERMARK, encoded_len);

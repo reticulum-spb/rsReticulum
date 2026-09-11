@@ -332,6 +332,8 @@ impl TransportActor {
 
     pub(super) async fn run_sqlite(mut self) -> Self {
         let mut tick = tokio::time::interval(Duration::from_millis(JOB_INTERVAL_MS));
+        let mut ingress_tick = tokio::time::interval(crate::backbone_ingress::INTERVAL);
+        ingress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut job: Option<JoinHandle<storage::Result<Prepared>>> = None;
         let mut stopping = false;
         let mut was_foreground = true;
@@ -397,6 +399,7 @@ impl TransportActor {
             }
             self.sqlite.as_mut().unwrap().busy = job.is_some();
             tokio::select! {
+                _ = ingress_tick.tick(), if !stopping => self.evaluate_dataplane_ingress(false),
                 _=std::future::ready(()), if !stopping && self.inbound_queues.snapshot().total > 0 => {
                     let packet = self.inbound_queues.pop().unwrap();
                     let msg = TransportMessage::AdmittedInbound(packet);

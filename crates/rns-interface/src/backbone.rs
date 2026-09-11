@@ -21,6 +21,7 @@ use crate::backbone_flow::{
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
+use rns_transport::backbone_ingress::{IngressControl, RECEIVE_BUFFER};
 use rns_transport::messages::{InboundPacket, TransportMessage};
 use rns_transport::tx_queue::{OutboundFrame, TxAccounting, TxLease, byte_channel};
 
@@ -112,6 +113,7 @@ fn tune_stream(stream: &TcpStream) {
     let (idle, intvl, retries, user_timeout) = keepalive_durations();
     set_keepalive_tuned(stream, idle, intvl, retries, user_timeout);
     set_socket_buffers(stream, HW_MTU as usize);
+    let _ = socket2::SockRef::from(stream).set_recv_buffer_size(RECEIVE_BUFFER);
 }
 
 fn child_mtu() -> u32 {
@@ -126,11 +128,20 @@ async fn backbone_read_loop(
     transport_tx: mpsc::Sender<TransportMessage>,
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
+    ingress: Arc<IngressControl>,
 ) {
+    struct ResetIngress(Arc<IngressControl>);
+    impl Drop for ResetIngress {
+        fn drop(&mut self) {
+            self.0.reset();
+        }
+    }
+    let _reset = ResetIngress(ingress.clone());
     let mut deframer = hdlc::HdlcDeframer::new();
     // Large buffer to amortise syscalls; inbound capped by HdlcDeframer::MAX_FRAME_SIZE.
     let mut buf = vec![0u8; 65536];
     loop {
+        ingress.wait_open().await;
         match reader.read(&mut buf).await {
             Ok(0) => {
                 tracing::info!(interface_id, "backbone read: EOF");
@@ -138,10 +149,13 @@ async fn backbone_read_loop(
             }
             Ok(n) => {
                 rxb.fetch_add(n as u64, Ordering::Relaxed);
+                ingress.received_bytes(n);
                 for frame in deframer.feed(&buf[..n]) {
                     if frame.is_empty() {
                         continue;
                     }
+                    ingress.wait_open().await;
+                    ingress.received_frame();
                     let msg = TransportMessage::Inbound(InboundPacket {
                         raw: Bytes::from(frame),
                         interface_id,
@@ -494,6 +508,8 @@ pub async fn spawn_backbone_server(
                     let c_online = Arc::new(AtomicBool::new(true));
                     let c_rxb = Arc::new(AtomicU64::new(0));
                     let c_txb = Arc::new(AtomicU64::new(0));
+                    let ingress = IngressControl::new();
+                    let reader_ingress = ingress.clone();
                     let (c_tx, c_rx, accounting) =
                         byte_channel(TX_CHANNEL_DEPTH, HIGH_WATERMARK, encoded_len);
                     let (reader, writer) = stream.into_split();
@@ -514,7 +530,7 @@ pub async fn spawn_backbone_server(
                     };
                     let read_handle = tokio::spawn(async move {
                         tokio::select! {
-                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r) => {},
+                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r, reader_ingress) => {},
                             _ = controlled_write_loop(writer, c_rx, c_online_w, c_txb_w, accounting) => {},
                         }
                         connection_online.store(false, Ordering::SeqCst);
@@ -531,7 +547,7 @@ pub async fn spawn_backbone_server(
                     let handle = InterfaceHandle {
                         id: client_id,
                         parent_id: Some(id),
-                        diagnostics: None,
+                        diagnostics: Some(ingress),
                         name: client_name,
                         mode,
                         direction: InterfaceDirection {
@@ -611,6 +627,8 @@ pub async fn spawn_backbone_client(
 
     let shared_rxb = Arc::new(AtomicU64::new(0));
     let shared_txb = Arc::new(AtomicU64::new(0));
+    let ingress = IngressControl::new();
+    let reader_ingress = ingress.clone();
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
 
@@ -694,6 +712,7 @@ pub async fn spawn_backbone_client(
             };
 
             tune_stream(&stream);
+            reader_ingress.reset();
             online2.store(true, Ordering::SeqCst);
             tries = 0;
 
@@ -720,8 +739,14 @@ pub async fn spawn_backbone_client(
                         }
                     }
                 };
-                let reading =
-                    backbone_read_loop(reader, id, transport_tx.clone(), c_online_r, c_rxb);
+                let reading = backbone_read_loop(
+                    reader,
+                    id,
+                    transport_tx.clone(),
+                    c_online_r,
+                    c_rxb,
+                    reader_ingress.clone(),
+                );
                 let writing =
                     controlled_write_loop(writer, conn_rx, c_online_w, c_txb, accounting.clone());
                 tokio::pin!(forward, reading, writing);
@@ -758,7 +783,7 @@ pub async fn spawn_backbone_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: None,
+        diagnostics: Some(ingress),
         name,
         mode,
         direction: InterfaceDirection {

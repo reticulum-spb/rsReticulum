@@ -510,6 +510,15 @@ impl TransportActor {
     }
 
     pub(super) fn on_shutdown(&mut self) {
+        for entry in self.interfaces.values() {
+            if let Some(control) = entry
+                .diagnostics
+                .as_ref()
+                .and_then(|d| d.dataplane_ingress())
+            {
+                control.reset();
+            }
+        }
         self.save_state();
     }
 

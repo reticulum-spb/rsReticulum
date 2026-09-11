@@ -1491,3 +1491,54 @@ hook и deregistration cleanup, с отдельными тестами мале�
 sqlite_crash_fixture) — 477 unit + 2 Python integration tests passed;
 workspace all-targets check и fmt/diff checks успешны. Прежние warnings
 database_path и tracing_subscriber::prelude сохраняются.
+
+### Этап 5 — подключение dataplane ingress к actor и reader
+
+Backbone client/accepted peers получили shared IngressControl с packet/byte
+snapshots, gate/hold и Notify для единственного reader. Listener fast-flap
+diagnostics не заменены; optional control доступен через InterfaceDiagnostics.
+Reader считает socket bytes и передаваемые transport frames, проверяет gate
+перед чтением и между кадрами. Frame counters включают все классы, pressure —
+только DATA. Запрос SO_RCVBUF теперь 32768 bytes, итог определяется ОС.
+TX loop независим от reader gate.
+
+Actor memory и SQLite имеют отдельный 250 ms timer с MissedTickBehavior::Skip,
+не зависящий от mobile maintenance interval. Periodic snapshots атомарно
+снимают/сбрасывают driver counters; immediate evaluation вызывается перед
+DATA append при достижении порога, не сбрасывает counters и не заменяет
+drop-tail admission. Выбор упорядочен по созданию shared controls, не HashMap;
+при reconnect клиент сохраняет control/order, что отличается от новой
+позиции socket в Python registry. LocalClient и интерфейсы без control исключены.
+
+Защитное отличие для малых queue limits: effective release watermark в actor
+равен max(Python low,1). Для capacity <10 пустая DATA queue после hold может
+освободить peer, вместо вечного gate при literal depth<0. Статическая модель
+и Python oracle по-прежнему проверяют исходные пороги; адаптация явная и
+локализована в рабочем actor. YAML limits остаются прежними.
+
+Release/reset будит reader без потерянного уведомления; reconnect, окончание
+reader, deregistration и shutdown очищают gate/counters. Уже запущенный read
+или transport send может завершиться после включения gate; последующие reads
+и deliveries ожидают release. Имеющийся deframer/frame buffer сохраняется.
+
+Оставшаяся lifecycle-граница: paused reader не наблюдает EOF немедленно, пока
+не получит release (в отличие от отдельного Python EPOLLHUP handling).
+При длительном давлении от других producers это может задерживать cleanup;
+нужны дополнительные проверки/обработка HUP, прежде чем заявлять полный
+multi-peer teardown parity. RX metrics/RPC/UI и нагрузочное сравнение также
+ещё не завершены. Полный этап 5 не закрывается.
+
+Новые проверки: shared sample/reset и release wakeup; actor gate при tiny
+DATA queue, удержание до deadline, recovery при пустой очереди; immediate
+перед 922-м append при исходной глубине 921; deregistration/shutdown cleanup;
+реальный 250 ms release в memory и SQLite actor. Loopback reader test проверяет
+две остановки/возобновления с escaped frame, отсутствие delivery до release,
+сохранение bytes и reset после EOF. Это не multi-peer stress benchmark.
+
+Interface suite: 198 passed, 3 ignored; отдельный TCP ingress test — 1 passed.
+Финальный transport SQLite/include-ignored run — 481 unit + 2 Python
+integration passed; timer test прошёл в обоих backend. Отдельные межпроцессные
+Python↔Rust mixed TCP memory/SQLite tests — 2 passed.
+Workspace all-targets и runtime client-only tests checks успешны, fmt/diff
+checks успешны, прежние warnings сохраняются. Сетевые проверки выполняются
+с loopback-разрешением.

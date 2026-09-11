@@ -500,6 +500,21 @@ separate from the actual-write deadline. Actor admission rejections increment
 `tx_drops`; byte-drop snapshots are available on the driver TX handle but not
 yet exposed through RPC/UI. These thresholds are fixed, not YAML settings.
 
+Dataplane ingress control samples DATA queue pressure every 250 ms in both
+memory and SQLite modes. Above the 68% watermark it pauses the most active
+Backbone producer; before DATA enqueue at the high watermark (90%, minimum
+128 packets) it can pause immediately. Release occurs one peer per sample,
+after its hold expires and DATA depth is below the 10% watermark. For DATA
+capacities below 10, the effective release watermark is 1 instead of Python's
+0, so an empty queue can recover. Other Python threshold floors still apply.
+Reader pauses do not stop TX. Counters include all delivered frame classes,
+while the pressure signal is DATA only; announce/PR ingress settings are
+independent. Backbone requests a 32768-byte socket receive buffer (the OS can
+adjust it). An already pending read/send can finish before the gate takes
+effect; subsequent reads and frame deliveries wait for release. EOF detection
+while gated can be deferred until release. Multi-peer overload/teardown parity
+and ingress diagnostics in RPC/UI are still under validation.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |
