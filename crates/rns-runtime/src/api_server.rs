@@ -1420,6 +1420,7 @@ async fn settings(State(s): State<AppState>) -> ApiResult<Json<Value>> {
 
 fn settings_differ(a: &ReticulumConfig, b: &ReticulumConfig) -> bool {
     a.share_instance != b.share_instance
+        || a.inbound_queue_limits != b.inbound_queue_limits
         || a.instance_name != b.instance_name
         || a.shared_instance_type != b.shared_instance_type
         || a.shared_instance_port != b.shared_instance_port
@@ -2236,6 +2237,20 @@ fn visible_by_default(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inbound_queue_changes_require_restart() {
+        let running = super::ReticulumConfig::default();
+        for index in 0..4 {
+            let mut stored = running.clone();
+            let mut sizes = stored.inbound_queue_limits.sizes();
+            sizes[index] += 1;
+            stored.inbound_queue_limits =
+                rns_transport::inbound_queue::InboundQueueLimits::new(sizes).unwrap();
+            assert!(super::settings_differ(&stored, &running));
+            assert!(!super::settings_differ(&stored, &stored));
+        }
+    }
+
     #[test]
     fn gravity_api_roundtrip_preserves_signed_values_and_tristate() {
         for internal in [Value::Null, json!(false), json!(true)] {

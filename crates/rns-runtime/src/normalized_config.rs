@@ -24,6 +24,37 @@ pub enum ConfigError {
     },
 }
 
+/// Shared startup parsing for both the full runtime and shared-client build.
+pub(crate) fn parse_inbound_queue_limits(
+    section: &NormalizedSection,
+) -> Result<rns_transport::inbound_queue::InboundQueueLimits, ConfigError> {
+    use rns_transport::inbound_queue::InboundQueueLimits;
+    let mut sizes = InboundQueueLimits::default().sizes();
+    for (size, key) in sizes.iter_mut().zip([
+        "qlen_in_data",
+        "qlen_in_announce",
+        "qlen_in_pr",
+        "qlen_in_il",
+    ]) {
+        if section.has(key) {
+            *size = section
+                .get(key)
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| ConfigError::InvalidValue {
+                    section: "reticulum".into(),
+                    key: key.into(),
+                    message: "must be a positive integer fitting usize".into(),
+                })?;
+        }
+    }
+    InboundQueueLimits::new(sizes).ok_or_else(|| ConfigError::InvalidValue {
+        section: "reticulum".into(),
+        key: "qlen_in_*".into(),
+        message: "sum of inbound queue sizes must fit usize".into(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedValue {
     Scalar(String),

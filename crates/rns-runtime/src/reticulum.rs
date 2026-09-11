@@ -648,6 +648,7 @@ pub struct ReticulumConfig {
     pub default_ar_penalty: Option<u64>,
     pub default_ar_grace: Option<u32>,
     pub default_gravity: i64,
+    pub inbound_queue_limits: rns_transport::inbound_queue::InboundQueueLimits,
     pub autoconnect_interface_mode: Option<rns_interface::traits::InterfaceMode>,
     pub autoconnect_interface_gravity: Option<i64>,
     pub autoconnect_announces_to_internal: bool,
@@ -715,6 +716,7 @@ impl Default for ReticulumConfig {
             default_ar_penalty: None,
             default_ar_grace: None,
             default_gravity: 0,
+            inbound_queue_limits: Default::default(),
             autoconnect_interface_mode: None,
             autoconnect_interface_gravity: None,
             autoconnect_announces_to_internal: false,
@@ -1005,6 +1007,7 @@ impl ReticulumConfig {
             rc.autoconnect_discovered_interfaces =
                 parse_autoconnect_limit(sec)?.unwrap_or(rc.autoconnect_discovered_interfaces);
             rc.default_gravity = config_int("reticulum", sec, "default_gravity")?.unwrap_or(0);
+            rc.inbound_queue_limits = crate::normalized_config::parse_inbound_queue_limits(sec)?;
             rc.autoconnect_interface_gravity =
                 config_int("reticulum", sec, "autoconnect_interface_gravity")?;
             rc.autoconnect_interface_mode = sec
@@ -1126,7 +1129,9 @@ pub async fn init_with_options(
     let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
 
     let (mut actor, interface_transport_tx, transport_tx) =
-        rns_transport::actor::TransportActor::new_with_control_channel();
+        rns_transport::actor::TransportActor::new_with_control_channel_and_queue_limits(
+            rc.inbound_queue_limits,
+        );
     actor.is_foreground = is_foreground.clone();
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
     // per-boot wire-facing transport identity unless static_transport_identity

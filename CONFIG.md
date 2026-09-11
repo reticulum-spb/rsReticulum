@@ -72,6 +72,10 @@ interfaces: []
 | `default_ar_penalty` | integer or null | `null` | Default announce-rate penalty. |
 | `default_ar_grace` | integer or null | `null` | Default announce-rate grace, `0..=4294967295`. |
 | `default_gravity` | signed integer | `0` | Default route preference for configured interfaces. Negative values are valid. |
+| `qlen_in_data` | positive integer | `1024` | Admitted DATA/proof/link packet queue capacity, in packets. |
+| `qlen_in_announce` | positive integer | `128` | Admitted announce queue capacity, in packets. |
+| `qlen_in_pr` | positive integer | `128` | Admitted path-request queue capacity, in packets. |
+| `qlen_in_il` | positive integer | `8` | Ingress-limited path-request and released held-announce queue capacity, in packets. |
 | `autoconnect_interface_mode` | interface mode or null | `null` | Override discovered-connection mode; absent means `gateway` on transport nodes, otherwise `full`. |
 | `autoconnect_interface_gravity` | signed integer or null | `null` | Discovered-connection gravity; absent means `0`, independently of `default_gravity`. |
 | `autoconnect_announces_to_internal` | boolean | `false` | Set source-side `announces_to_internal: true` on discovered connections; false leaves the mode policy unchanged. Python's positive integer setting maps to YAML `true`. |
@@ -85,6 +89,17 @@ interfaces: []
 | `publish_blackhole` | boolean | `false` | Publish the local blackhole table. |
 | `blackhole_update_interval_minutes` | number | `60.0` | Blackhole-source refresh interval in minutes. Runtime clamps it to at least two minutes. |
 | `bootstrap_configs` | sequence of paths | `[]` | Additional bootstrap configuration paths consumed by discovery/bootstrap logic. |
+
+The four `qlen_in_*` settings apply at startup to both the full runtime and
+shared clients; changing them requires a runtime restart. Each queue is FIFO,
+with strict priority DATA → announce → path request → ingress-limited. A full
+queue drops its incoming packet without evicting another class. Capacities are
+packet counts, not bytes, and do not resize the separate raw interface channel
+(4096 messages) or control channel (256 messages). Buffers grow as needed rather
+than reserving their maximum size at startup; large limits can still consume
+substantial memory under load. All values and their sum must fit platform
+`usize`. Python 1.5.2 ignores non-positive overrides; strict Rust YAML rejects
+them as configuration errors instead of silently falling back to defaults.
 
 ### Ingress mappings
 

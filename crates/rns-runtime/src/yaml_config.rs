@@ -15,6 +15,11 @@ reticulum:
   share_instance: true
   enable_transport: false
   default_gravity: 0
+  # Inbound queue capacities in packets (highest priority first):
+  # qlen_in_data: 1024
+  # qlen_in_announce: 128
+  # qlen_in_pr: 128
+  # qlen_in_il: 8
   # autoconnect_interface_mode: internal
   # autoconnect_interface_gravity: -10
   # autoconnect_announces_to_internal: true
@@ -128,6 +133,18 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), YamlConfigError> {
+        if rns_transport::inbound_queue::InboundQueueLimits::new([
+            self.reticulum.qlen_in_data,
+            self.reticulum.qlen_in_announce,
+            self.reticulum.qlen_in_pr,
+            self.reticulum.qlen_in_il,
+        ])
+        .is_none()
+        {
+            return Err(YamlConfigError::Validation(
+                "reticulum.qlen_in_* must be positive integers with a sum fitting usize".into(),
+            ));
+        }
         if self.reticulum.shared_instance_port == 0 || self.reticulum.instance_control_port == 0 {
             return Err(YamlConfigError::Validation(
                 "reticulum shared_instance_port and instance_control_port must be in 1..=65535"
@@ -261,6 +278,10 @@ impl Config {
             );
             set_opt_num(section, "default_ar_grace", self.reticulum.default_ar_grace);
             set_num(section, "default_gravity", self.reticulum.default_gravity);
+            set_num(section, "qlen_in_data", self.reticulum.qlen_in_data);
+            set_num(section, "qlen_in_announce", self.reticulum.qlen_in_announce);
+            set_num(section, "qlen_in_pr", self.reticulum.qlen_in_pr);
+            set_num(section, "qlen_in_il", self.reticulum.qlen_in_il);
             set_opt_num(
                 section,
                 "autoconnect_interface_gravity",
@@ -377,6 +398,10 @@ pub struct ReticulumConfig {
     pub default_ar_penalty: Option<u64>,
     pub default_ar_grace: Option<u32>,
     pub default_gravity: i64,
+    pub qlen_in_data: usize,
+    pub qlen_in_announce: usize,
+    pub qlen_in_pr: usize,
+    pub qlen_in_il: usize,
     pub autoconnect_interface_mode: Option<InterfaceMode>,
     pub autoconnect_interface_gravity: Option<i64>,
     pub autoconnect_announces_to_internal: bool,
@@ -415,6 +440,8 @@ impl Default for StorageConfig {
 
 impl Default for ReticulumConfig {
     fn default() -> Self {
+        let [qlen_in_data, qlen_in_announce, qlen_in_pr, qlen_in_il] =
+            rns_transport::inbound_queue::InboundQueueLimits::default().sizes();
         Self {
             sqlite_storage: false,
             share_instance: true,
@@ -437,6 +464,10 @@ impl Default for ReticulumConfig {
             default_ar_penalty: None,
             default_ar_grace: None,
             default_gravity: 0,
+            qlen_in_data,
+            qlen_in_announce,
+            qlen_in_pr,
+            qlen_in_il,
             autoconnect_interface_mode: None,
             autoconnect_interface_gravity: None,
             autoconnect_announces_to_internal: false,

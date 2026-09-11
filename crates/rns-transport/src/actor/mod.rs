@@ -316,7 +316,20 @@ impl TransportActor {
         mpsc::Sender<TransportMessage>,
         mpsc::Sender<TransportMessage>,
     ) {
+        Self::new_with_control_channel_and_queue_limits(Default::default())
+    }
+
+    /// Configure admitted packet queues at startup. Limits do not resize the
+    /// independent raw interface (4096) or control (256) channels.
+    pub fn new_with_control_channel_and_queue_limits(
+        limits: crate::inbound_queue::InboundQueueLimits,
+    ) -> (
+        Self,
+        mpsc::Sender<TransportMessage>,
+        mpsc::Sender<TransportMessage>,
+    ) {
         let (mut actor, interface_tx) = Self::new();
+        actor.inbound_queues = crate::inbound_queue::InboundQueues::new(limits);
         let (control_tx, control_rx) = mpsc::channel(256);
         actor.control_rx = Some(control_rx);
         (actor, interface_tx, control_tx)
@@ -3986,9 +3999,13 @@ mod tests {
 
     #[test]
     fn admitted_queues_classify_prioritize_and_drop_each_class_independently() {
-        use crate::inbound_queue::{InboundQueueLimits, InboundQueues, TrafficClass};
-        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
-        actor.inbound_queues = InboundQueues::new(InboundQueueLimits::new([1; 4]).unwrap());
+        use crate::inbound_queue::{InboundQueueLimits, TrafficClass};
+        let sizes = [1, 2, 3, 4];
+        let (mut actor, input, control) = TransportActor::new_with_control_channel_and_queue_limits(
+            InboundQueueLimits::new(sizes).unwrap(),
+        );
+        assert_eq!(input.max_capacity(), 4096);
+        assert_eq!(control.max_capacity(), 256);
         let (mut regular, _rx) = make_test_interface("regular");
         regular.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, regular);
@@ -3996,7 +4013,7 @@ mod tests {
         actor.interfaces.insert(2, limited);
         prime_ingress_pr_burst(&mut actor, 2);
         for class in TrafficClass::ALL.into_iter().rev() {
-            for value in 0..2 {
+            for value in 0..=sizes[class as usize] as u8 {
                 let dest = [(class as u8) * 10 + value; 16];
                 let raw = match class {
                     TrafficClass::Announce => {
@@ -4029,13 +4046,15 @@ mod tests {
                 }));
             }
         }
-        assert_eq!(actor.inbound_queues.snapshot().heights, [1; 4]);
+        assert_eq!(actor.inbound_queues.snapshot().heights, sizes);
         assert_eq!(actor.inbound_queues.snapshot().dropped, [1; 4]);
         assert_eq!(actor.channel_drops, 4);
         for class in TrafficClass::ALL {
-            let prepared = actor.inbound_queues.pop().unwrap();
-            assert_eq!(prepared.traffic_class(), class);
-            actor.dispatch_inbound(prepared);
+            for _ in 0..sizes[class as usize] {
+                let prepared = actor.inbound_queues.pop().unwrap();
+                assert_eq!(prepared.traffic_class(), class);
+                actor.dispatch_inbound(prepared);
+            }
         }
         assert_eq!(actor.inbound_queues.snapshot().total, 0);
     }

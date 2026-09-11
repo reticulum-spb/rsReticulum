@@ -76,6 +76,7 @@ pub struct ReticulumConfig {
     pub rpc_key: Option<Vec<u8>>,
     pub use_implicit_proof: bool,
     pub link_mtu_discovery: bool,
+    pub inbound_queue_limits: rns_transport::inbound_queue::InboundQueueLimits,
 }
 
 impl Default for ReticulumConfig {
@@ -89,6 +90,7 @@ impl Default for ReticulumConfig {
             rpc_key: None,
             use_implicit_proof: true,
             link_mtu_discovery: true,
+            inbound_queue_limits: Default::default(),
         }
     }
 }
@@ -99,6 +101,8 @@ impl ReticulumConfig {
         let Some(section) = config.section("reticulum") else {
             return Ok(result);
         };
+        result.inbound_queue_limits =
+            crate::normalized_config::parse_inbound_queue_limits(section)?;
         if let Some(value) = section.get_bool("share_instance") {
             result.share_instance = value;
         }
@@ -386,7 +390,9 @@ async fn connect_shared_inner(
     ensure_shared_available(&config, &socket_base).await?;
 
     let (mut actor, interface_transport_tx, transport_tx) =
-        rns_transport::actor::TransportActor::new_with_control_channel();
+        rns_transport::actor::TransportActor::new_with_control_channel_and_queue_limits(
+            config.inbound_queue_limits,
+        );
     actor.is_foreground = is_foreground.clone();
     actor.shared_instance_client_mode = true;
     actor.client_announce_policy = options.announce_policy;

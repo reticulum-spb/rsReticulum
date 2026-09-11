@@ -595,3 +595,45 @@ driver channel; SQLite имеет собственную bounded storage queue. 
 относится к выбору из четырёх классов и не отменяет уже выполняющийся storage
 job. Throughput, задержки и dataplane throttling относятся к этапу 5; их
 эффективность этим изменением не заявляется.
+
+## Этап 4 — YAML-размеры входящих очередей
+
+Добавлены `reticulum.qlen_in_data`, `qlen_in_announce`, `qlen_in_pr`,
+`qlen_in_il`: YAML → normalized config → runtime config → создание actor.
+Цепочка подключена как в полном runtime (включая SQLite), так и в client-only
+сборке. Defaults берутся из общего `InboundQueueLimits`: 1024/128/128/8 пакетов.
+Существующий конструктор actor сохраняет defaults; новый принимает проверенные
+лимиты при создании, не меняя raw/control каналы 4096/256 сообщений.
+
+Проверяются положительные целые значения и отсутствие переполнения суммы
+`usize`, в том числе при прямой передаче normalized config. Python
+`Reticulum.py:705–720` применяет только положительные overrides и игнорирует
+неположительные; Rust отклоняет их явно, в соответствии со строгой YAML-схемой.
+Различие документировано в CONFIG.md. Предварительного выделения максимальных
+буферов нет; тест создаёт actor с предельной допустимой суммой размеров.
+
+Изменения применяются после перезапуска; Web API `restart_required` учитывает
+отличие сохранённых лимитов от работающего runtime. Отдельные поля формы
+редактирования и live-статистика очередей этим изменением не добавлены.
+Обновлены пример YAML и справочник CONFIG.md.
+
+Проверки:
+
+- `cargo test -p rns-runtime --test inbound_queue_config --quiet`: 3 passed.
+- `cargo test -p rns-runtime --no-default-features --features client --test inbound_queue_config --quiet`:
+  3 passed. Проверены round-trip, defaults, частичный override, нулевые,
+  отрицательные, нецелые/нечисловые значения, overflow и normalized bypass.
+- Actor regression с лимитами 1/2/3/4 проверяет фактическую ёмкость каждого
+  класса, независимые drops, порядок dispatch и неизменные raw/control каналы.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  440 passed, 1 ignored.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 231 passed,
+  4 ignored. Повтор выполнен с разрешением на loopback после 9 sandbox
+  PermissionDenied; тест restart_required покрывает изменение каждого лимита.
+- `cargo check --workspace --all-targets`, сборка runtime с
+  `api,serial,rnode-tcp,sqlite-bundled`, `cargo fmt --all -- --check`,
+  `git diff --check`: успешно. Имеющиеся warnings не затрагивались.
+
+Этап 4 остаётся частичным: далее live queue counters в RPC/API/UI, ранние
+protocol/IFAC violation counters, MTU/filter semantics и ротация PR tags.
+Этапы 5–7 и итоговая интеграция ещё не завершены; версия не изменена.
