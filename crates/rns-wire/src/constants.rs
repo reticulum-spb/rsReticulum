@@ -1,5 +1,9 @@
 //! Shared protocol constants (MTU, hash sizes, header bounds).
 
+/// Link modes this implementation may emit in MTU signalling (AES-256-CBC).
+/// Shared by handshake generation and transport-side signalling rewrites.
+pub const LINK_ENABLED_MODES: &[u8] = &[0x01];
+
 /// Maximum Transmission Unit — hard protocol limit.
 pub const MTU: usize = 500;
 

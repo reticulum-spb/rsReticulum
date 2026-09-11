@@ -51,7 +51,7 @@ pub const MODE_PQ_RESERVED_3: u8 = 0x06;
 pub const MODE_PQ_RESERVED_4: u8 = 0x07;
 
 /// Encryption modes accepted by this implementation; others are advertised-but-refused.
-pub const ENABLED_MODES: &[u8] = &[MODE_AES256_CBC];
+pub const ENABLED_MODES: &[u8] = rns_wire::constants::LINK_ENABLED_MODES;
 
 pub const DEFAULT_MODE: u8 = MODE_AES256_CBC;
 

@@ -1179,6 +1179,17 @@ impl TransportActor {
                     if let Some(next) = next.filter(|mtu| *mtu > 0) {
                         let previous = self.interfaces.get(&interface_id).map(|entry| entry.mtu);
                         let clamped = offer.min(next).min(previous.unwrap_or(offer));
+                        // Python signalling_bytes validates the mode only when
+                        // clamping actually rewrites the offer. Do not invent
+                        // an early rejection for unchanged/removed signalling.
+                        let mode = forwarded[offset] >> 5;
+                        if clamped < offer
+                            && !rns_wire::constants::LINK_ENABLED_MODES.contains(&mode)
+                        {
+                            self.protocol_violation(interface_id);
+                            debug!(interface_id, mode, "invalid Link MTU signalling mode");
+                            return;
+                        }
                         let bytes = clamped.to_be_bytes();
                         forwarded[offset] = (forwarded[offset] & 0xe0) | (bytes[1] & 0x1f);
                         forwarded[offset + 1..offset + 3].copy_from_slice(&bytes[2..]);

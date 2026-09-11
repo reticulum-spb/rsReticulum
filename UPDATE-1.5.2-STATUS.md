@@ -2001,3 +2001,27 @@ Interface lib — 226 passed, 5 ignored; runtime API lib — 239 passed, 5 ignor
 Workspace all-targets, runtime client-only tests и fmt/diff checks успешны;
 прежние warnings сохраняются.
 Этап 5 не завершён; local Link cap 500 и версия проекта сохранены.
+
+### Этап 5 — ошибки режима при transit MTU clamping
+
+При уменьшении nonzero MTU offer транспорт теперь проверяет signalling mode:
+недопустимый режим отбрасывает request до отправки и создания relay entry,
+увеличивая protocol_violations только incoming interface. Python вызывает
+Link.signalling_bytes именно в ветке уменьшения; при unchanged offer,
+zero offer или удалении signalling новая проверка не применяется.
+
+Список разрешённых режимов вынесен в rns-wire::constants::LINK_ENABLED_MODES;
+rns-link::constants::ENABLED_MODES сохраняет публичное имя и ссылается на него.
+Transport и handshake generation теперь используют один список (AES-256-CBC).
+Mode bits валидного кадра и Link ID не изменяются. Local responder validation
+остаётся отдельной существующей проверкой; local Link cap по-прежнему 500.
+
+Actor matrix расширена до 8 modes × 7 MTU cases, включая уменьшение по входу
+и выходу, unchanged/zero и unsupported interface. Для отказа проверены пустой
+TX, отсутствие relay entry и точный счётчик нарушения; для разрешённого
+forwarding — прежние ключи/identity/signalling. Целевые forwarding tests —
+2 passed; rns-link lib — 98 passed, 1 ignored. Workspace all-targets и
+client-only tests checks успешны; прежние warnings сохраняются.
+
+Дополнительно: полный transport lib — 459 passed, 4 ignored; rns-wire lib —
+46 passed. Fmt/diff checks успешны. Этап 5 остаётся открытым; версия прежняя.

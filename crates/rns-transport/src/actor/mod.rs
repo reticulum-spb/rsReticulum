@@ -3707,56 +3707,81 @@ mod tests {
 
     #[test]
     fn link_request_forwarding_clamps_capabilities_and_preserves_identity() {
-        for (previous, next, offer, expected) in [
-            (32768, Some(16384), 65536, Some(16384)),
-            (1024, Some(32768), 65536, Some(1024)),
-            (32768, Some(65536), 1024, Some(1024)),
-            (32768, None, 65536, None),
-            (32768, None, 0, Some(0)),
-            (524288, Some(262144), 524288, Some(262144)),
-            (262144, Some(1196), 262144, Some(1196)),
-        ] {
-            let (mut actor, _tx) = TransportActor::new();
-            actor.is_transport_enabled = true;
-            let transport_id = [0xAA; 16];
-            actor.transport_identity_hash = Some(transport_id);
-            let (mut incoming, _) = make_test_interface("incoming");
-            incoming.mtu = previous;
-            let (mut outgoing, mut rx) = make_test_interface("outgoing");
-            outgoing.diagnostics = Some(crate::messages::LinkMtuDiagnostics::new(next, None));
-            actor.interfaces.insert(1, incoming);
-            actor.interfaces.insert(2, outgoing);
-            let dest = [0x55; 16];
-            actor.path_table.insert(
-                dest,
-                crate::path_table::PathEntry::new(Some([0xBB; 16]), 1, 2, InterfaceMode::Gateway),
-            );
-            let mut payload = vec![0x42; 64];
-            let encoded = (offer | (1u32 << 21)).to_be_bytes();
-            payload.extend_from_slice(&encoded[1..]);
-            let raw = make_header2_link_request_packet(transport_id, dest, 0, &payload);
-            let link_id =
-                rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
-            actor.on_inbound(InboundPacket {
-                raw,
-                interface_id: 1,
-                rssi: None,
-                snr: None,
-                q: None,
-            });
-            let forwarded = rx.try_recv().unwrap();
-            let (header, offset) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
-            assert_eq!(&forwarded[offset..offset + 64], &payload[..64]);
-            assert_eq!(
-                rns_wire::hash::link_id_from_raw(&forwarded, header.flags.header_type),
-                link_id
-            );
-            assert!(actor.link_table.get(&link_id).is_some());
-            if let Some(mtu) = expected {
-                let expected_bytes = (mtu | (1u32 << 21)).to_be_bytes();
-                assert_eq!(&forwarded[offset + 64..], &expected_bytes[1..]);
-            } else {
-                assert_eq!(forwarded.len(), offset + 64);
+        for mode in 0u32..=7 {
+            for (previous, next, offer, expected) in [
+                (32768, Some(16384), 65536, Some(16384)),
+                (1024, Some(32768), 65536, Some(1024)),
+                (32768, Some(65536), 1024, Some(1024)),
+                (32768, None, 65536, None),
+                (32768, None, 0, Some(0)),
+                (524288, Some(262144), 524288, Some(262144)),
+                (262144, Some(1196), 262144, Some(1196)),
+            ] {
+                let (mut actor, _tx) = TransportActor::new();
+                actor.is_transport_enabled = true;
+                let transport_id = [0xAA; 16];
+                actor.transport_identity_hash = Some(transport_id);
+                let (mut incoming, _) = make_test_interface("incoming");
+                incoming.mtu = previous;
+                let (mut outgoing, mut rx) = make_test_interface("outgoing");
+                outgoing.diagnostics = Some(crate::messages::LinkMtuDiagnostics::new(next, None));
+                actor.interfaces.insert(1, incoming);
+                actor.interfaces.insert(2, outgoing);
+                let dest = [0x55; 16];
+                actor.path_table.insert(
+                    dest,
+                    crate::path_table::PathEntry::new(
+                        Some([0xBB; 16]),
+                        1,
+                        2,
+                        InterfaceMode::Gateway,
+                    ),
+                );
+                let mut payload = vec![0x42; 64];
+                let encoded = (offer | (mode << 21)).to_be_bytes();
+                payload.extend_from_slice(&encoded[1..]);
+                let raw = make_header2_link_request_packet(transport_id, dest, 0, &payload);
+                let link_id =
+                    rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
+                actor.on_inbound(InboundPacket {
+                    raw,
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                });
+                let invalid_rewrite = mode != 1 && expected.is_some_and(|mtu| mtu < offer);
+                if invalid_rewrite {
+                    assert!(rx.try_recv().is_err());
+                    assert!(actor.link_table.get(&link_id).is_none());
+                    assert_eq!(
+                        actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                        1
+                    );
+                    assert_eq!(
+                        actor.interfaces[&2].inbound_diagnostics.protocol_violations,
+                        0
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                    0
+                );
+                let forwarded = rx.try_recv().unwrap();
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
+                assert_eq!(&forwarded[offset..offset + 64], &payload[..64]);
+                assert_eq!(
+                    rns_wire::hash::link_id_from_raw(&forwarded, header.flags.header_type),
+                    link_id
+                );
+                assert!(actor.link_table.get(&link_id).is_some());
+                if let Some(mtu) = expected {
+                    let expected_bytes = (mtu | (mode << 21)).to_be_bytes();
+                    assert_eq!(&forwarded[offset + 64..], &expected_bytes[1..]);
+                } else {
+                    assert_eq!(forwarded.len(), offset + 64);
+                }
             }
         }
     }
