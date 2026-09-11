@@ -2273,3 +2273,29 @@ clamp — тестовый адаптер, как в предыдущем intero
 Остаются shared-client session opening, active path-request discovery,
 transit/multi-peer проверки и сопоставимые throughput/latency/drops/RSS
 измерения этапа 5. Этап открыт, версия остаётся 1.0.1.
+
+### Продолжение этапа 5: Link MTU через TCP transit relay
+
+Добавлен неигнорируемый `transit_link_mtu_tcp_roundtrip`: два отдельных loopback
+TCP-соединения через настоящие Rust TcpClient drivers и один transport actor.
+На концах — библиотечные Rust Links; маршрут к responder и ключ проверки его
+подписи заранее внесены в actor. Этот тест не запускает announce discovery.
+
+Пять случаев offer/incoming/outgoing/expected:
+32768/32768/500/500, 32768/32768/1196/1196,
+524288/524288/262144/262144, 32768/1196/32768/1196,
+1196/32768/32768/1196. Проверяется MTU прямо в ретранслированном LINKREQUEST
+до создания responder, преобразование Header2→Header1, hops, неизменность
+ключевых байтов и Link ID. LRPROOF проходит проверку подписи relay и возвращается
+инициатору; LRRTT и payload1/полный MDU идут по Link relay в обе стороны.
+Wire packets не превышают согласованный MTU. Общий deadline30s, порты ОС,
+task guard отменяет actor/driver при выходе/ошибке.
+
+Полный TCP target с include-ignored: default/full — 5 passed; client-only —
+4 passed. Workspace all-targets check, fmt/diff check успешны; прежние warnings
+сохраняются. Python-эталон ea98db4f не изменён.
+
+Одиночный relay проверен, но concurrent multi-peer и multi-relay сценарии,
+shared-client session opening, active path requests и сопоставимые измерения
+throughput/latency/drops/RSS остаются. Следующий шаг — конкурирующие peers и
+нагрузочные измерения. Этап 5 открыт, версия 1.0.1.

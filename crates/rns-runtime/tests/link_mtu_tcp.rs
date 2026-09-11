@@ -61,6 +61,15 @@ struct Peer {
     pending: VecDeque<Vec<u8>>,
 }
 impl Peer {
+    async fn receive_for(&mut self, destination: [u8; 16]) -> Vec<u8> {
+        loop {
+            let raw = self.receive().await;
+            if PacketHeader::unpack(&raw).unwrap().0.destination_hash == destination {
+                return raw;
+            }
+        }
+    }
+
     async fn send(&mut self, raw: &[u8]) {
         // Force framing to tolerate arbitrary TCP read boundaries.
         for chunk in hdlc::frame(raw).chunks(997) {
@@ -78,6 +87,197 @@ impl Peer {
             assert_ne!(count, 0, "TCP peer closed before packet delivery");
             self.pending.extend(self.decoder.feed(&buffer[..count]));
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transit_link_mtu_tcp_roundtrip() {
+    timeout(Duration::from_secs(30), async {
+        for (offer, incoming, outgoing, expected) in [
+            (32768, 32768, 500, 500),
+            (32768, 32768, 1196, 1196),
+            (524288, 524288, 262144, 262144),
+            (32768, 1196, 32768, 1196),
+            (1196, 32768, 32768, 1196),
+        ] {
+            exercise_transit(offer, incoming, outgoing, expected).await;
+        }
+    })
+    .await
+    .expect("transit TCP MTU regression timed out");
+}
+
+async fn transit_peer(
+    actor: &mut TransportActor,
+    input: &mpsc::Sender<TransportMessage>,
+    tasks: &mut Tasks,
+    id: u64,
+    mtu: u32,
+) -> Peer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = tcp::TcpClientConfig::new(
+        "transit-mtu",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    config.fixed_mtu = Some(mtu);
+    config.receive_ifac_size = Some(0);
+    config.max_reconnect_tries = Some(1);
+    let handle = tcp::spawn_tcp_client(config, id, input.clone())
+        .await
+        .unwrap();
+    tasks.0.push(handle.read_task);
+    let (stream, _) = listener.accept().await.unwrap();
+    while !handle.online.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    let mut entry = InterfaceEntry::new(
+        handle.name,
+        InterfaceMode::Full,
+        InterfaceDirection::bidirectional(),
+        handle.bitrate,
+        handle.mtu,
+        handle.tx,
+    );
+    entry.online = Some(handle.online);
+    entry.diagnostics = handle.diagnostics;
+    actor.interfaces.insert(id, entry);
+    Peer {
+        stream,
+        decoder: hdlc::HdlcDeframer::with_max_decoded_size(mtu as usize),
+        pending: VecDeque::new(),
+    }
+}
+
+async fn exercise_transit(offer: u32, incoming: u32, outgoing: u32, expected: u32) {
+    let (mut actor, input) = TransportActor::new();
+    let mut tasks = Tasks(Vec::new());
+    let mut initiator_peer = transit_peer(&mut actor, &input, &mut tasks, 1, incoming).await;
+    let mut responder_peer = transit_peer(&mut actor, &input, &mut tasks, 2, outgoing).await;
+    let transport_id = [0xCC; 16];
+    let dest = [0xDD; 16];
+    actor.is_transport_enabled = true;
+    actor.transport_identity_hash = Some(transport_id);
+    actor.path_table.insert(
+        dest,
+        rns_transport::path_table::PathEntry::new(None, 1, 2, InterfaceMode::Full),
+    );
+    // Seed only the destination key needed for the relay's signature check.
+    // Announce/path discovery is covered by the full-runtime test separately.
+    let key = Ed25519PrivateKey::generate();
+    let public = key.public_key();
+    let mut identity = [0u8; 64];
+    identity[32..].copy_from_slice(&public.to_bytes());
+    actor.recent_announces.insert(
+        dest,
+        rns_transport::actor::RecentAnnounce {
+            dest_hash: dest,
+            hops: 1,
+            app_data: None,
+            timestamp: rns_transport::now_f64(),
+            public_key: Some(identity),
+            ratchet: None,
+            packet_hash: None,
+            is_path_response: false,
+            retained: false,
+            last_used: None,
+            name_hash: [0; 10],
+        },
+    );
+    tasks.0.push(tokio::spawn(actor.run()));
+    let (mut initiator, request) = Link::new_initiator_with_mtu(dest, 2, offer);
+    let mut header = PacketHeader::unpack(&packet(
+        dest,
+        PacketType::LinkRequest,
+        PacketContext::None,
+        &request,
+    ))
+    .unwrap()
+    .0;
+    header.flags.header_type = HeaderType::Header2;
+    header.flags.transport_type = TransportType::Transport;
+    header.transport_id = Some(transport_id);
+    let mut raw = header.pack().unwrap();
+    raw.extend_from_slice(&request);
+    assert_eq!(
+        rns_wire::hash::link_id_from_raw(&raw, HeaderType::Header2),
+        initiator.link_id
+    );
+    initiator_peer.send(&raw).await;
+    let forwarded = responder_peer.receive_for(dest).await;
+    let (header, offset) = PacketHeader::unpack(&forwarded).unwrap();
+    assert_eq!(header.flags.header_type, HeaderType::Header1);
+    assert_eq!(header.hops, 1);
+    assert_eq!(&forwarded[offset..offset + 64], &request[..64]);
+    assert_eq!(
+        rns_link::handshake::LinkRequestData::unpack(&forwarded[offset..])
+            .unwrap()
+            .signalling
+            .mtu,
+        expected
+    );
+    assert_eq!(
+        rns_wire::hash::link_id_from_raw(&forwarded, HeaderType::Header1),
+        initiator.link_id
+    );
+    let (mut responder, proof) =
+        Link::new_responder_with_mtu(&forwarded[offset..], &key, dest, 2, outgoing).unwrap();
+    responder_peer
+        .send(&packet(
+            responder.link_id,
+            PacketType::Proof,
+            PacketContext::Lrproof,
+            &proof,
+        ))
+        .await;
+    let proof = initiator_peer.receive_for(initiator.link_id).await;
+    let (header, offset) = PacketHeader::unpack(&proof).unwrap();
+    assert_eq!(header.context, PacketContext::Lrproof);
+    let rtt = initiator
+        .validate_proof(&proof[offset..], &public, &public.to_bytes())
+        .unwrap();
+    assert_eq!((initiator.mtu, responder.mtu), (expected, expected));
+    assert_eq!(initiator.mdu, responder.mdu);
+    initiator_peer
+        .send(&packet(
+            initiator.link_id,
+            PacketType::Data,
+            PacketContext::Lrrtt,
+            &rtt,
+        ))
+        .await;
+    let rtt = responder_peer.receive_for(responder.link_id).await;
+    let (header, offset) = PacketHeader::unpack(&rtt).unwrap();
+    assert_eq!(header.context, PacketContext::Lrrtt);
+    responder.receive_rtt_packet(&rtt[offset..]).unwrap();
+    for length in [1, initiator.mdu] {
+        let payload: Vec<u8> = (0..length).map(|i| (i % 256) as u8).collect();
+        initiator_peer
+            .send(&packet(
+                initiator.link_id,
+                PacketType::Data,
+                PacketContext::None,
+                &initiator.encrypt(&payload).unwrap(),
+            ))
+            .await;
+        let raw = responder_peer.receive_for(responder.link_id).await;
+        let (header, offset) = PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(header.context, PacketContext::None);
+        assert!(raw.len() <= expected as usize);
+        assert_eq!(responder.decrypt(&raw[offset..]).unwrap(), payload);
+        responder_peer
+            .send(&packet(
+                responder.link_id,
+                PacketType::Data,
+                PacketContext::None,
+                &responder.encrypt(&payload).unwrap(),
+            ))
+            .await;
+        let raw = initiator_peer.receive_for(initiator.link_id).await;
+        let (header, offset) = PacketHeader::unpack(&raw).unwrap();
+        assert_eq!(header.context, PacketContext::None);
+        assert!(raw.len() <= expected as usize);
+        assert_eq!(initiator.decrypt(&raw[offset..]).unwrap(), payload);
     }
 }
 

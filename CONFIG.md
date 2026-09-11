@@ -281,8 +281,12 @@ same target also starts a runtime from temporary YAML and tests public
 `LinkSession::open/send/recv`: a real Python announce supplies the destination
 key and direct route, and the session discovers the configured TCP MTU itself.
 All four MTU cases exchange full-MDU data; runtime tasks stop before temporary
-storage is removed. Shared-client session opening, active path requests,
-transit paths and load/RSS benchmarks remain outside these tests.
+storage is removed. A non-ignored transit test also connects two TCP peers through
+a Rust relay: incoming/outgoing/offer MTU limits, unchanged Link ID, authenticated
+proof forwarding and full-MDU data in both directions. Its route and destination
+verification key are seeded; endpoints use the Rust Link library. Shared-client
+session opening, active path requests, concurrent multi-peer loads, multi-relay
+paths and load/RSS benchmarks remain outside these tests.
 Applications constructing
 LinkRequest events directly must now supply `max_mtu` (500 preserves the old cap).
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately
