@@ -478,6 +478,23 @@ struct InterfaceRequest {
     egress_control: Option<bool>,
     recursive_prs: Option<bool>,
     announces_from_internal: Option<bool>,
+    bootstrap_only: Option<bool>,
+    ignore_config_warnings: Option<bool>,
+    discoverable: Option<bool>,
+    publish_ifac: Option<bool>,
+    discovery_encrypt: Option<bool>,
+    discovery_name: Option<String>,
+    reachable_on: Option<String>,
+    discovery_lxmf_address: Option<String>,
+    location_cmd: Option<String>,
+    discovery_modulation: Option<String>,
+    announce_interval: Option<u64>,
+    discovery_stamp_value: Option<u64>,
+    discovery_frequency: Option<u64>,
+    discovery_bandwidth: Option<u64>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    height: Option<f64>,
 
     // SerialInterface / KISSInterface
     port: Option<String>,
@@ -600,6 +617,11 @@ impl InterfaceRequest {
             ("egress_control", self.egress_control),
             ("recursive_prs", self.recursive_prs),
             ("announces_from_internal", self.announces_from_internal),
+            ("bootstrap_only", self.bootstrap_only),
+            ("ignore_config_warnings", self.ignore_config_warnings),
+            ("discoverable", self.discoverable),
+            ("publish_ifac", self.publish_ifac),
+            ("discovery_encrypt", self.discovery_encrypt),
         ] {
             if let Some(value) = value {
                 s.set(key, if value { "Yes" } else { "No" });
@@ -610,6 +632,10 @@ impl InterfaceRequest {
             ("announce_rate_target", self.announce_rate_target),
             ("announce_rate_penalty", self.announce_rate_penalty),
             ("ic_max_held_announces", self.ic_max_held_announces),
+            ("announce_interval", self.announce_interval),
+            ("discovery_stamp_value", self.discovery_stamp_value),
+            ("discovery_frequency", self.discovery_frequency),
+            ("discovery_bandwidth", self.discovery_bandwidth),
         ] {
             if let Some(value) = value {
                 s.set(key, &value.to_string());
@@ -629,6 +655,9 @@ impl InterfaceRequest {
             ("ic_burst_penalty", self.ic_burst_penalty),
             ("ic_held_release_interval", self.ic_held_release_interval),
             ("ec_pr_freq", self.ec_pr_freq),
+            ("latitude", self.latitude),
+            ("longitude", self.longitude),
+            ("height", self.height),
         ] {
             if let Some(value) = value {
                 s.set(key, &value.to_string());
@@ -636,6 +665,17 @@ impl InterfaceRequest {
         }
         if let Some(ref value) = self.network_name {
             s.set("networkname", value);
+        }
+        for (key, value) in [
+            ("discovery_name", &self.discovery_name),
+            ("reachable_on", &self.reachable_on),
+            ("discovery_lxmf_address", &self.discovery_lxmf_address),
+            ("location_cmd", &self.location_cmd),
+            ("discovery_modulation", &self.discovery_modulation),
+        ] {
+            if let Some(value) = value {
+                s.set(key, value);
+            }
         }
         if let Some(ref value) = self.passphrase {
             s.set("passphrase", value);
@@ -734,6 +774,9 @@ impl InterfaceRequest {
     }
 
     fn validate_fields(&self) -> Result<(), ApiError> {
+        if self.discovery_stamp_value.is_some_and(|v| v > 255) {
+            return Err(ApiError::bad("discovery_stamp_value must be in 0..=255"));
+        }
         #[cfg(feature = "serial")]
         if self.iface_type == "AX25KISSInterface" {
             let callsign = self
@@ -1900,6 +1943,11 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
         "egress_control",
         "recursive_prs",
         "announces_from_internal",
+        "bootstrap_only",
+        "ignore_config_warnings",
+        "discoverable",
+        "publish_ifac",
+        "discovery_encrypt",
     ] {
         object.insert(key.into(), json!(section.get_bool(key)));
     }
@@ -1910,6 +1958,10 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
         "announce_rate_penalty",
         "ifac_size",
         "ic_max_held_announces",
+        "announce_interval",
+        "discovery_stamp_value",
+        "discovery_frequency",
+        "discovery_bandwidth",
     ] {
         object.insert(key.into(), json!(section.get_uint(key)));
     }
@@ -1924,6 +1976,9 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
         "ic_burst_penalty",
         "ic_held_release_interval",
         "ec_pr_freq",
+        "latitude",
+        "longitude",
+        "height",
     ] {
         object.insert(key.into(), json!(section.get_float(key)));
     }
@@ -1935,6 +1990,15 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
                 .or_else(|| section.get("network_name"))
         ),
     );
+    for key in [
+        "discovery_name",
+        "reachable_on",
+        "discovery_lxmf_address",
+        "location_cmd",
+        "discovery_modulation",
+    ] {
+        object.insert(key.into(), json!(section.get(key)));
+    }
     object.insert("passphrase".into(), json!(section.get("passphrase")));
     value
 }
@@ -2132,6 +2196,41 @@ fn visible_by_default(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_api_fields_survive_yaml_and_response() {
+        use super::*;
+        let request: InterfaceRequest = serde_json::from_value(json!({
+            "type": "BackboneInterface", "name": "discovery-api", "listen_on": "127.0.0.1",
+            "port": "4242", "discoverable": true, "interface_mode": "internal",
+            "bootstrap_only": true, "ignore_config_warnings": true,
+            "discovery_name": "Public relay", "announce_interval": 360,
+            "discovery_stamp_value": 16, "reachable_on": "relay.example.org",
+            "publish_ifac": true, "discovery_encrypt": true,
+            "discovery_lxmf_address": "0123456789abcdef0123456789abcdef",
+            "latitude": 55.75, "longitude": 37.6, "height": 150.0,
+            "location_cmd": "/tmp/location", "discovery_frequency": 868000000,
+            "discovery_bandwidth": 125000, "discovery_modulation": "LoRa"
+        }))
+        .unwrap();
+        let interface = request.to_yaml_config().unwrap();
+        let config = crate::config::Config {
+            interfaces: vec![interface],
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        let reparsed =
+            crate::config::Config::parse(&config.to_yaml().unwrap(), "config.yaml").unwrap();
+        assert_eq!(reparsed, config);
+        let common = reparsed.interfaces[0].common();
+        assert!(common.discoverable && common.publish_ifac && common.discovery_encrypt);
+        assert!(common.bootstrap_only && common.ignore_config_warnings);
+        assert_eq!(common.mode, crate::config::InterfaceMode::Internal);
+        assert_eq!(common.location_cmd.as_deref(), Some("/tmp/location"));
+        assert_eq!(
+            common.discovery_lxmf_address.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, header};

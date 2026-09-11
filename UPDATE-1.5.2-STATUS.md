@@ -123,7 +123,7 @@ Discovery publication отдельно строится в `discovery_config_for
 - [x] Проверены HEAD/рабочие деревья и инструкции, прочитан changelog 1.3.9–1.5.2.
 - [x] Составлена матрица с привязкой пробелов к реализации и этапам.
 - [ ] Уточнить все строки «воспроизвести» целевыми проверками соответствующих этапов.
-- [ ] Этап 1: незавершённые изменения YAML/runtime discovery в рабочем дереве.
+- [x] Этап 1: YAML/runtime publication, internal mode, location_cmd, API/UI.
 - [ ] Этапы 2–7 и финальная интеграция.
 
 Уже выполненные команды:
@@ -133,5 +133,50 @@ Discovery publication отдельно строится в `discovery_config_for
 - `cargo test -p rns-transport discovery::announcer --lib`: 13/13 успешно.
 - `cargo fmt --all`: выполнено после первоначальных изменений.
 
-Ни версия, ни заявленная совместимость пока не обновлены. Аппаратные,
-межъязыковые и нагрузочные проверки текущего обновления пока не выполнены.
+### Этап 1: реализация и результаты
+
+Добавлены типизированные flat discovery-поля, bootstrap_only и
+ignore_config_warnings; преобразования YAML↔normalized↔Web API сохраняют их.
+Internal mode допустим; минуты интервала ограничены снизу пятью минутами.
+Location/reachability executables обновляют metadata перед due announce;
+ошибка изолирована на одном интерфейсе, выход ограничен 4096 байтами и 5 секундами.
+Добавлены live scheduler refresh/deregister и сохранение API rollback пути.
+
+Обнаружены два дополнительных блокирующих пробела: штатный runtime не
+устанавливал stamper, а discovery destination не регистрировалась как локальная
+(transport отбрасывал outbound announce). Исправлены оба. Native stamper
+сопоставлен с реальным LXStamper; embedding override сохранён. PoW выполняется
+в blocking worker с ограниченным числом попыток. Raw runtime receiver default
+исправлен с 14 на 16, как уже было в typed YAML и документированном контракте.
+
+Проверки:
+
+- `cargo test -p rns-transport discovery --lib`: 84 passed.
+- `cargo test -p rns-runtime --features api --lib`: 219 passed, 2 ignored
+  до добавления API roundtrip и live scheduler regression; дополнительные тесты
+  запускались отдельно.
+- `cargo test -p rns-runtime --features api discovery_api_fields --lib`: 1 passed.
+- `cargo test -p rns-runtime --features api,serial,rnode-tcp,sqlite-bundled discovery --lib -- --skip discovery_python_receiver`: 9 passed.
+- `cargo check --workspace --all-targets`: успешно; существующие предупреждения
+  о database_path и tracing_subscriber::prelude остаются.
+- `cargo fmt --all -- --check`: успешно.
+- `node --test crates/rns-runtime/web/app.test.js`: exit 0.
+- `cargo test -p rns-runtime --features api discovery_python_receiver --lib -- --ignored --nocapture`:
+  passed; два реальных Rust→TCP→Python receive сценария, открытый и зашифрованный.
+  Python подтвердил signature/stamp, IFAC, operator LXMF и executable coordinates.
+  Тест использует stamp target 8 для скорости; native HKDF vector отдельно совпал
+  с Python (workblock 5120 bytes, SHA256 7c06f15571960ba62e26a1d51bc4f9c86ebc44810701d232af0fe9a6c10f9e61).
+
+Первый live тест выявил отсутствие регистрации destination; после исправления
+он прошёл. Сетевые tests внутри sandbox получали PermissionDenied, повторный
+запуск с разрешёнными loopback сокетами прошёл. `python3` здесь версии 3.6.15,
+не импортирует эталон; тесты используют установленный `python3.11`.
+
+Границы этапа: I2P auto b32 publication не подтверждена, поддерживается явный
+reachable_on. Радиометаданные покрыты преобразованиями, аппаратные тесты не
+выполнены. Rust принимает строковую modulation (Python config/formatter
+противоречат друг другу), ограничивает команды и исправляет longitude typo.
+Оптимизации receiver caches и остальные открытые строки матрицы не закрыты
+этим этапом. Полная нагрузочная проверка и этапы 2–7 остаются впереди.
+
+Версия и заявленная совместимость пока не обновлены.

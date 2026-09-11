@@ -29,6 +29,7 @@ serde = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 fs2 = { workspace = true, optional = true }
 

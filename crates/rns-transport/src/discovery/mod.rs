@@ -10,8 +10,7 @@
 //!
 //! Python imports `LXMF.LXStamper` at startup. rsReticulum avoids an upward
 //! dependency on rsLXMF, so discovery takes a [`DiscoveryStamper`] trait object;
-//! the concrete implementation lives in `lxmf-core::discovery_stamper`.
-//! Without a stamper installed, discovery is silent.
+//! the runtime supplies a native default, and embedding apps can override it.
 
 pub mod announcer;
 pub mod app_data;

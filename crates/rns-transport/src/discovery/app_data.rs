@@ -393,7 +393,8 @@ pub fn sanitize_name(name: &str) -> String {
     trimmed[..end].to_string()
 }
 
-fn valid_reachable_on(value: &str) -> bool {
+/// Validate the address form accepted by discovery decoding and publication.
+pub fn valid_reachable_on(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
         return false;

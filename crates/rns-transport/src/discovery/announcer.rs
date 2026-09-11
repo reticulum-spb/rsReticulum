@@ -3,7 +3,7 @@
 //! identity-signed emit. Memoises `(infohash, stamp)` per interface so an
 //! unchanged info doesn't redo PoW.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::{debug, trace};
@@ -118,6 +118,8 @@ pub struct AnnounceRequest {
 /// Why an interface was skipped on a given tick.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
+    /// Runtime could not refresh external metadata for this tick.
+    MetadataUnavailable,
     /// `discoverable = false`.
     NotDiscoverable,
     /// Interface type not in [`DISCOVERABLE_INTERFACE_TYPES`].
@@ -173,6 +175,28 @@ impl Announcer {
         self.interfaces.remove(&interface_id);
     }
 
+    /// Replace the coordinates advertised by an interface. A changed location
+    /// invalidates the cached stamp naturally because it changes the infohash.
+    pub fn update_location(
+        &mut self,
+        interface_id: InterfaceId,
+        latitude: f64,
+        longitude: f64,
+        height: f64,
+    ) {
+        if let Some(state) = self.interfaces.get_mut(&interface_id) {
+            state.config.latitude = Some(latitude);
+            state.config.longitude = Some(longitude);
+            state.config.height = Some(height);
+        }
+    }
+
+    pub fn update_reachable_on(&mut self, interface_id: InterfaceId, address: String) {
+        if let Some(state) = self.interfaces.get_mut(&interface_id) {
+            state.config.reachable_on = Some(address);
+        }
+    }
+
     /// Inspect registered interfaces (for tests / introspection).
     pub fn len(&self) -> usize {
         self.interfaces.len()
@@ -182,6 +206,16 @@ impl Announcer {
         self.interfaces.is_empty()
     }
 
+    /// Whether metadata needs refreshing before the next announce attempt.
+    pub fn is_due(&self, interface_id: InterfaceId, now: f64) -> bool {
+        self.interfaces.get(&interface_id).is_some_and(|state| {
+            state.config.discoverable
+                && state.config.is_advertisable()
+                && (state.last_announce_at == 0.0
+                    || now - state.last_announce_at >= state.config.announce_interval_secs as f64)
+        })
+    }
+
     /// Return announces due at `now` plus the skip list (so tests can
     /// assert on both). `encrypt` is required only when a config has `encrypt=true`.
     pub fn tick(
@@ -189,10 +223,25 @@ impl Announcer {
         now: f64,
         encrypt: Option<EncryptFn<'_>>,
     ) -> (Vec<AnnounceRequest>, Vec<(InterfaceId, SkipReason)>) {
+        self.tick_excluding(now, encrypt, &HashSet::new())
+    }
+
+    /// Skip failed metadata updates without advancing their announce clocks or
+    /// preventing independent interfaces from publishing.
+    pub fn tick_excluding(
+        &mut self,
+        now: f64,
+        encrypt: Option<EncryptFn<'_>>,
+        unavailable: &HashSet<InterfaceId>,
+    ) -> (Vec<AnnounceRequest>, Vec<(InterfaceId, SkipReason)>) {
         let mut out = Vec::new();
         let mut skips = Vec::new();
 
         for (id, state) in self.interfaces.iter_mut() {
+            if unavailable.contains(id) {
+                skips.push((*id, SkipReason::MetadataUnavailable));
+                continue;
+            }
             if !state.config.discoverable {
                 skips.push((*id, SkipReason::NotDiscoverable));
                 continue;
@@ -311,6 +360,29 @@ fn config_to_info(cfg: &DiscoveryInterfaceConfig, transport_id: [u8; 16]) -> Dis
 mod tests {
     use super::*;
     use crate::discovery::constants::{FLAG_ENCRYPTED, FLAG_SIGNED};
+
+    #[test]
+    fn failed_metadata_is_isolated_and_retried_without_advancing_clock() {
+        let mut a = Announcer::new(static_stamper());
+        a.register(1, [1; 16], sample_backbone());
+        a.register(2, [2; 16], sample_backbone());
+        let (requests, skips) = a.tick_excluding(100.0, None, &HashSet::from([1]));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].interface_id, 2);
+        assert!(skips.contains(&(1, SkipReason::MetadataUnavailable)));
+        assert!(a.is_due(1, 101.0));
+        assert!(!a.is_due(2, 101.0));
+        a.update_location(1, 55.75, 37.6, 150.0);
+        let (requests, _) = a.tick(101.0, None);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].interface_id, 1);
+        let (_, body) = app_data::split_flags(&requests[0].app_data).unwrap();
+        let (packed, _) = app_data::split_stamp(body).unwrap();
+        let info = app_data::decode_info(packed).unwrap();
+        assert_eq!(info.latitude, Some(55.75));
+        assert_eq!(info.longitude, Some(37.6));
+        assert_eq!(info.height, Some(150.0));
+    }
 
     struct StaticStamper {
         stamp: Vec<u8>,

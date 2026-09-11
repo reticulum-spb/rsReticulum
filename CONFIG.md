@@ -73,7 +73,7 @@ interfaces: []
 | `default_ar_grace` | integer or null | `null` | Default announce-rate grace, `0..=4294967295`. |
 | `ingress` | mapping | `{}` | Global ingress/egress-control overrides; see below. |
 | `network_identity` | path or null | `null` | Optional network identity file. A leading `~/` is expanded using the user home directory. |
-| `discover_interfaces` | boolean | `false` | Publish and process interface-discovery announces. |
+| `discover_interfaces` | boolean | `false` | Receive discovery announces; publication is independently enabled by per-interface `discoverable`. |
 | `autoconnect_discovered_interfaces` | integer | `0` | Maximum discovered interfaces to connect automatically; `0` disables autoconnect. |
 | `required_discovery_value` | integer | `16` | Required discovery stamp value, `0..=255`. |
 | `interface_discovery_sources` | sequence of strings | `[]` | Accepted discovery publisher identity hashes; each is 32 hexadecimal characters. |
@@ -145,6 +145,61 @@ level as `type`:
 | `ingress` | mapping | `{}` | Per-interface overrides listed in “Ingress mappings”. |
 | `recursive_path_requests` | boolean | `false` | Force recursive path requests. |
 | `announces_from_internal` | boolean | `true` | Permit rebroadcast of announces learned from internal interfaces. |
+
+## Discovery publication
+
+These flat fields use the Python interface parameter names. The daemon installs
+a native discovery stamper automatically; applications can override it through
+`enable_on_network_discovery`. IFAC sizes elsewhere in YAML remain bytes.
+
+| Field | Default / meaning |
+| --- | --- |
+| `discoverable` | `false`; publish a supported interface |
+| `discovery_name` | Interface name |
+| `reachable_on` | Advertised address or executable path; a non-wildcard listen address is a Rust fallback |
+| `announce_interval` | `360` minutes; clamped to a minimum of `5` |
+| `discovery_stamp_value` | `16`; `0` selects default; range `0..=255` |
+| `publish_ifac` | `false`; include IFAC name and passphrase |
+| `discovery_encrypt` | `false`; requires `reticulum.network_identity` |
+| `discovery_lxmf_address` | Optional 32-character hexadecimal operator address |
+| `latitude`, `longitude`, `height` | Optional finite decimal degrees / metres above sea level |
+| `location_cmd` | Executable path returning `LAT,LON,HEIGHT` |
+| `discovery_frequency`, `discovery_bandwidth` | Optional integer Hz; RNode falls back to its radio settings |
+| `discovery_modulation` | Optional string for KISS metadata |
+| `bootstrap_only` | `false`; mark a temporary bootstrap interface |
+| `ignore_config_warnings` | `false`; preserve an otherwise automatically corrected mode |
+
+Modes `gateway`, `access_point` and `internal` are preserved. Other discoverable
+interfaces become `gateway` (RNode becomes `access_point`) unless
+`ignore_config_warnings` is true. KISS-framed TCP clients advertise `KISSInterface`.
+Auto/UDP/Local/Pipe are not publication types. Automatic discovery of the local
+I2P b32 address remains unverified; configure `reachable_on` explicitly for I2P.
+
+On Unix, commands execute directly without shell arguments and support `~/`.
+They run when publication is due. Missing/non-executable location paths preserve
+static coordinates, matching Python. Invalid output or nonzero exit skips that
+interface; others continue. Rust bounds commands to five seconds and 4096 stdout
+bytes. Longitude is correctly limited to `[-180,180]`, fixing the Python 1.5.2
+parser's upper-bound typo. Windows uses static metadata. Rust modulation remains
+a string: Python's numeric config parser conflicts with its KISS formatter.
+
+The Web UI exposes these fields under **Advanced → Discovery publication**.
+API changes use atomic save/rollback and refresh live publication; deletion or
+disabling stops it. Missing encryption identity suppresses publication instead
+of falling back to plaintext.
+
+```yaml
+interfaces:
+  - type: backbone
+    name: Public relay
+    listen_on: 0.0.0.0
+    port: 4242
+    mode: internal
+    discoverable: true
+    reachable_on: relay.example.org
+    announce_interval: 360
+    discovery_lxmf_address: "0123456789abcdef0123456789abcdef"
+```
 
 ## `type: auto`
 

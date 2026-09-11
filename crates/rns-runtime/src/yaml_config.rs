@@ -550,6 +550,27 @@ impl InterfaceConfig {
                 self.common().name
             )));
         }
+        let common = self.common();
+        if let Some(address) = &common.discovery_lxmf_address
+            && (address.len() != 32 || hex::decode(address).is_err())
+        {
+            return Err(YamlConfigError::Validation(format!(
+                "interface {:?}: discovery_lxmf_address must be a 32-character hexadecimal address",
+                common.name
+            )));
+        }
+        for (field, value) in [
+            ("latitude", common.latitude),
+            ("longitude", common.longitude),
+            ("height", common.height),
+        ] {
+            if value.is_some_and(|value| !value.is_finite()) {
+                return Err(YamlConfigError::Validation(format!(
+                    "interface {:?}: {field} must be finite",
+                    common.name
+                )));
+            }
+        }
         match self {
             Self::Auto(v) if v.discovery_port == 0 || v.data_port == 0 => {
                 Err(YamlConfigError::Validation(format!(
@@ -862,6 +883,24 @@ pub struct InterfaceCommonConfig {
     pub ingress: IngressConfig,
     pub recursive_path_requests: bool,
     pub announces_from_internal: bool,
+    pub bootstrap_only: bool,
+    pub ignore_config_warnings: bool,
+    pub discoverable: bool,
+    pub discovery_name: Option<String>,
+    /// Discovery announce interval in minutes (Python-compatible units).
+    pub announce_interval: Option<u64>,
+    pub discovery_stamp_value: Option<u8>,
+    pub reachable_on: Option<String>,
+    pub publish_ifac: bool,
+    pub discovery_encrypt: bool,
+    pub discovery_lxmf_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub height: Option<f64>,
+    pub location_cmd: Option<String>,
+    pub discovery_frequency: Option<u64>,
+    pub discovery_bandwidth: Option<u64>,
+    pub discovery_modulation: Option<String>,
 }
 
 impl InterfaceCommonConfig {
@@ -909,6 +948,23 @@ impl Default for InterfaceCommonConfig {
             ingress: IngressConfig::default(),
             recursive_path_requests: false,
             announces_from_internal: true,
+            bootstrap_only: false,
+            ignore_config_warnings: false,
+            discoverable: false,
+            discovery_name: None,
+            announce_interval: None,
+            discovery_stamp_value: None,
+            reachable_on: None,
+            publish_ifac: false,
+            discovery_encrypt: false,
+            discovery_lxmf_address: None,
+            latitude: None,
+            longitude: None,
+            height: None,
+            location_cmd: None,
+            discovery_frequency: None,
+            discovery_bandwidth: None,
+            discovery_modulation: None,
         }
     }
 }
@@ -1525,6 +1581,39 @@ fn write_common(
         "announces_from_internal",
         common.announces_from_internal,
     );
+    set_bool(section, "bootstrap_only", common.bootstrap_only);
+    set_bool(
+        section,
+        "ignore_config_warnings",
+        common.ignore_config_warnings,
+    );
+    set_bool(section, "discoverable", common.discoverable);
+    set_opt(section, "discovery_name", common.discovery_name.as_deref());
+    set_opt_num(section, "announce_interval", common.announce_interval);
+    set_opt_num(
+        section,
+        "discovery_stamp_value",
+        common.discovery_stamp_value,
+    );
+    set_opt(section, "reachable_on", common.reachable_on.as_deref());
+    set_bool(section, "publish_ifac", common.publish_ifac);
+    set_bool(section, "discovery_encrypt", common.discovery_encrypt);
+    set_opt(
+        section,
+        "discovery_lxmf_address",
+        common.discovery_lxmf_address.as_deref(),
+    );
+    set_opt_num(section, "latitude", common.latitude);
+    set_opt_num(section, "longitude", common.longitude);
+    set_opt_num(section, "height", common.height);
+    set_opt(section, "location_cmd", common.location_cmd.as_deref());
+    set_opt_num(section, "discovery_frequency", common.discovery_frequency);
+    set_opt_num(section, "discovery_bandwidth", common.discovery_bandwidth);
+    set_opt(
+        section,
+        "discovery_modulation",
+        common.discovery_modulation.as_deref(),
+    );
 }
 
 fn write_ingress(
@@ -1868,6 +1957,25 @@ fn common_from_normalized(
         },
         recursive_path_requests: section.get_bool("recursive_prs").unwrap_or(false),
         announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
+        bootstrap_only: section.get_bool("bootstrap_only").unwrap_or(false),
+        ignore_config_warnings: section.get_bool("ignore_config_warnings").unwrap_or(false),
+        discoverable: section.get_bool("discoverable").unwrap_or(false),
+        discovery_name: section.get("discovery_name").map(str::to_string),
+        announce_interval: section.get_uint("announce_interval"),
+        discovery_stamp_value: section
+            .get_uint("discovery_stamp_value")
+            .and_then(|v| v.try_into().ok()),
+        reachable_on: section.get("reachable_on").map(str::to_string),
+        publish_ifac: section.get_bool("publish_ifac").unwrap_or(false),
+        discovery_encrypt: section.get_bool("discovery_encrypt").unwrap_or(false),
+        discovery_lxmf_address: section.get("discovery_lxmf_address").map(str::to_string),
+        latitude: section.get_float("latitude"),
+        longitude: section.get_float("longitude"),
+        height: section.get_float("height"),
+        location_cmd: section.get("location_cmd").map(str::to_string),
+        discovery_frequency: section.get_uint("discovery_frequency"),
+        discovery_bandwidth: section.get_uint("discovery_bandwidth"),
+        discovery_modulation: section.get("discovery_modulation").map(str::to_string),
     }
 }
 
@@ -1942,6 +2050,38 @@ fn validate_radio(name: &str, radio: &RadioConfig) -> Result<(), YamlConfigError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_yaml_roundtrip_and_normalization_preserve_publication() {
+        let yaml = "interfaces:\n  - type: backbone\n    name: Relay\n    listen_on: 127.0.0.1\n    port: 4242\n    mode: internal\n    discoverable: true\n    bootstrap_only: true\n    ignore_config_warnings: true\n    discovery_name: Test relay\n    announce_interval: 10\n    discovery_stamp_value: 16\n    reachable_on: relay.example.org\n    publish_ifac: true\n    discovery_encrypt: true\n    discovery_lxmf_address: '0123456789abcdef0123456789abcdef'\n    latitude: 55.75\n    longitude: 37.6\n    height: 150.0\n    location_cmd: /tmp/test-location\n    discovery_frequency: 868000000\n    discovery_bandwidth: 125000\n    discovery_modulation: LoRa\n";
+        let config = Config::parse(yaml, "config.yaml").unwrap();
+        assert_eq!(
+            Config::parse(&config.to_yaml().unwrap(), "config.yaml").unwrap(),
+            config
+        );
+        let runtime = config.to_runtime_config().unwrap();
+        let section = runtime.subsection("interfaces", "Relay").unwrap();
+        assert_eq!(section.get_bool("discoverable"), Some(true));
+        assert_eq!(section.get_uint("announce_interval"), Some(10));
+        assert_eq!(section.get("location_cmd"), Some("/tmp/test-location"));
+        #[cfg(feature = "api")]
+        assert_eq!(
+            interface_from_normalized_section("Relay", section).unwrap(),
+            config.interfaces[0]
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_invalid_operator_address_and_nonfinite_location() {
+        for extra in [
+            "discovery_lxmf_address: bad",
+            "latitude: .nan",
+            "height: .inf",
+        ] {
+            let yaml = format!("interfaces:\n  - type: auto\n    name: test\n    {extra}\n");
+            assert!(Config::parse(&yaml, "config.yaml").is_err());
+        }
+    }
 
     #[test]
     fn minimal_config_applies_defaults_and_validates() {

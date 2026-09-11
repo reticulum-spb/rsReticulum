@@ -1020,6 +1020,11 @@ async function openInterfaceDialog(item = null) {
     Boolean(config.i2p_tunneled);
   setBackboneRole(backboneRole);
   setField("#advanced-bitrate", config.bitrate);
+  for (const input of document.querySelectorAll("[data-discovery-field]")) {
+    const value = config[input.dataset.discoveryField];
+    if (input.type === "checkbox") input.checked = value === true;
+    else input.value = value ?? "";
+  }
   setField("#advanced-announce-cap", config.announce_cap);
   setField("#advanced-rate-target", config.announce_rate_target);
   setField("#advanced-rate-grace", config.announce_rate_grace);
@@ -1244,6 +1249,13 @@ async function requestSystemAction(action) {
 }
 
 function addAdvancedOptions(payload) {
+  for (const input of document.querySelectorAll("[data-discovery-field]")) {
+    const key = input.dataset.discoveryField;
+    if (input.type === "checkbox") payload[key] = input.checked;
+    else if (input.value.trim() !== "") {
+      payload[key] = input.type === "number" ? Number(input.value) : input.value.trim();
+    }
+  }
   payload.outgoing = document.querySelector("#advanced-outgoing").checked;
   payload.ingress_control =
     document.querySelector("#advanced-ingress-control").checked;

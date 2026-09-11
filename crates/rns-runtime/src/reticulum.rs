@@ -88,12 +88,13 @@ pub struct ReticulumHandle {
 /// doesn't proliferate state. Holds inputs for the eventual announce tick /
 /// subscriber loop.
 pub struct DiscoveryRuntime {
-    stamper: Mutex<Option<Arc<dyn DiscoveryStamper + Send + Sync>>>,
+    stamper: std::sync::RwLock<Option<Arc<dyn DiscoveryStamper + Send + Sync>>>,
     store: Mutex<Option<Arc<DiscoveryStore>>>,
     receiver_started: Mutex<bool>,
     announcer_started: Mutex<bool>,
     subscriber_started: Mutex<bool>,
     local_interfaces: Mutex<Vec<LocalDiscoveryInterface>>,
+    publication_changed: tokio::sync::Notify,
     autoconnected: Mutex<HashMap<[u8; 32], u64>>,
     bootstrap_interfaces: Mutex<Vec<u64>>,
 }
@@ -101,12 +102,13 @@ pub struct DiscoveryRuntime {
 impl Default for DiscoveryRuntime {
     fn default() -> Self {
         Self {
-            stamper: Mutex::new(None),
+            stamper: std::sync::RwLock::new(None),
             store: Mutex::new(None),
             receiver_started: Mutex::new(false),
             announcer_started: Mutex::new(false),
             subscriber_started: Mutex::new(false),
             local_interfaces: Mutex::new(Vec::new()),
+            publication_changed: tokio::sync::Notify::new(),
             autoconnected: Mutex::new(HashMap::new()),
             bootstrap_interfaces: Mutex::new(Vec::new()),
         }
@@ -117,6 +119,35 @@ impl Default for DiscoveryRuntime {
 struct LocalDiscoveryInterface {
     id: u64,
     config: DiscoveryInterfaceConfig,
+    location_cmd: Option<String>,
+}
+
+/// Forward to the currently installed stamper, including replacements made by
+/// embedding applications after automatic discovery startup.
+struct RuntimeDiscoveryStamper(Arc<DiscoveryRuntime>);
+
+impl RuntimeDiscoveryStamper {
+    fn current(&self) -> Option<Arc<dyn DiscoveryStamper + Send + Sync>> {
+        self.0
+            .stamper
+            .read()
+            .expect("discovery stamper lock poisoned")
+            .clone()
+    }
+}
+
+impl DiscoveryStamper for RuntimeDiscoveryStamper {
+    fn generate(&self, infohash: &[u8; 32], target_value: u8) -> Option<Vec<u8>> {
+        self.current()?.generate(infohash, target_value)
+    }
+    fn value(&self, infohash: &[u8; 32], stamp: &[u8]) -> u8 {
+        self.current()
+            .map_or(0, |stamper| stamper.value(infohash, stamp))
+    }
+    fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: u8) -> bool {
+        self.current()
+            .is_some_and(|stamper| stamper.valid(infohash, stamp, required_value))
+    }
 }
 
 impl ReticulumHandle {
@@ -229,19 +260,26 @@ impl ReticulumHandle {
     }
 
     /// Install a [`DiscoveryStamper`] so this node can emit PoW-stamped
-    /// discovery announces. Inverts Python's hard `LXMF.LXStamper` import
-    /// (RNS/Discovery.py:41) — downstream apps install at startup. Idempotent;
-    /// without a stamper, discovery stays silently inert.
+    /// discovery announces. Replaces the native default for embedding apps.
+    /// Repeated calls do not start duplicate scheduler/receiver tasks.
     pub async fn enable_on_network_discovery(
         &self,
         stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
     ) {
-        *self.discovery.stamper.lock().await = Some(stamper);
+        *self
+            .discovery
+            .stamper
+            .write()
+            .expect("discovery stamper lock poisoned") = Some(stamper);
         start_on_network_discovery(self.clone()).await;
     }
 
     pub async fn discovery_enabled(&self) -> bool {
-        self.discovery.stamper.lock().await.is_some()
+        self.discovery
+            .stamper
+            .read()
+            .expect("discovery stamper lock poisoned")
+            .is_some()
     }
 
     /// Snapshot of currently-known interfaces. Stale + disallowed entries
@@ -670,7 +708,7 @@ impl Default for ReticulumConfig {
             network_identity_path: None,
             discover_interfaces: false,
             autoconnect_discovered_interfaces: 0,
-            discover_interfaces_required_value: 14,
+            discover_interfaces_required_value: rns_transport::discovery::DEFAULT_STAMP_VALUE,
             interface_discovery_sources: Vec::new(),
             blackhole_sources: Vec::new(),
             publish_blackhole: false,
@@ -1490,6 +1528,9 @@ pub async fn init_with_options(
                                 LocalDiscoveryInterface {
                                     id: registered_id,
                                     config: cfg.clone(),
+                                    location_cmd: interface_section(&config, iface_config)
+                                        .and_then(|section| section.get("location_cmd"))
+                                        .map(ToString::to_string),
                                 },
                             );
                         }
@@ -1560,6 +1601,15 @@ pub async fn init_with_options(
             Ok(dest) => tracing::info!(dest = %hex::encode(dest), "blackhole publisher started"),
             Err(e) => tracing::warn!("failed to start blackhole publisher: {}", e),
         }
+    }
+    if instance_mode != InstanceMode::Client
+        && (rc.discover_interfaces || !handle.discovery.local_interfaces.lock().await.is_empty())
+    {
+        handle
+            .enable_on_network_discovery(Arc::new(
+                rns_transport::discovery::stamper::NativeDiscoveryStamper,
+            ))
+            .await;
     }
     if instance_mode != InstanceMode::Client && !rc.blackhole_sources.is_empty() {
         start_blackhole_subscriber(handle.clone()).await;
@@ -2201,8 +2251,8 @@ fn interface_config_mode_mut(
     }
 }
 
-/// Python Reticulum.py:841-848: a `discoverable` interface must run in
-/// Gateway or Access Point mode for discovery to be useful, so the mode is
+/// Python 1.5.2 permits Gateway, Access Point or Internal discovery modes.
+/// For other modes the interface is
 /// auto-corrected (AP for RNode radios, Gateway otherwise) with a notice.
 /// `ignore_config_warnings = yes` opts out and keeps the configured mode.
 fn apply_discovery_mode_autocorrect(
@@ -2246,7 +2296,10 @@ fn apply_discovery_mode_autocorrect(
 
     let name = interface_config_name(iface_config).to_string();
     let mode = interface_config_mode_mut(iface_config);
-    if matches!(*mode, InterfaceMode::Gateway | InterfaceMode::AccessPoint) {
+    if matches!(
+        *mode,
+        InterfaceMode::Gateway | InterfaceMode::AccessPoint | InterfaceMode::Internal
+    ) {
         return;
     }
     *mode = if is_rnode {
@@ -2257,7 +2310,7 @@ fn apply_discovery_mode_autocorrect(
     tracing::warn!(
         interface = %name,
         mode = ?*mode,
-        "discovery enabled without gateway or AP mode — auto-configured; \
+        "discovery enabled without gateway, internal or AP mode — auto-configured; \
          set ignore_config_warnings to keep the configured mode"
     );
 }
@@ -2298,15 +2351,9 @@ fn discovery_config_for_interface(
                 None,
                 None,
             ),
-            interface_factory::InterfaceConfig::TcpClient(c) if c.kiss_framing => (
-                "TCPClientInterface",
-                configured_reachable_on(section).or_else(|| Some(c.target_host.clone())),
-                Some(c.target_port),
-                None,
-                None,
-                None,
-                None,
-            ),
+            interface_factory::InterfaceConfig::TcpClient(c) if c.kiss_framing => {
+                ("KISSInterface", None, None, None, None, None, None)
+            }
             interface_factory::InterfaceConfig::Backbone(c) => (
                 "BackboneInterface",
                 configured_reachable_on(section).or_else(|| {
@@ -2405,6 +2452,7 @@ fn discovery_config_for_interface(
         stamp_value: section
             .get_uint("discovery_stamp_value")
             .or_else(|| section.get_uint("stamp_value"))
+            .filter(|v| *v > 0)
             .map(|v| v.min(u8::MAX as u64) as u8)
             .unwrap_or(rns_transport::discovery::DEFAULT_STAMP_VALUE),
         reachable_on,
@@ -2467,7 +2515,7 @@ fn discovery_announce_interval_secs(section: &NormalizedSection) -> u64 {
     section
         .get_float("discovery_announce_interval")
         .or_else(|| section.get_float("announce_interval"))
-        .map(|minutes| (minutes.max(0.0) * 60.0).round().max(1.0) as u64)
+        .map(|minutes| (minutes.max(5.0) * 60.0).round() as u64)
         .unwrap_or(6 * 60 * 60)
 }
 
@@ -2482,10 +2530,11 @@ impl DiscoveryDecryptor for IdentityDiscoveryDecryptor {
 }
 
 async fn start_on_network_discovery(handle: ReticulumHandle) {
-    let stamper = handle.discovery.stamper.lock().await.clone();
-    let Some(stamper) = stamper else {
+    if !handle.discovery_enabled().await {
         return;
-    };
+    }
+    let stamper: Arc<dyn DiscoveryStamper + Send + Sync> =
+        Arc::new(RuntimeDiscoveryStamper(handle.discovery.clone()));
     let store = handle.discovery.store.lock().await.clone();
     let Some(store) = store else {
         return;
@@ -2546,7 +2595,7 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
             *started = true;
             drop(started);
             tokio::spawn(async move {
-                run_discovery_announcer(handle, stamper, locals).await;
+                run_discovery_announcer(handle, stamper).await;
             });
         }
     }
@@ -2555,28 +2604,119 @@ async fn start_on_network_discovery(handle: ReticulumHandle) {
 async fn run_discovery_announcer(
     handle: ReticulumHandle,
     stamper: Arc<dyn DiscoveryStamper + Send + Sync>,
-    locals: Vec<LocalDiscoveryInterface>,
 ) {
     let mut announcer = Announcer::new(stamper);
-    for local in locals {
-        announcer.register(local.id, handle.transport_identity.hash, local.config);
-    }
+    let mut registered = std::collections::HashSet::new();
 
     let announce_identity = handle
         .network_identity
         .clone()
         .unwrap_or_else(|| handle.transport_identity.clone());
     let encrypt_identity = handle.network_identity.clone();
+    let destination_hash = rns_identity::destination::Destination::hash_from_name_and_identity(
+        rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
+        Some(&announce_identity.hash),
+    );
+    if handle
+        .transport_tx
+        .send(TransportMessage::RegisterDestination {
+            hash: destination_hash,
+            app_name: rns_transport::discovery::DISCOVERY_ASPECT_FILTER.to_string(),
+            delivery_tx: None,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
     let tick_interval = Duration::from_secs(rns_transport::discovery::ANNOUNCE_JOB_INTERVAL_SECS);
 
     loop {
-        let encrypt = |plaintext: &[u8]| {
-            encrypt_identity
-                .as_ref()
-                .and_then(|identity| identity.encrypt(plaintext, None).ok())
+        let locals = handle.discovery.local_interfaces.lock().await.clone();
+        let live: std::collections::HashSet<_> = locals.iter().map(|local| local.id).collect();
+        for id in registered.difference(&live) {
+            announcer.deregister(*id);
+        }
+        for local in &locals {
+            if !registered.contains(&local.id) {
+                announcer.register(
+                    local.id,
+                    handle.transport_identity.hash,
+                    local.config.clone(),
+                );
+            }
+        }
+        registered = live;
+        let now = unix_now();
+        let mut unavailable = std::collections::HashSet::new();
+        for local in &locals {
+            if !announcer.is_due(local.id, now) {
+                continue;
+            }
+            if matches!(
+                local.config.interface_type.as_str(),
+                "BackboneInterface" | "TCPServerInterface"
+            ) {
+                let result = tokio::select! {
+                    _ = handle.shutdown.wait() => return,
+                    result = resolve_discovery_address(local.config.reachable_on.as_deref()) => result,
+                };
+                match result {
+                    Ok(address) => announcer.update_reachable_on(local.id, address),
+                    Err(error) => {
+                        tracing::warn!(interface_id = local.id, %error, "skipping discovery announce with invalid reachable_on");
+                        unavailable.insert(local.id);
+                        continue;
+                    }
+                }
+            }
+            if let Some(command) = &local.location_cmd {
+                let result = tokio::select! {
+                    _ = handle.shutdown.wait() => return,
+                    result = resolve_discovery_location(command) => result,
+                };
+                match result {
+                    Ok(Some((latitude, longitude, height))) => {
+                        announcer.update_location(local.id, latitude, longitude, height);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(interface_id = local.id, %error, "skipping interface discovery announce after location_cmd failure");
+                        unavailable.insert(local.id);
+                    }
+                }
+            }
+        }
+        let tick_identity = encrypt_identity.clone();
+        let tick = tokio::task::spawn_blocking(move || {
+            let encrypt = |plaintext: &[u8]| {
+                tick_identity
+                    .as_ref()
+                    .and_then(|identity| identity.encrypt(plaintext, None).ok())
+            };
+            let result = announcer.tick_excluding(now, Some(&encrypt), &unavailable);
+            (announcer, result)
+        });
+        let result = tokio::select! {
+            _ = handle.shutdown.wait() => return,
+            result = tick => result,
         };
-        let (requests, _skips) = announcer.tick(unix_now(), Some(&encrypt));
+        let Ok((updated, (requests, _skips))) = result else {
+            tracing::error!("discovery announcer worker failed");
+            return;
+        };
+        announcer = updated;
         for request in requests {
+            if !handle
+                .discovery
+                .local_interfaces
+                .lock()
+                .await
+                .iter()
+                .any(|local| local.id == request.interface_id)
+            {
+                continue;
+            }
             match build_announce_packet(
                 &announce_identity,
                 rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
@@ -2587,11 +2727,7 @@ async fn run_discovery_announcer(
                         .transport_tx
                         .send(TransportMessage::Outbound(OutboundRequest {
                             raw: Bytes::from(raw),
-                            destination_hash:
-                                rns_identity::destination::Destination::hash_from_name_and_identity(
-                                    rns_transport::discovery::DISCOVERY_ASPECT_FILTER,
-                                    Some(&announce_identity.hash),
-                                ),
+                            destination_hash,
                         }))
                         .await;
                 }
@@ -2603,9 +2739,121 @@ async fn run_discovery_announcer(
 
         tokio::select! {
             _ = handle.shutdown.wait() => break,
+            _ = handle.discovery.publication_changed.notified() => {},
             _ = tokio::time::sleep(tick_interval) => {}
         }
     }
+}
+
+async fn resolve_discovery_location(command: &str) -> Result<Option<(f64, f64, f64)>, String> {
+    let Some(output) = discovery_command_output(command).await? else {
+        return Ok(None);
+    };
+    parse_discovery_location(&output).map(Some)
+}
+
+async fn resolve_discovery_address(value: Option<&str>) -> Result<String, String> {
+    let value = value.ok_or_else(|| "reachable_on is required for discovery".to_string())?;
+    let output = discovery_command_output(value).await?;
+    let address = match output {
+        Some(bytes) => String::from_utf8(bytes).map_err(|e| e.to_string())?,
+        None => value.to_string(),
+    };
+    let address = address.replace(['\r', '\n'], "").trim().to_string();
+    if !rns_transport::discovery::app_data::valid_reachable_on(&address) {
+        return Err(format!("invalid reachable_on: {address:?}"));
+    }
+    Ok(address)
+}
+
+/// Match Python's executable-path (no shell/arguments) contract. Missing or
+/// non-executable paths leave static metadata in place. Bound runtime and stdout
+/// so a configured helper cannot indefinitely block shutdown or grow memory.
+async fn discovery_command_output(command: &str) -> Result<Option<Vec<u8>>, String> {
+    if cfg!(windows) {
+        return Ok(None);
+    }
+    let sanitized = command.replace(['\r', '\n'], "");
+    let sanitized = sanitized.trim();
+    let path = if let Some(relative) = sanitized.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "cannot expand discovery command home directory".to_string())?
+            .join(relative)
+    } else {
+        PathBuf::from(sanitized)
+    };
+    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Ok(None);
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        use tokio::io::AsyncReadExt;
+        let mut child = tokio::process::Command::new(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| "missing command stdout".to_string())?
+            .take(4097)
+            .read_to_end(&mut stdout)
+            .await
+            .map_err(|error| error.to_string())?;
+        if stdout.len() > 4096 {
+            return Err("discovery command output exceeds 4096 bytes".to_string());
+        }
+        let status = child.wait().await.map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("discovery command exited with {status}"));
+        }
+        Ok(Some(stdout))
+    })
+    .await
+    .map_err(|_| "discovery command timed out after 5 seconds".to_string())?
+}
+
+fn parse_discovery_location(output: &[u8]) -> Result<(f64, f64, f64), String> {
+    let stdout = std::str::from_utf8(output)
+        .map_err(|error| format!("location output is not UTF-8: {error}"))?;
+    let values = stdout
+        .trim()
+        .replace([' ', '\r', '\n'], "")
+        .split(',')
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid location number: {error}"))?;
+    if values.len() != 3 {
+        return Err(format!(
+            "expected LAT,LON,HEIGHT, got {} components",
+            values.len()
+        ));
+    }
+    let (latitude, longitude, height) = (values[0], values[1], values[2]);
+    if !(-90.0..=90.0).contains(&latitude) {
+        return Err(format!("latitude out of range: {latitude}"));
+    }
+    if !(-180.0..=180.0).contains(&longitude) {
+        return Err(format!("longitude out of range: {longitude}"));
+    }
+    if !(-4000.0..=1_000_000.0).contains(&height) {
+        return Err(format!("height out of range: {height}"));
+    }
+    Ok((latitude, longitude, height))
 }
 
 async fn run_discovery_autoconnect(
@@ -3614,6 +3862,19 @@ pub async fn teardown_android_usb_rnode_interface(handle: &ReticulumHandle, id: 
 }
 
 pub async fn teardown_interface(handle: &ReticulumHandle, id: u64) {
+    handle
+        .discovery
+        .local_interfaces
+        .lock()
+        .await
+        .retain(|local| local.id != id);
+    handle
+        .discovery
+        .bootstrap_interfaces
+        .lock()
+        .await
+        .retain(|candidate| *candidate != id);
+    handle.discovery.publication_changed.notify_one();
     // Abort the driver task FIRST so loops stop accepting traffic; then
     // deregister so the dropped tx cascades through writer/forwarder.
     // Order matters: dereg-first would let the master task reconnect once
@@ -3656,8 +3917,21 @@ pub async fn spawn_interface_from_config(
         crate::config::Config::from_file(handle.config_dir.join(crate::config::CONFIG_FILE_NAME))
             .and_then(|config| config.to_runtime_config())
             .unwrap_or_default();
+    let mut corrected_config = iface_config.clone();
+    apply_discovery_mode_autocorrect(&disk_config, &mut corrected_config);
+    let iface_config = &corrected_config;
     let mut post_init = get_post_init_for_config(&disk_config, iface_config);
     finalize_post_init(&mut post_init, &handle.config);
+    let discovery_config = discovery_config_for_interface(
+        &disk_config,
+        iface_config,
+        &post_init,
+        handle.config.enable_transport,
+    );
+    let location_cmd = interface_section(&disk_config, iface_config)
+        .and_then(|section| section.get("location_cmd"))
+        .map(str::to_string);
+    let bootstrap_only = interface_bootstrap_only(&disk_config, iface_config);
 
     let iface_handles = spawn_interface(
         iface_config,
@@ -3671,6 +3945,7 @@ pub async fn spawn_interface_from_config(
     .await?;
 
     for iface_handle in iface_handles {
+        let registered_id = iface_handle.id;
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
         register_interface_with_post_init(
             &handle.transport_tx,
@@ -3680,6 +3955,39 @@ pub async fn spawn_interface_from_config(
             &handle.interface_controls,
         )
         .await;
+        if let Some(config) = &discovery_config {
+            handle
+                .discovery
+                .local_interfaces
+                .lock()
+                .await
+                .push(LocalDiscoveryInterface {
+                    id: registered_id,
+                    config: config.clone(),
+                    location_cmd: location_cmd.clone(),
+                });
+        }
+        if bootstrap_only {
+            handle
+                .discovery
+                .bootstrap_interfaces
+                .lock()
+                .await
+                .push(registered_id);
+        }
+    }
+
+    if discovery_config.is_some() {
+        if !handle.discovery_enabled().await {
+            handle
+                .enable_on_network_discovery(Arc::new(
+                    rns_transport::discovery::stamper::NativeDiscoveryStamper,
+                ))
+                .await;
+        } else {
+            start_on_network_discovery(handle.clone()).await;
+        }
+        handle.discovery.publication_changed.notify_one();
     }
 
     tracing::info!(
@@ -4155,6 +4463,311 @@ pub enum ReticulumError {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn discovery_scheduler_refreshes_live_interfaces_and_stops_removed_ones() {
+        use super::*;
+        let mut handle = dummy_handle();
+        let (tx, mut rx) = mpsc::channel(16);
+        handle.transport_tx = tx;
+        handle
+            .discovery
+            .local_interfaces
+            .lock()
+            .await
+            .push(LocalDiscoveryInterface {
+                id: 41,
+                config: DiscoveryInterfaceConfig::backbone(
+                    "first relay".into(),
+                    "127.0.0.1".into(),
+                    4242,
+                ),
+                location_cmd: None,
+            });
+        let running_handle = handle.clone();
+        let task = tokio::spawn(async move {
+            run_discovery_announcer(running_handle, Arc::new(StaticStamper)).await;
+        });
+        assert!(matches!(
+            rx.recv().await,
+            Some(TransportMessage::RegisterDestination { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap(),
+            Some(TransportMessage::Outbound(_))
+        ));
+        handle.discovery.local_interfaces.lock().await.clear();
+        handle.discovery.publication_changed.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
+        );
+        handle
+            .discovery
+            .local_interfaces
+            .lock()
+            .await
+            .push(LocalDiscoveryInterface {
+                id: 42,
+                config: DiscoveryInterfaceConfig::backbone(
+                    "second relay".into(),
+                    "127.0.0.1".into(),
+                    4243,
+                ),
+                location_cmd: None,
+            });
+        handle.discovery.publication_changed.notify_one();
+        let Some(TransportMessage::Outbound(packet)) =
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("expected replacement announce");
+        };
+        assert!(
+            packet
+                .raw
+                .windows(b"second relay".len())
+                .any(|bytes| bytes == b"second relay")
+        );
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires Python 3.11+, local Reticulum and LXMF reference repositories"]
+    async fn discovery_python_receiver() {
+        for encrypted in [false, true] {
+            check_discovery_python_receiver(encrypted).await;
+        }
+    }
+
+    async fn check_discovery_python_receiver(encrypted: bool) {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let advertised = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advertised_port = advertised.local_addr().unwrap().port();
+        drop(advertised);
+        let dir =
+            std::env::temp_dir().join(format!("rns-discovery-live-{}-{port}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut yaml = format!(
+            "reticulum:\n  share_instance: false\ninterfaces:\n  - type: tcp_client\n    name: Capture\n    target_host: 127.0.0.1\n    target_port: {port}\n  - type: backbone\n    name: Relay\n    listen_on: 127.0.0.1\n    port: {advertised_port}\n    mode: internal\n    discoverable: true\n    discovery_name: Interop relay\n    discovery_stamp_value: 8\n    reachable_on: 127.0.0.1\n    latitude: 55.75\n    longitude: 37.6\n    height: 150.0\n    publish_ifac: true\n    ifac_network_name: public-net\n    ifac_passphrase: public-passphrase\n    discovery_lxmf_address: '0123456789abcdef0123456789abcdef'\n"
+        );
+        let identity_path = dir.join("network_identity");
+        if encrypted {
+            Identity::new().to_file(&identity_path).unwrap();
+            yaml = yaml.replace(
+                "share_instance: false",
+                &format!(
+                    "share_instance: false\n  network_identity: {}",
+                    identity_path.display()
+                ),
+            );
+            yaml = yaml.replace(
+                "discoverable: true",
+                "discoverable: true\n    discovery_encrypt: true",
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let location = dir.join("location");
+            std::fs::write(&location, "#!/bin/sh\nprintf '55.75,37.6,150\\n'\n").unwrap();
+            std::fs::set_permissions(&location, std::fs::Permissions::from_mode(0o700)).unwrap();
+            yaml = yaml.replace(
+                "latitude: 55.75",
+                &format!("latitude: 0.0\n    location_cmd: {}", location.display()),
+            );
+        }
+        std::fs::write(dir.join("config.yaml"), yaml).unwrap();
+        let shutdown = ShutdownSignal::new();
+        let handle = init(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        let capture = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut decoder = rns_interface::hdlc::HdlcDeframer::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                for raw in decoder.feed(&buffer[..n]) {
+                    if raw.len() > 2 && raw[0] & 3 == 1 {
+                        return raw;
+                    }
+                }
+            }
+        };
+        let raw = tokio::time::timeout(Duration::from_secs(10), capture).await;
+        shutdown.trigger();
+        assert!(handle.discovery_enabled().await);
+        let raw = raw.expect("runtime did not publish discovery");
+        let mut child = tokio::process::Command::new("python3.11")
+            .args(["-B", "-c", include_str!("../tests/discovery_receiver.py")])
+            .arg(if encrypted {
+                identity_path.to_str().unwrap()
+            } else {
+                ""
+            })
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(hex::encode(raw).as_bytes())
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.status.success(),
+            "Python receiver failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    #[test]
+    fn discovery_yaml_reaches_runtime_and_preserves_internal_mode() {
+        use super::*;
+        let yaml = "interfaces:\n  - type: backbone\n    name: relay\n    listen_on: 127.0.0.1\n    port: 4242\n    mode: internal\n    discoverable: true\n    announce_interval: 1\n    reachable_on: relay.example.org\n    discovery_lxmf_address: '0123456789abcdef0123456789abcdef'\n    latitude: 55.75\n    longitude: 37.6\n    height: 150.0\n    publish_ifac: true\n    ifac_network_name: net\n    ifac_passphrase: secret\n";
+        let typed = crate::config::Config::parse(yaml, "config.yaml").unwrap();
+        let config = typed.to_runtime_config().unwrap();
+        let mut interface = synthesize_interfaces(&config, true).unwrap().remove(0);
+        apply_discovery_mode_autocorrect(&config, &mut interface);
+        assert_eq!(
+            *interface_config_mode_mut(&mut interface),
+            rns_interface::traits::InterfaceMode::Internal
+        );
+        let post = get_post_init_for_config(&config, &interface);
+        let discovery = discovery_config_for_interface(&config, &interface, &post, true).unwrap();
+        assert_eq!(discovery.announce_interval_secs, 300);
+        assert_eq!(discovery.stamp_value, 16);
+        assert_eq!(discovery.latitude, Some(55.75));
+        assert_eq!(
+            discovery.operator_address,
+            Some(
+                hex::decode("0123456789abcdef0123456789abcdef")
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert_eq!(discovery.ifac_netname.as_deref(), Some("net"));
+        assert_eq!(discovery.ifac_netkey.as_deref(), Some("secret"));
+        for (mode, ignore, expected) in [
+            ("full", false, rns_interface::traits::InterfaceMode::Gateway),
+            ("full", true, rns_interface::traits::InterfaceMode::Full),
+            (
+                "internal",
+                true,
+                rns_interface::traits::InterfaceMode::Internal,
+            ),
+        ] {
+            let input = yaml.replace(
+                "mode: internal",
+                &format!("mode: {mode}\n    ignore_config_warnings: {ignore}"),
+            );
+            let config = crate::config::Config::parse(&input, "config.yaml")
+                .unwrap()
+                .to_runtime_config()
+                .unwrap();
+            let mut interface = synthesize_interfaces(&config, true).unwrap().remove(0);
+            apply_discovery_mode_autocorrect(&config, &mut interface);
+            assert_eq!(*interface_config_mode_mut(&mut interface), expected);
+        }
+        let disabled = crate::config::Config::parse(
+            &yaml.replace("discoverable: true", "discoverable: false"),
+            "config.yaml",
+        )
+        .unwrap()
+        .to_runtime_config()
+        .unwrap();
+        assert!(discovery_config_for_interface(&disabled, &interface, &post, true).is_none());
+    }
+
+    #[test]
+    fn discovery_location_validates_three_finite_bounded_coordinates() {
+        assert_eq!(
+            super::parse_discovery_location(b"55.75, 37.6, 150\r\n").unwrap(),
+            (55.75, 37.6, 150.0)
+        );
+        for bad in [
+            "1,2",
+            "1,2,3,4",
+            "NaN,2,3",
+            "1,inf,3",
+            "91,2,3",
+            "1,181,3",
+            "1,-181,3",
+            "1,2,-4001",
+            "1,2,1000001",
+            "foo,2,3",
+        ] {
+            assert!(
+                super::parse_discovery_location(bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_location_command_updates_and_reports_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "rns-discovery-location-{}-{}",
+            std::process::id(),
+            super::unix_now().to_bits()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("location helper");
+        let command = path.to_str().unwrap();
+        assert_eq!(
+            super::resolve_discovery_location(command).await.unwrap(),
+            None
+        );
+        std::fs::write(&path, "#!/bin/sh\nprintf '1, 2, 3\\n'\n").unwrap();
+        assert_eq!(
+            super::resolve_discovery_location(command).await.unwrap(),
+            None
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            super::resolve_discovery_location(command).await.unwrap(),
+            Some((1.0, 2.0, 3.0))
+        );
+        std::fs::write(&path, "#!/bin/sh\nprintf '4, 5, 6\\n'\n").unwrap();
+        assert_eq!(
+            super::resolve_discovery_location(command).await.unwrap(),
+            Some((4.0, 5.0, 6.0))
+        );
+        std::fs::write(&path, "#!/bin/sh\nprintf '4, 5, 6\\n'\nexit 1\n").unwrap();
+        assert!(super::resolve_discovery_location(command).await.is_err());
+        std::fs::write(&path, "#!/bin/sh\nprintf 'bad\\n'\n").unwrap();
+        assert!(super::resolve_discovery_location(command).await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::*;
 
     fn make_plain_data_packet(dest_hash: [u8; 16], body: &[u8]) -> bytes::Bytes {
@@ -4552,7 +5165,7 @@ mod tests {
         let rc = ReticulumConfig::default();
         assert!(!rc.discover_interfaces);
         assert_eq!(rc.autoconnect_discovered_interfaces, 0);
-        assert_eq!(rc.discover_interfaces_required_value, 14);
+        assert_eq!(rc.discover_interfaces_required_value, 16);
         assert_eq!(rc.network_identity_path, None);
         assert!(rc.interface_discovery_sources.is_empty());
         assert!(rc.blackhole_sources.is_empty());

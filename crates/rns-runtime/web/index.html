@@ -736,6 +736,26 @@
         <button class="icon-button" value="done" aria-label="Close dialog">×</button>
       </div>
       <fieldset class="form-grid">
+        <legend>Discovery publication</legend>
+        <label class="check-field"><input data-discovery-field="discoverable" type="checkbox"><span>Publish discovery</span></label>
+        <label class="check-field"><input data-discovery-field="bootstrap_only" type="checkbox"><span>Bootstrap only</span></label>
+        <label class="check-field"><input data-discovery-field="ignore_config_warnings" type="checkbox"><span>Keep configured mode</span></label>
+        <label class="check-field"><input data-discovery-field="publish_ifac" type="checkbox"><span>Include IFAC name and passphrase</span></label>
+        <label class="check-field"><input data-discovery-field="discovery_encrypt" type="checkbox"><span>Encrypt discovery</span></label>
+        <label>Published name<input data-discovery-field="discovery_name" type="text"></label>
+        <label>Reachable address or executable path<input data-discovery-field="reachable_on" type="text"></label>
+        <label>Announce interval, minutes<input data-discovery-field="announce_interval" type="number" min="5" placeholder="360"></label>
+        <label>Stamp value<input data-discovery-field="discovery_stamp_value" type="number" min="0" max="255" placeholder="16"></label>
+        <label>Operator LXMF address<input data-discovery-field="discovery_lxmf_address" type="text" pattern="[0-9a-fA-F]{32}"></label>
+        <label>Latitude, degrees<input data-discovery-field="latitude" type="number" step="any" min="-90" max="90"></label>
+        <label>Longitude, degrees<input data-discovery-field="longitude" type="number" step="any" min="-180" max="180"></label>
+        <label>Height above sea level, m<input data-discovery-field="height" type="number" step="any"></label>
+        <label>Location executable path<input data-discovery-field="location_cmd" type="text"></label>
+        <label>Radio frequency, Hz<input data-discovery-field="discovery_frequency" type="number" min="0"></label>
+        <label>Radio bandwidth, Hz<input data-discovery-field="discovery_bandwidth" type="number" min="0"></label>
+        <label>Radio modulation<input data-discovery-field="discovery_modulation" type="text"></label>
+      </fieldset>
+      <fieldset class="form-grid">
         <legend>General</legend>
         <label>Bitrate, bit/s <span class="optional">optional</span>
           <input id="advanced-bitrate" type="number" min="1" step="1">

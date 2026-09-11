@@ -230,6 +230,11 @@ embeds the signer metadata needed for 1.3.8 validation.
 
 ## Web Configurator
 
+Interface **Advanced** settings include discovery publication, operator LXMF
+address, coordinates/executable location, encryption and bootstrap options.
+See [Discovery publication](CONFIG.md#discovery-publication) for YAML units,
+defaults and current compatibility limits.
+
 The optional REST API includes an embedded Web UI and is available only from
 the Shared `rnsd-rs` process. Build the daemon with the `api` feature:
 

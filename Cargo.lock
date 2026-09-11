@@ -2108,6 +2108,7 @@ dependencies = [
  "rns-wire",
  "rusqlite",
  "serde",
+ "sha2",
  "subtle",
  "thiserror 2.0.18",
  "tokio",

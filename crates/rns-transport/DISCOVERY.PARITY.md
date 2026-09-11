@@ -57,10 +57,19 @@ PARITY_PYTHON=/path/to/reference/python PYTHONPATH=vendor/Reticulum \
   cargo test --manifest-path spec/rust/Cargo.toml discovery_stamp -- --ignored --nocapture
 ```
 
-The Rust PoW implementation is supplied by the embedding application through
-`DiscoveryStamper`. These checks establish the configured costs and the Python
-acceptance boundary; they do not exercise a live Rust discovery publisher.
-Without an installed stamper, runtime discovery remains inactive.
+The daemon installs `NativeDiscoveryStamper` when receiving or publishing
+discovery is configured. Applications can override `DiscoveryStamper`. The
+native implementation uses the 20-round LXStamper HKDF workblock and inclusive
+hash threshold. Generation runs off the async executor, bounded to 1,048,576
+attempts per tick; subsequent attempts use fresh randomness. High stamp values
+may require many ticks.
+
+`cargo test -p rns-runtime --features api discovery_python_receiver --lib -- --ignored --nocapture`
+starts Rust from YAML, captures an announce over loopback TCP, and passes it to
+the real Python signature validator and discovery receiver. It checks public and
+encrypted payloads, IFAC, LXMF address and executable coordinates. Requires
+`python3.11` and reference repositories (override `RNS_REFERENCE` and
+`LXMF_REFERENCE`). All daemon data lives in temporary directories.
 
 ## Operator address and implementation metadata (RUST-S10)
 
