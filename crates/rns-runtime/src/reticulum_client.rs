@@ -385,7 +385,8 @@ async fn connect_shared_inner(
     let socket_base = socket_dir.unwrap_or_else(std::env::temp_dir);
     ensure_shared_available(&config, &socket_base).await?;
 
-    let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
+    let (mut actor, interface_transport_tx, transport_tx) =
+        rns_transport::actor::TransportActor::new_with_control_channel();
     actor.is_foreground = is_foreground.clone();
     actor.shared_instance_client_mode = true;
     actor.client_announce_policy = options.announce_policy;
@@ -428,7 +429,7 @@ async fn connect_shared_inner(
             rns_interface::tcp::spawn_tcp_client(
                 interface_config,
                 interface_id,
-                transport_tx.clone(),
+                interface_transport_tx.clone(),
             )
             .await
             .map_err(|error| ReticulumError::SharedInstanceUnavailable(error.to_string()))?
@@ -441,7 +442,7 @@ async fn connect_shared_inner(
             rns_interface::local::spawn_reconnecting_local_client(
                 interface_config,
                 interface_id,
-                transport_tx.clone(),
+                interface_transport_tx.clone(),
             )
             .await
             .map_err(|error| ReticulumError::SharedInstanceUnavailable(error.to_string()))?

@@ -49,6 +49,7 @@ pub struct TransportActor {
     #[cfg(feature = "sqlite")]
     sqlite: Option<sqlite::SqliteState>,
     rx: mpsc::Receiver<TransportMessage>,
+    control_rx: Option<mpsc::Receiver<TransportMessage>>,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -297,12 +298,25 @@ impl TransportActor {
             receipts: self.receipt_table.len(),
             interfaces: self.interfaces.len(),
             path_waiters: self.path_waiters.values().map(Vec::len).sum(),
-            queued_messages: self.rx.len(),
+            queued_messages: self.rx.len() + self.control_rx.as_ref().map_or(0, |rx| rx.len()),
         }
     }
 
     pub fn new() -> (Self, mpsc::Sender<TransportMessage>) {
         Self::new_with_capacity(4096, HASHLIST_MAXSIZE)
+    }
+
+    /// Runtime entry point with independent bounded admission for commands and
+    /// interface traffic. The legacy constructor retains its single-channel API.
+    pub fn new_with_control_channel() -> (
+        Self,
+        mpsc::Sender<TransportMessage>,
+        mpsc::Sender<TransportMessage>,
+    ) {
+        let (mut actor, interface_tx) = Self::new();
+        let (control_tx, control_rx) = mpsc::channel(256);
+        actor.control_rx = Some(control_rx);
+        (actor, interface_tx, control_tx)
     }
 
     /// Benchmarks at scale override both caps to avoid running the host out of
@@ -315,6 +329,7 @@ impl TransportActor {
 
         let actor = Self {
             rx,
+            control_rx: None,
             path_table: PathTable::new(),
             link_table: LinkTable::new(),
             announce_table: AnnounceTable::new(),
@@ -419,16 +434,26 @@ impl TransportActor {
         }
         let mut tick_interval = tokio::time::interval(Duration::from_millis(JOB_INTERVAL_MS));
         let mut was_foreground = true;
+        let mut interface_open = true;
+        let mut control_open = self.control_rx.is_some();
 
         loop {
             tokio::select! {
-                msg = self.rx.recv() => {
+                msg = async { self.control_rx.as_mut().unwrap().recv().await }, if control_open => {
                     match msg {
-                        Some(TransportMessage::Shutdown) | None => {
+                        Some(TransportMessage::Shutdown) => { self.on_shutdown(); break; }
+                        Some(msg) => self.handle_message(msg),
+                        None => control_open = false,
+                    }
+                }
+                msg = self.rx.recv(), if interface_open => {
+                    match msg {
+                        Some(TransportMessage::Shutdown) => {
                             self.on_shutdown();
                             break;
                         }
                         Some(msg) => self.handle_message(msg),
+                        None => interface_open = false,
                     }
                 }
                 _ = tick_interval.tick() => {
@@ -453,6 +478,10 @@ impl TransportActor {
                     }
                     self.on_tick();
                 }
+            }
+            if !interface_open && !control_open {
+                self.on_shutdown();
+                break;
             }
         }
     }
@@ -1988,6 +2017,90 @@ mod tests {
         actor.local_destinations.insert(hash);
         actor.handle_message(TransportMessage::DeregisterDestination { hash });
         assert!(!actor.local_destinations.contains(&hash));
+    }
+
+    #[tokio::test]
+    async fn separate_control_channel_survives_inbound_flood() {
+        let (actor, interface_tx, control_tx) = TransportActor::new_with_control_channel();
+        exercise_control_during_flood(actor, interface_tx, control_tx).await;
+    }
+
+    pub(super) async fn exercise_control_during_flood(
+        actor: TransportActor,
+        interface_tx: mpsc::Sender<TransportMessage>,
+        control_tx: mpsc::Sender<TransportMessage>,
+    ) {
+        let packet = || {
+            TransportMessage::Inbound(InboundPacket {
+                raw: Bytes::new(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+        };
+        for _ in 0..4096 {
+            interface_tx.try_send(packet()).unwrap();
+        }
+        assert!(matches!(
+            interface_tx.try_send(packet()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        control_tx
+            .try_send(TransportMessage::Rpc {
+                query: TransportQuery::GetInterfaceStats,
+                response_tx,
+            })
+            .expect("full packet channel must not consume command capacity");
+        assert_eq!(actor.memory_stats().queued_messages, 4097);
+        let flood = tokio::spawn(async move { while interface_tx.send(packet()).await.is_ok() {} });
+        let task = tokio::spawn(actor.run());
+        tokio::time::timeout(Duration::from_secs(2), response_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        control_tx.send(TransportMessage::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), flood)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_channels_close_independently_and_both_closed_stops_actor() {
+        for close_interface in [true, false] {
+            let (actor, interface_tx, control_tx) = TransportActor::new_with_control_channel();
+            let remaining = if close_interface {
+                drop(interface_tx);
+                control_tx
+            } else {
+                drop(control_tx);
+                interface_tx
+            };
+            let task = tokio::spawn(actor.run());
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            remaining
+                .send(TransportMessage::Rpc {
+                    query: TransportQuery::GetInterfaceStats,
+                    response_tx,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), response_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(remaining);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

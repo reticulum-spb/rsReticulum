@@ -326,6 +326,8 @@ impl TransportActor {
         let mut job: Option<JoinHandle<storage::Result<Prepared>>> = None;
         let mut stopping = false;
         let mut was_foreground = true;
+        let mut interface_open = true;
+        let mut control_open = self.control_rx.is_some();
         loop {
             if job.is_none() {
                 let state = self.sqlite.as_mut().unwrap();
@@ -411,8 +413,17 @@ impl TransportActor {
                         }
                     }
                 }
-                msg=self.rx.recv(), if !stopping=>match msg {
-                    None|Some(TransportMessage::Shutdown)=>{stopping=true;},
+                msg=async { self.control_rx.as_mut().unwrap().recv().await }, if !stopping && control_open=>match msg {
+                    None=>{control_open=false; stopping=!interface_open;},
+                    Some(TransportMessage::Shutdown)=>{stopping=true;},
+                    Some(TransportMessage::SetStoragePaths {..})=>warn!("cannot change active SQLite storage ownership"),
+                    Some(msg)=> {
+                        if self.sqlite_dependent(&msg) {self.enqueue_sqlite(msg);} else {self.handle_message(msg);}
+                    }
+                },
+                msg=self.rx.recv(), if !stopping && interface_open=>match msg {
+                    None=>{interface_open=false; stopping=!control_open;},
+                    Some(TransportMessage::Shutdown)=>{stopping=true;},
                     Some(TransportMessage::SetStoragePaths {..})=>warn!("cannot change active SQLite storage ownership"),
                     Some(msg)=> {
                         if self.sqlite_dependent(&msg) {self.enqueue_sqlite(msg);} else {self.handle_message(msg);}
@@ -849,6 +860,14 @@ mod tests {
         assert_eq!(state.vacuum_pages, 7);
         state.worker.try_shutdown().unwrap().wait().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_control_channel_survives_sqlite_inbound_flood() {
+        let dir = temp();
+        let (mut actor, interface_tx, control_tx) = TransportActor::new_with_control_channel();
+        actor.initialize_sqlite_storage(dir).await.unwrap();
+        super::super::tests::exercise_control_during_flood(actor, interface_tx, control_tx).await;
     }
 
     #[tokio::test]

@@ -61,6 +61,8 @@ type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMet
 #[derive(Clone)]
 pub struct ReticulumHandle {
     pub transport_tx: mpsc::Sender<TransportMessage>,
+    /// Driver packets use a separate bounded channel from API/RPC commands.
+    interface_transport_tx: mpsc::Sender<TransportMessage>,
     pub config_dir: PathBuf,
     pub instance_mode: InstanceMode,
     pub interface_configs: Vec<interface_factory::InterfaceConfig>,
@@ -1123,7 +1125,8 @@ pub async fn init_with_options(
     }
     let mut rc = ReticulumConfig::try_from_config(&config).map_err(ReticulumError::Config)?;
 
-    let (mut actor, transport_tx) = rns_transport::actor::TransportActor::new();
+    let (mut actor, interface_transport_tx, transport_tx) =
+        rns_transport::actor::TransportActor::new_with_control_channel();
     actor.is_foreground = is_foreground.clone();
     // Python 1.3.8 Transport.py:234-238: non-transport nodes get a fresh
     // per-boot wire-facing transport identity unless static_transport_identity
@@ -1199,7 +1202,7 @@ pub async fn init_with_options(
                 match rns_interface::tcp::spawn_tcp_client(
                     client_config,
                     client_id,
-                    transport_tx.clone(),
+                    interface_transport_tx.clone(),
                 )
                 .await
                 {
@@ -1225,7 +1228,7 @@ pub async fn init_with_options(
                     server_config,
                     server_id,
                     id_gen.clone(),
-                    transport_tx.clone(),
+                    interface_transport_tx.clone(),
                     handle_tx.clone(),
                 )
                 .await
@@ -1247,7 +1250,7 @@ pub async fn init_with_options(
                             match rns_interface::tcp::spawn_tcp_client(
                                 client_config,
                                 client_id,
-                                transport_tx.clone(),
+                                interface_transport_tx.clone(),
                             )
                             .await
                             {
@@ -1307,7 +1310,7 @@ pub async fn init_with_options(
                 match rns_interface::local::spawn_reconnecting_local_client(
                     client_config,
                     client_id,
-                    transport_tx.clone(),
+                    interface_transport_tx.clone(),
                 )
                 .await
                 {
@@ -1330,7 +1333,7 @@ pub async fn init_with_options(
                 match rns_interface::local::spawn_local_server(
                     server_config,
                     id_gen.clone(),
-                    transport_tx.clone(),
+                    interface_transport_tx.clone(),
                     handle_tx.clone(),
                 )
                 .await
@@ -1354,7 +1357,7 @@ pub async fn init_with_options(
                         match rns_interface::local::spawn_reconnecting_local_client(
                             client_config,
                             client_id,
-                            transport_tx.clone(),
+                            interface_transport_tx.clone(),
                         )
                         .await
                         {
@@ -1526,7 +1529,7 @@ pub async fn init_with_options(
             match spawn_interface(
                 iface_config,
                 iface_id,
-                transport_tx.clone(),
+                interface_transport_tx.clone(),
                 id_gen.clone(),
                 handle_tx.clone(),
                 &socket_base,
@@ -1603,6 +1606,7 @@ pub async fn init_with_options(
 
     let handle = ReticulumHandle {
         transport_tx: transport_tx.clone(),
+        interface_transport_tx: interface_transport_tx.clone(),
         config_dir: config_dir.clone(),
         instance_mode,
         interface_configs: interfaces,
@@ -3001,10 +3005,13 @@ async fn spawn_discovered_backbone_client(
     );
     let mut config = rns_interface::backbone::BackboneClientConfig::new(&name, host, port);
     config.mode = discovered_backbone_client_mode(&handle.config);
-    let iface_handle =
-        rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
-            .await
-            .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let iface_handle = rns_interface::backbone::spawn_backbone_client(
+        config,
+        id,
+        handle.interface_transport_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
     let mut post_init =
         interface_factory::InterfacePostInit::from_section(&NormalizedSection::new())
@@ -3299,7 +3306,7 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
     let post_init = runtime_ifac_post_init(ifac, 16)?;
     let config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
     let iface_handle =
-        rns_interface::tcp::spawn_tcp_client(config, id, handle.transport_tx.clone())
+        rns_interface::tcp::spawn_tcp_client(config, id, handle.interface_transport_tx.clone())
             .await
             .map_err(|e| format!("TCP client spawn failed: {e}"))?;
 
@@ -3351,7 +3358,7 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
         config,
         id,
         handle.id_gen.clone(),
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
         handle.handle_tx.clone(),
     )
     .await
@@ -3424,10 +3431,13 @@ pub async fn spawn_backbone_client_runtime_with_ifac(
     }
     config.max_reconnect_tries = runtime_config.max_reconnect_tries;
 
-    let iface_handle =
-        rns_interface::backbone::spawn_backbone_client(config, id, handle.transport_tx.clone())
-            .await
-            .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
+    let iface_handle = rns_interface::backbone::spawn_backbone_client(
+        config,
+        id,
+        handle.interface_transport_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("Backbone client spawn failed: {e}"))?;
 
     if let Some(post_init) = post_init {
         let ifac_key = derive_ifac_key_from_post_init(&post_init);
@@ -3493,7 +3503,7 @@ pub async fn spawn_backbone_server_runtime_with_ifac(
         config,
         id,
         handle.id_gen.clone(),
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
         handle.handle_tx.clone(),
     )
     .await
@@ -3586,7 +3596,7 @@ pub async fn spawn_ble_rnode_runtime(
     let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface(
         config,
         id,
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
     )
     .await
     .map_err(|e| format!("BLE RNode spawn failed: {e}"))?;
@@ -3662,10 +3672,13 @@ pub async fn spawn_rnode_runtime(
     config.lt_alock = lt_alock;
     config.flow_control = flow_control;
 
-    let iface_handle =
-        rns_interface::rnode::spawn_rnode_interface(config, id, handle.transport_tx.clone())
-            .await
-            .map_err(|e| format!("RNode spawn failed: {e}"))?;
+    let iface_handle = rns_interface::rnode::spawn_rnode_interface(
+        config,
+        id,
+        handle.interface_transport_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("RNode spawn failed: {e}"))?;
 
     let online = iface_handle.online.clone();
     register_interface_handle(
@@ -3716,7 +3729,7 @@ pub async fn spawn_ble_rnode_runtime_native(
     let iface_handle = rns_interface::ble_rnode::spawn_ble_rnode_interface_native(
         config,
         id,
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
         tcp_port,
     )
     .await
@@ -3745,7 +3758,7 @@ pub async fn spawn_auto_interface_runtime_with_config(
     let iface_handle = rns_interface::auto::spawn_auto_interface(
         config,
         id,
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
         handle.is_foreground.clone(),
     )
     .await
@@ -3803,7 +3816,7 @@ pub async fn spawn_ble_peer_runtime(
     let iface_handle = rns_interface::ble_peer::spawn_ble_peer_interface(
         config,
         id,
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
         handle.is_foreground.clone(),
         foreground_wake,
         seed_addresses,
@@ -3894,7 +3907,7 @@ pub async fn spawn_android_usb_rnode_runtime(
     let iface_handle = rns_interface::android_usb::spawn_android_usb_rnode_interface(
         config,
         id,
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
     )
     .await
     .map_err(|e| format!("Android USB spawn failed: {e}"))?;
@@ -3991,7 +4004,7 @@ pub async fn spawn_interface_from_config(
     let iface_handles = spawn_interface(
         iface_config,
         id,
-        handle.transport_tx.clone(),
+        handle.interface_transport_tx.clone(),
         handle.id_gen.clone(),
         handle.handle_tx.clone(),
         &handle.socket_base,
@@ -5049,6 +5062,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<TransportMessage>(1);
         let (htx, _hrx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(1);
         ReticulumHandle {
+            interface_transport_tx: tx.clone(),
             transport_tx: tx,
             config_dir: PathBuf::from("/tmp/dummy"),
             instance_mode: InstanceMode::Standalone,

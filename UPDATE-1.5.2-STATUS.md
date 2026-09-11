@@ -478,3 +478,50 @@ live-статистики очередей. Admission helper сейчас выз
 учёт tag/частот и обработку engaged. Межъязыковой тест lifecycle gate не
 запускался; семантика сверена с локальным `Transport.py` ea98db4f, reference
 остался чистым. Adaptive medium timeout относится к последующим этапам.
+
+## Этап 4, часть 4 — отдельный канал управления в runtime
+
+Добавлен `TransportActor::new_with_control_channel`: независимые ограниченные
+входы для driver traffic (4096 сообщений) и runtime/API/RPC команд (256).
+Обычный `new`/`new_with_capacity` сохраняет прежний single-channel API для
+существующих пользователей и тестов. Full runtime и client-only runtime
+переведены на новый конструктор; встроенные, динамические и discovery-драйверы
+получают пакетный sender, а публичный ReticulumHandle.transport_tx и shutdown
+работают через управляющий вход. Ввод/вывод сообщений по-прежнему типизирован
+TransportMessage; это разделение runtime-маршрутов, не новый wire-протокол.
+
+Обе actor-петли (memory и SQLite) обслуживают каналы независимо через fair
+Tokio select. Закрытие одного sender не останавливает оставшийся канал;
+закрытие обоих завершает actor. Явный Shutdown с любого входа завершает работу;
+SQLite сохраняет существующее дренирование принятой storage-очереди и shutdown
+worker. Счётчик queued_messages учитывает оба входа.
+
+Проверки:
+
+- Новые тесты полностью заполняют пакетный вход 4096 сообщениями до запуска
+  actor, проверяют независимый приём RPC, затем поддерживают поток пакетов.
+  Ответ RPC и shutdown завершаются в пределах двухсекундных test deadlines.
+  Один и тот же сценарий проходит для memory и SQLite actor; отдельно проверено
+  независимое закрытие каждого входа и остановка после закрытия обоих.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  432 passed, 1 ignored; целевой фильтр `separate_`: 3 passed.
+- `cargo test -p rns-transport --lib --quiet`: 416 passed.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 230 passed,
+  4 ignored.
+- `cargo check --workspace --all-targets`, client-only build и
+  `cargo check -p rns-runtime --features api,serial,rnode-tcp,sqlite-bundled`:
+  успешно. Прежние warnings не изменялись.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно; Python reference
+  остаётся чистым.
+
+Граница этой части: тестовый flood — поток malformed packets для проверки
+изоляции каналов, не benchmark throughput/криптографической нагрузки. Команды
+driver lifecycle пока идут вместе с driver traffic; команды runtime, включая
+явное отключение/статус/shutdown, используют независимый вход. Массовый outbound
+от приложений ещё разделяет вход с runtime-командами. Приоритеты внутри control
+channel не добавлялись, глобальный порядок между двумя каналами не гарантируется.
+
+Этап 4 **не завершён**: классовый контейнер InboundQueues пока не включён,
+нужны ранняя валидация/классификация до постановки, YAML размеров и live queue
+статистика. Следующий шаг — связать обработку с четырьмя очередями без повторного
+учёта IFAC, dedup, ingress frequency и inflight gate при drain.
