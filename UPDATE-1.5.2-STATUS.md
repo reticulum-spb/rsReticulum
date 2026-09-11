@@ -2618,3 +2618,69 @@ fmt/diff checks успешны; прежние warnings database_path/tracing pr
 Повторный pressured client lifecycle проверен. Whole-pipeline before/after,
 длительный soak и churn на уровне transport остаются.
 Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: сравнение connected TX pipeline до/после
+
+Добавлен ignored `compare_live_tcp_transmit_pipelines`. Текущая ветка
+использует настоящий BackboneClient; старая воспроизводит connected TX path
+из7a5747c^: два mpsc по1024 frames, отдельные forward/writer tasks,
+покадровый HDLC/write_all без byte quota и egress controller. Сохраняются
+текущие HDLC helpers и socket tuning в обеих ветках. Исторические DNS,
+reconnect, RX и весь transport actor не реконструируются: это сравнение
+TX datapath от admission до декодирования TCP, не целых версий Reticulum.
+
+После готовности соединения producer делает4096 try_send попыток с payload
+2048 bytes (FLAG fill, ESC marker, sequence, timestamp), yield каждые32.
+Очереди изначально пусты; reader работает одновременно с admission. Два
+режима: постоянное чтение и pause100ms + sleep1ms после каждого read≤8192.
+Каждый режим проверяется AB/BA; deadline20s на случай, guards отменяют tasks.
+После закрытия producer требуется EOF, точная сверка всех принятых sequence,
+content и wire bytes, TX counter, rejected+accepted=4096; для managed TX
+также quota≤4MiB, освобождение buffered/gated и drops=отказам admission.
+
+Команды:
+`cargo test -p rns-interface backbone::tx_tests::compare_live_tcp_transmit_pipelines -- --ignored --exact --nocapture`
+и та же команда с `--release` после `cargo test`.
+
+Это одинаковая политика конечного burst, но не одинаковый offered rate по
+настенным часам: scheduling/admission cost меняют время producer. При отказах
+доставленные объёмы различаются; throughput считается по accepted payload,
+latency только по принятым кадрам, от timestamp перед admission до декодирования.
+Нет строгих performance thresholds или вывода «меньшая latency = ускорение».
+
+Финальные последовательные прогоны: debug13.75s, release8.68s, по8 случаев.
+Диапазоны двух AB/BA наблюдений:
+
+| Profile / receiver | TX path | Accepted | Rejected | Delivered MiB/s | p99, ms |
+|---|---|---|---|---|---|
+| debug / draining | legacy | 4096 | 0 | 13.753–14.036 | 7.745–7.839 |
+| debug / draining | current | 3081–3105 | 991–1015 | 10.289–10.387 | 198.830–199.687 |
+| debug / throttled | legacy | 2168 | 1928 | 1.093–1.095 | 3782.017–3787.325 |
+| debug / throttled | current | 1152–1164 | 2932–2944 | 1.231–1.237 | 1759.664–1770.285 |
+| release / draining | legacy | 4096 | 0 | 138.159–148.340 | 0.968–1.194 |
+| release / draining | current | 4096 | 0 | 142.086–147.806 | 1.051–1.455 |
+| release / throttled | legacy | 2168 | 1928 | 1.545–1.561 | 2678.047–2702.060 |
+| release / throttled | current | 1146–1153 | 2943–2950 | 1.483–1.513 | 1464.217–1483.320 |
+
+Отрицательный debug-результат не скрывается: текущий driver на этом burst
+имеет ниже throughput, больше отказов и выше latency при быстром receiver.
+В release обе ветки доставили всю нагрузку быстрому receiver без drops;
+два наблюдения не доказывают устойчивое ускорение. При медленном receiver
+current допускает меньшую очередь/объём и чаще отказывает; уменьшение p99
+сопровождается потерями admission, а release throughput чуть ниже legacy.
+Причины debug-разницы не профилировались; результаты не переносятся на
+равный paced offered rate или production capacity без дополнительных замеров.
+Предварительные debug/release прогоны также успешны. В финальном варианте
+выравнен старт после online и убран лишний счётчик write polls только у
+исторической ветки; таблица относится к этому варианту. Общий helper
+legacy_socket_writer стал generic по AsyncWrite: прежний изолированный writer
+benchmark сохраняет одинаковые CountedSocket wrappers в обеих ветках,
+а новый pipeline benchmark не добавляет их ни в одну ветку.
+
+Регрессии интерфейсов:229 passed,11 ignored; workspace all-targets,
+fmt/diff checks успешны. Прежние warnings сохраняются, Python ea98db4f
+не изменён. CONFIG содержит команды и ограничения сравнения.
+
+Сравнение старой/текущей connected TX-цепочки выполнено. Сравнение всей
+цепочки с transport actor, длительный soak и transport-level churn остаются.
+Этап 5 открыт, версия 1.0.1.

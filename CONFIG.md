@@ -717,6 +717,25 @@ count rejected admissions, not accepted data discarded on intentional teardown.
 This is 48 client lifecycles, not automatic reconnect on a surviving handle,
 server-side flap protection, a transport-actor test or a long-duration soak.
 
+For a live connected TX pipeline comparison, run alone:
+`cargo test --release -p rns-interface backbone::tx_tests::compare_live_tcp_transmit_pipelines -- --ignored --exact --nocapture`.
+Omit `--release` for debug measurements, but do not compare the profiles as if
+they were the same build. The current path uses the real BackboneClient;
+the historical connected TX path is reconstructed from `7a5747c^` with two
+1024-frame channels and separate forwarding/per-frame writer tasks. Both use
+current HDLC helpers and socket tuning. Each producer attempts 4096 escaped
+2048-byte frames via `try_send`, yielding every 32 attempts; queues start empty.
+The receiver either drains continuously or pauses for 100 ms and then sleeps
+1 ms after each read of at most 8192 bytes. Both modes run in AB/BA order.
+All admitted frames must arrive intact and in order; wire-byte counts, admission
+rejects and current-path reservation cleanup are checked. Reports include
+producer/total duration, delivered payload throughput and attempt-timestamp to
+receive p50/p99 for admitted frames. This is the same finite burst policy, not
+equal wall-clock offered rates or equal admitted volume: different backpressure
+and scheduling change producer duration and rejects. Lower latency with more
+rejects is not a universal speedup. This test covers admission through TCP decode,
+not transport-actor scheduling, RX policies, reconnect or full historical versions.
+
 For an isolated TCP writer comparison, run
 `cargo test -p rns-interface backbone::tx_tests::compare_legacy_and_coalesced_tcp_writers -- --ignored --exact --nocapture`.
 It recreates the per-frame `write_all` loop from `7a5747c^` alongside the current

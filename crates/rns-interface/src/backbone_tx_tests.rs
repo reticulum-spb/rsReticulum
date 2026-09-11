@@ -1156,8 +1156,8 @@ impl AsyncWrite for CountedSocket {
 }
 
 /// Historical writer algorithm from 7a5747c^, isolated from other old behavior.
-async fn legacy_socket_writer(
-    mut socket: CountedSocket,
+async fn legacy_socket_writer<W: AsyncWrite + Unpin>(
+    mut socket: W,
     mut rx: mpsc::Receiver<Bytes>,
     txb: Arc<AtomicU64>,
 ) {
@@ -1282,6 +1282,193 @@ async fn compare_tcp_writer_case(coalesced: bool, slow: bool, round: usize) {
         latencies[COUNT / 2].as_secs_f64() * 1000.0,
         latencies[(COUNT - 1) * 99 / 100].as_secs_f64() * 1000.0,
         writes.load(Ordering::Relaxed)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live legacy/current TX pipeline TCP load comparison; run alone"]
+async fn compare_live_tcp_transmit_pipelines() {
+    for slow in [false, true] {
+        for (round, order) in [[false, true], [true, false]].into_iter().enumerate() {
+            for current in order {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    compare_live_tx_case(current, slow, round),
+                )
+                .await
+                .expect("live TX pipeline comparison timed out");
+            }
+        }
+    }
+}
+
+async fn compare_live_tx_case(current: bool, slow: bool, round: usize) {
+    use rns_transport::tx_queue::InterfaceTx;
+    struct Tasks(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for Tasks {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    const ATTEMPTS: usize = 4096;
+    const SIZE: usize = 2048;
+    let mut tasks = Tasks(Vec::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (transport_tx, _events) = mpsc::channel(8);
+    let mut legacy_read_half = None;
+    let (tx, txb, online) = if current {
+        let mut config = BackboneClientConfig::new(
+            "pipeline-comparison",
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+        );
+        config.max_reconnect_tries = Some(1);
+        let handle = spawn_backbone_client(config, 1, transport_tx)
+            .await
+            .unwrap();
+        tasks.0.push(handle.read_task);
+        (handle.tx, handle.txb.unwrap(), Some(handle.online))
+    } else {
+        // The steady connected TX path from 7a5747c^: two 1024-frame channels,
+        // separate forward/writer tasks, no byte admission or egress controller.
+        // DNS/reconnect/RX are deliberately not reconstructed for this one-way test.
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        tune_stream(&socket);
+        let (reader, writer) = socket.into_split();
+        legacy_read_half = Some(reader);
+        let (tx, rx) = mpsc::channel::<Bytes>(1024);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let (conn_tx, conn_rx) = mpsc::channel::<Bytes>(1024);
+        tasks.0.push(tokio::spawn(async move {
+            let mut guard = rx.lock().await;
+            while let Some(data) = guard.recv().await {
+                if conn_tx.send(data).await.is_err() {
+                    break;
+                }
+            }
+        }));
+        let txb = Arc::new(AtomicU64::new(0));
+        tasks.0.push(tokio::spawn(legacy_socket_writer(
+            writer,
+            conn_rx,
+            txb.clone(),
+        )));
+        (InterfaceTx::Plain(tx), txb, None)
+    };
+    let (mut peer, _) = listener.accept().await.unwrap();
+    if let Some(online) = online {
+        while !online.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    }
+    let accounting = tx.accounting();
+    let started = std::time::Instant::now();
+    let produce = async move {
+        let mut admitted = Vec::new();
+        let mut rejected = 0u64;
+        let mut wire_bytes = 0u64;
+        for sequence in 0..ATTEMPTS {
+            let mut raw = vec![hdlc::FLAG; SIZE];
+            raw[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
+            raw[8..16].copy_from_slice(&(started.elapsed().as_nanos() as u64).to_be_bytes());
+            raw[16] = hdlc::ESC;
+            let encoded = encoded_len(&raw);
+            match tx.try_send(raw.into()) {
+                Ok(()) => {
+                    admitted.push(sequence as u64);
+                    wire_bytes += encoded;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => rejected += 1,
+                Err(error) => panic!("unexpected disconnect: {error}"),
+            }
+            if let Some(accounting) = tx.accounting() {
+                assert!(accounting.snapshot().buffered <= HIGH_WATERMARK);
+            }
+            // Identical finite burst policy, not a fixed-rate or prefilled workload.
+            if (sequence + 1) % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(tx);
+        (admitted, rejected, wire_bytes, started.elapsed())
+    };
+    let receive = async {
+        if slow {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut decoder = hdlc::HdlcDeframer::with_max_decoded_size(SIZE);
+        let mut buffer = [0; 8192];
+        let mut sequences = Vec::new();
+        let mut latency = Vec::new();
+        let mut wire_bytes = 0u64;
+        loop {
+            let n = peer.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            wire_bytes += n as u64;
+            for frame in decoder.feed(&buffer[..n]) {
+                assert!(sequences.len() < ATTEMPTS);
+                assert_eq!(frame.len(), SIZE);
+                assert_eq!(frame[16], hdlc::ESC);
+                assert!(frame[17..].iter().all(|byte| *byte == hdlc::FLAG));
+                sequences.push(u64::from_be_bytes(frame[..8].try_into().unwrap()));
+                let sent = u64::from_be_bytes(frame[8..16].try_into().unwrap());
+                latency.push(
+                    started
+                        .elapsed()
+                        .as_nanos()
+                        .checked_sub(u128::from(sent))
+                        .unwrap(),
+                );
+            }
+            if slow {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        (sequences, latency, wire_bytes)
+    };
+    let ((admitted, rejected, expected_wire, produce_elapsed), (received, mut latency, wire_bytes)) =
+        tokio::join!(produce, receive);
+    let elapsed = started.elapsed();
+    assert!(!admitted.is_empty());
+    assert_eq!(admitted.len() as u64 + rejected, ATTEMPTS as u64);
+    assert_eq!(received, admitted);
+    assert_eq!(wire_bytes, expected_wire);
+    assert_eq!(txb.load(Ordering::Relaxed), expected_wire);
+    for task in &mut tasks.0 {
+        task.await.unwrap();
+    }
+    if let Some(accounting) = accounting {
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.buffered, 0);
+        assert!(!snapshot.gated);
+        assert_eq!(snapshot.dropped_frames, rejected);
+    }
+    drop(legacy_read_half);
+    latency.sort_unstable();
+    eprintln!(
+        "live_tx_pipeline: round={round} mode={} receiver={} attempts={ATTEMPTS} accepted={} rejected={rejected} payload_size={SIZE} wire_bytes={wire_bytes} producer_ms={:.3} elapsed_ms={:.3} delivered_payload_MiB_s={:.3} enqueue_to_receive_p50_ms={:.3} enqueue_to_receive_p99_ms={:.3}; live try_send burst/yield every32, unequal admitted volume, old connected TX reconstructed from 7a5747c^ with current HDLC/socket tuning, no transport actor or full-version/RX comparison",
+        if current {
+            "current_driver"
+        } else {
+            "legacy_tx_pipeline"
+        },
+        if slow {
+            "paused_then_throttled"
+        } else {
+            "draining"
+        },
+        admitted.len(),
+        produce_elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0,
+        (admitted.len() * SIZE) as f64 / 1048576.0 / elapsed.as_secs_f64(),
+        latency[latency.len() / 2] as f64 / 1e6,
+        latency[(latency.len() - 1) * 99 / 100] as f64 / 1e6
     );
 }
 
