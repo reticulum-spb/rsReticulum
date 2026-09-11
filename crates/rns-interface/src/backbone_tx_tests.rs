@@ -1373,6 +1373,149 @@ fn process_memory_parser_keeps_rss_and_lifetime_high_water_separate() {
     );
 }
 
+/// Each case gets a fresh allocator and process-lifetime VmHWM.
+#[tokio::test]
+#[ignore = "isolated local TCP memory scaling measurement"]
+async fn measure_tcp_memory_scaling() {
+    for peers in [1, 2, 4, 8] {
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "backbone::tx_tests::memory_scaling_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RNS_BACKBONE_MEMORY_PEERS", peers.to_string())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(40), child.wait())
+            .await
+            .expect("memory scaling child timed out")
+            .unwrap();
+        assert!(status.success(), "memory scaling failed for {peers} peers");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "internal fixture; run measure_tcp_memory_scaling instead"]
+async fn memory_scaling_child() {
+    let Ok(value) = std::env::var("RNS_BACKBONE_MEMORY_PEERS") else {
+        eprintln!("internal fixture: use measure_tcp_memory_scaling");
+        return;
+    };
+    let count: usize = value.parse().unwrap();
+    assert!([1, 2, 4, 8].contains(&count));
+    struct Tasks(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for Tasks {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        const SIZE: usize = 16384;
+        const ATTEMPTS: u64 = 512;
+        let baseline = ProcessMemory::read();
+        let mut tasks = Tasks(Vec::new());
+        let mut handles = Vec::new();
+        let mut peers = Vec::new();
+        let (transport_tx, _events) = mpsc::channel(16);
+        for id in 1..=count {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = BackboneClientConfig::new(
+                "memory-scaling", "127.0.0.1", listener.local_addr().unwrap().port());
+            config.max_reconnect_tries = Some(1);
+            config.receive_ifac_size = Some(0);
+            let handle = spawn_backbone_client(config, id as u64, transport_tx.clone()).await.unwrap();
+            tasks.0.push(handle.read_task);
+            let (peer, _) = listener.accept().await.unwrap();
+            while !handle.online.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            handles.push((handle.tx, handle.online));
+            peers.push(peer);
+        }
+        let connected = ProcessMemory::read();
+        eprintln!("memory scaling: {count} peers connected");
+        let mut admitted = vec![Vec::new(); count];
+        let mut rejected = vec![0u64; count];
+        let mut high_buffered = vec![0u64; count];
+        // Round-robin admission gives every connection the same finite workload.
+        for sequence in 0..ATTEMPTS {
+            for id in 0..count {
+                let mut payload = vec![0x55; SIZE];
+                payload[..8].copy_from_slice(&sequence.to_be_bytes());
+                match handles[id].0.try_send(payload.into()) {
+                    Ok(()) => admitted[id].push(sequence),
+                    Err(mpsc::error::TrySendError::Full(_)) => rejected[id] += 1,
+                    Err(error) => panic!("peer disconnected during admission: {error}"),
+                }
+                let snapshot = handles[id].0.accounting().unwrap().snapshot();
+                high_buffered[id] = high_buffered[id].max(snapshot.buffered);
+                assert!(snapshot.buffered <= HIGH_WATERMARK);
+            }
+        }
+        assert!(rejected.iter().all(|n| *n > 0));
+        assert!(admitted.iter().all(|frames| !frames.is_empty()));
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while !handles.iter().all(|(tx, _)| tx.accounting().unwrap().snapshot().gated) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("all stopped readers must gate");
+        let gated = ProcessMemory::read();
+        let gated_bytes: Vec<_> = handles.iter().map(|(tx, _)| {
+            let buffered = tx.accounting().unwrap().snapshot().buffered;
+            assert!(buffered > 0 && buffered <= HIGH_WATERMARK);
+            buffered
+        }).collect();
+        let accepted_counts: Vec<_> = admitted.iter().map(Vec::len).collect();
+        eprintln!("memory scaling: gated, accepted={accepted_counts:?}, rejected={rejected:?}");
+        let mut readers = tokio::task::JoinSet::new();
+        for (mut peer, sequences) in peers.into_iter().zip(admitted) {
+            readers.spawn(async move {
+                let mut decoder = hdlc::HdlcDeframer::with_max_decoded_size(SIZE);
+                let mut received = 0;
+                let mut buffer = [0; 65536];
+                while received < sequences.len() {
+                    let n = peer.read(&mut buffer).await.unwrap();
+                    assert_ne!(n, 0, "EOF before admitted frames drained");
+                    for frame in decoder.feed(&buffer[..n]) {
+                        assert!(received < sequences.len());
+                        assert_eq!(frame.len(), SIZE);
+                        assert_eq!(u64::from_be_bytes(frame[..8].try_into().unwrap()), sequences[received]);
+                        assert!(frame[8..].iter().all(|byte| *byte == 0x55));
+                        received += 1;
+                    }
+                }
+                eprintln!("memory scaling: drained {received} frames");
+                peer
+            });
+        }
+        // Retain every drained socket until gates release; EOF must not fake recovery.
+        let mut drained_peers = Vec::new();
+        while let Some(result) = readers.join_next().await {
+            drained_peers.push(result.unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while handles.iter().any(|(tx, _)| {
+                let snapshot = tx.accounting().unwrap().snapshot();
+                snapshot.gated || snapshot.buffered != 0
+            }) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("gates must release after concurrent drain");
+        for (id, (tx, online)) in handles.iter().enumerate() {
+            assert!(online.load(Ordering::SeqCst));
+            assert_eq!(tx.accounting().unwrap().snapshot().dropped_frames, rejected[id]);
+            assert_eq!(accepted_counts[id] as u64 + rejected[id], ATTEMPTS);
+        }
+        let drained = ProcessMemory::read();
+        eprintln!("tcp_memory_scaling: peers={count} accepted={accepted_counts:?} rejected={rejected:?} observed_high_buffered={high_buffered:?} gated_bytes={gated_bytes:?} per_peer_limit={HIGH_WATERMARK} baseline={baseline:?} connected={connected:?} gated={gated:?} drained={drained:?}; memory in KiB, process-wide including both TCP endpoints/harness; VmHWM is lifetime peak, RSS checkpoints can miss peaks, not a driver memory bound");
+    }).await.expect("memory scaling fixture timed out");
+}
+
 /// Run alone: memory readings include both peers and the test harness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "local two-peer TCP load measurement; holds one reader until egress gates"]

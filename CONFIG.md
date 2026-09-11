@@ -686,6 +686,23 @@ driver baseline, not a before/after speedup comparison, production capacity
 estimate or transport-actor ingress/fairness benchmark; build profile, kernel
 buffers and host scheduling affect the results.
 
+For memory scaling across 1, 2, 4 and 8 stopped TCP receivers, run
+`cargo test -p rns-interface backbone::tx_tests::measure_tcp_memory_scaling -- --ignored --exact --nocapture`.
+The parent starts a fresh test process for each peer count, avoiding allocator
+and lifetime-high-water carryover between cases. Each connection receives 512
+admission attempts of 16384 bytes, with round-robin admission and default OS
+receive buffers. Readers remain stopped until every connection gates, then
+drain concurrently. The test checks per-peer encoded TX accounting against the
+4 MiB quota, rejected-frame counts, content/order of all admitted frames, and
+gate release with the connections still online. RSS and VmHWM checkpoints are
+taken before connections, after connection setup, while gated and after drain.
+These are process-wide readings including the driver, raw peers and harness,
+not kernel socket memory or a bound on driver allocations; RSS checkpoints can
+miss peaks and allocator retention can keep RSS high after drain. Missing procfs
+readings remain unavailable. This finite measurement does not establish a
+linear memory formula, production peer capacity or leak freedom under churn.
+The ignored `memory_scaling_child` fixture is internal; invoke the parent above.
+
 For an isolated TCP writer comparison, run
 `cargo test -p rns-interface backbone::tx_tests::compare_legacy_and_coalesced_tcp_writers -- --ignored --exact --nocapture`.
 It recreates the per-frame `write_all` loop from `7a5747c^` alongside the current
