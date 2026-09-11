@@ -178,6 +178,22 @@ context. Existing context exemptions remain unchanged.
 Full receive-diagnostics coverage still requires additional dispatch-time
 violation sites. CLI and remote-management display are pending.
 
+### Path-request tag history
+
+Path requests are deduplicated by destination hash plus their truncated tag,
+using current and previous generations as in Python 1.5.2. During maintenance,
+if the current set has **more than 16,000** entries, it replaces the previous
+set and a new empty current set is created. Equality does not rotate, and
+duplicates from either set do not refresh or promote the tag. There is no
+120-second tag expiry: at low traffic, history can persist until two rotations.
+
+The threshold is not a hard per-packet memory cap: requests admitted between
+maintenance passes can exceed it, and that oversized generation is retained
+until replacement. Old generations are released as a whole; no timestamp sort
+or oldest-first trimming is performed. Shared-state reset and path-table clear
+do not erase tag history. The independent 45-second inflight request gate and
+15-second discovery waiters keep their existing timeouts.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

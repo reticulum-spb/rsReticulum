@@ -52,8 +52,6 @@ pub const PATH_REQUEST_TIMEOUT: f64 = 15.0;
 
 /// Python 1.5.2 local and in-flight path request gate (seconds).
 pub const PATH_REQUEST_GATE_TIMEOUT: f64 = 45.0;
-/// Legacy Rust tag history lifetime, independent of the request gate.
-pub const DISCOVERY_PR_TAG_RETENTION: f64 = 120.0;
 /// Rust safety bound for unresolved incoming destinations.
 pub const MAX_INFLIGHT_PATH_REQUESTS: usize = 32_000;
 
@@ -97,9 +95,9 @@ pub const STATE_SAVE_INTERVAL_SECS: f64 = 300.0;
 /// without a path are dropped from the announce cache after this idle time.
 pub const UNUSED_DESTINATION_LINGER: f64 = 360.0;
 
-/// Python `Transport.max_pr_tags`: hard count cap on the discovery
-/// path-request tag gate, on top of the time-based retain.
-pub const MAX_DISCOVERY_PR_TAGS: usize = 32_000;
+/// Python `Transport.max_pr_tags`: rotate current history on maintenance only
+/// when its length exceeds this threshold. This is not a per-insertion cap.
+pub const MAX_DISCOVERY_PR_TAGS: usize = 16_000;
 
 /// Link table check interval.
 pub const LINKS_CHECK_INTERVAL: f64 = 1.0;

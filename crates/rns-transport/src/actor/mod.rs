@@ -86,7 +86,9 @@ pub struct TransportActor {
     /// matching announce while this transport recursively searches elsewhere.
     pub discovery_path_requests: HashMap<[u8; 16], DiscoveryPathRequest>,
     /// Python `discovery_pr_tags`: destination hash plus truncated path-request tag.
-    pub discovery_pr_tags: HashMap<Vec<u8>, f64>,
+    pub discovery_pr_tags: HashSet<Vec<u8>>,
+    /// Previous generation, retained until the next count-triggered rotation.
+    pub discovery_pr_tags_prev: HashSet<Vec<u8>>,
     /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
     /// for throttled emission.
     pub pending_discovery_prs: VecDeque<PendingDiscoveryPathRequest>,
@@ -368,7 +370,8 @@ impl TransportActor {
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
             inflight_path_requests: HashMap::new(),
-            discovery_pr_tags: HashMap::new(),
+            discovery_pr_tags: HashSet::new(),
+            discovery_pr_tags_prev: HashSet::new(),
             pending_discovery_prs: VecDeque::new(),
             path_interface_suppressions: HashMap::new(),
             last_discovery_pr_tx: 0.0,
@@ -10107,7 +10110,7 @@ mod tests {
         actor.interfaces.insert(2, iface);
         let dest = [0xF1; 16];
         assert_eq!(PATH_REQUEST_GATE_TIMEOUT, 45.0);
-        assert_eq!(DISCOVERY_PR_TAG_RETENTION, 120.0);
+        assert_eq!(MAX_DISCOVERY_PR_TAGS, 16_000);
         assert!(actor.admit_inflight_path_request(dest, 1, false, 100.0));
         assert!(!actor.admit_inflight_path_request(dest, 2, false, 110.0));
         assert!(!actor.discovery_path_requests[&dest].engaged);
@@ -10169,11 +10172,111 @@ mod tests {
             },
         );
         actor.path_requests.insert(dest, start);
-        actor.discovery_pr_tags.insert(vec![1; 32], start);
+        actor.discovery_pr_tags.insert(vec![1; 32]);
         actor.on_tick();
         assert!(actor.inflight_path_requests.is_empty());
         assert!(actor.path_requests.is_empty());
         assert_eq!(actor.discovery_pr_tags.len(), 1);
+    }
+
+    #[test]
+    fn previous_pr_tag_is_rejected_without_refresh_until_generation_replacement() {
+        let (mut actor, _tx) = TransportActor::new();
+        let payload = make_path_request_payload_with_tag([0xA1; 16], None, [0xB2; 16]);
+        actor.discovery_pr_tags_prev.insert(payload.clone());
+        assert!(actor.prepare_path_request(&payload, 1).is_none());
+        assert!(
+            actor.discovery_pr_tags.is_empty(),
+            "duplicates are not promoted to current generation"
+        );
+        actor.clear_shared_connection_state();
+        actor.handle_query(TransportQuery::DropPathTable);
+        actor.on_tick();
+        assert!(actor.prepare_path_request(&payload, 2).is_none());
+        for i in 0..=MAX_DISCOVERY_PR_TAGS {
+            actor
+                .discovery_pr_tags
+                .insert((i as u64).to_be_bytes().to_vec());
+        }
+        actor.on_tick();
+        assert!(!actor.discovery_pr_tags_prev.contains(&payload));
+        assert!(actor.prepare_path_request(&payload, 2).is_some());
+        assert!(actor.discovery_pr_tags.contains(&payload));
+    }
+
+    #[test]
+    #[ignore = "requires read-only Python reference; set RNS_PYTHON_ROOT and RNS_PYTHON_BIN"]
+    fn path_request_tag_generations_match_python() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let (mut actor, _tx) = TransportActor::new();
+        let mut input = String::new();
+        let mut expected = String::new();
+        let mut step = |value: Option<usize>| {
+            let result = if let Some(value) = value {
+                let mut tag = [0; 16];
+                tag[8..].copy_from_slice(&(value as u64).to_be_bytes());
+                let payload = make_path_request_payload_with_tag([0xAA; 16], None, tag);
+                input.push_str(&format!("add {}\n", hex::encode(&payload)));
+                // Isolate tag admission from the separate inflight gate.
+                actor.inflight_path_requests.clear();
+                u8::from(actor.prepare_path_request(&payload, 1).is_some()).to_string()
+            } else {
+                input.push_str("tick\n");
+                actor.on_tick();
+                "tick".into()
+            };
+            expected.push_str(&format!(
+                "{result} {} {}\n",
+                actor.discovery_pr_tags.len(),
+                actor.discovery_pr_tags_prev.len()
+            ));
+        };
+        for i in 0..MAX_DISCOVERY_PR_TAGS {
+            step(Some(i));
+        }
+        step(None); // Equal to threshold: no rotation.
+        step(Some(0));
+        step(Some(MAX_DISCOVERY_PR_TAGS));
+        step(Some(MAX_DISCOVERY_PR_TAGS + 1)); // Overshoot before maintenance.
+        step(None);
+        step(Some(0)); // Previous generation rejects, without promotion.
+        step(None); // Idle maintenance leaves history intact.
+        for i in MAX_DISCOVERY_PR_TAGS + 2..2 * MAX_DISCOVERY_PR_TAGS + 4 {
+            step(Some(i));
+        }
+        step(None);
+        step(Some(0)); // Forgotten after replacement of previous generation.
+        step(Some(2 * MAX_DISCOVERY_PR_TAGS)); // Still in previous generation.
+        let mut child = Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .args([
+            "-B",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/path_request_tags_reference.py"
+            ),
+        ])
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output().unwrap();
+        let written = writer.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     }
 
     #[test]

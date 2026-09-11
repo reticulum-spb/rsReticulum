@@ -227,21 +227,10 @@ impl TransportActor {
             .retain(|_, request| now - request.started_at <= PATH_REQUEST_GATE_TIMEOUT);
         self.discovery_path_requests
             .retain(|_, request| now < request.timeout);
-        self.discovery_pr_tags
-            .retain(|_, last| now - *last < DISCOVERY_PR_TAG_RETENTION);
-        // Python `max_pr_tags` hard cap on top of the time gate: a tag storm
-        // inside the gate window must not grow the map without bound.
+        // Python 1.5.2 uses two generations, not a time-to-live or oldest-first
+        // trim. Duplicates found in either generation do not refresh history.
         if self.discovery_pr_tags.len() > MAX_DISCOVERY_PR_TAGS {
-            let mut by_age: Vec<(Vec<u8>, f64)> = self
-                .discovery_pr_tags
-                .iter()
-                .map(|(tag, last)| (tag.clone(), *last))
-                .collect();
-            by_age.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-            let excess = self.discovery_pr_tags.len() - MAX_DISCOVERY_PR_TAGS;
-            for (tag, _) in by_age.into_iter().take(excess) {
-                self.discovery_pr_tags.remove(&tag);
-            }
+            self.discovery_pr_tags_prev = std::mem::take(&mut self.discovery_pr_tags);
         }
 
         self.process_pending_discovery_path_requests(now);
@@ -786,22 +775,39 @@ mod cleanup_tests {
     }
 
     #[test]
-    fn discovery_pr_tags_capped_at_max() {
+    fn discovery_pr_tags_rotate_only_above_threshold_and_keep_previous_generation() {
         let (mut actor, _tx) = TransportActor::new();
-        let now = crate::now_f64();
-        // All inside PATH_REQUEST_GATE_TIMEOUT, so only the count cap trims.
-        for i in 0..=MAX_DISCOVERY_PR_TAGS {
+        for i in 0..MAX_DISCOVERY_PR_TAGS {
             let tag = (i as u64).to_be_bytes().to_vec();
-            actor.discovery_pr_tags.insert(tag, now - (i as f64) * 1e-4);
+            actor.discovery_pr_tags.insert(tag);
         }
-        assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS + 1);
-
         actor.on_tick();
-
         assert_eq!(actor.discovery_pr_tags.len(), MAX_DISCOVERY_PR_TAGS);
-        let oldest = (MAX_DISCOVERY_PR_TAGS as u64).to_be_bytes().to_vec();
-        assert!(!actor.discovery_pr_tags.contains_key(&oldest));
-        let newest = 0u64.to_be_bytes();
-        assert!(actor.discovery_pr_tags.contains_key(newest.as_slice()));
+        assert!(actor.discovery_pr_tags_prev.is_empty());
+        actor.discovery_pr_tags.insert(vec![0xFF; 32]);
+        actor.on_tick();
+        assert!(actor.discovery_pr_tags.is_empty());
+        assert_eq!(
+            actor.discovery_pr_tags_prev.len(),
+            MAX_DISCOVERY_PR_TAGS + 1
+        );
+        // Idle maintenance does not age out or refresh the previous set.
+        actor.on_tick();
+        assert_eq!(
+            actor.discovery_pr_tags_prev.len(),
+            MAX_DISCOVERY_PR_TAGS + 1
+        );
+        for i in 0..=MAX_DISCOVERY_PR_TAGS {
+            let mut tag = vec![1];
+            tag.extend_from_slice(&(i as u64).to_be_bytes());
+            actor.discovery_pr_tags.insert(tag);
+        }
+        actor.on_tick();
+        assert!(actor.discovery_pr_tags.is_empty());
+        assert_eq!(
+            actor.discovery_pr_tags_prev.len(),
+            MAX_DISCOVERY_PR_TAGS + 1
+        );
+        assert!(!actor.discovery_pr_tags_prev.contains(&vec![0xFF; 32]));
     }
 }

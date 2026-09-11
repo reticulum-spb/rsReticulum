@@ -817,3 +817,46 @@ fixtures нет. Неправильный ID для локальной destinati
 Этап 4 ещё частичный: ротация PR tags, дополнительные dispatch-time violation
 sites и оставшаяся traffic-flow статистика. Этапы 5–7 и итоговая интеграция
 не завершены; версия не менялась.
+
+## Этап 4 — два поколения discovery PR tags
+
+Временная HashMap с 120-second expiry и сортировкой/обрезкой до 32000
+заменена на два HashSet: discovery_pr_tags и discovery_pr_tags_prev.
+Проверка повтора учитывает оба множества до ingress sample/inflight gate;
+повтор не обновляет историю и не переносится в текущее поколение.
+
+На maintenance при current.len() >16000 предыдущее поколение заменяется
+текущим целиком, current становится пустым (`mem::take`). При ровно 16000
+и при idle ticks ротации нет. Это Python Transport.py:193–195,850–853,
+1849–1852, без TTL и без oldest-first eviction. Размер между обслуживающими
+проходами может превышать порог; 16000 не выдаётся за жёсткий per-insertion
+cap. Старое поколение освобождается при замене. Сортировка истории удалена.
+
+Shared-state reset и DropPathTable сохраняют оба поколения, как прежняя Rust
+история и фактический Python lifecycle. Inflight timeout 45 секунд, discovery
+waiters и обработка tagless/overlong PR не менялись. Старый constant
+DISCOVERY_PR_TAG_RETENTION удалён; MAX_DISCOVERY_PR_TAGS теперь означает
+порог 16000, а не ошибочно описанный hard cap.
+
+Проверки:
+
+- Unit tests покрывают 16000/16001, сохранение поколения на idle tick,
+  замену старого поколения при второй ротации, отсутствие promotion при
+  повторе, lifecycle reset и повторный допуск забытого tag.
+- `cargo test -p rns-transport --lib path_request_tag_generations_match_python -- --ignored --nocapture`:
+  passed. 32012 операций admission/maintenance сверены с AST оригинальных
+  Python tag admission и rotation, включая превышение порога до tick и
+  повтор из previous. Inflight gate в тесте сбрасывается отдельно для
+  изоляции tag semantics. RNS runtime не импортируется/не запускается;
+  Python 3.11 с `-B`, эталонный checkout не изменён.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  451 passed, 3 ignored.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  4 ignored; повтор с loopback-разрешением после sandbox PermissionDenied.
+- `cargo fmt --all -- --check` и `git diff --check`: успешно.
+- Workspace all-targets, runtime client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` собираются; новых warnings нет.
+
+Этап 4 остаётся частичным: дополнительные dispatch-time violation sites,
+оставшаяся traffic-flow статистика и итоговая проверка смешанной нагрузки.
+Этапы 5–7 и финальная интеграция ещё не завершены; версия не менялась.

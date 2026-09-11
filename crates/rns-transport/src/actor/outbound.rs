@@ -369,13 +369,13 @@ impl TransportActor {
         let mut unique_tag = Vec::with_capacity(32);
         unique_tag.extend_from_slice(&requested_dest);
         unique_tag.extend_from_slice(tag);
-        if let Some(last) = self.discovery_pr_tags.get(&unique_tag) {
-            if now - last < DISCOVERY_PR_TAG_RETENTION {
-                trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
-                return None;
-            }
+        if self.discovery_pr_tags.contains(&unique_tag)
+            || self.discovery_pr_tags_prev.contains(&unique_tag)
+        {
+            trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
+            return None;
         }
-        self.discovery_pr_tags.insert(unique_tag, now);
+        self.discovery_pr_tags.insert(unique_tag);
 
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
             entry.ingress.received_path_request();
