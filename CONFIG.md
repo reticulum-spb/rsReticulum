@@ -476,6 +476,14 @@ At least one of `listen_port` and `forward_port` is required.
 
 ## `type: backbone`
 
+TX combines already queued HDLC frames into encoded batches of at most 64 KiB,
+processing at most 64 frames per batch. It does not wait for more traffic to
+fill a batch. Large frames span batches without changing wire framing. TX byte
+counters include framing and count bytes accepted by the socket, including
+partial writes, not confirmed remote delivery. The encoded batch limit is not
+a byte limit for the existing packet-count-bounded input queues. Adaptive
+backpressure and stalled-peer timeouts are not implemented yet.
+
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `listen_on` | string or null | `null` | Optional listen address. |

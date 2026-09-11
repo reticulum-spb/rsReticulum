@@ -161,19 +161,122 @@ async fn backbone_read_loop(
     online.store(false, Ordering::SeqCst);
 }
 
-async fn backbone_write_loop(
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
+// Python TransmitBuffer.COALESCE_TARGET. Unlike the Python chunk queue, only
+// one bounded encoded batch is held here; the existing mpsc provides backlog.
+const TX_COALESCE_TARGET: usize = 65536;
+const TX_COALESCE_FRAMES: usize = 64;
+
+#[cfg(test)]
+#[path = "backbone_tx_tests.rs"]
+mod tx_tests;
+
+struct TxFrame {
+    raw: Bytes,
+    offset: usize,
+    started: bool,
+}
+
+impl TxFrame {
+    fn new(raw: Bytes) -> Self {
+        Self {
+            raw,
+            offset: 0,
+            started: false,
+        }
+    }
+
+    /// Append as much as fits, retaining state even across an escaped byte
+    /// boundary or a final delimiter. No frame-sized encoded allocation.
+    fn append(&mut self, out: &mut Vec<u8>) -> bool {
+        if !self.started {
+            if out.len() == TX_COALESCE_TARGET {
+                return false;
+            }
+            out.push(hdlc::FLAG);
+            self.started = true;
+        }
+        while self.offset < self.raw.len() {
+            // Copy ordinary runs together instead of pushing each byte. Limit
+            // the scan to this batch so a large frame is never rescanned.
+            let available = TX_COALESCE_TARGET - out.len();
+            let end = self.raw.len().min(self.offset + available);
+            let run = &self.raw[self.offset..end];
+            let plain = run
+                .iter()
+                .position(|&byte| byte == hdlc::FLAG || byte == hdlc::ESC)
+                .unwrap_or(run.len());
+            out.extend_from_slice(&run[..plain]);
+            self.offset += plain;
+            if self.offset == self.raw.len() {
+                break;
+            }
+            if out.len() == TX_COALESCE_TARGET {
+                return false;
+            }
+            let byte = self.raw[self.offset];
+            if TX_COALESCE_TARGET - out.len() < 2 {
+                return false;
+            }
+            out.push(hdlc::ESC);
+            out.push(byte ^ hdlc::ESC_MASK);
+            self.offset += 1;
+        }
+        if out.len() == TX_COALESCE_TARGET {
+            return false;
+        }
+        out.push(hdlc::FLAG);
+        true
+    }
+}
+
+async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin>(
+    mut writer: W,
     mut rx: mpsc::Receiver<Bytes>,
     online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
 ) {
-    while let Some(data) = rx.recv().await {
-        let framed = hdlc::frame(&data);
-        txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
-        if let Err(e) = writer.write_all(&framed).await {
-            tracing::warn!(error = %e, "backbone write error");
-            break;
+    let mut pending: Option<TxFrame> = None;
+    let mut batch = Vec::with_capacity(TX_COALESCE_TARGET);
+    'transmit: loop {
+        if pending.is_none() {
+            let Some(raw) = rx.recv().await else { break };
+            pending = Some(TxFrame::new(raw));
         }
+        batch.clear();
+        for _ in 0..TX_COALESCE_FRAMES {
+            if !pending.as_mut().unwrap().append(&mut batch) {
+                break;
+            }
+            pending = None;
+            if batch.len() == TX_COALESCE_TARGET {
+                break;
+            }
+            // Never wait for another frame: sparse traffic is sent immediately.
+            match rx.try_recv() {
+                Ok(raw) => pending = Some(TxFrame::new(raw)),
+                Err(_) => break,
+            }
+        }
+        let mut sent = 0;
+        while sent < batch.len() {
+            match writer.write(&batch[sent..]).await {
+                Ok(0) => {
+                    tracing::warn!("backbone write returned zero");
+                    break 'transmit;
+                }
+                Ok(written) => {
+                    sent += written;
+                    txb.fetch_add(written as u64, Ordering::Relaxed);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "backbone write error");
+                    break 'transmit;
+                }
+            }
+        }
+        // A ready writer and a permanently full input must still yield to peers.
+        tokio::task::yield_now().await;
     }
     online.store(false, Ordering::SeqCst);
 }

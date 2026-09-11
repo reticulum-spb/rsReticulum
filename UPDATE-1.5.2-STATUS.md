@@ -1226,3 +1226,40 @@ traffic counters/rates, actor/storage и ограниченная межпроц
 Это позволяет продолжить этап 5 без дальнейшего расширения входящих очередей
 задачами глобальной диагностики. Полный паритет 1.5.2 и финальная интеграция
 не заявляются; версия и пользовательский план остаются неизменными.
+
+### Этап 5 — ограниченное объединение TX-записей Backbone
+
+Первый участок этапа 5: общий writer клиента и принятых соединений Backbone
+объединяет уже готовые кадры в encoded buffer до 65536 bytes (Python
+TransmitBuffer.COALESCE_TARGET), до 64 кадров за batch. Ожидания заполнения
+нет; после отправки batch writer уступает выполнение другим задачам.
+Крупные кадры кодируются частями с сохранением cursor и HDLC delimiters;
+обычные последовательности байтов копируются целиком. Отдельная allocation
+полного escaped frame больше не нужна. Существующие входные mpsc queues
+ограничены числом пакетов, не суммарным объёмом: лимит 64 KiB относится
+только к encoded batch и не означает общего ограничения памяти интерфейса.
+
+TX counter обновляется по каждому успешному write, включая частичный.
+Interrupted повторяется, zero write/error завершает writer; незаписанный
+остаток больше не засчитывается. Это принятые socket bytes с framing, не
+подтверждение доставки peer и не изменение actor control-traffic counters.
+
+Проверки:
+
+- `cargo test -p rns-interface --lib --quiet`: 184 passed, 1 ignored,
+  с разрешением локальных сокетов. Целевые Backbone tests: 15 passed,
+  1 ignored; sandbox EPERM в loopback-тесте устранён разрешённым повтором.
+- Пять новых обычных тестов: bounded chunks и точное совпадение с прежним
+  HDLC encoder до 1 MiB escaped input; batching готовых кадров; порядок
+  больших/малых кадров при fragmented writes; Interrupted/error/zero write
+  и точные counters; остановка/возобновление duplex reader и sparse traffic.
+- `cargo test -p rns-interface --release compare_coalesced_and_legacy_writes -- --ignored --nocapture`:
+  1 passed. На 8192 кадрах по 500 bytes число вызовов записи 8192 → 128,
+  wire bytes совпадают. Один in-memory run: legacy 5.80 ms, новый 6.07 ms.
+  Это не сетевой throughput benchmark и не доказательство ускорения CPU.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно.
+
+Осталось по этапу 5: адаптивный backpressure/пороги и stalled-peer teardown,
+ingress throttling, capabilities/MTU-семантика и связанные diagnostics,
+сетевая многопользовательская нагрузка с медленными peers и измерением памяти.
+Полный Python TransmitBuffer/controller parity этим изменением не заявляется.
