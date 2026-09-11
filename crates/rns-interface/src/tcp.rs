@@ -292,6 +292,16 @@ pub async fn spawn_tcp_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    if config
+        .fixed_mtu
+        .is_some_and(|mtu| mtu < rns_wire::constants::MTU as u32)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TCP fixed MTU must be at least 500 bytes",
+        )
+        .into());
+    }
     let online = Arc::new(AtomicBool::new(false));
     let online2 = online.clone();
     let (tx, rx) = mpsc::channel::<Bytes>(1024);
@@ -602,6 +612,25 @@ pub async fn spawn_tcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fixed_mtu_is_validated_before_client_spawn() {
+        let (tx, _events) = mpsc::channel(1);
+        for mtu in [0, 1, 499] {
+            let mut config = TcpClientConfig::new("invalid", "127.0.0.1", 1);
+            config.fixed_mtu = Some(mtu);
+            assert!(spawn_tcp_client(config, 1, tx.clone()).await.is_err());
+        }
+        // No yield before abort: metadata checks do not open a connection.
+        for mtu in [500, 1064, u32::MAX] {
+            let mut config = TcpClientConfig::new("fixed", "127.0.0.1", 1);
+            config.fixed_mtu = Some(mtu);
+            let handle = spawn_tcp_client(config, 1, tx.clone()).await.unwrap();
+            assert_eq!(handle.mtu, mtu);
+            handle.read_task.abort();
+            let _ = handle.read_task.await;
+        }
+    }
 
     #[test]
     fn test_tcp_client_config() {

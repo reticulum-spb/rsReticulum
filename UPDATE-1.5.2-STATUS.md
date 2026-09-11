@@ -1810,3 +1810,32 @@ Python read_watchdog/process_incoming сверены статически с л�
 runtime client-only tests checks успешны; прежние warnings сохраняются.
 Этап 5 остаётся открытым: capabilities/Link clamp, shared_medium, полная
 диагностика и multi-peer нагрузочные сравнения не завершены. Версия прежняя.
+
+### Этап 5 — проверка границ TCP fixed_mtu и shared-medium hints
+
+В фабрике normalized config устранено unchecked u64→u32 преобразование
+fixed_mtu: значения вне 500..=u32::MAX теперь отвергаются до cast. Ранее
+u32::MAX+1 превращался в нулевой MTU, несмотря на проверку нижней границы.
+Строгая YAML-схема уже использует Option<u32> и отвергает переполнение;
+исправлен именно normalized factory path, а не обход строгого YAML parser.
+Прямой spawn_tcp_client теперь также отвергает fixed_mtu <500 до создания
+задач/соединения; раньше проверка существовала только в конфигурации.
+
+Границы покрыты тестами: factory rejects 0/400/499/u32::MAX+1/u64::MAX,
+driver rejects 0/1/499, оба сохраняют exact 500/1064/u32::MAX. Driver metadata
+проверяется без открытия сокета. Верхняя граница — представимость поля,
+не обещание приёма 4 GiB кадра: TCP deframer limits и Link capability/clamp
+требуют отдельной работы. Явный zero остаётся ошибкой Rust, а не Python
+truthy-config fallback; null/отсутствие настройки сохраняют автоматический MTU.
+
+Сверка shared_medium по всему локальному Python RNS (HEAD ea98db4f, clean)
+обнаружила только объявления: default false; true у UDP, Serial, Pipe,
+KISS/AX25KISS, RNode и соответствующих вариантов. Чтений этого поля в Python
+ядре нет, поэтому не добавлено неиспользуемое Rust поле и не заявлена новая
+transport семантика. Отдельные AUTOCONFIGURE_MTU/FIXED_MTU реально участвуют
+в Link request clamping и next-hop MTU — этот перенос остаётся открытым.
+
+Проверки: целевой interface test — 1 passed; целевой runtime API factory test —
+1 passed. Workspace all-targets, runtime client-only tests и fmt/diff checks
+успешны; прежние warnings сохраняются. Полные suites в этом блоке повторно
+не запускались. Этап 5, версия и пользовательский план остаются без изменений.

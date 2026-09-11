@@ -479,10 +479,13 @@ fn synthesize_tcp_client(
     }
     if let Some(mtu) = section.get_uint("fixed_mtu") {
         // Python TCPInterface.py:112 — fixed MTU below protocol MTU is invalid.
-        if (mtu as usize) < rns_wire::constants::MTU {
+        if !(rns_wire::constants::MTU as u64..=u32::MAX as u64).contains(&mtu) {
             return Err(InterfaceFactoryError::InvalidValue {
                 field: format!("{name}.fixed_mtu"),
-                message: format!("{mtu} is below the protocol MTU of 500"),
+                message: format!(
+                    "{mtu} is outside the supported fixed MTU range 500..={}",
+                    u32::MAX
+                ),
             });
         }
         config.fixed_mtu = Some(mtu as u32);
@@ -1744,11 +1747,25 @@ mod tests {
             _ => panic!("expected TcpClient"),
         }
 
-        client.set("fixed_mtu", "400");
-        assert!(matches!(
-            synthesize_interface("tcp_small_mtu", &client),
-            Err(InterfaceFactoryError::InvalidValue { field, .. }) if field.ends_with("fixed_mtu")
-        ));
+        for mtu in [0, 400, 499, u32::MAX as u64 + 1, u64::MAX] {
+            client.set("fixed_mtu", &mtu.to_string());
+            assert!(
+                matches!(
+                    synthesize_interface("tcp_bad_mtu", &client),
+                    Err(InterfaceFactoryError::InvalidValue { field, .. }) if field.ends_with("fixed_mtu")
+                ),
+                "MTU {mtu} must not wrap or fall below the protocol minimum"
+            );
+        }
+        for mtu in [500, 1064, u32::MAX] {
+            client.set("fixed_mtu", &mtu.to_string());
+            let InterfaceConfig::TcpClient(config) =
+                synthesize_interface("tcp_fixed", &client).unwrap()
+            else {
+                panic!("expected TCP client")
+            };
+            assert_eq!(config.fixed_mtu, Some(mtu));
+        }
 
         let mut server = NormalizedSection::new();
         server.set("type", "TCPServerInterface");

@@ -428,7 +428,7 @@ interfaces:
 | `kiss_framing` | boolean | `false` | Use KISS instead of HDLC framing. |
 | `connect_timeout` | integer | `5` | Initial connection timeout in seconds. |
 | `max_reconnect_tries` | integer or null | `null` | Retry limit; `null` retries indefinitely. |
-| `fixed_mtu` | integer or null | `null` | Fixed MTU, at least `500`. |
+| `fixed_mtu` | integer or null | `null` | Fixed MTU metadata, `500..=4294967295`; does not imply receive-buffer or local Link support for the entire range. |
 
 ## `type: tcp_server`
 
