@@ -3713,6 +3713,8 @@ mod tests {
             (32768, Some(65536), 1024, Some(1024)),
             (32768, None, 65536, None),
             (32768, None, 0, Some(0)),
+            (524288, Some(262144), 524288, Some(262144)),
+            (262144, Some(1196), 262144, Some(1196)),
         ] {
             let (mut actor, _tx) = TransportActor::new();
             actor.is_transport_enabled = true;

@@ -1724,7 +1724,10 @@ pub async fn spawn_auto_interface(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            Some(HW_MTU),
+            None,
+        )),
         name,
         mode,
         direction: InterfaceDirection {
@@ -1746,6 +1749,29 @@ pub async fn spawn_auto_interface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn auto_reports_fixed_link_mtu_independent_of_bitrate() {
+        // Empty NIC whitelist and ephemeral ports: no multicast discovery on
+        // real interfaces. Dropping this test runtime cancels background jobs.
+        let config = AutoInterfaceConfig {
+            devices: Some(Vec::new()),
+            data_port: 0,
+            discovery_port: 0,
+            configured_bitrate: Some(1_000_000_000),
+            ..Default::default()
+        };
+        let (tx, _events) = mpsc::channel(1);
+        let handle = spawn_auto_interface(config, 1, tx, Arc::new(AtomicBool::new(true)))
+            .await
+            .unwrap();
+        assert_eq!(handle.bitrate, 1_000_000_000);
+        assert_eq!(handle.mtu, 1196);
+        assert_eq!(handle.diagnostics.as_ref().unwrap().link_mtu(), Some(1196));
+        handle.online.store(false, Ordering::SeqCst);
+        handle.read_task.abort();
+        let _ = handle.read_task.await;
+    }
 
     #[test]
     fn test_multicast_group_derivation() {

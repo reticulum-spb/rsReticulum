@@ -1875,3 +1875,35 @@ metadata Arc; отдельная live RPC проверка не выполнял
 5 ignored; transport lib (default features) — 459 passed, 4 ignored.
 Workspace all-targets и runtime client-only tests checks успешны; прежние
 warnings сохраняются. Этап 5 остаётся открытым; версия проекта не менялась.
+
+### Этап 5 — Local и Auto Link MTU capabilities
+
+Local server/client/accepted handles теперь сообщают capability 262144 bytes.
+Исправлена прежняя автоматическая оценка 524288: Python Local имеет
+AUTOCONFIGURE_MTU=True, но при обычном старте HW_MTU остаётся 262144;
+__start_local_interface вызывает optimise_mtu только для специального
+_force_shared_instance_bitrate. Rust этот override не реализует. Проверены
+LocalInterface.py и точки инициализации в Reticulum.py, а не только флаг класса.
+
+Local reader использует decoded limit 262144 без IFAC allowance и encoded
+limit вдвое больше. Допустимый полностью escaped boundary frame принимается;
+превышение plain/escaped размера отбрасывается с resynchronisation. Минимальная
+длина кадров и Local diagnostics в этом блоке не менялись. Не смешивать
+interface MTU с прежним local Link cap 500 — последний пока сохранён.
+
+Auto handle сообщает fixed capability 1196 bytes независимо от bitrate.
+Python Auto/AutoPeer имеют FIXED_MTU=True и наследуют этот HW_MTU; Rust пока
+представляет Auto peers общим handle, его архитектура не менялась. Остальные
+существующие Python драйверы не включают AUTOCONFIGURE_MTU/FIXED_MTU;
+Weave — отдельный отсутствующий драйвер, его реализация не добавлялась.
+Для остальных Rust drivers, включая plugins, upgrade остаётся отключённым,
+пока capability не объявлена явно.
+
+Проверки: Local IPC roundtrip сверяет server/client/accepted metadata; новый
+duplex test — escaped boundary, plain/escaped overflow и следующий frame;
+Auto spawn test — configured 1 Gbit/s при fixed 1196, ephemeral UDP ports и
+пустой whitelist NIC (без реального multicast discovery). Transit actor
+matrix дополнена Local 262144 и Auto 1196. Interface lib — 222 passed,
+5 ignored; целевые forwarding tests — 2 passed. Workspace all-targets,
+runtime client-only tests и fmt/diff checks успешны; прежние warnings остаются.
+Этап 5 остаётся открытым; версия и пользовательский план не изменены.

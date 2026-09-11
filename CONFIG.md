@@ -250,15 +250,17 @@ before the proof is returned and agrees with the initiator after validation.
 Offers too small to fit an encrypted payload produce an MDU of zero, not an
 unsigned underflow or the default payload capacity. This is defensive arithmetic,
 not a guarantee that handshake frames fit such a small offered MTU.
-TCP and Backbone now expose negotiable MTU through driver metadata, separately
+TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately
 from the raw receive limit. Transit Link Requests with exactly 64 key bytes plus
 3 signalling bytes retain at most the offered, incoming-interface and outgoing
 negotiable MTU. If the outgoing driver does not expose this capability, nonzero
 MTU signalling is removed. Zero offers and requests without exact signalling
 remain unchanged. Link ID and key material are preserved.
 TCP uses its automatic MTU or explicit `fixed_mtu`; Backbone uses its automatic
-curve (no upgrade below its minimum bitrate). Other drivers are not yet wired
-and conservatively disable transit upgrades. Full nullable hardware MTU,
+curve (no upgrade below its minimum bitrate). Local IPC uses the Python default
+262144 bytes, not the automatic curve's 524288-byte result at 1 Gbit/s; Auto
+advertises its fixed 1196-byte MTU regardless of configured bitrate. Remaining
+drivers conservatively disable transit upgrades. Full nullable hardware MTU,
 next-hop MTU RPC, mode-validation diagnostics and larger local Links remain
 unfinished. Advertising a capability does not remove existing driver RX limits.
 
@@ -466,6 +468,12 @@ At least one of `listen_port` and `forward_port` is required.
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |
 | `port` | integer | `37428` | Local shared-instance port, `1..=65535`. |
+
+Local IPC handles and their Link MTU capability use 262144 bytes. The HDLC
+reader bounds decoded frames to this size without an IFAC allowance; fully
+escaped boundary frames are accepted and oversized frames are discarded.
+This interface MTU is separate from the current 500-byte local Link cap.
+Python's forced shared-instance bitrate/MTU override is not implemented here.
 
 ## `type: i2p`
 

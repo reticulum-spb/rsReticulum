@@ -94,7 +94,9 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
     rxb: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; 8192];
-    let mut deframer = hdlc::HdlcDeframer::new();
+    // Local IPC has no IFAC allowance. Bound decoded data independently from
+    // HDLC expansion, matching the Python default hardware MTU.
+    let mut deframer = hdlc::HdlcDeframer::with_max_decoded_size(LOCAL_MTU as usize);
 
     loop {
         match reader.read(&mut buf).await {
@@ -192,7 +194,10 @@ where
     InterfaceHandle {
         id,
         parent_id,
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            Some(LOCAL_MTU),
+            None,
+        )),
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {
@@ -202,7 +207,7 @@ where
             repeat: false,
         },
         bitrate: 1_000_000_000,
-        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        mtu: LOCAL_MTU,
         online,
         rxb: Some(rxb),
         txb: Some(txb),
@@ -222,7 +227,10 @@ fn server_listener_handle(
     InterfaceHandle {
         id: 0,
         parent_id: None,
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            Some(LOCAL_MTU),
+            None,
+        )),
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {
@@ -232,7 +240,7 @@ fn server_listener_handle(
             repeat: false,
         },
         bitrate: 1_000_000_000,
-        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        mtu: LOCAL_MTU,
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
@@ -561,7 +569,10 @@ pub async fn spawn_reconnecting_local_client(
     Ok(InterfaceHandle {
         id,
         parent_id: None,
-        diagnostics: None,
+        diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
+            Some(LOCAL_MTU),
+            None,
+        )),
         name,
         mode: InterfaceMode::Full,
         direction: InterfaceDirection {
@@ -571,7 +582,7 @@ pub async fn spawn_reconnecting_local_client(
             repeat: false,
         },
         bitrate: 1_000_000_000,
-        mtu: crate::traits::optimise_mtu(1_000_000_000).unwrap_or(LOCAL_MTU),
+        mtu: LOCAL_MTU,
         online,
         rxb: Some(rxb),
         txb: Some(txb),
@@ -583,6 +594,46 @@ pub async fn spawn_reconnecting_local_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn decoded_local_mtu_accepts_escaped_boundary_and_rejects_overflow() {
+        let (reader, mut peer) = tokio::io::duplex(8192);
+        let (tx, mut events) = mpsc::channel(2);
+        let online = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(local_read_loop(
+            reader,
+            1,
+            tx,
+            online,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let payload = vec![hdlc::FLAG; LOCAL_MTU as usize];
+            peer.write_all(&hdlc::frame(&payload)).await.unwrap();
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("boundary")
+            };
+            assert_eq!(packet.raw.as_ref(), payload);
+            for byte in [42, hdlc::ESC] {
+                peer.write_all(&hdlc::frame(&vec![byte; LOCAL_MTU as usize + 1]))
+                    .await
+                    .unwrap();
+            }
+            peer.write_all(&hdlc::frame(b"after oversized frames"))
+                .await
+                .unwrap();
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("resynchronisation")
+            };
+            assert_eq!(packet.raw.as_ref(), b"after oversized frames");
+            peer.shutdown().await.unwrap();
+            assert!(events.recv().await.is_none());
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        result.unwrap();
+    }
 
     fn unique_test_socket_path(prefix: &str) -> String {
         #[cfg(unix)]
@@ -722,6 +773,14 @@ mod tests {
             .await
             .expect("timeout waiting for accepted handle")
             .expect("handle channel closed");
+
+        for handle in [&server_handle, &client_handle, &accepted] {
+            assert_eq!(handle.mtu, 262144);
+            assert_eq!(
+                handle.diagnostics.as_ref().unwrap().link_mtu(),
+                Some(handle.mtu)
+            );
+        }
 
         let payload = Bytes::from_static(b"local ipc test");
         client_handle.tx.send(payload.clone()).await.unwrap();
