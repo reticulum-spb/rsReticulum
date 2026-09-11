@@ -427,6 +427,8 @@ impl Link {
 
         if proof_data.len() == 96 + LINK_MTU_SIZE && proof.signalling.mtu > 0 {
             self.mtu = self.mtu.min(proof.signalling.mtu);
+        } else {
+            self.mtu = self.mtu.min(rns_wire::constants::MTU as u32);
         }
         self.update_mdu();
 
@@ -1660,7 +1662,7 @@ mod tests {
     fn legacy_96_byte_proof_rebalances_with_its_actual_signed_payload() {
         let key = Ed25519PrivateKey::generate();
         let public = key.public_key();
-        let (mut link, request) = Link::new_initiator([0xbb; 16], 4);
+        let (mut link, request) = Link::new_initiator_with_mtu([0xbb; 16], 4, 32768);
         let (_, proof) = Link::new_responder(&request, &key, [0xbb; 16], 1).unwrap();
         let mut legacy = proof[..96].to_vec();
         let mut signed = link.link_id.to_vec();
@@ -1676,6 +1678,10 @@ mod tests {
             .unwrap();
         assert_eq!(link.expected_hops, Some(2));
         assert_eq!(link.state, LinkState::Active);
+        assert_eq!(
+            link.mtu, 500,
+            "legacy proof must not confirm the large offer"
+        );
     }
 
     #[test]

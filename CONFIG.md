@@ -242,8 +242,7 @@ CLI and remote-management display are pending.
 
 ### Local Link MTU negotiation (partial)
 
-Local Links currently retain the base 500-byte MTU cap; larger driver MTUs and
-`fixed_mtu` do not yet enable larger local Link payloads. The responder signs
+Runtime responders currently retain the base 500-byte MTU cap. The responder signs
 the same effective MTU in LRPROOF that it stores locally: a missing or zero
 offer means 500, and a positive offer is capped at 500. Its MDU is computed
 before the proof is returned and agrees with the initiator after validation.
@@ -254,8 +253,15 @@ Library callers can explicitly opt into larger handshakes with
 `Link::new_initiator_with_mtu`, `new_responder_with_mtu` or the external-signer
 variant `new_responder_with_signer_and_mtu`. Explicit interface limits are
 bounded to 500..=2097151; responder proof and MDU use the smaller offered limit.
-The existing constructors and runtime still use 500. These APIs do not discover
+The existing constructors still use 500. These APIs do not discover
 or validate a network path's actual capacity on the caller's behalf.
+Async `LinkSession::open*` and `LinkClient::query` now ask the local actor for
+the next-hop capability before constructing the request. Unknown/invalid
+capabilities fall back to 500. The query, including channel admission, is
+bounded to one second and the caller's remaining budget. A legacy or zero-MTU
+proof reduces the initiator to at most 500. Synchronous preparation remains
+I/O-free and keeps its 500-byte offer. Runtime responder integration and full
+large-packet transport tests are still pending.
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately
 from the raw receive limit. Transit Link Requests with exactly 64 key bytes plus
 3 signalling bytes retain at most the offered, incoming-interface and outgoing

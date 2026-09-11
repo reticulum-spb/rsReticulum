@@ -447,7 +447,25 @@ impl LinkSession {
         public_key: [u8; 64],
         hops: u8,
     ) -> PreparedLinkSession {
-        let (link, request_data) = Link::new_initiator(destination_hash, hops);
+        Self::prepare_on_transport_with_mtu(
+            transport_tx,
+            identity,
+            destination_hash,
+            public_key,
+            hops,
+            rns_wire::constants::MTU as u32,
+        )
+    }
+
+    fn prepare_on_transport_with_mtu(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        identity: Identity,
+        destination_hash: [u8; 16],
+        public_key: [u8; 64],
+        hops: u8,
+        mtu: u32,
+    ) -> PreparedLinkSession {
+        let (link, request_data) = Link::new_initiator_with_mtu(destination_hash, hops, mtu);
         PreparedLinkSession {
             transport_tx,
             identity,
@@ -498,9 +516,22 @@ impl LinkSession {
         hops: u8,
         deadline: Duration,
     ) -> Result<Self, LinkClientError> {
-        Self::prepare_with_public_key(runtime, identity, destination_hash, public_key, hops)
-            .establish(deadline)
-            .await
+        let started = Instant::now();
+        let mtu = discover_link_mtu(&runtime.transport_tx, destination_hash, deadline).await;
+        let remaining = deadline
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(LinkClientError::Timeout("MTU discovery"))?;
+        Self::prepare_on_transport_with_mtu(
+            runtime.transport_tx.clone(),
+            identity,
+            destination_hash,
+            public_key,
+            hops,
+            mtu,
+        )
+        .establish(remaining)
+        .await
     }
 
     pub fn id(&self) -> [u8; 16] {
@@ -1491,7 +1522,9 @@ impl LinkClient {
                 aspect_filter: Some(app_name.to_string()),
             });
 
-        let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
+        let mtu = discover_link_mtu(&self.transport_tx, dest_hash, time_remaining(deadline)?).await;
+        time_remaining(deadline)?;
+        let (mut link, request_data) = Link::new_initiator_with_mtu(dest_hash, hops, mtu);
         let link_id = link.link_id;
 
         // Register link_id as a destination so inbound LRPROOF / Response
@@ -1729,6 +1762,30 @@ async fn wait_for_proof(
 
 // Only used within wait_for_proof's deadline; these in-process queries are
 // deliberately not part of the external control RPC protocol.
+async fn discover_link_mtu(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination: [u8; 16],
+    remaining: Duration,
+) -> u32 {
+    // Bound send and response together, and never consume more than the
+    // caller's remaining budget. Unknown/old actors retain base-MTU behaviour.
+    match timeout(
+        remaining.min(Duration::from_secs(1)),
+        link_transport_query(
+            transport_tx,
+            TransportQuery::GetNextHopMtu { dest: destination },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(TransportQueryResponse::IntResult(value))) => u32::try_from(value)
+            .ok()
+            .filter(|mtu| *mtu >= rns_wire::constants::MTU as u32)
+            .unwrap_or(rns_wire::constants::MTU as u32),
+        _ => rns_wire::constants::MTU as u32,
+    }
+}
+
 async fn link_transport_query(
     transport_tx: &mpsc::Sender<TransportMessage>,
     query: TransportQuery,
@@ -2170,6 +2227,63 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovered_mtu_reaches_prepared_request_with_safe_fallbacks() {
+        for (value, expected) in [
+            (1196, 1196),
+            (262144, 262144),
+            (-1, 500),
+            (0, 500),
+            (499, 500),
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let actor = tokio::spawn(async move {
+                let Some(TransportMessage::Rpc {
+                    query: TransportQuery::GetNextHopMtu { dest },
+                    response_tx,
+                }) = rx.recv().await
+                else {
+                    panic!("MTU query")
+                };
+                assert_eq!(dest, [0xab; 16]);
+                response_tx
+                    .send(TransportQueryResponse::IntResult(value))
+                    .unwrap();
+            });
+            let mtu = discover_link_mtu(&tx, [0xab; 16], Duration::from_secs(1)).await;
+            let prepared = LinkSession::prepare_on_transport_with_mtu(
+                tx,
+                Identity::new(),
+                [0xab; 16],
+                [0xcd; 64],
+                1,
+                mtu,
+            );
+            assert_eq!(prepared.link.mtu, expected);
+            assert_eq!(
+                rns_link::handshake::LinkRequestData::unpack(&prepared.request_data)
+                    .unwrap()
+                    .signalling
+                    .mtu,
+                expected
+            );
+            actor.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mtu_discovery_bounds_blocked_transport_admission() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        let mtu = timeout(
+            Duration::from_secs(1),
+            discover_link_mtu(&tx, [0xab; 16], Duration::from_millis(10)),
+        )
+        .await
+        .expect("query must bound send as well as response");
+        assert_eq!(mtu, 500);
+    }
 
     #[tokio::test]
     async fn failed_establishment_releases_registered_destination() {

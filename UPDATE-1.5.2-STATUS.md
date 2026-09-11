@@ -2113,3 +2113,26 @@ u32::MAX, уменьшение по каждой стороне и fallback500. 
 Link lib — 99 passed, 1 ignored; workspace all-targets и runtime client-only
 tests checks успешны. Прежние warnings сохраняются; этап 5 открыт, версия
 и пользовательский план не менялись.
+
+### Этап 5 — MTU discovery в runtime инициаторе
+
+Async LinkSession::open/open_with_public_key и LinkClient::query запрашивают
+GetNextHopMtu у локального actor до создания Link и используют explicit MTU
+constructor. Unknown, malformed, unsupported и <500 ответы дают fallback500.
+Query ограничен min(1s, remaining budget), включая send в заполненную очередь;
+для open время запроса вычитается из handshake deadline, у LinkClient query
+сохраняется общий absolute deadline. Synchronous prepare остаётся I/O-free
+и предлагает 500. Внешний daemon RPC не используется.
+
+Исправлена совместимость с legacy/zero-MTU proof: после большого offer
+подтверждение без positive MTU уменьшает инициатор до min(offer,500), а не
+оставляет неподтверждённый большой MTU. Подпись проверяется до изменения state.
+Legacy proof test теперь начинает с offer32768 и проверяет downgrade500;
+подрезанный без переподписания modern proof по-прежнему отвергается.
+
+Новые runtime tests проверяют capability→prepared wire offer и fallback
+1196/262144/-1/0/499, а также ограничение ожидания при полном transport channel.
+Runtime API lib — 241 passed, 5 ignored; Link lib — 99 passed, 1 ignored;
+workspace all-targets и runtime client-only tests checks успешны. Прежние
+warnings сохраняются. Runtime responder ещё ограничен 500; полномасштабный
+large-packet transport interop не заявляется. Этап 5 открыт, версия прежняя.
