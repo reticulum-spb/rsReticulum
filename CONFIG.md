@@ -267,8 +267,14 @@ paths, authenticated MTU agreement and in-memory encrypted payloads up to MDU.
 `cargo test -p rns-runtime --test link_mtu_tcp` additionally exercises a real
 loopback TCP driver, actor and responder: MTU 500/1196/262144, full-MDU payloads
 in both directions and receive recovery after oversized frames. The peer uses
-the Rust Link library with an explicit offer; this does not cover async initiator
-discovery, Python large-MTU interop, transit paths or load/RSS benchmarks.
+the Rust Link library with an explicit offer. Running the same test target with
+`-- --include-ignored` also checks a Python 1.5.2 Link initiator against the Rust
+responder over TCP, including signed proof validation and full-MDU data both ways.
+It requires the local reference (`RNS_PYTHON_ROOT`, default `/home/room/src/Reticulum`)
+and Python (`RNS_PYTHON_BIN`, default `/usr/bin/python3.11`). The Python peer uses
+stubbed daemon routing and watchdog services, but actual Link/Packet crypto and
+packing. Rust async initiator discovery, Python responder, transit paths and
+load/RSS benchmarks are not covered by these tests.
 Applications constructing
 LinkRequest events directly must now supply `max_mtu` (500 preserves the old cap).
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately

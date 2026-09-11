@@ -2190,3 +2190,29 @@ fmt/diff check чистые, прежние warnings без изменений.
 инициатор задаёт offer библиотечным API, не использует async MTU discovery.
 Python large-MTU Link interop, transit/multi-peer сценарии и сопоставимые
 throughput/latency/drop/RSS измерения остаются. Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: Python initiator → Rust responder, большой MTU по TCP
+
+В `link_mtu_tcp` добавлен ignored interop test с `link_mtu_peer.py`.
+Python Link создаёт настоящий LINKREQUEST, проверяет подпись Rust LRPROOF,
+выполняет ECDH и отправляет LRRTT; Python Packet шифрует/упаковывает данные.
+Четыре пары offer/cap прежней сетевой матрицы проверяют MTU500/1196/262144,
+равенство MDU у Python и Rust, payload1 и полный MDU в обе стороны.
+Приём/отправка идут через loopback TCP, Rust driver, actor и LinkManager.
+
+Python работает без daemon: routing/hops/first-hop timeout/MTU capability,
+регистрация Link, outbound dispatch и watchdog scheduling подменены тестовыми
+службами. Криптография, формат пакетов, согласование Link и расчёт MDU взяты
+из неизменённого локального эталона ea98db4f. HDLC escape — эталонный helper,
+unescape — те же две замены, что в TCPInterface.read_loop; тестовый socket
+decoder не является полным Python TCP driver. Процесс kill_on_drop, socket
+timeout10s, общий deadline45s; никаких внешних узлов/изменений Python repo.
+
+Запуск: `cargo test -p rns-runtime --test link_mtu_tcp -- --include-ignored`.
+Обычная и client-only сборки: по 2 passed (Rust peer + Python peer, каждый
+с четырьмя MTU случаями). Workspace all-targets check успешен, fmt/diff check
+чистые; прежние warnings сохраняются. CONFIG описывает окружение и границы.
+
+Следующие проверки: Rust initiator → Python responder, async MTU discovery
+по настоящему сетевому пути, transit/multi-peer и сопоставимые нагрузочные
+измерения throughput/latency/drops/RSS. Этап 5 открыт, версия остаётся 1.0.1.
