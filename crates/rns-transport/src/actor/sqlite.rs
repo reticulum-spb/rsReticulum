@@ -897,6 +897,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_classes_drain_and_deliver_through_sqlite_after_inputs_close() {
+        let dir = temp();
+        let (mut actor, input, control) = TransportActor::new_with_control_channel();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        super::super::tests::exercise_all_class_drain(actor, input, control).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_class_load_preserves_sqlite_control_and_shutdown() {
+        let dir = temp();
+        let (mut actor, input, control) = TransportActor::new_with_control_channel();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        super::super::tests::exercise_mixed_class_load(actor, input, control).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn separate_control_channel_survives_sqlite_inbound_flood() {
         let dir = temp();
         let (mut actor, interface_tx, control_tx) = TransportActor::new_with_control_channel();

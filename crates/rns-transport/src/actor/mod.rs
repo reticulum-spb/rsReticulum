@@ -2075,6 +2075,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_classes_drain_and_deliver_after_inputs_close() {
+        let (actor, input, control) = TransportActor::new_with_control_channel();
+        exercise_all_class_drain(actor, input, control).await;
+    }
+
+    pub(super) async fn exercise_all_class_drain(
+        mut actor: TransportActor,
+        input: mpsc::Sender<TransportMessage>,
+        control: mpsc::Sender<TransportMessage>,
+    ) {
+        use crate::link_messages::DestinationEvent;
+        let (mut regular, _regular_rx) = make_test_interface("drain-regular");
+        regular.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, regular);
+        let (limited, _limited_rx) = make_test_interface("drain-limited");
+        actor.interfaces.insert(2, limited);
+        prime_ingress_pr_burst(&mut actor, 2);
+        let (delivery_tx, mut delivery_rx) = mpsc::channel(8);
+        for hash in [[0xD0; 16], [0xD2; 16], [0xD3; 16]] {
+            actor.handle_message(TransportMessage::RegisterDestination {
+                hash,
+                app_name: "test.drain".into(),
+                delivery_tx: Some(delivery_tx.clone()),
+            });
+        }
+        drop(delivery_tx);
+        let (callback_tx, mut callback_rx) = mpsc::channel(8);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: None,
+            receive_path_responses: true,
+            callback_tx,
+        });
+        let (announce, announce_dest) = make_valid_announce("test.drain.all", 0);
+        // Insert in reverse priority order. Both PRs target local destinations,
+        // making dispatch visible without network peers or announce timers.
+        for class in (0..4).rev() {
+            let raw = match class {
+                0 => make_data_packet([0xD0; 16], 0),
+                1 => announce.clone(),
+                _ => {
+                    let base = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+                    let (mut header, _) = rns_wire::header::PacketHeader::unpack(&base).unwrap();
+                    header.flags.destination_type = rns_wire::flags::DestinationType::Plain;
+                    let mut raw = header.pack().unwrap();
+                    raw.extend_from_slice(&make_path_request_payload_with_tag(
+                        [0xD0 + class as u8; 16],
+                        None,
+                        [class as u8; 16],
+                    ));
+                    Bytes::from(raw)
+                }
+            };
+            actor.handle_message(TransportMessage::Inbound(InboundPacket {
+                raw,
+                interface_id: if class == 3 { 2 } else { 1 },
+                rssi: None,
+                snr: None,
+                q: None,
+            }));
+        }
+        assert_eq!(actor.inbound_queues.snapshot().heights, [1; 4]);
+        drop(input);
+        drop(control);
+        tokio::time::timeout(Duration::from_secs(10), actor.run())
+            .await
+            .expect("all-class drain");
+        assert_eq!(
+            callback_rx.try_recv().unwrap().destination_hash,
+            announce_dest
+        );
+        assert!(
+            callback_rx.try_recv().is_err(),
+            "no duplicate announce dispatch"
+        );
+        let mut data = 0;
+        let mut responses = Vec::new();
+        while let Ok(event) = delivery_rx.try_recv() {
+            match event {
+                DestinationEvent::InboundPacket {
+                    interface_id: 1, ..
+                } => data += 1,
+                DestinationEvent::AnnounceRequested(request) => {
+                    assert!(request.path_response);
+                    responses.push((request.attached_interface.unwrap(), request.tag.unwrap()));
+                }
+                other => panic!("unexpected delivery: {other:?}"),
+            }
+        }
+        assert_eq!(data, 1);
+        responses.sort();
+        assert_eq!(responses, vec![(1, vec![2; 16]), (2, vec![3; 16])]);
+    }
+
+    #[tokio::test]
+    async fn mixed_class_load_preserves_control_and_shutdown() {
+        let (actor, input, control) = TransportActor::new_with_control_channel();
+        exercise_mixed_class_load(actor, input, control).await;
+    }
+
+    pub(super) async fn exercise_mixed_class_load(
+        mut actor: TransportActor,
+        input: mpsc::Sender<TransportMessage>,
+        control: mpsc::Sender<TransportMessage>,
+    ) {
+        use crate::inbound_queue::{InboundQueueLimits, InboundQueues};
+        const LIMIT: usize = 4;
+        const LOCAL: [u8; 16] = [0xF1; 16];
+        actor.inbound_queues = InboundQueues::new(InboundQueueLimits::new([LIMIT; 4]).unwrap());
+        let (mut regular, _regular_rx) = make_test_interface("mixed-regular");
+        regular.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, regular);
+        let (limited, _limited_rx) = make_test_interface("mixed-limited");
+        actor.interfaces.insert(2, limited);
+        prime_ingress_pr_burst(&mut actor, 2);
+        let (removable, _removable_rx) = make_test_interface("mixed-removable");
+        actor.interfaces.insert(3, removable);
+        let (delivery_tx, mut delivery_rx) = mpsc::channel(8);
+        actor.handle_message(TransportMessage::RegisterDestination {
+            hash: LOCAL,
+            app_name: "test.mixed".into(),
+            delivery_tx: Some(delivery_tx),
+        });
+        let (callback_tx, mut callback_rx) = mpsc::channel(8);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: None,
+            receive_path_responses: true,
+            callback_tx,
+        });
+        let (announce, announce_dest) = make_valid_announce("test.mixed.load", 0);
+        let packet = move |sequence: u64, class: usize| {
+            let raw = match class {
+                0 => {
+                    let mut raw = make_data_packet(LOCAL, 0).to_vec();
+                    raw.extend_from_slice(&sequence.to_le_bytes());
+                    Bytes::from(raw)
+                }
+                1 => announce.clone(),
+                _ => {
+                    let base = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+                    let (mut header, _) = rns_wire::header::PacketHeader::unpack(&base).unwrap();
+                    header.flags.destination_type = rns_wire::flags::DestinationType::Plain;
+                    let mut raw = header.pack().unwrap();
+                    let mut dest = [class as u8; 16];
+                    dest[..8].copy_from_slice(&sequence.to_le_bytes());
+                    raw.extend_from_slice(&make_path_request_payload_with_tag(dest, None, dest));
+                    Bytes::from(raw)
+                }
+            };
+            TransportMessage::Inbound(InboundPacket {
+                raw,
+                interface_id: if class == 3 { 2 } else { 1 },
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+        };
+        // Deterministic saturation of every admitted class before concurrent
+        // scheduling. Subsequent overflow counts are intentionally not exact.
+        for sequence in 0..=LIMIT as u64 {
+            for class in 0..4 {
+                actor.handle_message(packet(sequence, class));
+            }
+        }
+        assert_eq!(actor.inbound_queues.snapshot().heights, [LIMIT; 4]);
+        assert_eq!(actor.inbound_queues.snapshot().dropped, [1; 4]);
+        for sequence in 5..1029 {
+            for class in 0..4 {
+                input.try_send(packet(sequence, class)).unwrap();
+            }
+        }
+        assert_eq!(input.capacity(), 0);
+        assert_eq!(actor.memory_stats().queued_messages, 4096 + 4 * LIMIT);
+
+        let producer = tokio::spawn(async move {
+            let mut sequence = 1029;
+            loop {
+                for class in 0..4 {
+                    if input.send(packet(sequence, class)).await.is_err() {
+                        return;
+                    }
+                }
+                sequence += 1;
+            }
+        });
+        let task = tokio::spawn(actor.run());
+        async fn query(
+            control: &mpsc::Sender<TransportMessage>,
+            query: TransportQuery,
+        ) -> TransportQueryResponse {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            control
+                .send(TransportMessage::Rpc { query, response_tx })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), response_rx)
+                .await
+                .expect("control query under mixed load")
+                .unwrap()
+        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            // Observe actual admission while producers keep the raw channel
+            // busy, not merely a response issued before any work was done.
+            loop {
+                let TransportQueryResponse::InterfaceStats(stats) =
+                    query(&control, TransportQuery::GetInterfaceStats).await
+                else {
+                    panic!()
+                };
+                let regular = &stats.iter().find(|e| e.id == 1).unwrap().control_traffic;
+                let limited = &stats.iter().find(|e| e.id == 2).unwrap().control_traffic;
+                if regular.arxc > 5 && regular.prxc > 5 && limited.prxc > 5 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(matches!(
+                delivery_rx.recv().await,
+                Some(crate::link_messages::DestinationEvent::InboundPacket {
+                    interface_id: 1,
+                    ..
+                })
+            ));
+            assert_eq!(
+                callback_rx.recv().await.unwrap().destination_hash,
+                announce_dest
+            );
+            for _ in 0..8 {
+                let TransportQueryResponse::InboundQueueStats(Some(stats)) =
+                    query(&control, TransportQuery::GetInboundQueueStats).await
+                else {
+                    panic!()
+                };
+                assert_eq!(stats.capacities, [LIMIT; 4]);
+                assert_eq!(stats.snapshot.total, stats.snapshot.heights.iter().sum());
+                assert!(stats.snapshot.total <= 4 * LIMIT);
+                assert!(stats.snapshot.heights.iter().all(|height| *height <= LIMIT));
+                assert!(stats.snapshot.dropped.iter().all(|drops| *drops >= 1));
+            }
+            control
+                .send(TransportMessage::DeregisterInterface { id: 3 })
+                .await
+                .unwrap();
+            let TransportQueryResponse::InterfaceStats(stats) =
+                query(&control, TransportQuery::GetInterfaceStats).await
+            else {
+                panic!()
+            };
+            assert!(
+                stats.iter().all(|e| e.id != 3),
+                "lifecycle command under load"
+            );
+            assert!(
+                !producer.is_finished(),
+                "shutdown must happen with a live producer"
+            );
+            control.send(TransportMessage::Shutdown).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .expect("mixed-load shutdown")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), producer)
+                .await
+                .expect("producer released after shutdown")
+                .unwrap();
+        })
+        .await
+        .expect("mixed-load scenario deadline");
+    }
+
+    #[tokio::test]
     async fn separate_control_channel_survives_inbound_flood() {
         let (actor, interface_tx, control_tx) = TransportActor::new_with_control_channel();
         exercise_control_during_flood(actor, interface_tx, control_tx).await;

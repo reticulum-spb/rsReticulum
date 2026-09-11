@@ -1017,3 +1017,52 @@ exception/MTU signalling границы. Для композиции требу�
 TX admission не равен физической передаче. Parent aggregation, внешние totals,
 PPS и CLI/remote presentation по-прежнему не объявлены готовыми. Этапы 5–7
 и финальная интеграция не завершены. Версия не менялась, push не выполнялся.
+
+## Этап 4 — смешанная нагрузка и завершение actor
+
+Добавлены два общих сценария, каждый запускается на memory и SQLite backend
+через настоящий async actor loop (четыре новых теста):
+
+- Непрерывная смесь DATA, подписанных ANNOUNCE, PR и ingress-limited PR.
+  До запуска детерминированно заполнены все четыре class queues (по 4 пакета)
+  и проверено по одному overflow drop. Затем заполнен raw channel на 4096
+  сообщений, а отдельная задача продолжает подавать смесь до shutdown.
+  Проверяется не только ответ на предварительно поставленный запрос: RX
+  counters всех control-классов должны вырасти после начала loop, DATA и
+  announce должны дойти до зарегистрированных обработчиков. Восемь повторных
+  queue queries проверяют согласованность total/heights, пределы ёмкости и
+  сохранение drops. Через control channel удаляется третий, не участвующий
+  в генерации интерфейс; последующий query подтверждает удаление. Shutdown
+  выполняется при живом producer, actor завершается, заблокированный sender
+  освобождается. SQLite должен закончить уже принятые storage jobs.
+- Мягкое завершение после закрытия обоих входов: классы ставятся в обратном
+  порядке приоритета, snapshot подтверждает `[1,1,1,1]`. После actor exit
+  проверены одна доставка DATA, один callback announce и два локальных
+  AnnounceRequested для обычного и ingress-limited PR, с правильными tags и
+  attached interfaces. Это проверка обработки очередей, а не только их очистки.
+
+Проверки:
+
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  462 passed, 4 ignored.
+- `cargo test -p rns-transport --lib --quiet`: 443 passed, 3 ignored.
+- Целевые `all_classes_drain` и `mixed_class_load`: по 2 passed; смешанный
+  сценарий дополнительно повторён три раза на обоих backend.
+- `cargo check --workspace --all-targets`, `cargo fmt --all -- --check`,
+  `git diff --check`: успешно; новых production изменений и warnings нет.
+
+Границы проверки: это локальная actor/storage интеграция без socket drivers,
+радио и Python-процессов. Проверены пределы очередей, не RSS всего процесса;
+timeouts (query 10 s, shutdown 15 s, общий сценарий 30 s) обнаруживают
+зависания, но не являются latency SLA/benchmark. Непрерывный DATA по правилам
+strict priority может задерживать низкие классы: fairness не заявляется.
+Lifecycle test удаляет отдельный idle endpoint, а не имитирует физический
+обрыв активного peer. Существующие tests stale registration/очистки waiters
+и таймаутов остаются отдельными проверками.
+
+Actor-level смешанная нагрузка этапа 4 теперь проверена на обоих backend.
+Композиция в Python rnstatus использует глобальные rxs/txs и относится к
+диагностике этапа 7; глобальный учёт/parent aggregation/PPS ещё не перенесены.
+Прежние exception/MTU signalling границы и межпроцессная интеграция остаются
+открытыми, полный этап 4 и обновление до 1.5.2 не объявлены завершёнными.
+Версия и пользовательский план не менялись, push не выполнялся.
