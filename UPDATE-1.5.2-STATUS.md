@@ -2404,3 +2404,41 @@ workspace all-targets, fmt/diff checks успешны. Прежние warnings �
 Память текущего ограниченного двух-peer сценария измерена. Сопоставимый
 before/after baseline, sustained/many-peer fairness и масштабирование памяти
 при росте нагрузки ещё остаются. Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: TCP сравнение старого и текущего TX writer
+
+Добавлен ignored `compare_legacy_and_coalesced_tcp_writers`. Старый цикл взят
+из `git show 7a5747c^:crates/rns-interface/src/backbone.rs`: frame для одного
+сообщения, предучёт txb, write_all. Он воспроизводится только в тесте с теми же
+нынешними HDLC helpers, что и текущий coalescing writer; рабочий driver не менялся.
+
+Одинаковые prefilled bounded queues4096×500 bytes, sequence и HDLC FLAG/ESC
+в payload, wire total4071456 bytes. TCP loopback, NODELAY, requested SO_SNDBUF/
+SO_RCVBUF65536, фактические значения131072/131072 на данном Linux. Два раунда
+AB/BA для каждого режима чтения: continuous и pause100ms + sleep1ms после
+каждого read до8192 bytes. Проверяется весь payload, порядок, число кадров,
+полная длина wire и txb. Join не оставляет detached writer/reader tasks;
+общий deadline30s. Успешные write polls считаются отдельно от OS syscalls.
+
+Debug-результаты двух раундов (один полный запуск8 случаев):
+
+| Получатель | Старый цикл MiB/s | Текущий MiB/s | Write polls старый / текущий |
+| --- | --- | --- | --- |
+| Continuous | 1.172 / 1.182 | 7.330 / 7.325 | 4105 / 64 |
+| Paused/throttled | 1.070 / 1.092 | 1.047 / 1.057 | 4144–4143 / 92 |
+
+Continuous p99 completion: старый1651.740–1665.102ms, текущий265.441–265.599ms.
+Paused/throttled p99: старый1772.365–1807.892ms, текущий1829.687–1848.308ms.
+При медленном чтении throughput не улучшился, текущий вариант немного медленнее.
+Completion отсчитывается от запуска уже заполненной очереди, не от времени
+индивидуального producer enqueue. Результат относится к этому debug/socket
+стенду; managed admission, egress controller, полная старая версия transport и
+сравнение RSS между версиями сюда не входят. Универсальное ускорение не заявляется.
+
+Команда и ограничения добавлены в CONFIG. Проверки: новый benchmark — 1 passed
+(8 случаев); interface lib — 229 passed, 7 ignored; workspace all-targets и
+fmt/diff checks успешны. Прежние warnings сохраняются, Python ea98db4f не изменён.
+
+Изолированное before/after TX writer сравнение выполнено. Whole-pipeline
+сравнение, sustained/many-peer fairness и масштабирование памяти остаются.
+Этап 5 открыт, версия остаётся 1.0.1.

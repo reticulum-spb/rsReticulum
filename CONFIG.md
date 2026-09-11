@@ -686,6 +686,20 @@ driver baseline, not a before/after speedup comparison, production capacity
 estimate or transport-actor ingress/fairness benchmark; build profile, kernel
 buffers and host scheduling affect the results.
 
+For an isolated TCP writer comparison, run
+`cargo test -p rns-interface backbone::tx_tests::compare_legacy_and_coalesced_tcp_writers -- --ignored --exact --nocapture`.
+It recreates the per-frame `write_all` loop from `7a5747c^` alongside the current
+coalescing writer, using the same current HDLC helpers and prefilled bounded
+queues (4096 x 500-byte payloads with extensive escaping). Both use NODELAY and
+the same requested 64 KiB socket buffers; actual OS buffer sizes are printed.
+Two AB/BA rounds cover continuous reading and a 100 ms pause followed by 1 ms
+pauses per read. Every decoded payload and wire-byte total must match.
+Reported completion percentiles start when the prefilled queue is released,
+not at an individual live producer's enqueue time. Positive write polls are not
+an OS syscall count. This compares writer algorithms only: no managed admission,
+adaptive controller or full historical runtime; do not generalise the resulting
+speed ratios to production throughput or all of version 1.5.2.
+
 `cargo test -p rns-runtime --test backbone_ingress_load -- --nocapture` covers
 the actor-facing path separately in `full` builds (Backbone is not part of
 client-only builds). Two real Backbone TCP peers send 4096 unique

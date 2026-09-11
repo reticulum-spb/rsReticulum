@@ -1129,6 +1129,162 @@ async fn compare_coalesced_and_legacy_writes() {
     );
 }
 
+/// Successful nonempty write polls, not OS syscall instrumentation.
+struct CountedSocket {
+    socket: tokio::net::tcp::OwnedWriteHalf,
+    writes: Arc<AtomicU64>,
+}
+
+impl AsyncWrite for CountedSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.socket).poll_write(cx, data);
+        if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
+/// Historical writer algorithm from 7a5747c^, isolated from other old behavior.
+async fn legacy_socket_writer(
+    mut socket: CountedSocket,
+    mut rx: mpsc::Receiver<Bytes>,
+    txb: Arc<AtomicU64>,
+) {
+    while let Some(data) = rx.recv().await {
+        let framed = hdlc::frame(&data);
+        txb.fetch_add(framed.len() as u64, Ordering::Relaxed);
+        socket.write_all(&framed).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated legacy/current TX writer TCP comparison; run alone"]
+async fn compare_legacy_and_coalesced_tcp_writers() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for slow in [false, true] {
+            // Alternate AB/BA so warmup/order does not always favour one writer.
+            for (round, order) in [[false, true], [true, false]].into_iter().enumerate() {
+                for coalesced in order {
+                    compare_tcp_writer_case(coalesced, slow, round).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("TCP writer comparison timed out");
+}
+
+async fn compare_tcp_writer_case(coalesced: bool, slow: bool, round: usize) {
+    const COUNT: usize = 4096;
+    const SIZE: usize = 500;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    socket.set_nodelay(true).unwrap();
+    peer.set_nodelay(true).unwrap();
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(65536)
+        .unwrap();
+    socket2::SockRef::from(&peer)
+        .set_recv_buffer_size(65536)
+        .unwrap();
+    let actual_send_buffer = socket2::SockRef::from(&socket).send_buffer_size().unwrap();
+    let actual_recv_buffer = socket2::SockRef::from(&peer).recv_buffer_size().unwrap();
+    let (tx, rx) = mpsc::channel(COUNT);
+    let mut expected_wire = 0u64;
+    for sequence in 0..COUNT {
+        // Include both HDLC escape bytes, not just an unescaped synthetic frame.
+        let mut raw = vec![hdlc::FLAG; SIZE];
+        raw[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
+        raw[8] = hdlc::ESC;
+        expected_wire += hdlc::frame(&raw).len() as u64;
+        tx.try_send(Bytes::from(raw)).unwrap();
+    }
+    drop(tx);
+    let (_read_half, writer) = socket.into_split();
+    let writes = Arc::new(AtomicU64::new(0));
+    let txb = Arc::new(AtomicU64::new(0));
+    let writer = CountedSocket {
+        socket: writer,
+        writes: writes.clone(),
+    };
+    let started = std::time::Instant::now();
+    let send = async {
+        if coalesced {
+            backbone_write_loop(writer, rx, Arc::new(AtomicBool::new(true)), txb.clone()).await;
+        } else {
+            legacy_socket_writer(writer, rx, txb.clone()).await;
+        }
+    };
+    let receive = async {
+        if slow {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut decoder = hdlc::HdlcDeframer::with_max_decoded_size(SIZE);
+        let mut buffer = [0; 8192];
+        let mut latencies = Vec::with_capacity(COUNT);
+        let mut wire_bytes = 0u64;
+        loop {
+            let n = peer.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            wire_bytes += n as u64;
+            for frame in decoder.feed(&buffer[..n]) {
+                assert!(latencies.len() < COUNT);
+                assert_eq!(frame.len(), SIZE);
+                assert_eq!(
+                    u64::from_be_bytes(frame[..8].try_into().unwrap()),
+                    latencies.len() as u64
+                );
+                assert_eq!(frame[8], hdlc::ESC);
+                assert!(frame[9..].iter().all(|byte| *byte == hdlc::FLAG));
+                latencies.push(started.elapsed());
+            }
+            if slow {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        assert_eq!(latencies.len(), COUNT);
+        assert_eq!(wire_bytes, expected_wire);
+        latencies
+    };
+    // No detached task: cancelling the test drops both sockets and the writer.
+    let (_, latencies) = tokio::join!(send, receive);
+    let elapsed = started.elapsed();
+    assert_eq!(txb.load(Ordering::Relaxed), expected_wire);
+    eprintln!(
+        "tcp_writer_comparison: round={round} mode={} receiver={} frames={COUNT} payload_size={SIZE} wire_bytes={expected_wire} payload_MiB_s={:.3} completion_p50_ms={:.3} completion_p99_ms={:.3} positive_write_polls={} sndbuf={actual_send_buffer} rcvbuf={actual_recv_buffer}; prefilled equal queues, no managed admission or egress controller, not a full-version comparison",
+        if coalesced {
+            "current"
+        } else {
+            "legacy_7a5747c_parent"
+        },
+        if slow {
+            "paused_then_throttled"
+        } else {
+            "draining"
+        },
+        (COUNT * SIZE) as f64 / 1048576.0 / elapsed.as_secs_f64(),
+        latencies[COUNT / 2].as_secs_f64() * 1000.0,
+        latencies[(COUNT - 1) * 99 / 100].as_secs_f64() * 1000.0,
+        writes.load(Ordering::Relaxed)
+    );
+}
+
 /// Linux process readings, unavailable on platforms without procfs.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ProcessMemory {
