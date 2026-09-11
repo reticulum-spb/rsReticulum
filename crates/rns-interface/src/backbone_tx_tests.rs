@@ -5,6 +5,179 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
 #[tokio::test]
+async fn full_transport_fin_and_reset_cancel_unsent_frame() {
+    for reset in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, _writer) = stream.into_split();
+        let (tx, mut events) = mpsc::channel(1);
+        tx.send(TransportMessage::Shutdown).await.unwrap(); // inert channel filler
+        let online = Arc::new(AtomicBool::new(true));
+        let ingress = IngressControl::new();
+        let mut task = tokio::spawn(backbone_read_loop(
+            reader,
+            7,
+            tx,
+            online.clone(),
+            Arc::new(AtomicU64::new(0)),
+            ingress.clone(),
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            peer.write_all(&hdlc::frame(b"unsent~}")).await.unwrap();
+            while ingress.snapshot(7, false).packets == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(events.len(), 1);
+            assert!(!task.is_finished());
+            if reset {
+                socket2::SockRef::from(&peer)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(peer);
+            } else {
+                peer.shutdown().await.unwrap();
+            }
+            (&mut task).await.unwrap();
+            assert!(!online.load(Ordering::SeqCst));
+            assert!(matches!(
+                events.recv().await,
+                Some(TransportMessage::Shutdown)
+            ));
+            assert!(
+                events.recv().await.is_none(),
+                "unsent frame must not leak after close"
+            );
+            assert_eq!(ingress.snapshot(7, false).packets, 0);
+        })
+        .await;
+        if result.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        result.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn full_transport_recovers_without_losing_live_peer_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (reader, _writer) = stream.into_split();
+    let (tx, mut events) = mpsc::channel(1);
+    tx.send(TransportMessage::Shutdown).await.unwrap();
+    let ingress = IngressControl::new();
+    let mut task = tokio::spawn(backbone_read_loop(
+        reader,
+        7,
+        tx,
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicU64::new(0)),
+        ingress.clone(),
+    ));
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut wire = hdlc::frame(b"first~}");
+        wire.extend(hdlc::frame(b"second"));
+        peer.write_all(&wire).await.unwrap();
+        while ingress.snapshot(7, false).packets == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "live reader waits for channel capacity"
+        );
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        for payload in [b"first~}".as_slice(), b"second".as_slice()] {
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("expected frame")
+            };
+            assert_eq!(packet.raw.as_ref(), payload);
+        }
+        peer.shutdown().await.unwrap();
+        (&mut task).await.unwrap();
+        assert!(events.recv().await.is_none());
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn full_transport_client_closes_before_deregistration_can_enqueue() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = BackboneClientConfig::new(
+        "full-transport",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    config.max_reconnect_tries = Some(1);
+    let (tx, mut events) = mpsc::channel(1);
+    tx.send(TransportMessage::Shutdown).await.unwrap();
+    let handle = spawn_backbone_client(config, 77, tx).await.unwrap();
+    let mut task = handle.read_task;
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        while !handle.online.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        peer.write_all(&hdlc::frame(b"blocked")).await.unwrap();
+        let ingress = handle
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .dataplane_ingress()
+            .unwrap();
+        while ingress.snapshot(77, false).packets == 0 {
+            tokio::task::yield_now().await;
+        }
+        peer.shutdown().await.unwrap();
+        while handle.online.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            events.len(),
+            1,
+            "transport remains full throughout socket teardown"
+        );
+        let mut tail = Vec::new();
+        peer.read_to_end(&mut tail).await.unwrap();
+        assert!(tail.is_empty());
+        assert!(
+            !task.is_finished(),
+            "deregistration still awaits the shared channel"
+        );
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::Shutdown)
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: 77 })
+        ));
+        (&mut task).await.unwrap();
+        assert!(handle.tx.is_closed());
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn ungated_fin_still_delivers_buffered_complete_frames() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut peer = TcpStream::connect(listener.local_addr().unwrap())

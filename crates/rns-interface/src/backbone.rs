@@ -122,31 +122,33 @@ fn child_mtu() -> u32 {
         .unwrap_or(rns_wire::constants::MTU as u32)
 }
 
-// Readable payload remains unread while gated. Polling is bounded because
+// Readable payload remains unread while gated or awaiting transport capacity.
+// Polling is bounded because
 // readiness stays asserted for unread data; awaiting ready alone would spin.
-const GATED_CLOSE_POLL: Duration = Duration::from_millis(50);
+const BLOCKED_CLOSE_POLL: Duration = Duration::from_millis(50);
+
+async fn wait_socket_closed(reader: &tokio::net::tcp::OwnedReadHalf) {
+    loop {
+        match reader
+            .ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR)
+            .await
+        {
+            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
+            Err(_) => return,
+            _ => {}
+        }
+        tokio::time::sleep(BLOCKED_CLOSE_POLL).await;
+    }
+}
 
 async fn wait_ingress_or_closed(
     reader: &tokio::net::tcp::OwnedReadHalf,
     ingress: &IngressControl,
 ) -> bool {
-    loop {
-        tokio::select! {
-            biased;
-            _ = ingress.wait_open() => return true,
-            ready = reader.ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR) => {
-                match ready {
-                    Ok(ready) if ready.is_read_closed() || ready.is_error() => return false,
-                    Err(_) => return false,
-                    _ => {},
-                }
-            }
-        }
-        tokio::select! {
-            biased;
-            _ = ingress.wait_open() => return true,
-            _ = tokio::time::sleep(GATED_CLOSE_POLL) => {},
-        }
+    tokio::select! {
+        biased;
+        _ = ingress.wait_open() => true,
+        _ = wait_socket_closed(reader) => false,
     }
 }
 
@@ -200,7 +202,18 @@ async fn backbone_read_loop(
                         snr: None,
                         q: None,
                     });
-                    if transport_tx.send(msg).await.is_err() {
+                    // Preserve ready delivery, including buffered frames before
+                    // normal FIN. If admission is blocked, closure cancels the
+                    // unsent frame instead of retaining a dead reader forever.
+                    let sent = tokio::select! {
+                        biased;
+                        result = transport_tx.send(msg) => result,
+                        _ = wait_socket_closed(&reader) => {
+                            tracing::info!(interface_id, "backbone peer closed while transport admission blocked");
+                            break 'receive;
+                        }
+                    };
+                    if sent.is_err() {
                         tracing::warn!(interface_id, "transport channel closed");
                         online.store(false, Ordering::SeqCst);
                         return;

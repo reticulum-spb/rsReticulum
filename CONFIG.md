@@ -515,8 +515,13 @@ effect; subsequent reads and frame deliveries wait for release. While waiting
 on the gate, reader observes socket close/error readiness without consuming
 payload. With unread data, readiness is rechecked every 50 ms to avoid busy
 polling; gate release wakes it immediately. Closure while gated discards
-pending inbound frames and uses normal disconnect cleanup. Ungated EOF still
-delivers complete buffered frames first. This depends on platform socket
+pending inbound frames and uses normal disconnect cleanup. When transport
+capacity is available, ungated EOF still delivers complete buffered frames
+first. While admission is blocked by a full transport channel, close/error
+cancels the unsent frame and closes the connection; a live peer instead waits
+and resumes delivery when capacity returns. Deregistration notification uses
+the same transport channel and may wait for capacity after socket teardown
+and the offline transition. This depends on platform socket
 readiness support and has been verified on Linux loopback. Multi-peer overload
 benchmarks and ingress diagnostics in RPC/UI are still under validation.
 

@@ -1582,3 +1582,35 @@ transport_tx.send при заполненном raw channel не заменён 
 Итог: interface lib — 202 passed, 3 ignored; workspace all-targets и runtime
 client-only tests checks успешны; fmt/diff checks успешны. Прежние workspace
 warnings сохраняются. Сетевые тесты выполнены с loopback-разрешением.
+
+### Этап 5 — разрыв при заполненном transport-канале
+
+Ожидание `transport_tx.send` в Backbone reader теперь конкурирует с
+наблюдением close/error readiness. Готовая отправка имеет приоритет: если
+канал принимает кадр, buffered complete frames перед обычным FIN сохраняют
+доставку. Если канал полон и peer закрывается, незавершённая отправка
+отменяется, unsent frame/оставшийся read batch освобождаются, reader выходит
+через общий offline/reset/disconnect путь. При живом peer кадр продолжает
+ждать capacity; освобождение канала не приводит к потере или перестановке.
+
+Gate wait и channel wait используют общий wait_socket_closed. Unread bytes
+не извлекаются ради диагностики, повторная проверка постоянно readable socket
+ограничена 50 ms. Это по-прежнему readiness-based Linux-проверенная семантика,
+не универсальная гарантия teardown за 50 ms на любой платформе.
+
+Отдельная граница подтверждена тестом: DeregisterInterface отправляется через
+тот же transport channel. Пока он полон, уведомление и завершение connection
+task могут ждать, но сокет уже закрыт и online=false. После освобождения
+slot доставляется deregistration, task завершается. Не заявляется мгновенное
+завершение всей задачи при навсегда остановленном actor.
+
+Три новых loopback tests (четыре сценария): full channel + FIN/RST отменяют
+unsent frame; живой peer после освобождения capacity доставляет два кадра
+в исходном порядке; реальный Backbone client закрывает сокет до возможности
+enqueue deregistration. Channel filler в тестах не исполняется actor.
+
+Проверки: целевые тесты — 3 passed; interface lib — 205 passed, 3 ignored;
+workspace all-targets, runtime client-only tests check, fmt/diff checks —
+успешны. Прежние warnings сохраняются, сетевые тесты выполнены с разрешением
+loopback. Этап 5 остаётся открытым: multi-peer нагрузочные сравнения,
+MTU/capabilities, служебные кадры и оставшаяся диагностика не завершены.
