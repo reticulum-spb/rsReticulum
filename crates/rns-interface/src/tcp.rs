@@ -188,7 +188,8 @@ async fn tcp_read_loop(
     let mut buf = [0u8; 32768];
 
     if kiss_framing {
-        let mut deframer = kiss::KissDeframer::new();
+        let mut deframer =
+            kiss::KissDeframer::with_max_decoded_size((mtu as usize).saturating_add(64));
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) => {
@@ -196,7 +197,17 @@ async fn tcp_read_loop(
                     break;
                 }
                 Ok(n) => {
-                    for (cmd, frame) in deframer.feed(&buf[..n]) {
+                    let rejected = deframer.oversized_frames();
+                    let frames = deframer.feed(&buf[..n]);
+                    if deframer.oversized_frames() != rejected {
+                        tracing::debug!(
+                            interface_id,
+                            mtu,
+                            dropped = deframer.oversized_frames() - rejected,
+                            "TCP oversized KISS frames rejected"
+                        );
+                    }
+                    for (cmd, frame) in frames {
                         // KissDeframer already strips the port nibble. Python
                         // TCP forwards only nonempty CMD_DATA, never TNC control.
                         if cmd != kiss::CMD_DATA || frame.is_empty() {
@@ -688,30 +699,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hdlc_reader_uses_fixed_mtu_with_escape_and_ifac_allowance() {
-        for fixed_mtu in [None, Some(500), Some(524288)] {
+    async fn tcp_readers_use_fixed_mtu_with_escape_and_ifac_allowance() {
+        for (fixed_mtu, kiss_framing) in [None, Some(500), Some(524288)]
+            .into_iter()
+            .flat_map(|mtu| [false, true].map(move |kiss| (mtu, kiss)))
+        {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut config =
                 TcpClientConfig::new("rx-mtu", "127.0.0.1", listener.local_addr().unwrap().port());
             config.fixed_mtu = fixed_mtu;
+            config.kiss_framing = kiss_framing;
             config.max_reconnect_tries = Some(1);
             let (tx, mut events) = mpsc::channel(8);
             let handle = spawn_tcp_client(config, 9, tx).await.unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let (mut peer, _) = listener.accept().await.unwrap();
                 let limit = handle.mtu as usize + 64;
-                let boundary = vec![hdlc::FLAG; limit];
-                peer.write_all(&hdlc::frame(&boundary)).await.unwrap();
+                let boundary = vec![if kiss_framing { kiss::FEND } else { hdlc::FLAG }; limit];
+                peer.write_all(&frame_for_tcp(&boundary, kiss_framing))
+                    .await
+                    .unwrap();
                 let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
                     panic!("boundary")
                 };
                 assert_eq!(packet.raw.as_ref(), boundary);
-                for byte in [42, hdlc::ESC] {
-                    peer.write_all(&hdlc::frame(&vec![byte; limit + 1]))
+                for byte in [42, if kiss_framing { kiss::FESC } else { hdlc::ESC }] {
+                    peer.write_all(&frame_for_tcp(&vec![byte; limit + 1], kiss_framing))
                         .await
                         .unwrap();
                 }
-                peer.write_all(&hdlc::frame(b"after oversized TCP frames"))
+                peer.write_all(&frame_for_tcp(b"after oversized TCP frames", kiss_framing))
                     .await
                     .unwrap();
                 let Some(TransportMessage::Inbound(packet)) = events.recv().await else {

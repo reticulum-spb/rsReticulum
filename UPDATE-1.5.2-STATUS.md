@@ -1949,3 +1949,29 @@ client-only tests checks успешны; fmt/diff checks успешны. Пре�
 сохраняются. Python command gate сверено статически, отдельный oracle не
 запускался. KISS decoded-MTU limits и точный TCP IFAC allowance ещё открыты;
 local Link cap 500 и версия проекта не менялись. Этап 5 не завершён.
+
+### Этап 5 — TCP KISS decoded-MTU limits
+
+KissDeframer получил opt-in with_max_decoded_size и oversized counter.
+Encoded accumulator ограничен удвоенным decoded limit; command byte и FEND
+не входят в payload. Decoded overflow проверяется на завершённом кадре,
+encoded overflow — при накоплении. Кадр отбрасывается целиком, чтение
+восстанавливается на FEND; reset очищает assembly, сохраняя counter.
+Обычные new() и RawKissDeframer callers сохраняют legacy limit, поэтому
+serial/RNode admin-command пути не переводились на новые ограничения.
+
+TCP KISS использует MTU+64, как HDLC: пока это conservative IFAC allowance,
+точная настройка ещё не передаётся драйверу. Oversized frames debug-логируются
+до transport admission; существующая фильтрация CMD_DATA сохранена.
+Это намеренная адаптация, не буквальное копирование Python TCP KISS parser:
+Python прекращает накапливать payload при HW_MTU и может передать truncated
+prefix, Rust отбрасывает overflow целиком. Допуск IFAC также отличается от
+plain HW_MTU bound этого Python loop. Не заявлена полная parser parity.
+
+Новый deframer test: limits 0/1/500/524352, plain/FEND/FESC payloads,
+fragmented command/data, exact boundary, overflow, reset и recovery. TCP
+loopback matrix расширена на HDLC/KISS × default/fixed500/fixed524288;
+проверяет boundary+IFAC allowance, два overflow варианта, recovery и EOF.
+Interface lib — 225 passed, 5 ignored; workspace all-targets, runtime
+client-only tests и fmt/diff checks успешны. Прежние warnings сохраняются.
+Этап 5 открыт; local Link cap 500, версия и пользовательский план не менялись.

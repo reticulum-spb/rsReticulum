@@ -441,18 +441,20 @@ interfaces:
 | `max_reconnect_tries` | integer or null | `null` | Retry limit; `null` retries indefinitely. |
 | `fixed_mtu` | integer or null | `null` | Fixed MTU metadata, `500..=4294967295`; does not imply receive-buffer or local Link support for the entire range. |
 
-TCP HDLC readers use the handle MTU plus a conservative 64-byte IFAC allowance
+TCP HDLC and KISS readers use the handle MTU plus a conservative 64-byte IFAC allowance
 as the decoded frame limit, permitting twice that many encoded bytes (excluding
 delimiters). Clients use `fixed_mtu` when configured; accepted peers use their
 automatic MTU. Oversized frames are debug-logged and discarded before actor
 admission, then framing resynchronises. The exact IFAC size is not yet passed
-to TCP; KISS still uses its existing deframer limits. This is not an RSS limit
+to TCP. KISS command bytes are excluded from the payload limit. This is not an RSS limit
 or permission to allocate arbitrarily large frames safely.
 
 In TCP KISS mode, only nonempty `CMD_DATA` frames reach transport and RX
 packet/byte counters. The TNC port nibble is ignored; control commands and
-empty frames are discarded. This does not add KISS decoded-MTU bounds or
-change command handling in serial/RNode drivers.
+empty frames are discarded. Serial/RNode deframer limits and command handling
+are unchanged. Unlike Python's older TCP KISS loop, oversized payloads are
+discarded whole instead of forwarding a truncated prefix. The conservative
+IFAC allowance also differs from that loop's plain hardware-MTU bound.
 
 ## `type: tcp_server`
 

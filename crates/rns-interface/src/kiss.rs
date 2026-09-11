@@ -135,6 +135,18 @@ impl KissDeframer {
         }
     }
 
+    /// Limit decoded payload, excluding the command and frame delimiters.
+    pub fn with_max_decoded_size(limit: usize) -> Self {
+        let mut inner = RawKissDeframer::new();
+        inner.max_encoded_size = limit.saturating_mul(2);
+        inner.max_decoded_size = Some(limit);
+        Self { inner }
+    }
+
+    pub fn oversized_frames(&self) -> u64 {
+        self.inner.oversized_frames
+    }
+
     /// Returns complete frames as (command, data) pairs.
     pub fn feed(&mut self, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let mut frames = self.inner.feed(data);
@@ -162,6 +174,9 @@ impl Default for KissDeframer {
 /// commands use the complete byte (`0x50`, `0x62`, `0x84`, ...), so they must
 /// use this deframer instead.
 pub struct RawKissDeframer {
+    max_encoded_size: usize,
+    max_decoded_size: Option<usize>,
+    oversized_frames: u64,
     buffer: Vec<u8>,
     in_frame: bool,
     command: u8,
@@ -172,6 +187,9 @@ pub struct RawKissDeframer {
 impl RawKissDeframer {
     pub fn new() -> Self {
         Self {
+            max_encoded_size: MAX_FRAME_SIZE,
+            max_decoded_size: None,
+            oversized_frames: 0,
             buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
             in_frame: false,
             command: CMD_UNKNOWN,
@@ -192,11 +210,18 @@ impl RawKissDeframer {
                         if !self.buffer.is_empty() {
                             self.unescape_scratch.clear();
                             unescape_into(&self.buffer, &mut self.unescape_scratch);
-                            let frame_data = std::mem::replace(
-                                &mut self.unescape_scratch,
-                                Vec::with_capacity(DEFRAME_BUF_CAPACITY),
-                            );
-                            frames.push((self.command, frame_data));
+                            if self
+                                .max_decoded_size
+                                .is_some_and(|limit| self.unescape_scratch.len() > limit)
+                            {
+                                self.oversized_frames = self.oversized_frames.saturating_add(1);
+                            } else {
+                                let frame_data = std::mem::replace(
+                                    &mut self.unescape_scratch,
+                                    Vec::with_capacity(DEFRAME_BUF_CAPACITY),
+                                );
+                                frames.push((self.command, frame_data));
+                            }
                         }
                         self.buffer.clear();
                     }
@@ -217,7 +242,7 @@ impl RawKissDeframer {
 
     /// Append `chunk` to the in-frame buffer. The first byte after a FEND is
     /// the command byte (consumed separately); subsequent bytes are payload
-    /// up to `MAX_FRAME_SIZE`. Overflow drops the in-progress frame and waits
+    /// up to the encoded limit. Overflow drops the in-progress frame and waits
     /// for the next FEND to resync — matching the previous byte-loop.
     fn append_in_frame(&mut self, chunk: &[u8]) {
         let mut chunk = chunk;
@@ -229,7 +254,8 @@ impl RawKissDeframer {
                 return;
             }
         }
-        if self.buffer.len() + chunk.len() > MAX_FRAME_SIZE {
+        if chunk.len() > self.max_encoded_size.saturating_sub(self.buffer.len()) {
+            self.oversized_frames = self.oversized_frames.saturating_add(1);
             self.buffer.clear();
             self.in_frame = false;
             self.command = CMD_UNKNOWN;
@@ -254,6 +280,42 @@ impl Default for RawKissDeframer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_limit_preserves_command_and_handles_fragmented_overflow() {
+        for limit in [0, 1, 500, 524288 + 64] {
+            for byte in [42, FEND, FESC] {
+                let mut decoder = KissDeframer::with_max_decoded_size(limit);
+                let valid = vec![byte; limit];
+                let mut frames = Vec::new();
+                for chunk in frame_with_command(0x70, &valid).chunks(997) {
+                    frames.extend(decoder.feed(chunk));
+                    assert!(decoder.inner.buffer.len() <= 2 * limit);
+                }
+                if limit == 0 {
+                    assert!(frames.is_empty());
+                } else {
+                    assert_eq!(frames, [(CMD_DATA, valid)]);
+                }
+                assert_eq!(decoder.oversized_frames(), 0);
+                for chunk in frame(&vec![byte; limit + 1]).chunks(7) {
+                    assert!(decoder.feed(chunk).is_empty());
+                    assert!(decoder.inner.buffer.len() <= 2 * limit);
+                }
+                assert_eq!(decoder.oversized_frames(), 1);
+                decoder.feed(&[FEND, CMD_DATA, FESC]);
+                decoder.reset();
+                let before = decoder.oversized_frames();
+                let expected = if limit == 0 {
+                    Vec::new()
+                } else {
+                    vec![(CMD_DATA, vec![42])]
+                };
+                assert_eq!(decoder.feed(&frame(&vec![42; limit.min(1)])), expected);
+                assert_eq!(decoder.oversized_frames(), before);
+            }
+        }
+    }
 
     #[test]
     fn test_escape_unescape_roundtrip() {
