@@ -2244,3 +2244,32 @@ kill_on_drop и task guard ограничивают время жизни рес
 
 Далее: полный async LinkSession open с MTU discovery, transit/multi-peer и
 сопоставимые throughput/latency/drop/RSS измерения. Этап 5 открыт, версия 1.0.1.
+
+### Продолжение этапа 5: полный runtime LinkSession::open по Python announce
+
+Добавлен full-only ignored integration test
+`runtime_session_open_discovers_python_route_and_large_mtu`. Runtime запускается
+штатным init из отдельного временного YAML: share_instance=false, transport=false,
+один loopback TCPClient с fixed_mtu. Python responder отправляет настоящий
+подписанный announce; ключ destination и прямой маршрут узнаются через драйвер
+и actor, без ручной записи в cache/path table и без передачи public key в open.
+
+Тест вызывает публичные LinkSession::open/send/recv. Проверяется capability
+маршрута, wire offer на стороне Python, подписанный handshake и одинаковые
+link_id/MDU. Матрица offer/cap/expected: 32768/500/500, 32768/1196/1196,
+524288/262144/262144, 1196/262144/1196. Payload1 и полный MDU передаются в обе
+стороны. Python Link/Packet остаются эталонными; daemon services и fixed-MTU
+clamp — тестовый адаптер, как в предыдущем interop.
+
+Каждый случай имеет deadline30s и собственный Tokio runtime. Shutdown guard
+срабатывает при выходе/ошибке, child kill_on_drop; задачи останавливаются до
+удаления только эксклюзивно созданного временного каталога конфигурации/storage.
+Эталон Python ea98db4f не изменён.
+
+Полный TCP target с include-ignored: default/full — 4 passed; client-only —
+3 passed (runtime-init тест исключён cfg(full)). Workspace all-targets check
+успешен, fmt/diff check чистые. Прежние warnings сохраняются.
+
+Остаются shared-client session opening, active path-request discovery,
+transit/multi-peer проверки и сопоставимые throughput/latency/drops/RSS
+измерения этапа 5. Этап открыт, версия остаётся 1.0.1.

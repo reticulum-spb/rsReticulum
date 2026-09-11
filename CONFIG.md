@@ -276,9 +276,13 @@ stubbed daemon routing and watchdog services, but actual Link/Packet crypto and
 packing. The Python responder adapter applies a fixed-interface MTU clamp before
 the reference `Link.validate_request`. The Rust initiator test queries the actor's
 next-hop MTU on a seeded direct route and confirms proof binding through the actor;
-it uses the Link library, not `LinkSession::open*`. Full async session opening,
-announce/path discovery, transit paths and load/RSS benchmarks remain outside
-these tests.
+it uses the Link library, not `LinkSession::open*`. With the `full` feature, the
+same target also starts a runtime from temporary YAML and tests public
+`LinkSession::open/send/recv`: a real Python announce supplies the destination
+key and direct route, and the session discovers the configured TCP MTU itself.
+All four MTU cases exchange full-MDU data; runtime tasks stop before temporary
+storage is removed. Shared-client session opening, active path requests,
+transit paths and load/RSS benchmarks remain outside these tests.
 Applications constructing
 LinkRequest events directly must now supply `max_mtu` (500 preserves the old cap).
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately

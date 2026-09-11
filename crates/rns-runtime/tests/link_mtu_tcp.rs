@@ -514,3 +514,144 @@ async fn exercise_python_responder(offer: u32, cap: u32, expected: u32) {
     assert_eq!(report["complete"], true);
     assert!(child.wait().await.unwrap().success());
 }
+
+// A separate Tokio runtime per case lets us stop all runtime-owned background
+// tasks before deleting the isolated config/storage directory.
+#[cfg(feature = "full")]
+#[test]
+#[ignore = "requires Python reference, full runtime and local TCP sockets"]
+fn runtime_session_open_discovers_python_route_and_large_mtu() {
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove owned test directory");
+        }
+    }
+    for (offer, cap, expected) in [
+        (32768, 500, 500),
+        (32768, 1196, 1196),
+        (524288, 262144, 262144),
+        (1196, 262144, 1196),
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "rns-session-mtu-{}",
+            hex::encode(Ed25519PrivateKey::generate().public_key().to_bytes())
+        ));
+        std::fs::create_dir(&path).unwrap();
+        // Only acquire cleanup ownership after exclusive creation succeeds.
+        let directory = Directory(path);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(timeout_case(&directory.0, offer, cap, expected));
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        result.expect("full LinkSession TCP MTU regression timed out");
+    }
+}
+
+#[cfg(feature = "full")]
+async fn timeout_case(
+    directory: &std::path::Path,
+    offer: u32,
+    cap: u32,
+    expected: u32,
+) -> Result<(), tokio::time::error::Elapsed> {
+    timeout(
+        Duration::from_secs(30),
+        exercise_runtime_session(directory, offer, cap, expected),
+    )
+    .await
+}
+
+#[cfg(feature = "full")]
+async fn exercise_runtime_session(
+    directory: &std::path::Path,
+    offer: u32,
+    cap: u32,
+    expected: u32,
+) {
+    use rns_identity::identity::Identity;
+    use rns_runtime::{lifecycle::ShutdownSignal, link_client::LinkSession};
+    use std::sync::{Arc, atomic::AtomicBool};
+    struct Stop(ShutdownSignal);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.trigger();
+        }
+    }
+    let mut child = tokio::process::Command::new(
+        std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+    )
+    .args(["-B", "-c", include_str!("link_mtu_peer.py")])
+    .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+    .arg("responder")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::inherit())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut peer_input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    let hello: serde_json::Value =
+        serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+    let port = u16::try_from(hello["port"].as_u64().unwrap()).unwrap();
+    let dest: [u8; 16] = hex::decode(hello["destination"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    std::fs::write(directory.join("config.yaml"), format!(
+        "reticulum:\n  share_instance: false\n  enable_transport: false\ninterfaces:\n  - type: tcp_client\n    name: Session MTU\n    target_host: 127.0.0.1\n    target_port: {port}\n    fixed_mtu: {offer}\n"
+    )).unwrap();
+    let stop = Stop(ShutdownSignal::new());
+    let handle = rns_runtime::reticulum::init(
+        Some(directory.to_str().unwrap()),
+        Some(directory.join("sockets")),
+        stop.0.clone(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+    .unwrap();
+    let config =
+        serde_json::json!({"offer": offer, "cap": cap, "expected": expected, "announce": true});
+    peer_input
+        .write_all(format!("{config}\n").as_bytes())
+        .await
+        .unwrap();
+    // A real signed announce must populate both the key cache and live path.
+    loop {
+        if matches!(
+            handle
+                .query_transport(TransportQuery::Recall {
+                    destination_hash: dest
+                })
+                .await,
+            Some(TransportQueryResponse::Announce(Some(_)))
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(handle.next_hop_mtu(dest).await, Some(offer));
+    let mut session = LinkSession::open(&handle, Identity::new(), dest, 1, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(report["link_id"], hex::encode(session.id()));
+    assert_eq!(report["mtu"].as_u64(), Some(u64::from(expected)));
+    assert_eq!(report["mdu"].as_u64(), Some(session.mdu() as u64));
+    for length in [1, session.mdu()] {
+        let payload: Vec<u8> = (0..length).map(|i| (i % 256) as u8).collect();
+        session.send(&payload).await.unwrap();
+        assert_eq!(session.recv().await.unwrap(), payload);
+    }
+    let report: serde_json::Value =
+        serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(report["complete"], true);
+    assert!(child.wait().await.unwrap().success());
+    stop.0.trigger();
+    handle.transport_tx.closed().await;
+}

@@ -85,9 +85,12 @@ with connection:
         return pending.popleft()
 
     if responder:
-        request = receive()
-        assert request.packet_type == RNS.Packet.LINKREQUEST
-        assert request.destination_hash == destination.hash
+        if config.get("announce", False):
+            destination.announce()
+        while True:
+            request = receive()
+            if request.packet_type == RNS.Packet.LINKREQUEST and request.destination_hash == destination.hash:
+                break
         assert RNS.Link.mtu_from_lr_packet(request) == offer
         # Adapt the local-destination Transport.py clamp for a fixed-MTU socket.
         # Link.validate_request itself deliberately does not impose interface caps.
