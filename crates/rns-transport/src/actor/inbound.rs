@@ -412,7 +412,15 @@ impl TransportActor {
             let random_seen = existing.has_random_blob(&announce_random_hash);
             let path_timebase = path_timebase_from_random_blobs(existing.random_blobs.iter());
             if header.hops <= existing.hops {
-                !random_seen && announce_emitted > path_timebase
+                (!random_seen && announce_emitted > path_timebase)
+                    || (announce_emitted == path_timebase
+                        && self
+                            .interfaces
+                            .get(&interface_id)
+                            .zip(self.interfaces.get(&existing.interface_id))
+                            .is_some_and(|(candidate, current)| {
+                                candidate.gravity > current.gravity
+                            }))
             } else if existing.is_expired() || announce_emitted > path_timebase {
                 !random_seen
             } else if announce_emitted == path_timebase {
@@ -1104,7 +1112,8 @@ impl TransportActor {
                     // forwarded the request to; a mismatch is either a routing
                     // change or a spoof and must not be relayed.
                     let hops_match = header.hops == expected_hops;
-                    if hops_match && _interface_id == outbound_interface {
+                    let rebalance = !hops_match && !link_entry.validated;
+                    if (hops_match || rebalance) && _interface_id == outbound_interface {
                         if !self.validate_transit_lrproof(raw, header, link_entry) {
                             return;
                         }
@@ -1129,6 +1138,17 @@ impl TransportActor {
                         }
                         if let Some(entry) = self.link_table.get_mut(&header.destination_hash) {
                             entry.validated = true;
+                            if rebalance {
+                                entry.remaining_hops = header.hops;
+                            }
+                        }
+                        // Never mutate routing state before authenticating the
+                        // proof; active/validated links cannot be rebalanced.
+                        if rebalance {
+                            if let Some(path) = self.path_table.get_mut(&destination_hash) {
+                                path.hops = header.hops;
+                            }
+                            self.state_dirty = true;
                         }
                         self.send_to_interface(target_interface, &forwarded);
                         if !self.is_shared_instance {

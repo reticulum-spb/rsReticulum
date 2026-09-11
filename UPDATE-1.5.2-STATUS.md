@@ -39,11 +39,11 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.0 stamp default 16 | Реализовано в `discovery/constants.rs` и runtime | 1, сохранить |
 | 1.4.0 blocked IP ifstats | Отсутствует вместе с механизмом блокировок | 3, 7 |
 | 1.4.0 reduced log noise | Воспроизвести уровни на локальной нагрузке; Rust tracing не требует копирования Python сообщений | 7 |
-| 1.4.1 dynamic rebalance / gravity | Отсутствует: `PathEntry` и выбор announce-пути в `actor/inbound.rs` не содержат gravity/rebalance | 2 |
+| 1.4.1 dynamic rebalance / gravity | Частично: gravity выбирает announce-путь; транзитный LRPROOF корректирует hops после аутентификации. Локальный pending Link и межъязыковые проверки ещё не закрыты | 2 |
 | 1.4.1 set_max_request_size | Отсутствует в Destination и runtime request admission | 6 |
 | 1.4.1 max_response_size | Реализован `link_client.rs:request_with_metadata_limit`, включая Resource advertisement; сегменты проверить | 6, сохранить |
-| 1.4.1 autoconnect mode/gravity/to_internal, default_gravity, interface gravity/to_internal | Отсутствуют в `yaml_config.rs`, runtime autoconnect и transport registration | 2 |
-| 1.4.1 rnstatus gravity display/sort | Отсутствует в CLI и статистике | 7 |
+| 1.4.1 autoconnect mode/gravity/to_internal, default_gravity, interface gravity/to_internal | YAML/normalized/factory/registration, autoconnect defaults, child metadata, RPC и API/UI реализованы; I2P live inheritance не подтверждено | 2 |
+| 1.4.1 rnstatus gravity display/sort | Gravity есть в runtime/local RPC/remote schema; вывод и сортировка CLI ещё не перенесены | 7 |
 | 1.4.1 boundary→boundary/gateway PR | Воспроизвести таблицу переходов `actor/outbound.rs` с recursive/internal flags | 2 |
 | 1.4.1 I2P tasks garbage collection | Python GC причина неприменима к Tokio; прочие minor I2P fixes требуют локального воспроизведения | 5 |
 | 1.4.1 ingress burst active deadlock | Воспроизвести тайминги `ingress.rs` и maintenance без новых announces | 4 |
@@ -180,3 +180,51 @@ reachable_on. Радиометаданные покрыты преобразов
 этим этапом. Полная нагрузочная проверка и этапы 2–7 остаются впереди.
 
 Версия и заявленная совместимость пока не обновлены.
+
+### Этап 2: проверенная конфигурационная и транзитная часть (этап не завершён)
+
+- Добавлены signed `default_gravity` / `gravity`, autoconnect mode/gravity/
+  announces_to_internal и интерфейсный tri-state `announces_to_internal`.
+  Поля проходят YAML↔normalized↔API; интерфейсные значения доступны в форме UI.
+- Configured interface наследует default_gravity, явный 0 его переопределяет.
+  Autoconnect gravity по умолчанию 0 независимо от default_gravity, режим
+  gateway при transport и full иначе. Python positive integer autoconnect
+  announces_to_internal представлен boolean в YAML.
+- Регистрация дочерних соединений наследует gravity через parent metadata;
+  announces_to_internal остаётся None, как в Python TCP/Backbone/Auto/I2P.
+  Проверено на runtime registration; SAM/I2P и радио live не запускались.
+- Выбор announce-пути повторяет Transport.py: gravity разрешает замену при
+  равном timestamp и не большем hops; строго выше gravity, включая signed
+  значения и повтор того же random blob. Свежесть/expiry/unresponsive и
+  подавление отказавшего интерфейса сохраняют свои существующие правила.
+- Source-side announces_to_internal=True разрешает boundary→internal;
+  False/None не запрещают прочие режимы. announces_from_internal=False
+  остаётся отдельным egress-фильтром.
+- Unknown PR с boundary отправляется только в boundary/gateway, если
+  recursive_prs не переопределяет ограничение. Ingress/egress limits сохранены.
+- Транзитный pending Link допускает изменение remaining_hops по LRPROOF
+  только с правильного интерфейса и после проверки подписи. Уже validated
+  Link, неверная подпись и неверный интерфейс не изменяют hops/path.
+- Gravity и announces_to_internal добавлены в transport stats, shared RPC,
+  remote-management schema и Web API. Старые ответы читаются с 0/None.
+
+Проверки:
+
+- `cargo test -p rns-transport --lib --quiet`: 401 passed. Один старый тест
+  запрета boundary→gateway обновлён по Python 1.5.2; новые матрицы gravity,
+  modes и transit proof authentication прошли.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 224 passed,
+  2 ignored. Первый sandbox-прогон: 215 passed, 9 PermissionDenied на
+  loopback-сокетах; повтор с разрешением прошёл полностью.
+- `cargo check --workspace --all-targets`: успешно (старые warnings сохранены).
+- `node --test crates/rns-runtime/web/app.test.js`: exit 0.
+
+- `cargo test -p rns-runtime --features api,serial,rnode-tcp,sqlite-bundled gravity --lib --quiet`: 3 passed.
+- `cargo fmt --all -- --check` и `git diff --check`: успешно.
+
+Остаток этапа 2: перенос authenticated rebalance в локальный pending Link,
+проверка привязки активных Links при смене announce-пути и Python↔Rust
+многоузловые сценарии. I2P server использует placeholder parent ID 0 — нужно
+проверить наследование при нескольких таких серверах отдельно; этот пробел
+не выдаётся за закрытый. Sorting/display rnstatus остаются в этапе 7.
+Текущие route-матрицы основаны на чтении Python 1.5.2, а не на live interop.

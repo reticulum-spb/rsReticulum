@@ -550,6 +550,8 @@ async fn register_shared_interface(
         multipoint: false,
         recursive_prs: false,
         announces_from_internal: true,
+        announces_to_internal: None,
+        gravity: 0,
     };
     transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -586,6 +588,8 @@ fn interface_stats_to_transport_response(
         entries
             .into_iter()
             .map(|entry| InterfaceStatRpcEntry {
+                gravity: entry.gravity,
+                announces_to_internal: entry.announces_to_internal,
                 id: entry.id,
                 name: entry.name,
                 rx_bytes: entry.rx_bytes,

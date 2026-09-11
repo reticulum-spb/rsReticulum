@@ -244,6 +244,8 @@ fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats 
         None
     };
     schema::InterfaceStats {
+        gravity: e.gravity,
+        announces_to_internal: e.announces_to_internal,
         name: e.name.clone(),
         short_name: e.name,
         hash: None,
@@ -328,6 +330,8 @@ mod tests {
     fn status_response_is_python_compatible_list() {
         let stats = schema::TransportStats {
             interfaces: vec![schema::InterfaceStats {
+                gravity: 0,
+                announces_to_internal: None,
                 name: "TestIf".to_string(),
                 short_name: "TestIf".to_string(),
                 hash: None,
@@ -462,6 +466,8 @@ mod tests {
                     let resp = match query {
                         TransportQuery::GetInterfaceStats => {
                             let stats = vec![InterfaceStatRpcEntry {
+                                gravity: -42,
+                                announces_to_internal: Some(true),
                                 id: 1,
                                 name: "MockIf".to_string(),
                                 rx_bytes: 100,

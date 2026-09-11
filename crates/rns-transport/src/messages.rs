@@ -111,6 +111,8 @@ pub struct InterfaceEntry {
     /// when false, this interface does not rebroadcast announces whose
     /// next-hop interface is `InterfaceMode::Internal`.
     pub announces_from_internal: bool,
+    pub announces_to_internal: Option<bool>,
+    pub gravity: i64,
 }
 
 impl InterfaceEntry {
@@ -149,6 +151,8 @@ impl InterfaceEntry {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            announces_to_internal: None,
+            gravity: 0,
         }
     }
 
@@ -597,6 +601,8 @@ pub struct PathTableRpcEntry {
 
 #[derive(Debug, Clone)]
 pub struct InterfaceStatRpcEntry {
+    pub gravity: i64,
+    pub announces_to_internal: Option<bool>,
     pub id: InterfaceId,
     pub name: String,
     pub rx_bytes: u64,

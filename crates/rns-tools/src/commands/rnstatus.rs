@@ -1478,6 +1478,8 @@ mod tests {
         pr_burst_active: bool,
     ) -> rpc::InterfaceStatEntry {
         rpc::InterfaceStatEntry {
+            gravity: 0,
+            announces_to_internal: None,
             id: 1,
             name: name.to_string(),
             rx_bytes: 0,

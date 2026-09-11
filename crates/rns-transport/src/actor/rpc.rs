@@ -63,6 +63,8 @@ impl TransportActor {
                             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(0);
                         InterfaceStatRpcEntry {
+                            gravity: entry.gravity,
+                            announces_to_internal: entry.announces_to_internal,
                             id: iface_id,
                             name: entry.name.clone(),
                             rx_bytes,

@@ -1330,9 +1330,14 @@ impl TransportActor {
         match entry.mode {
             InterfaceMode::AccessPoint => false,
             InterfaceMode::Internal => {
-                // Internal egress relays everything except boundary-origin and
-                // mode-less-origin announces (Transport.py:1228-1236).
+                // Python 1.5.2: an explicit source-side opt-in also permits
+                // boundary-origin announces. False is not a general deny rule.
                 local
+                    || self
+                        .path_table
+                        .get_live(destination_hash)
+                        .and_then(|path| self.interfaces.get(&path.interface_id))
+                        .is_some_and(|source| source.announces_to_internal == Some(true))
                     || !matches!(
                         from_iface_mode,
                         Some(None) | Some(Some(InterfaceMode::Boundary))
@@ -1912,6 +1917,8 @@ mod tests {
             multipoint: false,
             recursive_prs: false,
             announces_from_internal: true,
+            announces_to_internal: None,
+            gravity: 0,
             ingress: crate::ingress::IngressController::new(),
             announce_queue: Vec::new(),
         };
@@ -4165,6 +4172,208 @@ mod tests {
             Some(1),
             "replayed announces must not refresh rebroadcast state"
         );
+    }
+
+    #[test]
+    fn gravity_route_selection_matches_python_152() {
+        // Python Transport.inbound: same timestamp + no more hops permits a
+        // strictly higher gravity, including the exact same random blob.
+        for (hops, gravity, timestamp, accepted) in [
+            (3, -9, 100, true),
+            (1, -9, 100, true),
+            (3, -10, 100, false),
+            (1, -11, 100, false),
+            (4, 1000, 100, false),
+            (1, 1000, 99, false),
+            (4, -100, 101, true),
+            (1, -100, 101, true),
+        ] {
+            let (mut actor, _tx) = TransportActor::new();
+            let (mut first, _rx1) = make_test_interface("first");
+            let (mut candidate, _rx2) = make_test_interface("candidate");
+            first.gravity = -10;
+            candidate.gravity = gravity;
+            actor.interfaces.insert(1, first);
+            actor.interfaces.insert(2, candidate);
+            let identity = rns_identity::identity::Identity::new();
+            let (raw, dest) = make_announce_for_with_random_blob(
+                &identity,
+                "test.gravity",
+                3,
+                random_blob(1, 100),
+            );
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            let (raw, _) = make_announce_for_with_random_blob(
+                &identity,
+                "test.gravity",
+                hops,
+                random_blob(1, timestamp),
+            );
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: 2,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            let path = actor.path_table.get(&dest).unwrap();
+            assert_eq!(
+                path.interface_id,
+                if accepted { 2 } else { 1 },
+                "hops={hops} gravity={gravity} timestamp={timestamp}"
+            );
+            assert_eq!(path.hops, if accepted { hops + 1 } else { 4 });
+        }
+    }
+
+    #[test]
+    fn announces_to_internal_mode_matrix() {
+        for source_mode in [
+            InterfaceMode::Full,
+            InterfaceMode::PointToPoint,
+            InterfaceMode::AccessPoint,
+            InterfaceMode::Roaming,
+            InterfaceMode::Boundary,
+            InterfaceMode::Gateway,
+            InterfaceMode::Internal,
+        ] {
+            for opt_in in [None, Some(false), Some(true)] {
+                let (mut actor, _tx) = TransportActor::new();
+                let (mut source, _rx1) = make_test_interface("source");
+                source.mode = source_mode;
+                source.announces_to_internal = opt_in;
+                let (mut target, _rx2) = make_test_interface("internal");
+                target.mode = InterfaceMode::Internal;
+                actor.interfaces.insert(1, source);
+                actor.interfaces.insert(2, target);
+                let dest = [1; 16];
+                actor.path_table.insert(
+                    dest,
+                    crate::path_table::PathEntry::new(None, 1, 1, source_mode),
+                );
+                assert_eq!(
+                    actor.interface_allows_announce(2, &dest, Some(1)),
+                    source_mode != InterfaceMode::Boundary || opt_in == Some(true)
+                );
+                actor
+                    .interfaces
+                    .get_mut(&2)
+                    .unwrap()
+                    .announces_from_internal = false;
+                if source_mode == InterfaceMode::Internal {
+                    assert!(!actor.interface_allows_announce(2, &dest, Some(1)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_path_request_search_mode_matrix() {
+        for recursive in [false, true] {
+            for target_mode in [
+                InterfaceMode::Full,
+                InterfaceMode::PointToPoint,
+                InterfaceMode::AccessPoint,
+                InterfaceMode::Roaming,
+                InterfaceMode::Boundary,
+                InterfaceMode::Gateway,
+                InterfaceMode::Internal,
+            ] {
+                let (mut actor, _tx) = TransportActor::new();
+                actor.is_transport_enabled = true;
+                let (mut source, mut source_rx) = make_test_interface("boundary");
+                source.mode = InterfaceMode::Boundary;
+                source.recursive_prs = recursive;
+                let (mut target, mut target_rx) = make_test_interface("target");
+                target.mode = target_mode;
+                actor.interfaces.insert(1, source);
+                actor.interfaces.insert(2, target);
+                actor.handle_inbound_path_request(&make_path_request_payload([0x62; 16], None), 1);
+                assert_eq!(
+                    target_rx.try_recv().is_ok(),
+                    recursive
+                        || matches!(
+                            target_mode,
+                            InterfaceMode::Boundary | InterfaceMode::Gateway
+                        ),
+                    "{target_mode:?} recursive={recursive}"
+                );
+                assert!(source_rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn transit_lrproof_rebalance_requires_authentication_and_pending_link() {
+        for (valid_signature, incoming_interface, validated, accepted) in [
+            (true, 2, false, true),
+            (false, 2, false, false),
+            (true, 1, false, false),
+            (true, 2, true, false),
+        ] {
+            let (mut actor, _tx) = TransportActor::new();
+            actor.is_transport_enabled = true;
+            let (first, mut rx) = make_test_interface("initiator");
+            let (second, _rx2) = make_test_interface("destination");
+            actor.interfaces.insert(1, first);
+            actor.interfaces.insert(2, second);
+            let link_id = [0x77; 16];
+            let destination_hash = [0xcc; 16];
+            let identity = rns_identity::identity::Identity::new();
+            let wrong_identity = rns_identity::identity::Identity::new();
+            insert_announce_for(&mut actor, destination_hash, &identity);
+            actor.path_table.insert(
+                destination_hash,
+                crate::path_table::PathEntry::new(None, 1, 2, InterfaceMode::Full),
+            );
+            actor.link_table.insert(
+                link_id,
+                crate::link_table::LinkEntry {
+                    timestamp: now_f64(),
+                    next_hop: None,
+                    interface_id: 2,
+                    remaining_hops: 1,
+                    destination_hash,
+                    established: validated,
+                    validated,
+                    proof_timeout: now_f64() + 120.0,
+                    receiving_interface: 1,
+                    taken_hops: 0,
+                },
+            );
+            let raw = make_lrproof_packet(
+                link_id,
+                2,
+                if valid_signature {
+                    &identity
+                } else {
+                    &wrong_identity
+                },
+                Some([1, 0, 0]),
+            );
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: incoming_interface,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            assert_eq!(rx.try_recv().is_ok(), accepted);
+            assert_eq!(
+                actor.link_table.get(&link_id).unwrap().remaining_hops,
+                if accepted { 3 } else { 1 }
+            );
+            assert_eq!(
+                actor.path_table.get(&destination_hash).unwrap().hops,
+                if accepted { 3 } else { 1 }
+            );
+        }
     }
 
     #[test]
@@ -8162,7 +8371,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_path_request_only_forwards_from_discovery_modes() {
+    fn boundary_and_gateway_discover_unknown_paths_through_each_other() {
         let (mut actor, _tx) = TransportActor::new();
         actor.is_transport_enabled = true;
 
@@ -8175,8 +8384,8 @@ mod tests {
 
         actor.handle_inbound_path_request(&make_path_request_payload([0x11; 16], None), 1);
         assert!(
-            gateway_rx.try_recv().is_err(),
-            "boundary interfaces should not trigger recursive unknown path discovery"
+            gateway_rx.try_recv().is_ok(),
+            "Python 1.5.2 permits boundary-to-gateway discovery"
         );
 
         actor.handle_inbound_path_request(&make_path_request_payload([0x22; 16], None), 2);

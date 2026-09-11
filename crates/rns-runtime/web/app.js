@@ -1020,6 +1020,8 @@ async function openInterfaceDialog(item = null) {
     Boolean(config.i2p_tunneled);
   setBackboneRole(backboneRole);
   setField("#advanced-bitrate", config.bitrate);
+  setField("#advanced-gravity", config.gravity);
+  setField("#advanced-announces-to-internal", config.announces_to_internal);
   for (const input of document.querySelectorAll("[data-discovery-field]")) {
     const value = config[input.dataset.discoveryField];
     if (input.type === "checkbox") input.checked = value === true;
@@ -1249,6 +1251,8 @@ async function requestSystemAction(action) {
 }
 
 function addAdvancedOptions(payload) {
+  const toInternal = document.querySelector("#advanced-announces-to-internal").value;
+  if (toInternal !== "") payload.announces_to_internal = toInternal === "true";
   for (const input of document.querySelectorAll("[data-discovery-field]")) {
     const key = input.dataset.discoveryField;
     if (input.type === "checkbox") payload[key] = input.checked;
@@ -1265,6 +1269,7 @@ function addAdvancedOptions(payload) {
     document.querySelector("#advanced-announces-internal").checked;
   for (const [selector, key] of [
     ["#advanced-bitrate", "bitrate"],
+    ["#advanced-gravity", "gravity"],
     ["#advanced-announce-cap", "announce_cap"],
     ["#advanced-rate-target", "announce_rate_target"],
     ["#advanced-rate-grace", "announce_rate_grace"],

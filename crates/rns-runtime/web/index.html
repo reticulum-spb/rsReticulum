@@ -775,6 +775,16 @@
         <label class="check-field"><input id="advanced-outgoing" type="checkbox" checked><span>Outgoing</span></label>
         <label class="check-field"><input id="advanced-recursive-prs" type="checkbox"><span>Recursive path requests</span></label>
         <label class="check-field"><input id="advanced-announces-internal" type="checkbox" checked><span>Announces from internal</span></label>
+        <label>Gravity <span class="optional">default from reticulum</span>
+          <input id="advanced-gravity" type="number" step="1">
+        </label>
+        <label>Announces to internal
+          <select id="advanced-announces-to-internal">
+            <option value="">Default (mode policy)</option>
+            <option value="true">Allow boundary announces</option>
+            <option value="false">False (mode policy)</option>
+          </select>
+        </label>
       </fieldset>
       <fieldset class="form-grid">
         <legend>IFAC</legend>

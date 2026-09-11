@@ -14,6 +14,10 @@ pub const EXAMPLE_CONFIG: &str = r#"# rsReticulum YAML configuration
 reticulum:
   share_instance: true
   enable_transport: false
+  default_gravity: 0
+  # autoconnect_interface_mode: internal
+  # autoconnect_interface_gravity: -10
+  # autoconnect_announces_to_internal: true
 
 logging:
   level: 4
@@ -41,6 +45,8 @@ interfaces:
   - type: tcp_client
     name: TCP Client Interface
     enabled: false
+    # gravity: -10
+    # announces_to_internal: true
     target_host: 127.0.0.1
     target_port: 4242
 "#;
@@ -254,6 +260,20 @@ impl Config {
                 self.reticulum.default_ar_penalty,
             );
             set_opt_num(section, "default_ar_grace", self.reticulum.default_ar_grace);
+            set_num(section, "default_gravity", self.reticulum.default_gravity);
+            set_opt_num(
+                section,
+                "autoconnect_interface_gravity",
+                self.reticulum.autoconnect_interface_gravity,
+            );
+            if let Some(mode) = self.reticulum.autoconnect_interface_mode {
+                section.set("autoconnect_interface_mode", mode_name(mode));
+            }
+            set_bool(
+                section,
+                "autoconnect_announces_to_internal",
+                self.reticulum.autoconnect_announces_to_internal,
+            );
             write_ingress(section, &self.reticulum.ingress);
             if let Some(path) = &self.reticulum.network_identity {
                 section.set("network_identity", &path.to_string_lossy());
@@ -356,6 +376,10 @@ pub struct ReticulumConfig {
     pub default_ar_target: Option<u64>,
     pub default_ar_penalty: Option<u64>,
     pub default_ar_grace: Option<u32>,
+    pub default_gravity: i64,
+    pub autoconnect_interface_mode: Option<InterfaceMode>,
+    pub autoconnect_interface_gravity: Option<i64>,
+    pub autoconnect_announces_to_internal: bool,
     pub ingress: IngressConfig,
     pub network_identity: Option<PathBuf>,
     pub discover_interfaces: bool,
@@ -412,6 +436,10 @@ impl Default for ReticulumConfig {
             default_ar_target: None,
             default_ar_penalty: None,
             default_ar_grace: None,
+            default_gravity: 0,
+            autoconnect_interface_mode: None,
+            autoconnect_interface_gravity: None,
+            autoconnect_announces_to_internal: false,
             ingress: IngressConfig::default(),
             network_identity: None,
             discover_interfaces: false,
@@ -883,6 +911,8 @@ pub struct InterfaceCommonConfig {
     pub ingress: IngressConfig,
     pub recursive_path_requests: bool,
     pub announces_from_internal: bool,
+    pub announces_to_internal: Option<bool>,
+    pub gravity: Option<i64>,
     pub bootstrap_only: bool,
     pub ignore_config_warnings: bool,
     pub discoverable: bool,
@@ -948,6 +978,8 @@ impl Default for InterfaceCommonConfig {
             ingress: IngressConfig::default(),
             recursive_path_requests: false,
             announces_from_internal: true,
+            announces_to_internal: None,
+            gravity: None,
             bootstrap_only: false,
             ignore_config_warnings: false,
             discoverable: false,
@@ -1576,6 +1608,10 @@ fn write_common(
     set_bool(section, "ingress_control", common.ingress_control);
     write_ingress(section, &common.ingress);
     set_bool(section, "recursive_prs", common.recursive_path_requests);
+    set_opt_num(section, "gravity", common.gravity);
+    if let Some(value) = common.announces_to_internal {
+        set_bool(section, "announces_to_internal", value);
+    }
     set_bool(
         section,
         "announces_from_internal",
@@ -1957,6 +1993,8 @@ fn common_from_normalized(
         },
         recursive_path_requests: section.get_bool("recursive_prs").unwrap_or(false),
         announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
+        announces_to_internal: section.get_bool("announces_to_internal"),
+        gravity: section.get_int("gravity"),
         bootstrap_only: section.get_bool("bootstrap_only").unwrap_or(false),
         ignore_config_warnings: section.get_bool("ignore_config_warnings").unwrap_or(false),
         discoverable: section.get_bool("discoverable").unwrap_or(false),
@@ -2050,6 +2088,48 @@ fn validate_radio(name: &str, radio: &RadioConfig) -> Result<(), YamlConfigError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gravity_yaml_roundtrip_and_normalization() {
+        let yaml = "reticulum:\n  default_gravity: -17\n  autoconnect_interface_gravity: -9\n  autoconnect_interface_mode: internal\n  autoconnect_announces_to_internal: true\ninterfaces:\n  - type: auto\n    name: explicit\n    gravity: -42\n    announces_to_internal: false\n  - type: auto\n    name: inherited\n";
+        let config = Config::parse(yaml, "config.yaml").unwrap();
+        assert_eq!(
+            Config::parse(&config.to_yaml().unwrap(), "config.yaml").unwrap(),
+            config
+        );
+        let runtime = config.to_runtime_config().unwrap();
+        let globals = runtime.section("reticulum").unwrap();
+        let runtime_config = crate::reticulum::ReticulumConfig::try_from_config(&runtime).unwrap();
+        assert_eq!(runtime_config.default_gravity, -17);
+        assert_eq!(runtime_config.autoconnect_interface_gravity, Some(-9));
+        assert_eq!(
+            runtime_config.autoconnect_interface_mode,
+            Some(rns_interface::traits::InterfaceMode::Internal)
+        );
+        assert!(runtime_config.autoconnect_announces_to_internal);
+        assert_eq!(globals.get_int("default_gravity"), Some(-17));
+        assert_eq!(globals.get_int("autoconnect_interface_gravity"), Some(-9));
+        assert_eq!(globals.get("autoconnect_interface_mode"), Some("internal"));
+        assert_eq!(
+            globals.get_bool("autoconnect_announces_to_internal"),
+            Some(true)
+        );
+        for (index, name, gravity, internal) in [
+            (0, "explicit", Some(-42), Some(false)),
+            (1, "inherited", None, None),
+        ] {
+            let section = runtime.subsection("interfaces", name).unwrap();
+            let post = crate::interface_factory::InterfacePostInit::from_section(section);
+            assert_eq!(post.gravity, gravity);
+            assert_eq!(post.announces_to_internal, internal);
+            #[cfg(feature = "api")]
+            assert_eq!(
+                interface_from_normalized_section(name, section).unwrap(),
+                config.interfaces[index]
+            );
+            let _ = index;
+        }
+    }
 
     #[test]
     fn discovery_yaml_roundtrip_and_normalization_preserve_publication() {

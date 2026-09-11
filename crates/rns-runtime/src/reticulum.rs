@@ -47,6 +47,7 @@ fn interface_tasks() -> &'static std::sync::Mutex<HashMap<u64, JoinHandle<()>>> 
 
 #[derive(Clone)]
 struct InterfaceControlMetadata {
+    gravity: i64,
     role: rns_transport::messages::InterfaceRole,
     ingress_overrides: rns_transport::ingress::IngressOverrides,
     // Parent IFAC, inherited by accepted child connections (Python parity:
@@ -418,6 +419,8 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .map(|entry| InterfaceStatRpcEntry {
+                    gravity: entry.gravity,
+                    announces_to_internal: entry.announces_to_internal,
                     id: entry.id,
                     name: entry.name,
                     rx_bytes: entry.rx_bytes,
@@ -640,6 +643,10 @@ pub struct ReticulumConfig {
     pub default_ar_target: Option<u64>,
     pub default_ar_penalty: Option<u64>,
     pub default_ar_grace: Option<u32>,
+    pub default_gravity: i64,
+    pub autoconnect_interface_mode: Option<rns_interface::traits::InterfaceMode>,
+    pub autoconnect_interface_gravity: Option<i64>,
+    pub autoconnect_announces_to_internal: bool,
     /// Global Reticulum defaults for per-interface ingress/egress control.
     pub ingress_overrides: rns_transport::ingress::IngressOverrides,
     pub loglevel: i32,
@@ -703,6 +710,10 @@ impl Default for ReticulumConfig {
             default_ar_target: None,
             default_ar_penalty: None,
             default_ar_grace: None,
+            default_gravity: 0,
+            autoconnect_interface_mode: None,
+            autoconnect_interface_gravity: None,
+            autoconnect_announces_to_internal: false,
             ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
             loglevel: 4,
             network_identity_path: None,
@@ -989,6 +1000,15 @@ impl ReticulumConfig {
             }
             rc.autoconnect_discovered_interfaces =
                 parse_autoconnect_limit(sec)?.unwrap_or(rc.autoconnect_discovered_interfaces);
+            rc.default_gravity = config_int("reticulum", sec, "default_gravity")?.unwrap_or(0);
+            rc.autoconnect_interface_gravity =
+                config_int("reticulum", sec, "autoconnect_interface_gravity")?;
+            rc.autoconnect_interface_mode = sec
+                .get("autoconnect_interface_mode")
+                .and_then(interface_factory::parse_interface_mode);
+            rc.autoconnect_announces_to_internal = sec
+                .get_bool("autoconnect_announces_to_internal")
+                .unwrap_or(false);
             if let Some(v) = config_uint("reticulum", sec, "required_discovery_value")?.or(
                 config_uint("reticulum", sec, "discover_interfaces_required_value")?,
             ) {
@@ -1799,7 +1819,9 @@ fn child_registration_from_parent(
 fn discovered_backbone_client_mode(
     config: &ReticulumConfig,
 ) -> rns_interface::traits::InterfaceMode {
-    if config.enable_transport {
+    if let Some(mode) = config.autoconnect_interface_mode {
+        mode
+    } else if config.enable_transport {
         rns_interface::traits::InterfaceMode::Gateway
     } else {
         rns_interface::traits::InterfaceMode::Full
@@ -1930,6 +1952,18 @@ async fn register_interface_handle_with_role_and_overrides(
     let name = handle.name.clone();
     let id = handle.id;
     let ingress = ingress_for_role(role, &ingress_overrides);
+    // Python TCP/Backbone/Auto children copy gravity, but retain the base
+    // class default (None) for announces_to_internal.
+    let gravity = handle
+        .parent_id
+        .and_then(|parent| {
+            interface_controls
+                .lock()
+                .expect("interface_controls mutex poisoned")
+                .get(&parent)
+                .map(|control| control.gravity)
+        })
+        .unwrap_or(0);
     // Stash the driver task so `teardown_interface` can abort it; drop alone only detaches.
     interface_tasks()
         .lock()
@@ -1942,6 +1976,7 @@ async fn register_interface_handle_with_role_and_overrides(
             id,
             InterfaceControlMetadata {
                 role,
+                gravity,
                 ingress_overrides: ingress_overrides.clone(),
                 ifac_key,
                 ifac_size,
@@ -1976,6 +2011,8 @@ async fn register_interface_handle_with_role_and_overrides(
         // inherit recursive_prs/announces_from_internal (TCPInterface.py:579+).
         recursive_prs: false,
         announces_from_internal: true,
+        announces_to_internal: None,
+        gravity,
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -2019,6 +2056,7 @@ async fn register_interface_with_post_init(
             id,
             InterfaceControlMetadata {
                 role: rns_transport::messages::InterfaceRole::Normal,
+                gravity: post_init.gravity.unwrap_or(0),
                 ingress_overrides: post_init.ingress_overrides.clone(),
                 ifac_key,
                 ifac_size: post_init.ifac_size.unwrap_or(post_init.default_ifac_size),
@@ -2048,6 +2086,8 @@ async fn register_interface_with_post_init(
         multipoint: false,
         recursive_prs: post_init.recursive_prs,
         announces_from_internal: post_init.announces_from_internal,
+        announces_to_internal: post_init.announces_to_internal,
+        gravity: post_init.gravity.unwrap_or(0),
     };
     if let Err(e) = transport_tx
         .send(TransportMessage::RegisterInterface { id, entry })
@@ -2186,7 +2226,17 @@ fn finalize_post_init(
     config: &ReticulumConfig,
 ) {
     apply_default_announce_rate(post_init, config);
+    post_init.gravity = Some(post_init.gravity.unwrap_or(config.default_gravity));
     apply_reticulum_ingress_defaults(post_init, config);
+}
+
+fn apply_autoconnect_routing_defaults(
+    post_init: &mut interface_factory::InterfacePostInit,
+    config: &ReticulumConfig,
+) {
+    // Python Discovery.AC_GRAVITY is independent of default_gravity.
+    post_init.gravity = Some(config.autoconnect_interface_gravity.unwrap_or(0));
+    post_init.announces_to_internal = config.autoconnect_announces_to_internal.then_some(true);
 }
 
 fn interface_config_name(iface_config: &interface_factory::InterfaceConfig) -> &str {
@@ -2957,6 +3007,7 @@ async fn spawn_discovered_backbone_client(
             .with_default_ifac_size(16);
     finalize_post_init(&mut post_init, &handle.config);
     post_init.ifac_network_name = record.info.ifac_netname.clone();
+    apply_autoconnect_routing_defaults(&mut post_init, &handle.config);
     post_init.ifac_passphrase = record.info.ifac_netkey.clone();
     let ifac_key = derive_ifac_key_from_post_init(&post_init);
     register_interface_with_post_init(
@@ -4463,6 +4514,44 @@ pub enum ReticulumError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gravity_defaults_explicit_zero_and_autoconnect_override() {
+        use super::*;
+        let mut config = ReticulumConfig {
+            default_gravity: -10,
+            ..Default::default()
+        };
+        let mut section = NormalizedSection::new();
+        let mut post = interface_factory::InterfacePostInit::from_section(&section);
+        finalize_post_init(&mut post, &config);
+        assert_eq!(post.gravity, Some(-10));
+        section.set("gravity", "0");
+        let mut post = interface_factory::InterfacePostInit::from_section(&section);
+        finalize_post_init(&mut post, &config);
+        assert_eq!(post.gravity, Some(0));
+        apply_autoconnect_routing_defaults(&mut post, &config);
+        assert_eq!(post.gravity, Some(0));
+        assert_eq!(post.announces_to_internal, None);
+        assert_eq!(
+            discovered_backbone_client_mode(&config),
+            rns_interface::traits::InterfaceMode::Full
+        );
+        config.enable_transport = true;
+        assert_eq!(
+            discovered_backbone_client_mode(&config),
+            rns_interface::traits::InterfaceMode::Gateway
+        );
+        config.autoconnect_interface_mode = Some(rns_interface::traits::InterfaceMode::Internal);
+        config.autoconnect_interface_gravity = Some(-42);
+        config.autoconnect_announces_to_internal = true;
+        apply_autoconnect_routing_defaults(&mut post, &config);
+        assert_eq!(post.gravity, Some(-42));
+        assert_eq!(post.announces_to_internal, Some(true));
+        assert_eq!(
+            discovered_backbone_client_mode(&config),
+            rns_interface::traits::InterfaceMode::Internal
+        );
+    }
     #[tokio::test]
     async fn discovery_scheduler_refreshes_live_interfaces_and_stops_removed_ones() {
         use super::*;
@@ -5299,6 +5388,8 @@ mod tests {
         section.set("ic_pr_burst_freq", "9.0");
         section.set("ec_pr_freq", "6.0");
         section.set("egress_control", "Yes");
+        section.set("gravity", "-42");
+        section.set("announces_to_internal", "Yes");
         let post_init = interface_factory::InterfacePostInit::from_section(&section);
 
         register_interface_with_post_init(
@@ -5334,6 +5425,11 @@ mod tests {
         assert_eq!(entry.ingress.pr_burst_freq(), 9.0);
         assert_eq!(entry.ingress.ec_pr_freq(), 6.0);
         assert!(entry.ingress.is_egress_control_enabled());
+        assert_eq!(entry.gravity, -42);
+        assert_eq!(
+            entry.announces_to_internal, None,
+            "Python children do not inherit this flag"
+        );
 
         interface_tasks()
             .lock()
@@ -5402,6 +5498,7 @@ mod tests {
                 parent_id,
                 InterfaceControlMetadata {
                     role: rns_transport::messages::InterfaceRole::SharedServer,
+                    gravity: 0,
                     ingress_overrides: rns_transport::ingress::IngressOverrides::default(),
                     ifac_key: None,
                     ifac_size: 0,

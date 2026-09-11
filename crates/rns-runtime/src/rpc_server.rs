@@ -313,6 +313,8 @@ async fn process_rpc_request(
                     let rpc_entries = entries
                         .into_iter()
                         .map(|e| rpc::InterfaceStatEntry {
+                            gravity: e.gravity,
+                            announces_to_internal: e.announces_to_internal,
                             id: e.id,
                             name: e.name,
                             rx_bytes: e.rx_bytes,

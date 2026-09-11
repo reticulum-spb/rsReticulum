@@ -143,6 +143,10 @@ pub struct PathTableEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceStatEntry {
+    #[serde(default)]
+    pub gravity: i64,
+    #[serde(default)]
+    pub announces_to_internal: Option<bool>,
     pub id: u64,
     pub name: String,
     pub rx_bytes: u64,
@@ -515,6 +519,13 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 .map(|e| {
                     py_dict(vec![
                         ("id", PyValue::Int(i128::from(e.id))),
+                        ("gravity", PyValue::Int(i128::from(e.gravity))),
+                        (
+                            "announces_to_internal",
+                            e.announces_to_internal
+                                .map(PyValue::Bool)
+                                .unwrap_or(PyValue::None),
+                        ),
                         ("name", PyValue::String(e.name.clone())),
                         ("short_name", PyValue::String(e.name.clone())),
                         ("type", PyValue::String(e.role.clone())),
@@ -776,6 +787,13 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
         .map(|(idx, entry)| {
             let m = as_dict(entry)?;
             Ok(InterfaceStatEntry {
+                gravity: dict_get(m, "gravity")
+                    .and_then(|value| match value {
+                        PyValue::Int(value) => i64::try_from(*value).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                announces_to_internal: dict_get(m, "announces_to_internal").and_then(py_bool),
                 id: dict_get(m, "id")
                     .and_then(py_u64)
                     .unwrap_or((idx as u64) + 1),
@@ -1730,6 +1748,8 @@ mod tests {
 
     fn interface_stat_entry() -> InterfaceStatEntry {
         InterfaceStatEntry {
+            gravity: -42,
+            announces_to_internal: Some(true),
             id: 7,
             name: "TestIf".to_string(),
             rx_bytes: 100,
@@ -1771,6 +1791,8 @@ mod tests {
             RpcResponse::InterfaceStats(entries) => {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
+                assert_eq!(entry.gravity, -42);
+                assert_eq!(entry.announces_to_internal, Some(true));
                 assert_eq!(entry.incoming_pr_frequency, 6.0);
                 assert_eq!(entry.outgoing_pr_frequency, 7.0);
                 assert!(entry.burst_active);
@@ -1801,6 +1823,8 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
                 assert_eq!(entry.incoming_pr_frequency, 0.0);
+                assert_eq!(entry.gravity, 0);
+                assert_eq!(entry.announces_to_internal, None);
                 assert_eq!(entry.outgoing_pr_frequency, 0.0);
                 assert!(!entry.burst_active);
                 assert_eq!(entry.burst_activated, 0.0);

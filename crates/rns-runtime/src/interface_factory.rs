@@ -249,7 +249,7 @@ pub struct BackboneInterfaceConfig {
     pub i2p_tunneled: bool,
 }
 
-fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
+pub(crate) fn parse_interface_mode(s: &str) -> Option<InterfaceMode> {
     match s.to_lowercase().as_str() {
         "full" => Some(InterfaceMode::Full),
         "pointtopoint" | "point_to_point" => Some(InterfaceMode::PointToPoint),
@@ -1230,6 +1230,8 @@ pub struct InterfacePostInit {
     /// Python 1.3.8 `announces_from_internal` (Reticulum.py:811-812, default
     /// true): rebroadcast announces learned via MODE_INTERNAL interfaces.
     pub announces_from_internal: bool,
+    pub announces_to_internal: Option<bool>,
+    pub gravity: Option<i64>,
 }
 
 impl InterfacePostInit {
@@ -1280,6 +1282,8 @@ impl InterfacePostInit {
             ingress_overrides,
             recursive_prs: section.get_bool("recursive_prs").unwrap_or(false),
             announces_from_internal: section.get_bool("announces_from_internal").unwrap_or(true),
+            announces_to_internal: section.get_bool("announces_to_internal"),
+            gravity: section.get_int("gravity"),
         }
     }
 

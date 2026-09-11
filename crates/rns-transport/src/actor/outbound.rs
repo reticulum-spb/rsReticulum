@@ -474,12 +474,15 @@ impl TransportActor {
             }
         }
 
-        // Python 1.3.8 Transport.py:2946-2947: recursive_prs forces discovery
-        // independent of interface mode (flag checked first).
-        let should_search_unknown = self
+        // Python 1.5.2: boundary discovers only through boundary/gateway,
+        // unless recursive_prs explicitly overrides that restriction.
+        let boundary_search = self
             .interfaces
             .get(&interface_id)
-            .is_some_and(|iface| iface.recursive_prs || mode_discovers_unknown_paths(iface.mode));
+            .is_some_and(|iface| !iface.recursive_prs && iface.mode == InterfaceMode::Boundary);
+        let should_search_unknown = self.interfaces.get(&interface_id).is_some_and(|iface| {
+            iface.recursive_prs || mode_discovers_unknown_paths(iface.mode) || boundary_search
+        });
 
         if is_from_local_client {
             pr_log!(
@@ -487,7 +490,7 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "forwarding path request from local shared client"
             );
-            self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false);
+            self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, false, false);
         } else if self.is_transport_enabled && should_search_unknown {
             if self.discovery_path_requests.contains_key(&requested_dest) {
                 debug!(
@@ -521,7 +524,13 @@ impl TransportActor {
                     timeout: now + PATH_REQUEST_TIMEOUT,
                 },
             );
-            self.forward_path_request(requested_dest, Some(interface_id), tag_bytes, true);
+            self.forward_path_request(
+                requested_dest,
+                Some(interface_id),
+                tag_bytes,
+                true,
+                boundary_search,
+            );
         } else if self.has_local_client_interfaces() {
             pr_log!(
                 self,
@@ -641,12 +650,17 @@ impl TransportActor {
         except: Option<InterfaceId>,
         tag: Option<&[u8]>,
         recursive: bool,
+        boundary_search: bool,
     ) {
         let ids: Vec<InterfaceId> = self
             .interfaces
             .iter()
             .filter_map(|(&id, entry)| {
-                if except == Some(id) || !entry.direction.outbound {
+                if except == Some(id)
+                    || !entry.direction.outbound
+                    || (boundary_search
+                        && !matches!(entry.mode, InterfaceMode::Boundary | InterfaceMode::Gateway))
+                {
                     None
                 } else {
                     Some(id)
@@ -681,7 +695,7 @@ impl TransportActor {
             rand::thread_rng().fill_bytes(&mut request_tag);
         }
 
-        self.forward_path_request(destination_hash, None, Some(&request_tag), false);
+        self.forward_path_request(destination_hash, None, Some(&request_tag), false, false);
 
         debug!(
             dest = hex::encode(destination_hash),

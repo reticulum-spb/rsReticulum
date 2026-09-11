@@ -24,6 +24,10 @@ pub(crate) mod bytes_opt {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InterfaceStats {
+    #[serde(default)]
+    pub gravity: i64,
+    #[serde(default)]
+    pub announces_to_internal: Option<bool>,
     pub name: String,
     pub short_name: String,
     #[serde(skip_serializing_if = "Option::is_none", with = "bytes_opt")]

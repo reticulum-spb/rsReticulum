@@ -478,6 +478,8 @@ struct InterfaceRequest {
     egress_control: Option<bool>,
     recursive_prs: Option<bool>,
     announces_from_internal: Option<bool>,
+    announces_to_internal: Option<bool>,
+    gravity: Option<i64>,
     bootstrap_only: Option<bool>,
     ignore_config_warnings: Option<bool>,
     discoverable: Option<bool>,
@@ -617,6 +619,7 @@ impl InterfaceRequest {
             ("egress_control", self.egress_control),
             ("recursive_prs", self.recursive_prs),
             ("announces_from_internal", self.announces_from_internal),
+            ("announces_to_internal", self.announces_to_internal),
             ("bootstrap_only", self.bootstrap_only),
             ("ignore_config_warnings", self.ignore_config_warnings),
             ("discoverable", self.discoverable),
@@ -643,6 +646,9 @@ impl InterfaceRequest {
         }
         if let Some(value) = self.announce_rate_grace {
             s.set("announce_rate_grace", &value.to_string());
+        }
+        if let Some(value) = self.gravity {
+            s.set("gravity", &value.to_string());
         }
         for (key, value) in [
             ("announce_cap", self.announce_cap),
@@ -1783,6 +1789,8 @@ fn merge_iface_json(
         // ── runtime status ────────────────────────────────────────────
         "online":                       e.online,
         "mode":                         e.mode,
+        "gravity":                      e.gravity,
+        "announces_to_internal":         e.announces_to_internal,
         "role":                         e.role,
         "bitrate":                      e.bitrate,
         "mtu":                          e.mtu,
@@ -1937,12 +1945,14 @@ fn iface_section_json(section: &NormalizedSection) -> Value {
         ),
     ]);
     let object = value.as_object_mut().unwrap();
+    object.insert("gravity".into(), json!(section.get_int("gravity")));
     for key in [
         "outgoing",
         "ingress_control",
         "egress_control",
         "recursive_prs",
         "announces_from_internal",
+        "announces_to_internal",
         "bootstrap_only",
         "ignore_config_warnings",
         "discoverable",
@@ -2196,6 +2206,26 @@ fn visible_by_default(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gravity_api_roundtrip_preserves_signed_values_and_tristate() {
+        for internal in [Value::Null, json!(false), json!(true)] {
+            let request: InterfaceRequest = serde_json::from_value(json!({
+                "type": "AutoInterface", "name": "gravity-api", "gravity": -42,
+                "announces_to_internal": internal
+            }))
+            .unwrap();
+            let interface = request.to_yaml_config().unwrap();
+            let config = crate::config::Config {
+                interfaces: vec![interface],
+                ..Default::default()
+            };
+            let runtime = config.to_runtime_config().unwrap();
+            let response =
+                iface_section_json(runtime.subsection("interfaces", "gravity-api").unwrap());
+            assert_eq!(response["gravity"], json!(-42));
+            assert_eq!(response["announces_to_internal"], internal);
+        }
+    }
     #[test]
     fn discovery_api_fields_survive_yaml_and_response() {
         use super::*;

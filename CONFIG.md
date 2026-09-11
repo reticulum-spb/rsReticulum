@@ -71,6 +71,10 @@ interfaces: []
 | `default_ar_target` | integer or null | `null` | Default announce-rate target. `0` disables the target after normalization. |
 | `default_ar_penalty` | integer or null | `null` | Default announce-rate penalty. |
 | `default_ar_grace` | integer or null | `null` | Default announce-rate grace, `0..=4294967295`. |
+| `default_gravity` | signed integer | `0` | Default route preference for configured interfaces. Negative values are valid. |
+| `autoconnect_interface_mode` | interface mode or null | `null` | Override discovered-connection mode; absent means `gateway` on transport nodes, otherwise `full`. |
+| `autoconnect_interface_gravity` | signed integer or null | `null` | Discovered-connection gravity; absent means `0`, independently of `default_gravity`. |
+| `autoconnect_announces_to_internal` | boolean | `false` | Set source-side `announces_to_internal: true` on discovered connections; false leaves the mode policy unchanged. Python's positive integer setting maps to YAML `true`. |
 | `ingress` | mapping | `{}` | Global ingress/egress-control overrides; see below. |
 | `network_identity` | path or null | `null` | Optional network identity file. A leading `~/` is expanded using the user home directory. |
 | `discover_interfaces` | boolean | `false` | Receive discovery announces; publication is independently enabled by per-interface `discoverable`. |
@@ -145,6 +149,14 @@ level as `type`:
 | `ingress` | mapping | `{}` | Per-interface overrides listed in “Ingress mappings”. |
 | `recursive_path_requests` | boolean | `false` | Force recursive path requests. |
 | `announces_from_internal` | boolean | `true` | Permit rebroadcast of announces learned from internal interfaces. |
+| `gravity` | signed integer or null | `null` | Inherit `reticulum.default_gravity` when absent; explicit `0` overrides that default. Accepted TCP/Backbone and Auto children inherit their parent's gravity. |
+| `announces_to_internal` | boolean or null | `null` | `true` permits this interface's boundary-origin announces on internal egress. False/null retain mode policy (not a blanket deny). Accepted children keep null, as in Python. |
+
+Gravity breaks ties between equally dated announces when the candidate has no
+more hops than the current route. It does not override announce freshness or
+prefer longer routes of the same age. A boundary interface searches unknown
+paths through boundary/gateway interfaces; `recursive_path_requests: true`
+removes this mode restriction. Existing ingress and egress limits still apply.
 
 ## Discovery publication
 
