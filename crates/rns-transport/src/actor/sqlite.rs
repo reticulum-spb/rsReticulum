@@ -42,6 +42,7 @@ struct Prepared {
 fn weight(msg: &TransportMessage) -> usize {
     match msg {
         TransportMessage::Inbound(p) => p.raw.len() + 256,
+        TransportMessage::AdmittedInbound(p) => p.raw.len().saturating_mul(2).saturating_add(1024),
         TransportMessage::Rpc {
             query: Q::FilterBlackholedDests { dests },
             ..
@@ -204,8 +205,14 @@ impl TransportActor {
 
     fn sqlite_header(
         &self,
-        p: &crate::messages::InboundPacket,
+        msg: &TransportMessage,
     ) -> Option<(rns_wire::header::PacketHeader, Vec<u8>)> {
+        if let TransportMessage::AdmittedInbound(p) = msg {
+            return Some((p.header.clone(), p.raw[p.data_offset..].to_vec()));
+        }
+        let TransportMessage::Inbound(p) = msg else {
+            return None;
+        };
         let raw = if let Some(e) = self.interfaces.get(&p.interface_id) {
             if let Some(key) = &e.ifac_key {
                 crate::ifac::ifac_verify(&p.raw, key, e.ifac_size)?
@@ -239,12 +246,14 @@ impl TransportActor {
                     | Q::FilterBlackholedDests { .. }
                     | Q::PurgeUnverifiedBlackholes
             ),
-            TransportMessage::Inbound(p) => self.sqlite_header(p).is_some_and(|(h, _)| {
-                h.flags.packet_type == rns_wire::flags::PacketType::Announce
-                    || h.flags.destination_type == rns_wire::flags::DestinationType::Plain
-                    || h.context == rns_wire::context::PacketContext::CacheRequest
-                    || h.context == rns_wire::context::PacketContext::Lrproof
-            }),
+            TransportMessage::Inbound(_) | TransportMessage::AdmittedInbound(_) => {
+                self.sqlite_header(msg).is_some_and(|(h, _)| {
+                    h.flags.packet_type == rns_wire::flags::PacketType::Announce
+                        || h.flags.destination_type == rns_wire::flags::DestinationType::Plain
+                        || h.context == rns_wire::context::PacketContext::CacheRequest
+                        || h.context == rns_wire::context::PacketContext::Lrproof
+                })
+            }
             _ => false,
         }
     }
@@ -252,8 +261,8 @@ impl TransportActor {
     fn sqlite_reads(&self, msg: &TransportMessage) -> Reads {
         let mut reads = Reads::default();
         match msg {
-            TransportMessage::Inbound(p) => {
-                if let Some((h, payload)) = self.sqlite_header(p) {
+            TransportMessage::Inbound(_) | TransportMessage::AdmittedInbound(_) => {
+                if let Some((h, payload)) = self.sqlite_header(msg) {
                     if h.flags.packet_type == rns_wire::flags::PacketType::Announce {
                         reads.keys.push(h.destination_hash);
                     }
@@ -388,6 +397,11 @@ impl TransportActor {
             }
             self.sqlite.as_mut().unwrap().busy = job.is_some();
             tokio::select! {
+                _=std::future::ready(()), if !stopping && self.inbound_queues.snapshot().total > 0 => {
+                    let packet = self.inbound_queues.pop().unwrap();
+                    let msg = TransportMessage::AdmittedInbound(packet);
+                    if self.sqlite_dependent(&msg) {self.enqueue_sqlite(msg);} else {self.handle_message(msg);}
+                },
                 result=async {job.as_mut().unwrap().await}, if job.is_some()=> {
                     job=None;
                     self.sqlite.as_mut().unwrap().busy=false;
@@ -414,19 +428,19 @@ impl TransportActor {
                     }
                 }
                 msg=async { self.control_rx.as_mut().unwrap().recv().await }, if !stopping && control_open=>match msg {
-                    None=>{control_open=false; stopping=!interface_open;},
+                    None=>{control_open=false; stopping=!interface_open && self.inbound_queues.snapshot().total == 0;},
                     Some(TransportMessage::Shutdown)=>{stopping=true;},
                     Some(TransportMessage::SetStoragePaths {..})=>warn!("cannot change active SQLite storage ownership"),
                     Some(msg)=> {
-                        if self.sqlite_dependent(&msg) {self.enqueue_sqlite(msg);} else {self.handle_message(msg);}
+                        self.accept_sqlite_message(msg);
                     }
                 },
                 msg=self.rx.recv(), if !stopping && interface_open=>match msg {
-                    None=>{interface_open=false; stopping=!control_open;},
+                    None=>{interface_open=false; stopping=!control_open && self.inbound_queues.snapshot().total == 0;},
                     Some(TransportMessage::Shutdown)=>{stopping=true;},
                     Some(TransportMessage::SetStoragePaths {..})=>warn!("cannot change active SQLite storage ownership"),
                     Some(msg)=> {
-                        if self.sqlite_dependent(&msg) {self.enqueue_sqlite(msg);} else {self.handle_message(msg);}
+                        self.accept_sqlite_message(msg);
                     }
                 },
                 _=tick.tick(), if !stopping=> {
@@ -434,6 +448,9 @@ impl TransportActor {
                     if fg!=was_foreground { if fg {self.on_resume();} else {self.save_state_async();} was_foreground=fg; }
                     self.on_tick();
                 }
+            }
+            if !interface_open && !control_open && self.inbound_queues.snapshot().total == 0 {
+                stopping = true;
             }
         }
         self.on_shutdown();
@@ -447,6 +464,16 @@ impl TransportActor {
             Err(e) => tracing::error!(error=%e.error,"SQLite shutdown rejected"),
         }
         self
+    }
+
+    fn accept_sqlite_message(&mut self, msg: TransportMessage) {
+        if matches!(&msg, TransportMessage::Inbound(_)) && self.control_rx.is_some() {
+            self.handle_message(msg);
+        } else if self.sqlite_dependent(&msg) {
+            self.enqueue_sqlite(msg);
+        } else {
+            self.handle_message(msg);
+        }
     }
 
     fn sqlite_live_packets(&self) -> HashSet<[u8; 32]> {
@@ -860,6 +887,13 @@ mod tests {
         assert_eq!(state.vacuum_pages, 7);
         state.worker.try_shutdown().unwrap().wait().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_ifac_announce_drains_through_sqlite_after_inputs_close() {
+        let (mut actor, input, control) = TransportActor::new_with_control_channel();
+        actor.initialize_sqlite_storage(temp()).await.unwrap();
+        super::super::tests::exercise_admitted_drain(actor, input, control).await;
     }
 
     #[tokio::test]

@@ -1,6 +1,44 @@
 use super::*;
 use crate::now_f64;
 
+type VerifiedAnnounce = (
+    rns_identity::announce::AnnounceData,
+    rns_identity::identity::Identity,
+);
+
+/// Admission result owned by the actor. No Clone: a packet must be dispatched
+/// once, without repeating IFAC, dedup, hop adjustment or ingress accounting.
+pub struct PreparedInbound {
+    pub(super) raw: bytes::Bytes,
+    pub(super) header: rns_wire::header::PacketHeader,
+    pub(super) data_offset: usize,
+    admitted_on: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    pub(super) interface_id: InterfaceId,
+    announce: Option<VerifiedAnnounce>,
+    path_request: Option<super::outbound::PreparedPathRequest>,
+    released_from_ingress: bool,
+    remember_hash: Option<[u8; 32]>,
+}
+
+impl PreparedInbound {
+    pub(super) fn traffic_class(&self) -> crate::inbound_queue::TrafficClass {
+        use crate::inbound_queue::TrafficClass;
+        if self.released_from_ingress {
+            TrafficClass::IngressLimited
+        } else if self.announce.is_some() {
+            TrafficClass::Announce
+        } else if let Some(request) = &self.path_request {
+            if request.ingress_limited {
+                TrafficClass::IngressLimited
+            } else {
+                TrafficClass::PathRequest
+            }
+        } else {
+            TrafficClass::Data
+        }
+    }
+}
+
 impl TransportActor {
     fn client_wants_announce(
         &self,
@@ -35,20 +73,42 @@ impl TransportActor {
         })
     }
 
+    pub(super) fn prepare_inbound(
+        &mut self,
+        packet: crate::messages::InboundPacket,
+    ) -> Option<PreparedInbound> {
+        self.prepare_inbound_inner(packet, false)
+    }
+
+    /// Held announces contain IFAC-stripped bytes. Python releases them with
+    /// ifac_handled=True and TC_INGRESS_LIMITED.
+    pub(super) fn prepare_released_announce(
+        &mut self,
+        packet: crate::messages::InboundPacket,
+    ) -> Option<PreparedInbound> {
+        self.prepare_inbound_inner(packet, true)
+    }
+
     #[tracing::instrument(
         level = "trace",
-        name = "actor.on_inbound",
+        name = "actor.prepare_inbound",
         skip_all,
         fields(interface_id = packet.interface_id, raw_len = packet.raw.len()),
     )]
-    pub(super) fn on_inbound(&mut self, packet: crate::messages::InboundPacket) {
+    fn prepare_inbound_inner(
+        &mut self,
+        packet: crate::messages::InboundPacket,
+        released_from_ingress: bool,
+    ) -> Option<PreparedInbound> {
         self.traffic
             .record_rx(packet.interface_id, packet.raw.len() as u64);
 
         // Strip the IFAC tag if the interface gates membership on one; packets
         // that fail verification are silently dropped so a misconfigured peer
         // can't leak into a closed access group.
-        let raw: bytes::Bytes = if let Some(entry) = self.interfaces.get(&packet.interface_id) {
+        let raw: bytes::Bytes = if released_from_ingress {
+            packet.raw.clone()
+        } else if let Some(entry) = self.interfaces.get(&packet.interface_id) {
             if let Some(ref ifac_key) = entry.ifac_key {
                 let ifac_size = entry.ifac_size;
                 match crate::ifac::ifac_verify(&packet.raw, ifac_key, ifac_size) {
@@ -58,10 +118,13 @@ impl TransportActor {
                             interface_id = packet.interface_id,
                             "IFAC verification failed, dropping packet"
                         );
-                        return;
+                        return None;
                     }
                 }
             } else {
+                if crate::ifac::has_ifac_flag(&packet.raw) {
+                    return None;
+                }
                 packet.raw.clone()
             }
         } else {
@@ -78,7 +141,7 @@ impl TransportActor {
                     error = %e,
                     "inbound packet dropped: header parse failed"
                 );
-                return;
+                return None;
             }
         };
 
@@ -92,7 +155,7 @@ impl TransportActor {
                 interface_id = packet.interface_id,
                 "inbound packet dropped: invalid hop count"
             );
-            return;
+            return None;
         }
 
         if self
@@ -100,7 +163,7 @@ impl TransportActor {
             .get(&parsed.destination_hash)
             .is_some_and(|&bound| bound != packet.interface_id)
         {
-            return;
+            return None;
         }
 
         // An opt-in server client does not accumulate unrelated network state.
@@ -108,10 +171,13 @@ impl TransportActor {
         // packets still go through the ordinary validation below.
         if self.shared_instance_client_mode
             && self.client_announce_policy == ClientAnnouncePolicy::Requested
+            // SQLite may need to load a retained record before this policy can
+            // be decided. Recheck after storage preparation during dispatch.
+            && !self.using_sqlite()
             && parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
             && !self.client_wants_announce(&parsed, &raw[data_offset..])
         {
-            return;
+            return None;
         }
 
         // Dedup via the packet hashlist. A handful of contexts legitimately
@@ -143,7 +209,7 @@ impl TransportActor {
         let defer_hashlist = self.link_table.contains(&parsed.destination_hash)
             || parsed.context == rns_wire::context::PacketContext::Lrproof;
 
-        if !skip_hashlist && !defer_hashlist && !self.packet_hashlist.insert(pkt_hash) {
+        if !skip_hashlist && !defer_hashlist && self.packet_hashlist.contains(&pkt_hash) {
             // SINGLE announces are retransmitted to refresh paths, so an
             // exact duplicate is expected and must not be dropped.
             if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce
@@ -151,7 +217,7 @@ impl TransportActor {
             {
             } else {
                 trace!("duplicate packet dropped");
-                return;
+                return None;
             }
         }
 
@@ -166,39 +232,114 @@ impl TransportActor {
             "inbound packet received"
         );
 
+        let announce = if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
+            Some(self.prepare_announce(&raw, &parsed, data_offset, packet.interface_id)?)
+        } else {
+            None
+        };
+        let path_request = if parsed.flags.packet_type == rns_wire::flags::PacketType::Data
+            && parsed.destination_hash == Self::path_request_dest_hash()
+        {
+            Some(self.prepare_path_request(&raw[data_offset..], packet.interface_id)?)
+        } else {
+            None
+        };
+        Some(PreparedInbound {
+            raw,
+            header: parsed,
+            data_offset,
+            admitted_on: self
+                .interfaces
+                .get(&packet.interface_id)
+                .map(|entry| entry.tx.clone()),
+            interface_id: packet.interface_id,
+            announce,
+            path_request,
+            released_from_ingress,
+            remember_hash: (!skip_hashlist && !defer_hashlist).then_some(pkt_hash),
+        })
+    }
+
+    pub(super) fn on_inbound(&mut self, packet: crate::messages::InboundPacket) {
+        if let Some(prepared) = self.prepare_inbound(packet) {
+            self.dispatch_inbound(prepared);
+        }
+    }
+
+    pub(super) fn dispatch_inbound(&mut self, packet: PreparedInbound) {
+        if self.shared_instance_client_mode
+            && self.client_announce_policy == ClientAnnouncePolicy::Requested
+            && packet.header.flags.packet_type == rns_wire::flags::PacketType::Announce
+            && !self.client_wants_announce(&packet.header, &packet.raw[packet.data_offset..])
+        {
+            return;
+        }
+        // Commands may remove/replace an interface or bind a Link while its
+        // packet waits in a class queue or in the asynchronous storage worker.
+        if packet.admitted_on.as_ref().is_some_and(|tx| {
+            !self
+                .interfaces
+                .get(&packet.interface_id)
+                .is_some_and(|entry| tx.same_channel(&entry.tx))
+        }) || self
+            .local_link_interfaces
+            .get(&packet.header.destination_hash)
+            .is_some_and(|bound| *bound != packet.interface_id)
+        {
+            return;
+        }
+        debug_assert!(packet.data_offset <= packet.raw.len());
+        // Python records admitted hashes in _inbound, not in the queue's
+        // admission filter: an overflow drop must not poison later retries.
+        if let Some(hash) = packet.remember_hash {
+            self.packet_hashlist.insert(hash);
+        }
+        let PreparedInbound {
+            raw,
+            header: parsed,
+            interface_id,
+            announce,
+            path_request,
+            ..
+        } = packet;
         match parsed.flags.packet_type {
             rns_wire::flags::PacketType::Announce => {
-                self.process_announce(&raw, &parsed, data_offset, packet.interface_id);
+                self.process_announce(
+                    &raw,
+                    &parsed,
+                    interface_id,
+                    announce.expect("announce admission verified"),
+                );
             }
             rns_wire::flags::PacketType::LinkRequest => {
-                self.process_link_request(&raw, &parsed, packet.interface_id);
+                self.process_link_request(&raw, &parsed, interface_id);
             }
             rns_wire::flags::PacketType::Proof => {
-                self.process_proof(&raw, &parsed, packet.interface_id);
+                self.process_proof(&raw, &parsed, interface_id);
             }
             rns_wire::flags::PacketType::Data => {
-                self.process_data(&raw, &parsed, packet.interface_id);
+                self.process_data(&raw, &parsed, interface_id, path_request);
             }
         }
     }
 
-    fn process_announce(
+    fn prepare_announce(
         &mut self,
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
         data_offset: usize,
         interface_id: InterfaceId,
-    ) {
+    ) -> Option<VerifiedAnnounce> {
         let is_from_local_client = self.is_local_client_interface(interface_id);
 
         if header.hops >= PATHFINDER_M {
             debug!(hops = header.hops, "announce exceeded hop limit");
-            return;
+            return None;
         }
 
         if self.local_destinations.contains(&header.destination_hash) {
             debug!("dropping own announce");
-            return;
+            return None;
         }
 
         let (announce_data, validated_identity) = {
@@ -207,7 +348,7 @@ impl TransportActor {
                     dest = hex::encode(header.destination_hash),
                     "announce missing payload, dropping"
                 );
-                return;
+                return None;
             }
 
             let payload = &raw[data_offset..];
@@ -235,7 +376,7 @@ impl TransportActor {
                                     dest = hex::encode(header.destination_hash),
                                     "announce from blackholed identity, dropping"
                                 );
-                                return;
+                                return None;
                             }
                             (announce_data, validated_identity)
                         }
@@ -246,7 +387,7 @@ impl TransportActor {
                                 error = %e,
                                 "announce validation failed, dropping"
                             );
-                            return;
+                            return None;
                         }
                     }
                 }
@@ -258,7 +399,7 @@ impl TransportActor {
                         error = %e,
                         "announce unpack failed, dropping"
                     );
-                    return;
+                    return None;
                 }
             }
         };
@@ -290,8 +431,26 @@ impl TransportActor {
                     interface = interface_id,
                     "announce held by ingress controller (burst active)"
                 );
-                return;
+                return None;
             }
+        }
+
+        Some((announce_data, validated_identity))
+    }
+
+    fn process_announce(
+        &mut self,
+        raw: &[u8],
+        header: &rns_wire::header::PacketHeader,
+        interface_id: InterfaceId,
+        verified: VerifiedAnnounce,
+    ) {
+        let (announce_data, validated_identity) = verified;
+        let is_from_local_client = self.is_local_client_interface(interface_id);
+        if self.local_destinations.contains(&header.destination_hash)
+            || self.blackhole_table.is_blackholed(&validated_identity.hash)
+        {
+            return;
         }
 
         let known_public_key = self
@@ -684,6 +843,7 @@ impl TransportActor {
         raw: &bytes::Bytes,
         header: &rns_wire::header::PacketHeader,
         interface_id: InterfaceId,
+        prepared_request: Option<super::outbound::PreparedPathRequest>,
     ) {
         let from_local_client = self.is_local_client_interface(interface_id);
         let for_local_client = self
@@ -721,9 +881,8 @@ impl TransportActor {
         }
 
         if header.destination_hash == path_request_dest {
-            if let Some(payload_start) = self.data_payload_offset(raw, header) {
-                let payload = &raw[payload_start..];
-                self.handle_inbound_path_request(payload, interface_id);
+            if let Some(request) = prepared_request {
+                self.process_inbound_path_request(request);
             }
             return;
         }

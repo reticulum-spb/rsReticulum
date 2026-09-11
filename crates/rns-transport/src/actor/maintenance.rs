@@ -506,12 +506,18 @@ impl TransportActor {
                     snr: None,
                     q: None,
                 };
-                #[cfg(feature = "sqlite")]
-                if self.using_sqlite() {
-                    self.enqueue_sqlite(TransportMessage::Inbound(packet));
-                    continue;
+                if let Some(prepared) = self.prepare_released_announce(packet) {
+                    if self.control_rx.is_some() {
+                        self.enqueue_prepared_inbound(prepared);
+                    } else {
+                        #[cfg(feature = "sqlite")]
+                        if self.using_sqlite() {
+                            self.enqueue_sqlite(TransportMessage::AdmittedInbound(prepared));
+                            continue;
+                        }
+                        self.dispatch_inbound(prepared);
+                    }
                 }
-                self.on_inbound(packet);
             }
         }
     }

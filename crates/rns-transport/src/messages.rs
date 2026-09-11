@@ -16,6 +16,7 @@ pub use crate::ingress::HeldAnnounce;
 use crate::ingress::IngressController;
 
 pub type InterfaceId = u64;
+pub use crate::actor::inbound::PreparedInbound;
 
 /// Transport-level role of an interface. Python Reticulum distinguishes
 /// ordinary network interfaces, the local shared-instance listener, accepted
@@ -257,6 +258,8 @@ pub struct AnnounceHandlerEvent {
 #[allow(clippy::large_enum_variant)]
 pub enum TransportMessage {
     Inbound(InboundPacket),
+    /// Actor-produced admission token; fields cannot be constructed externally.
+    AdmittedInbound(PreparedInbound),
     Outbound(OutboundRequest),
     OutboundAttached {
         request: OutboundRequest,
@@ -371,6 +374,7 @@ pub enum TransportMessage {
 pub fn msg_variant_name(msg: &TransportMessage) -> &'static str {
     match msg {
         TransportMessage::Inbound(_) => "Inbound",
+        TransportMessage::AdmittedInbound(_) => "AdmittedInbound",
         TransportMessage::Outbound(_) => "Outbound",
         TransportMessage::OutboundAttached { .. } => "OutboundAttached",
         TransportMessage::Tick(_) => "Tick",
@@ -708,6 +712,7 @@ pub struct BlackholeRpcEntry {
 impl std::fmt::Debug for TransportMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AdmittedInbound(_) => write!(f, "AdmittedInbound"),
             Self::Inbound(p) => f.debug_tuple("Inbound").field(p).finish(),
             Self::Outbound(r) => f.debug_tuple("Outbound").field(r).finish(),
             Self::OutboundAttached {

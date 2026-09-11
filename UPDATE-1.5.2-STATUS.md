@@ -525,3 +525,73 @@ channel не добавлялись, глобальный порядок меж�
 нужны ранняя валидация/классификация до постановки, YAML размеров и live queue
 статистика. Следующий шаг — связать обработку с четырьмя очередями без повторного
 учёта IFAC, dedup, ingress frequency и inflight gate при drain.
+
+## Этап 4, часть 5 — рабочие классовые очереди и ранний допуск
+
+В actor, создаваемом `new_with_control_channel` (full/client runtime), включены
+четыре FIFO: Data → Announce → PathRequest → IngressLimited. Используются
+defaults 1024/128/128/8, независимый drop-tail и счётчики контейнера. Переполнение
+также увеличивает общий channel_drops; queued_messages включает эти очереди.
+Обычный single-channel конструктор сохраняет немедленную обработку для
+совместимости существующих встраиваний. YAML размеров пока не добавлен.
+
+Обработка разделена на admission и dispatch. PreparedInbound имеет закрытые
+поля и не реализует Clone. До очереди выполняются IFAC, разбор заголовка,
+hop checks, проверка известных packet hashes, подпись/blackhole и ingress
+announce, PR tag/частоты/inflight. Класс PR определяется после ingress-проверки.
+При dispatch используются разобранный заголовок, проверенные данные announce
+и подготовленный PR — IFAC, подпись, счётчики и gate не выполняются повторно.
+SQLite получает тот же admission token, загружает необходимые записи и не
+проверяет повторно IFAC над уже очищенными байтами. Cache-dependent фильтр
+Requested-client проверяется после загрузки SQLite записи.
+
+Хеш принятого пакета записывается при dispatch, как `Transport._inbound` Python,
+а не при попытке постановки: отброшенная при переполнении передача не мешает
+приёму её ретрансляции. Существующие исключения dedup сохранены. Подпись announce
+проверяется до очереди, binding destination к identity остаётся на dispatch
+после загрузки кеша; это соответствует разделению ранней signature validation
+и полной обработки. IFAC-flag на интерфейсе без IFAC теперь отклоняется явно.
+
+Освобождаемые held-announces проходят отдельный доверенный вход с уже снятым
+IFAC и классом IngressLimited, как Python Interface.py:295. Это исправляет
+прежнюю повторную проверку IFAC при release. Локальный replay из announce cache
+также использует классовую очередь в новом режиме.
+
+Очередь очищается от пакетов удаляемого интерфейса и при shared-state reset.
+На dispatch повторно проверяется актуальность interface TX endpoint, Link
+binding, blackhole и локальной destination: команды могут изменить их во время
+ожидания, в том числе в storage worker. Закрытие обоих каналов дочитывает уже
+допущенные пакеты; явный Shutdown не обязан обрабатывать всю сетевую очередь.
+SQLite сохраняет завершение уже принятых storage jobs.
+
+Проверки:
+
+- Целевые тесты проверяют все четыре класса, строгий порядок выдачи,
+  независимое переполнение, malformed/signature rejection до очереди,
+  PR dedup, повтор передачи после overflow, IFAC без повторной проверки,
+  held-release в IL и отказ для заменённого интерфейса.
+- PR повторно проверяет актуальную ingress policy при dispatch без нового
+  frequency sample; тест покрывает burst, начавшийся во время ожидания.
+- Memory и SQLite async loops проверены с queued IFAC announce и закрытыми
+  входами: callback вызывается ровно один раз. Тест независимого управления
+  теперь использует уникальные корректные DATA-заголовки вместо пустых кадров.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  440 passed, 1 ignored.
+- `cargo test -p rns-transport --lib --quiet`: 423 passed.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 230 passed,
+  4 ignored. В одном запуске 9 socket-тестов получили sandbox PermissionDenied;
+  повтор с разрешением на loopback прошёл полностью.
+- `cargo check --workspace --all-targets`, комбинированная сборка
+  `api,serial,rnode-tcp,sqlite-bundled`, client-only build,
+  `cargo fmt --all -- --check`, `git diff --check`: успешно. Новых warnings нет.
+- `cargo test -p rns-runtime --features api link_rebalance_and_active_route_binding --lib -- --ignored --nocapture`:
+  2 Python packet interop passed (до последних изменений held-release/hash
+  recording). Это регрессия Link proof, не interop нагрузки очередей.
+
+Этап 4 **не завершён**. Следующие пункты: YAML qlen_in_*, live queue counters
+в RPC/API/UI, ранние protocol/IFAC violation counters и проверка MTU/filter
+семантики; завершение сверки ротации PR tags. Перед admission остаётся bounded
+driver channel; SQLite имеет собственную bounded storage queue. Приоритет
+относится к выбору из четырёх классов и не отменяет уже выполняющийся storage
+job. Throughput, задержки и dataplane throttling относятся к этапу 5; их
+эффективность этим изменением не заявляется.

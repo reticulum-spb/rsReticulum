@@ -24,7 +24,7 @@ use crate::traffic::TrafficCounter;
 use crate::tunnel::TunnelTable;
 use rns_wire::receipt::{PacketReceipt, ReceiptStatus};
 
-mod inbound;
+pub(crate) mod inbound;
 mod maintenance;
 mod outbound;
 mod persistence;
@@ -50,6 +50,7 @@ pub struct TransportActor {
     sqlite: Option<sqlite::SqliteState>,
     rx: mpsc::Receiver<TransportMessage>,
     control_rx: Option<mpsc::Receiver<TransportMessage>>,
+    inbound_queues: crate::inbound_queue::InboundQueues<inbound::PreparedInbound>,
 
     pub path_table: PathTable,
     pub link_table: LinkTable,
@@ -298,7 +299,9 @@ impl TransportActor {
             receipts: self.receipt_table.len(),
             interfaces: self.interfaces.len(),
             path_waiters: self.path_waiters.values().map(Vec::len).sum(),
-            queued_messages: self.rx.len() + self.control_rx.as_ref().map_or(0, |rx| rx.len()),
+            queued_messages: self.rx.len()
+                + self.control_rx.as_ref().map_or(0, |rx| rx.len())
+                + self.inbound_queues.snapshot().total,
         }
     }
 
@@ -330,6 +333,7 @@ impl TransportActor {
         let actor = Self {
             rx,
             control_rx: None,
+            inbound_queues: crate::inbound_queue::InboundQueues::new(Default::default()),
             path_table: PathTable::new(),
             link_table: LinkTable::new(),
             announce_table: AnnounceTable::new(),
@@ -439,6 +443,10 @@ impl TransportActor {
 
         loop {
             tokio::select! {
+                _ = std::future::ready(()), if self.inbound_queues.snapshot().total > 0 => {
+                    let packet = self.inbound_queues.pop().unwrap();
+                    self.dispatch_inbound(packet);
+                }
                 msg = async { self.control_rx.as_mut().unwrap().recv().await }, if control_open => {
                     match msg {
                         Some(TransportMessage::Shutdown) => { self.on_shutdown(); break; }
@@ -479,10 +487,17 @@ impl TransportActor {
                     self.on_tick();
                 }
             }
-            if !interface_open && !control_open {
+            if !interface_open && !control_open && self.inbound_queues.snapshot().total == 0 {
                 self.on_shutdown();
                 break;
             }
+        }
+    }
+
+    fn enqueue_prepared_inbound(&mut self, prepared: inbound::PreparedInbound) {
+        let class = prepared.traffic_class();
+        if self.inbound_queues.try_push(class, prepared).is_err() {
+            self.channel_drops += 1;
         }
     }
 
@@ -492,8 +507,15 @@ impl TransportActor {
             tracing::span!(tracing::Level::DEBUG, "actor.handle_message", msg = variant).entered();
         match msg {
             TransportMessage::Inbound(packet) => {
-                self.on_inbound(packet);
+                if self.control_rx.is_some() {
+                    if let Some(prepared) = self.prepare_inbound(packet) {
+                        self.enqueue_prepared_inbound(prepared);
+                    }
+                } else {
+                    self.on_inbound(packet);
+                }
             }
+            TransportMessage::AdmittedInbound(packet) => self.dispatch_inbound(packet),
             TransportMessage::Outbound(request) => {
                 self.on_outbound(request);
             }
@@ -557,7 +579,7 @@ impl TransportActor {
                         snr: None,
                         q: None,
                     };
-                    self.on_inbound(inbound);
+                    self.handle_message(TransportMessage::Inbound(inbound));
                     return;
                 }
 
@@ -889,6 +911,7 @@ impl TransportActor {
     }
 
     fn clear_shared_connection_state(&mut self) {
+        self.inbound_queues.retain(|_| false);
         self.path_table = PathTable::new();
         self.link_table = LinkTable::new();
         self.announce_table = AnnounceTable::new();
@@ -1141,6 +1164,8 @@ impl TransportActor {
     /// Drop `id` from the interface table and unwind tunnels + paths bound
     /// to it. Shared by `DeregisterInterface` and the `Closed`-tx auto-drop.
     fn deregister_interface(&mut self, id: InterfaceId) {
+        self.inbound_queues
+            .retain(|packet| packet.interface_id != id);
         let role = self.interfaces.get(&id).map(|entry| entry.role);
         // Flip the driver-shared online flag before dropping the entry:
         // driver tasks gated on it (Auto beacons/discovery, BLE loops) hold
@@ -2030,20 +2055,20 @@ mod tests {
         interface_tx: mpsc::Sender<TransportMessage>,
         control_tx: mpsc::Sender<TransportMessage>,
     ) {
-        let packet = || {
+        let packet = |value: u64| {
             TransportMessage::Inbound(InboundPacket {
-                raw: Bytes::new(),
+                raw: make_data_packet((value as u128).to_le_bytes(), 0),
                 interface_id: 1,
                 rssi: None,
                 snr: None,
                 q: None,
             })
         };
-        for _ in 0..4096 {
-            interface_tx.try_send(packet()).unwrap();
+        for value in 0..4096 {
+            interface_tx.try_send(packet(value)).unwrap();
         }
         assert!(matches!(
-            interface_tx.try_send(packet()),
+            interface_tx.try_send(packet(4096)),
             Err(mpsc::error::TrySendError::Full(_))
         ));
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -2054,7 +2079,12 @@ mod tests {
             })
             .expect("full packet channel must not consume command capacity");
         assert_eq!(actor.memory_stats().queued_messages, 4097);
-        let flood = tokio::spawn(async move { while interface_tx.send(packet()).await.is_ok() {} });
+        let flood = tokio::spawn(async move {
+            let mut value = 4096;
+            while interface_tx.send(packet(value)).await.is_ok() {
+                value += 1;
+            }
+        });
         let task = tokio::spawn(actor.run());
         tokio::time::timeout(Duration::from_secs(2), response_rx)
             .await
@@ -2069,6 +2099,52 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_queues_drain_after_input_channels_close() {
+        let (actor, input, control) = TransportActor::new_with_control_channel();
+        exercise_admitted_drain(actor, input, control).await;
+    }
+
+    pub(super) async fn exercise_admitted_drain(
+        mut actor: TransportActor,
+        input: mpsc::Sender<TransportMessage>,
+        control: mpsc::Sender<TransportMessage>,
+    ) {
+        let key = rns_identity::ifac::derive_ifac_key(Some("queued-loop"), None).unwrap();
+        let (mut iface, _rx) = make_test_interface("ifac");
+        iface.ifac_key = Some(key);
+        iface.ifac_size = 4;
+        iface.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, iface);
+        let (callback_tx, mut callback_rx) = mpsc::channel(4);
+        actor.handle_message(TransportMessage::RegisterAnnounceHandler {
+            aspect_filter: None,
+            receive_path_responses: true,
+            callback_tx,
+        });
+        let (raw, dest) = make_valid_announce("test.queue.loop", 0);
+        let signed = crate::ifac::ifac_sign(&raw, &key, 4);
+        actor.handle_message(TransportMessage::Inbound(InboundPacket {
+            raw: signed.into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        }));
+        assert_eq!(actor.inbound_queues.snapshot().heights, [0, 1, 0, 0]);
+        assert!(!actor.path_table.has_path(&dest));
+        drop(input);
+        drop(control);
+        tokio::time::timeout(Duration::from_secs(3), actor.run())
+            .await
+            .unwrap();
+        assert_eq!(callback_rx.try_recv().unwrap().destination_hash, dest);
+        assert!(
+            callback_rx.try_recv().is_err(),
+            "announce must be dispatched only once"
+        );
     }
 
     #[tokio::test]
@@ -3906,6 +3982,224 @@ mod tests {
 
         // The IFAC flag should be set on byte 0 (flags byte)
         assert!(sent[0] & 0x80 != 0);
+    }
+
+    #[test]
+    fn admitted_queues_classify_prioritize_and_drop_each_class_independently() {
+        use crate::inbound_queue::{InboundQueueLimits, InboundQueues, TrafficClass};
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        actor.inbound_queues = InboundQueues::new(InboundQueueLimits::new([1; 4]).unwrap());
+        let (mut regular, _rx) = make_test_interface("regular");
+        regular.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, regular);
+        let (limited, _rx) = make_test_interface("limited");
+        actor.interfaces.insert(2, limited);
+        prime_ingress_pr_burst(&mut actor, 2);
+        for class in TrafficClass::ALL.into_iter().rev() {
+            for value in 0..2 {
+                let dest = [(class as u8) * 10 + value; 16];
+                let raw = match class {
+                    TrafficClass::Announce => {
+                        make_valid_announce(&format!("test.queue.{value}"), 0).0
+                    }
+                    TrafficClass::Data => make_data_packet(dest, 0),
+                    _ => {
+                        let raw = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+                        let (mut header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                        header.flags.destination_type = rns_wire::flags::DestinationType::Plain;
+                        let mut raw = header.pack().unwrap();
+                        raw.extend_from_slice(&make_path_request_payload_with_tag(
+                            dest,
+                            None,
+                            [value; 16],
+                        ));
+                        raw.into()
+                    }
+                };
+                actor.handle_message(TransportMessage::Inbound(InboundPacket {
+                    raw,
+                    interface_id: if class == TrafficClass::IngressLimited {
+                        2
+                    } else {
+                        1
+                    },
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                }));
+            }
+        }
+        assert_eq!(actor.inbound_queues.snapshot().heights, [1; 4]);
+        assert_eq!(actor.inbound_queues.snapshot().dropped, [1; 4]);
+        assert_eq!(actor.channel_drops, 4);
+        for class in TrafficClass::ALL {
+            let prepared = actor.inbound_queues.pop().unwrap();
+            assert_eq!(prepared.traffic_class(), class);
+            actor.dispatch_inbound(prepared);
+        }
+        assert_eq!(actor.inbound_queues.snapshot().total, 0);
+    }
+
+    #[test]
+    fn admitted_ifac_announce_is_dispatched_once_and_stale_interface_is_rejected() {
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let key = rns_identity::ifac::derive_ifac_key(Some("queue-test"), Some("pass")).unwrap();
+        let (mut iface, _rx) = make_test_interface("ifac");
+        iface.ifac_key = Some(key);
+        iface.ifac_size = 4;
+        iface.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, iface);
+        let (raw, dest) = make_valid_announce("test.queue.ifac", 0);
+        let signed = crate::ifac::ifac_sign(&raw, &key, 4);
+        actor.handle_message(TransportMessage::Inbound(InboundPacket {
+            raw: signed.into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        }));
+        assert!(!actor.path_table.has_path(&dest));
+        let prepared = actor.inbound_queues.pop().unwrap();
+        assert_eq!(prepared.raw, raw, "IFAC stripped before queuing");
+        actor.dispatch_inbound(prepared);
+        assert!(
+            actor.path_table.has_path(&dest),
+            "dispatch must not attempt IFAC verification on stripped data"
+        );
+
+        let (raw, stale_dest) = make_valid_announce("test.queue.stale", 0);
+        let signed = crate::ifac::ifac_sign(&raw, &key, 4);
+        let prepared = actor
+            .prepare_inbound(InboundPacket {
+                raw: signed.into(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+            .unwrap();
+        let (replacement, _rx) = make_test_interface("replacement");
+        actor.interfaces.insert(1, replacement);
+        actor.dispatch_inbound(prepared);
+        assert!(!actor.path_table.has_path(&stale_dest));
+    }
+
+    #[test]
+    fn prepared_path_request_observes_burst_started_while_waiting() {
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        actor.is_transport_enabled = true;
+        let (mut requestor, _rx) = make_test_interface("requestor");
+        requestor.mode = InterfaceMode::Gateway;
+        actor.interfaces.insert(1, requestor);
+        let (source, mut rx) = make_test_interface("source");
+        actor.interfaces.insert(2, source);
+        let dest = [0xD3; 16];
+        let prepared = actor
+            .prepare_path_request(&make_path_request_payload_with_tag(dest, None, [1; 16]), 1)
+            .unwrap();
+        prime_ingress_pr_burst(&mut actor, 1);
+        actor.process_inbound_path_request(prepared);
+        assert!(rx.try_recv().is_err());
+        assert!(!actor.discovery_path_requests.contains_key(&dest));
+    }
+
+    #[test]
+    fn queue_overflow_does_not_mark_dropped_data_as_processed() {
+        use crate::inbound_queue::{InboundQueueLimits, InboundQueues};
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        actor.inbound_queues = InboundQueues::new(InboundQueueLimits::new([1; 4]).unwrap());
+        let packet = |raw| {
+            TransportMessage::Inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+        };
+        let first = make_data_packet([1; 16], 0);
+        let retry = make_data_packet([2; 16], 0);
+        let hash = rns_wire::hash::packet_hash(&retry, rns_wire::flags::HeaderType::Header1);
+        actor.handle_message(packet(first));
+        actor.handle_message(packet(retry.clone()));
+        assert_eq!(actor.inbound_queues.snapshot().dropped[0], 1);
+        assert!(!actor.packet_hashlist.contains(&hash));
+        let prepared = actor.inbound_queues.pop().unwrap();
+        actor.dispatch_inbound(prepared);
+        actor.handle_message(packet(retry.clone()));
+        assert_eq!(
+            actor.inbound_queues.snapshot().total,
+            1,
+            "dropped packet can be retransmitted"
+        );
+        let prepared = actor.inbound_queues.pop().unwrap();
+        actor.dispatch_inbound(prepared);
+        assert!(actor.packet_hashlist.contains(&hash));
+        actor.handle_message(packet(retry));
+        assert_eq!(
+            actor.inbound_queues.snapshot().total,
+            0,
+            "processed duplicate is filtered"
+        );
+    }
+
+    #[test]
+    fn released_ifac_announce_uses_ingress_limited_queue() {
+        use crate::inbound_queue::TrafficClass;
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let key = rns_identity::ifac::derive_ifac_key(Some("held"), None).unwrap();
+        let (mut iface, _rx) = make_test_interface("held-ifac");
+        iface.ifac_key = Some(key);
+        iface.ifac_size = 4;
+        iface.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, iface);
+        let (raw, dest) = make_valid_announce("test.queue.held", 0);
+        let packet = |raw| InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        };
+        assert!(
+            actor.prepare_inbound(packet(raw.clone())).is_none(),
+            "unprotected wire packet must fail IFAC"
+        );
+        let prepared = actor.prepare_released_announce(packet(raw)).unwrap();
+        assert_eq!(prepared.traffic_class(), TrafficClass::IngressLimited);
+        actor.enqueue_prepared_inbound(prepared);
+        assert_eq!(actor.inbound_queues.snapshot().heights, [0, 0, 0, 1]);
+        let prepared = actor.inbound_queues.pop().unwrap();
+        actor.dispatch_inbound(prepared);
+        assert!(actor.path_table.has_path(&dest));
+    }
+
+    #[test]
+    fn malformed_and_duplicate_path_requests_do_not_fill_class_queues() {
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let (iface, _rx) = make_test_interface("source");
+        actor.interfaces.insert(1, iface);
+        let packet = |raw| {
+            TransportMessage::Inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+        };
+        actor.handle_message(packet(Bytes::new()));
+        let (raw, _) = make_valid_announce("test.queue.invalid", 0);
+        let mut corrupt = raw.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        actor.handle_message(packet(corrupt.into()));
+        assert_eq!(actor.inbound_queues.snapshot().total, 0);
+        let raw = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+        actor.handle_message(packet(raw.clone()));
+        actor.handle_message(packet(raw));
+        assert_eq!(actor.inbound_queues.snapshot().heights, [0, 0, 1, 0]);
+        actor.deregister_interface(1);
+        assert_eq!(actor.inbound_queues.snapshot().total, 0);
     }
 
     #[test]

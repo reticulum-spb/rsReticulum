@@ -1,6 +1,15 @@
 use super::*;
 use crate::now_f64;
 
+#[derive(Debug)]
+pub(super) struct PreparedPathRequest {
+    requested_dest: [u8; 16],
+    requestor_transport_id: Option<[u8; 16]>,
+    tag: Vec<u8>,
+    interface_id: InterfaceId,
+    pub(super) ingress_limited: bool,
+}
+
 /// Python 1.3.8 Transport.PR_LOGLEVEL (Transport.py:220/306): path-request
 /// chatter logs at DEBUG on transport nodes, EXTREME (trace) on leaf nodes.
 macro_rules! pr_log {
@@ -312,12 +321,14 @@ impl TransportActor {
     /// Local destination -> fire waiters so the owner re-announces.
     /// Known path + transport enabled -> replay the cached announce.
     /// Otherwise, on a transport node, forward the request on other interfaces.
-    pub(super) fn handle_inbound_path_request(&mut self, data: &[u8], interface_id: InterfaceId) {
+    pub(super) fn prepare_path_request(
+        &mut self,
+        data: &[u8],
+        interface_id: InterfaceId,
+    ) -> Option<PreparedPathRequest> {
         if data.len() < 16 {
-            return;
+            return None;
         }
-
-        let is_from_local_client = self.is_local_client_interface(interface_id);
 
         let mut requested_dest = [0u8; 16];
         requested_dest.copy_from_slice(&data[..16]);
@@ -347,7 +358,7 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "ignoring tagless path request"
             );
-            return;
+            return None;
         };
 
         let now = now_f64();
@@ -357,7 +368,7 @@ impl TransportActor {
         if let Some(last) = self.discovery_pr_tags.get(&unique_tag) {
             if now - last < DISCOVERY_PR_TAG_RETENTION {
                 trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
-                return;
+                return None;
             }
         }
         self.discovery_pr_tags.insert(unique_tag, now);
@@ -371,8 +382,37 @@ impl TransportActor {
             .get_mut(&interface_id)
             .is_some_and(|entry| entry.ingress.should_ingress_limit_pr());
         if !self.admit_inflight_path_request(requested_dest, interface_id, ingress_limited, now) {
-            return;
+            return None;
         }
+
+        Some(PreparedPathRequest {
+            requested_dest,
+            requestor_transport_id,
+            tag: tag.to_vec(),
+            interface_id,
+            ingress_limited,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn handle_inbound_path_request(&mut self, data: &[u8], interface_id: InterfaceId) {
+        if let Some(prepared) = self.prepare_path_request(data, interface_id) {
+            self.process_inbound_path_request(prepared);
+        }
+    }
+
+    pub(super) fn process_inbound_path_request(&mut self, prepared: PreparedPathRequest) {
+        let PreparedPathRequest {
+            requested_dest,
+            requestor_transport_id,
+            tag,
+            interface_id,
+            ingress_limited,
+        } = prepared;
+        let tag = tag.as_slice();
+        let tag_bytes = Some(tag);
+        let now = now_f64();
+        let is_from_local_client = self.is_local_client_interface(interface_id);
 
         if self.local_destinations.contains(&requested_dest) {
             self.inflight_path_requests.remove(&requested_dest);
@@ -524,7 +564,14 @@ impl TransportActor {
             {
                 return;
             }
-            if ingress_limited {
+            // Python rechecks the live burst policy when a queued request is
+            // processed. This does not record another frequency sample.
+            if ingress_limited
+                || self
+                    .interfaces
+                    .get_mut(&interface_id)
+                    .is_some_and(|iface| iface.ingress.should_ingress_limit_pr())
+            {
                 debug!(
                     dest = %hex::encode(requested_dest),
                     interface_id,
