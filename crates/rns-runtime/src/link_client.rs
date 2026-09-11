@@ -90,6 +90,29 @@ pub struct PreparedLinkSession {
     request_data: Vec<u8>,
 }
 
+/// Release temporary link routing state when establishment fails or is cancelled.
+struct PendingLinkRegistration {
+    tx: mpsc::Sender<TransportMessage>,
+    hash: [u8; 16],
+    armed: bool,
+}
+
+impl Drop for PendingLinkRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            let message = TransportMessage::DeregisterDestination { hash: self.hash };
+            if let Err(mpsc::error::TrySendError::Full(message)) = self.tx.try_send(message) {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let tx = self.tx.clone();
+                    runtime.spawn(async move {
+                        let _ = tx.send(message).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Command handle for a runtime task that exclusively owns a reusable
 /// outbound [`LinkSession`].
 #[derive(Clone)]
@@ -173,6 +196,11 @@ impl PreparedLinkSession {
             },
         )
         .await?;
+        let mut registration = PendingLinkRegistration {
+            tx: self.transport_tx.clone(),
+            hash: link_id,
+            armed: true,
+        };
         send_transport(
             &self.transport_tx,
             TransportMessage::Outbound(OutboundRequest {
@@ -182,16 +210,14 @@ impl PreparedLinkSession {
         )
         .await?;
 
-        let proof_data = wait_for_proof(&mut event_rx, link_id, deadline).await?;
-        let ed25519_bytes: [u8; 32] = self.public_key[32..]
-            .try_into()
-            .map_err(|_| LinkClientError::ProofInvalid("invalid public key".into()))?;
-        let verify_key = Ed25519PublicKey::from_bytes(&ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(error.to_string()))?;
-        let rtt_data = self
-            .link
-            .validate_proof(&proof_data, &verify_key, &ed25519_bytes)
-            .map_err(|error| LinkClientError::ProofInvalid(format!("{error:?}")))?;
+        let rtt_data = wait_for_proof(
+            &self.transport_tx,
+            &mut event_rx,
+            &mut self.link,
+            &self.public_key,
+            deadline,
+        )
+        .await?;
         send_transport(
             &self.transport_tx,
             TransportMessage::Outbound(OutboundRequest {
@@ -200,6 +226,7 @@ impl PreparedLinkSession {
             }),
         )
         .await?;
+        registration.armed = false;
         Ok(LinkSession {
             transport_tx: self.transport_tx,
             identity: Arc::new(self.identity),
@@ -1399,9 +1426,11 @@ impl LinkSession {
 
 impl Drop for LinkSession {
     fn drop(&mut self) {
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: self.id() });
+        let _registration = PendingLinkRegistration {
+            tx: self.transport_tx.clone(),
+            hash: self.id(),
+            armed: true,
+        };
     }
 }
 
@@ -1476,23 +1505,25 @@ impl LinkClient {
         .await?;
 
         let req_pkt = build_link_request_packet(dest_hash, &request_data);
+        let _registration = PendingLinkRegistration {
+            tx: self.transport_tx.clone(),
+            hash: link_id,
+            armed: true,
+        };
         self.send_msg(TransportMessage::Outbound(OutboundRequest {
             raw: req_pkt,
             destination_hash: dest_hash,
         }))
         .await?;
 
-        let proof_data = wait_for_proof(&mut dest_rx, link_id, time_remaining(deadline)?).await?;
-
-        let identity_ed25519_pub: [u8; 32] = pubkey[32..64].try_into().map_err(|_| {
-            LinkClientError::ProofInvalid("remote public key is not 64 bytes".into())
-        })?;
-        let identity_verify_key = Ed25519PublicKey::from_bytes(&identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("verify key: {e}")))?;
-
-        let rtt_data = link
-            .validate_proof(&proof_data, &identity_verify_key, &identity_ed25519_pub)
-            .map_err(|e| LinkClientError::ProofInvalid(format!("{e:?}")))?;
+        let rtt_data = wait_for_proof(
+            &self.transport_tx,
+            &mut dest_rx,
+            &mut link,
+            &pubkey,
+            time_remaining(deadline)?,
+        )
+        .await?;
 
         let rtt_pkt =
             build_data_packet(link_id, rns_wire::context::PacketContext::Lrrtt, &rtt_data);
@@ -1555,10 +1586,6 @@ impl LinkClient {
 
         // Tear down even on failure so the remote doesn't keep link state.
         let _ = self.send_close(&mut link).await;
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::DeregisterDestination { hash: link_id });
-
         response
     }
 
@@ -1617,25 +1644,75 @@ async fn wait_for_pubkey(
 }
 
 async fn wait_for_proof(
+    transport_tx: &mpsc::Sender<TransportMessage>,
     rx: &mut mpsc::Receiver<DestinationEvent>,
-    link_id: [u8; 16],
+    link: &mut Link,
+    public_key: &[u8; 64],
     deadline: Duration,
 ) -> Result<Vec<u8>, LinkClientError> {
+    let link_id = link.link_id;
+    let signing_bytes: [u8; 32] = public_key[32..]
+        .try_into()
+        .expect("fixed public key length");
+    let verify_key = Ed25519PublicKey::from_bytes(&signing_bytes)
+        .map_err(|e| LinkClientError::ProofInvalid(e.to_string()))?;
     let fut = async {
         while let Some(ev) = rx.recv().await {
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
-                DestinationEvent::InboundPacket { raw, .. } => {
+                DestinationEvent::InboundPacket { raw, interface_id } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
                         Err(_) => continue,
                     };
                     let is_proof = header.flags.packet_type == rns_wire::flags::PacketType::Proof
+                        && header.context == rns_wire::context::PacketContext::Lrproof
                         && header.destination_hash == link_id;
                     if is_proof && raw.len() > data_offset {
-                        return Ok(raw[data_offset..].to_vec());
+                        let response = link_transport_query(
+                            transport_tx,
+                            TransportQuery::NormalizeInboundHops {
+                                raw_hops: header.hops,
+                                interface_id,
+                            },
+                        )
+                        .await?;
+                        let TransportQueryResponse::IntResult(hops) = response else {
+                            return Err(LinkClientError::TransportUnavailable);
+                        };
+                        let hops = u8::try_from(hops)
+                            .map_err(|_| LinkClientError::TransportUnavailable)?;
+                        let rtt = match link.validate_proof_with_hops(
+                            &raw[data_offset..],
+                            hops,
+                            &verify_key,
+                            &signing_bytes,
+                        ) {
+                            Ok(rtt) => rtt,
+                            // Invalid mismatched proofs must not close or poison
+                            // a pending link. Continue within the original deadline.
+                            Err(_) if link.state == LinkState::Pending => continue,
+                            Err(e) => return Err(LinkClientError::ProofInvalid(format!("{e:?}"))),
+                        };
+                        let confirmed = link_transport_query(
+                            transport_tx,
+                            TransportQuery::ConfirmLocalLinkProof {
+                                link_id,
+                                interface_id,
+                                dest: link.destination_hash,
+                                hops,
+                                rebalance: link.rebalanced.is_some(),
+                            },
+                        )
+                        .await?;
+                        if !matches!(confirmed, TransportQueryResponse::BoolResult(true)) {
+                            return Err(LinkClientError::HandshakeFailed(
+                                "link proof binding rejected".into(),
+                            ));
+                        }
+                        return Ok(rtt);
                     }
                 }
                 _ => {}
@@ -1648,6 +1725,19 @@ async fn wait_for_proof(
     timeout(deadline, fut)
         .await
         .map_err(|_| LinkClientError::Timeout("link proof"))?
+}
+
+// Only used within wait_for_proof's deadline; these in-process queries are
+// deliberately not part of the external control RPC protocol.
+async fn link_transport_query(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    query: TransportQuery,
+) -> Result<TransportQueryResponse, LinkClientError> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_transport(transport_tx, TransportMessage::Rpc { query, response_tx }).await?;
+    response_rx
+        .await
+        .map_err(|_| LinkClientError::TransportUnavailable)
 }
 
 async fn wait_for_response(
@@ -2080,6 +2170,331 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_establishment_releases_registered_destination() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let prepared = LinkSession::prepare_on_transport(
+            tx,
+            Identity::new(),
+            [0xad; 16],
+            Identity::new().get_public_key(),
+            4,
+        );
+        let link_id = prepared.id();
+        let task = tokio::spawn(prepared.establish(Duration::from_millis(20)));
+        let TransportMessage::RegisterDestination {
+            delivery_tx, hash, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("registration")
+        };
+        assert_eq!(hash, link_id);
+        // Keep the channel open to exercise timeout, not channel-closed cleanup.
+        let _delivery_tx = delivery_tx;
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::Outbound(_)
+        ));
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(LinkClientError::Timeout(_))
+        ));
+        assert!(
+            matches!(rx.recv().await.unwrap(), TransportMessage::DeregisterDestination { hash } if hash == link_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_cleanup_survives_full_transport_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        drop(PendingLinkRegistration {
+            tx,
+            hash: [0xae; 16],
+            armed: true,
+        });
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            TransportMessage::Shutdown
+        ));
+        assert!(
+            matches!(timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap(), TransportMessage::DeregisterDestination { hash } if hash == [0xae; 16])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the local Python Reticulum reference and python3.11"]
+    async fn python_link_rebalance_and_active_route_binding() {
+        check_python_link_rebalance(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the local Python Reticulum reference and python3.11"]
+    async fn python_legacy_link_rebalance_and_active_route_binding() {
+        check_python_link_rebalance(true).await;
+    }
+
+    async fn check_python_link_rebalance(legacy: bool) {
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InboundPacket, InterfaceEntry};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let reference =
+            std::env::var("RNS_REFERENCE").unwrap_or_else(|_| "/home/room/src/Reticulum".into());
+        let mut child = tokio::process::Command::new("python3.11")
+            .arg("-B")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/link_rebalance_peer.py"
+            ))
+            .arg(reference)
+            .arg(if legacy { "legacy" } else { "modern" })
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        async fn read_json(
+            output: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        ) -> serde_json::Value {
+            let line = timeout(Duration::from_secs(10), output.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("Python output");
+            serde_json::from_str(&line).unwrap()
+        }
+        async fn write_packet(input: &mut tokio::process::ChildStdin, raw: &[u8]) {
+            input
+                .write_all(format!("{}\n", hex::encode(raw)).as_bytes())
+                .await
+                .unwrap();
+            input.flush().await.unwrap();
+        }
+        fn from_hex(value: &serde_json::Value, field: &str) -> Vec<u8> {
+            hex::decode(value[field].as_str().unwrap()).unwrap()
+        }
+        let initial = read_json(&mut output).await;
+        let dest: [u8; 16] = from_hex(&initial, "destination").try_into().unwrap();
+        let public: [u8; 64] = from_hex(&initial, "public_key").try_into().unwrap();
+        let announce = from_hex(&initial, "announce");
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        let actor_task = tokio::spawn(actor.run());
+        let (network1, mut rx1) = mpsc::channel(32);
+        let (network2, mut rx2) = mpsc::channel(32);
+        for (id, network, gravity) in [(1, network1, -10), (2, network2, 10)] {
+            let mut entry = InterfaceEntry::new(
+                format!("path-{id}"),
+                InterfaceMode::Full,
+                InterfaceDirection {
+                    inbound: true,
+                    outbound: true,
+                },
+                1_000_000,
+                500,
+                network,
+            );
+            entry.gravity = gravity;
+            tx.send(TransportMessage::RegisterInterface { id, entry })
+                .await
+                .unwrap();
+        }
+        let mut first = announce.clone();
+        first[1] = 3; // advertised route is four hops; proof arrives at two
+        tx.send(TransportMessage::Inbound(InboundPacket {
+            raw: first.into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        }))
+        .await
+        .unwrap();
+        let prepared =
+            LinkSession::prepare_on_transport(tx.clone(), Identity::new(), dest, public, 4);
+        let establishing = tokio::spawn(prepared.establish(Duration::from_secs(10)));
+        let request = timeout(Duration::from_secs(5), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        write_packet(&mut input, &request).await;
+        let proof = from_hex(&read_json(&mut output).await, "proof");
+        let mut forged = proof.clone();
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&proof).unwrap();
+        forged[offset] ^= 1;
+        for raw in [forged, proof] {
+            tx.send(TransportMessage::Inbound(InboundPacket {
+                raw: raw.into(),
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            }))
+            .await
+            .unwrap();
+        }
+        let mut session = establishing.await.unwrap().unwrap();
+        assert_eq!(session.link.expected_hops, Some(2));
+        assert!(session.link.rebalanced.is_some());
+        let rtt = timeout(Duration::from_secs(5), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        write_packet(&mut input, &rtt).await;
+        assert_eq!(read_json(&mut output).await["rtt_ok"], true);
+
+        let mut alternative = announce;
+        alternative[1] = 1;
+        tx.send(TransportMessage::Inbound(InboundPacket {
+            raw: alternative.into(),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        }))
+        .await
+        .unwrap();
+        let TransportQueryResponse::PathTable(paths) =
+            link_transport_query(&tx, TransportQuery::GetPathTable)
+                .await
+                .unwrap()
+        else {
+            panic!("path table")
+        };
+        let path = paths.iter().find(|path| path.hash == dest).unwrap();
+        assert_eq!((path.interface_id, path.hops), (2, 2));
+        session
+            .send(b"still on the established interface")
+            .await
+            .unwrap();
+        let data = timeout(Duration::from_secs(5), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rx2.try_recv().is_err());
+        write_packet(&mut input, &data).await;
+        let reply = from_hex(&read_json(&mut output).await, "reply");
+        tx.send(TransportMessage::Inbound(InboundPacket {
+            raw: reply.clone().into(),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        }))
+        .await
+        .unwrap();
+        // A replay on the wrong interface must not poison the dedup filter.
+        tx.send(TransportMessage::Inbound(InboundPacket {
+            raw: reply.into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), session.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"python reply after gravity change"
+        );
+        session.close().await.unwrap();
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(5), actor_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_proof_rebalances_only_after_valid_proof_and_uses_transport_hops() {
+        let identity = Identity::new();
+        let signing = identity.get_signing_key().unwrap();
+        let (mut link, request) = Link::new_initiator([0xac; 16], 4);
+        let (_, proof) = Link::new_responder(&request, &signing, [0xac; 16], 1).unwrap();
+        let (tx, mut transport_rx) = mpsc::channel(8);
+        let (events, mut rx) = mpsc::channel(8);
+        let mut forged = proof.clone();
+        forged[0] ^= 1;
+        for body in [forged, proof] {
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_proof_packet(
+                        link.link_id,
+                        rns_wire::context::PacketContext::Lrproof,
+                        &body,
+                    ),
+                    interface_id: 7,
+                })
+                .await
+                .unwrap();
+        }
+        let link_id = link.link_id;
+        let worker = tokio::spawn(async move {
+            // A bad proof asks only for normalisation; it cannot mutate paths.
+            for _ in 0..2 {
+                let TransportMessage::Rpc {
+                    query:
+                        TransportQuery::NormalizeInboundHops {
+                            raw_hops: 0,
+                            interface_id: 7,
+                        },
+                    response_tx,
+                } = transport_rx.recv().await.unwrap()
+                else {
+                    panic!("expected hop query")
+                };
+                response_tx
+                    .send(TransportQueryResponse::IntResult(2))
+                    .unwrap();
+            }
+            let TransportMessage::Rpc {
+                query:
+                    TransportQuery::ConfirmLocalLinkProof {
+                        link_id: bound,
+                        dest,
+                        hops,
+                        interface_id,
+                        rebalance,
+                    },
+                response_tx,
+            } = transport_rx.recv().await.unwrap()
+            else {
+                panic!("expected authenticated confirmation")
+            };
+            assert_eq!(bound, link_id);
+            assert_eq!(dest, [0xac; 16]);
+            assert_eq!((hops, interface_id, rebalance), (2, 7, true));
+            response_tx
+                .send(TransportQueryResponse::BoolResult(true))
+                .unwrap();
+        });
+        wait_for_proof(
+            &tx,
+            &mut rx,
+            &mut link,
+            &identity.get_public_key(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(link.state, LinkState::Active);
+        assert_eq!(link.expected_hops, Some(2));
+        assert!(link.rebalanced.is_some());
+        worker.await.unwrap();
+    }
 
     #[test]
     fn build_link_request_packet_has_link_request_type() {

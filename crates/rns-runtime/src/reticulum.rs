@@ -4173,10 +4173,16 @@ async fn spawn_interface(
                 server_config.sam_host = c.i2p_sam_host.clone();
                 server_config.sam_port = c.i2p_sam_port;
                 server_config.mode = c.mode;
-                rns_interface::i2p::spawn_i2p_server(server_config, id_gen, transport_tx, handle_tx)
-                    .await
-                    .map(|h| vec![h])
-                    .map_err(|e| format!("I2P server: {e}"))
+                rns_interface::i2p::spawn_i2p_server_with_id(
+                    server_config,
+                    id,
+                    id_gen,
+                    transport_tx,
+                    handle_tx,
+                )
+                .await
+                .map(|h| vec![h])
+                .map_err(|e| format!("I2P server: {e}"))
             } else if let Some(peer) = c.peers.first() {
                 let mut client_config = rns_interface::i2p::I2PClientConfig::new(&c.name, peer);
                 client_config.sam_host = c.i2p_sam_host.clone();

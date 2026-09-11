@@ -534,6 +534,33 @@ impl TransportActor {
                     .unwrap_or(0.0);
                 TransportQueryResponse::FloatResult(Some(timeout))
             }
+            TransportQuery::NormalizeInboundHops {
+                raw_hops,
+                interface_id,
+            } => TransportQueryResponse::IntResult(i64::from(
+                self.adjusted_inbound_hops(raw_hops, interface_id),
+            )),
+            TransportQuery::ConfirmLocalLinkProof {
+                link_id,
+                interface_id,
+                dest,
+                hops,
+                rebalance,
+            } => {
+                if !self.local_destinations.contains(&link_id)
+                    || self.local_link_interfaces.contains_key(&link_id)
+                {
+                    return TransportQueryResponse::BoolResult(false);
+                }
+                self.local_link_interfaces.insert(link_id, interface_id);
+                if rebalance {
+                    if let Some(path) = self.path_table.get_mut(&dest) {
+                        path.hops = hops;
+                        self.state_dirty = true;
+                    }
+                }
+                TransportQueryResponse::BoolResult(true)
+            }
             TransportQuery::SetPathState { dest, state } => {
                 if self.path_table.has_path(&dest) {
                     self.path_table.set_state(dest, state);

@@ -516,6 +516,22 @@ pub enum TransportQuery {
         dest: [u8; 16],
         state: crate::constants::PathState,
     },
+    /// In-process link runtime: use the actor's shared-instance hop policy.
+    /// Not exposed through the external control RPC.
+    NormalizeInboundHops {
+        raw_hops: u8,
+        interface_id: InterfaceId,
+    },
+    /// In-process link runtime only, after authenticating a pending LRPROOF.
+    /// Pin the local link to its proof interface and optionally correct the
+    /// destination hop estimate, never its interface or next hop.
+    ConfirmLocalLinkProof {
+        link_id: [u8; 16],
+        interface_id: InterfaceId,
+        dest: [u8; 16],
+        hops: u8,
+        rebalance: bool,
+    },
     GetPathState {
         dest: [u8; 16],
     },

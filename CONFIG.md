@@ -158,6 +158,12 @@ prefer longer routes of the same age. A boundary interface searches unknown
 paths through boundary/gateway interfaces; `recursive_path_requests: true`
 removes this mode restriction. Existing ingress and egress limits still apply.
 
+Link establishment can correct a stale hop estimate once, using an authenticated
+LRPROOF with the requested encryption mode. This does not migrate active Links:
+local Links remain bound to the proof's interface even if a newer announce or
+higher gravity changes the destination route. Losing that interface does not
+make the established Link broadcast its traffic on other interfaces.
+
 ## Discovery publication
 
 These flat fields use the Python interface parameter names. The daemon installs

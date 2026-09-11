@@ -73,6 +73,9 @@ pub struct TransportActor {
     pub interfaces: HashMap<InterfaceId, InterfaceEntry>,
 
     pub local_destinations: HashSet<[u8; 16]>,
+    /// Authenticated local link bindings survive destination route changes.
+    /// Kept until deregistration even if the interface disappears: fail closed.
+    local_link_interfaces: HashMap<[u8; 16], InterfaceId>,
     pub destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
     pub path_requests: HashMap<[u8; 16], f64>,
@@ -319,6 +322,7 @@ impl TransportActor {
             receipt_msg_ids: HashMap::new(),
             interfaces: HashMap::new(),
             local_destinations: HashSet::new(),
+            local_link_interfaces: HashMap::new(),
             destination_channels: HashMap::new(),
             path_requests: HashMap::new(),
             discovery_path_requests: HashMap::new(),
@@ -494,6 +498,7 @@ impl TransportActor {
             }
             TransportMessage::DeregisterDestination { hash } => {
                 self.local_destinations.remove(&hash);
+                self.local_link_interfaces.remove(&hash);
                 self.destination_channels.remove(&hash);
             }
             TransportMessage::CacheRequest {
@@ -4372,6 +4377,103 @@ mod tests {
             assert_eq!(
                 actor.path_table.get(&destination_hash).unwrap().hops,
                 if accepted { 3 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn local_link_binding_survives_route_change_and_missing_interface() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (first, mut rx1) = make_test_interface("established");
+        let (second, mut rx2) = make_test_interface("new-route");
+        actor.interfaces.insert(1, first);
+        actor.interfaces.insert(2, second);
+        let link_id = [0xab; 16];
+        let dest = [0xac; 16];
+        let (events, mut event_rx) = mpsc::channel(8);
+        actor.local_destinations.insert(link_id);
+        actor.destination_channels.insert(link_id, events);
+        actor.path_table.insert(
+            dest,
+            crate::path_table::PathEntry::new(Some([0xdd; 16]), 4, 2, InterfaceMode::Full),
+        );
+        assert!(matches!(
+            actor.handle_query(TransportQuery::ConfirmLocalLinkProof {
+                link_id,
+                interface_id: 1,
+                dest,
+                hops: 2,
+                rebalance: true,
+            }),
+            TransportQueryResponse::BoolResult(true)
+        ));
+        let path = actor.path_table.get(&dest).unwrap();
+        assert_eq!(
+            (path.interface_id, path.hops, path.next_hop),
+            (2, 2, Some([0xdd; 16]))
+        );
+        assert!(matches!(
+            actor.handle_query(TransportQuery::ConfirmLocalLinkProof {
+                link_id,
+                interface_id: 2,
+                dest,
+                hops: 8,
+                rebalance: true,
+            }),
+            TransportQueryResponse::BoolResult(false)
+        ));
+        let raw = make_link_data_packet(link_id, 0);
+        actor.on_outbound(OutboundRequest {
+            raw: raw.clone(),
+            destination_hash: link_id,
+        });
+        assert_eq!(rx1.try_recv().unwrap(), raw);
+        assert!(rx2.try_recv().is_err());
+        let mut inbound = raw.to_vec();
+        inbound.push(99);
+        let inbound = Bytes::from(inbound);
+        actor.on_inbound(InboundPacket {
+            raw: inbound.clone(),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(event_rx.try_recv().is_err());
+        actor.on_inbound(InboundPacket {
+            raw: inbound,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert!(event_rx.try_recv().is_ok());
+        actor.handle_message(TransportMessage::DeregisterInterface { id: 1 });
+        actor.on_outbound(OutboundRequest {
+            raw,
+            destination_hash: link_id,
+        });
+        assert!(
+            rx2.try_recv().is_err(),
+            "lost interface must not cause broadcast fallback"
+        );
+        actor.handle_message(TransportMessage::DeregisterDestination { hash: link_id });
+        assert!(!actor.local_link_interfaces.contains_key(&link_id));
+    }
+
+    #[test]
+    fn link_proof_hop_query_uses_shared_instance_policy() {
+        for (role, expected) in [
+            (InterfaceRole::Normal, 3),
+            (InterfaceRole::LocalClient, 2),
+            (InterfaceRole::SharedInstancePeer, 2),
+        ] {
+            let (mut actor, _tx) = TransportActor::new();
+            let (mut iface, _rx) = make_test_interface("hop-policy");
+            iface.role = role;
+            actor.interfaces.insert(1, iface);
+            assert!(
+                matches!(actor.handle_query(TransportQuery::NormalizeInboundHops { raw_hops: 2, interface_id: 1 }), TransportQueryResponse::IntResult(hops) if hops == expected)
             );
         }
     }

@@ -148,6 +148,8 @@ pub struct Link {
     /// Path length in hops: initiator sets it at creation (Link.py:282), the
     /// destination side from the LRRTT packet at activation (Link.py:525).
     pub expected_hops: Option<u8>,
+    /// When an authenticated pending-link proof corrected the expected path.
+    pub rebalanced: Option<Instant>,
 
     pub destination_hash: [u8; 16],
 
@@ -243,6 +245,7 @@ impl Link {
             establishment_rate: None,
             expected_rate: None,
             expected_hops: Some(hops),
+            rebalanced: None,
             destination_hash,
             remote_identity_pub: None,
             identified: false,
@@ -267,6 +270,54 @@ impl Link {
     /// Extend the establishment timeout, typically by the transport's first-hop RTT.
     pub fn extend_establishment_timeout(&mut self, additional_secs: f64) {
         self.establishment_timeout += Duration::from_secs_f64(additional_secs);
+    }
+
+    /// Validate a proof with the transport-normalised inbound hop count.
+    /// Python 1.5.2 permits a one-time pending-link rebalance, but a forged
+    /// or wrong-mode mismatched proof must leave the pending link untouched.
+    pub fn validate_proof_with_hops(
+        &mut self,
+        proof_data: &[u8],
+        hops: u8,
+        identity_verify_key: &Ed25519PublicKey,
+        identity_ed25519_pub_bytes: &[u8; 32],
+    ) -> Result<Vec<u8>, HandshakeError> {
+        if self.state != LinkState::Pending {
+            return Err(HandshakeError::InvalidSignature);
+        }
+        let rebalance = self.expected_hops != Some(hops);
+        if rebalance {
+            if self.rebalanced.is_some() {
+                return Err(HandshakeError::InvalidSignature);
+            }
+            if proof_data.len() > 96 && (proof_data[96] & MODE_BYTEMASK as u8) >> 5 != self.mode {
+                return Err(HandshakeError::InvalidSignature);
+            }
+            let proof = LinkProofData::unpack(proof_data)?;
+            let valid = if proof_data.len() == 96 {
+                proof.validate_legacy(
+                    identity_verify_key,
+                    &self.link_id,
+                    identity_ed25519_pub_bytes,
+                )
+            } else {
+                proof.validate(
+                    identity_verify_key,
+                    &self.link_id,
+                    identity_ed25519_pub_bytes,
+                )
+            };
+            if proof.signalling.mode != self.mode || !valid {
+                return Err(HandshakeError::InvalidSignature);
+            }
+        }
+        let rtt =
+            self.validate_proof(proof_data, identity_verify_key, identity_ed25519_pub_bytes)?;
+        if rebalance {
+            self.expected_hops = Some(hops);
+            self.rebalanced = Some(Instant::now());
+        }
+        Ok(rtt)
     }
 
     /// Handle a received link proof (initiator side, Message 2).
@@ -305,11 +356,20 @@ impl Link {
 
         // Verify the signature before deriving session keys so we never hold keys
         // tied to an unvalidated proof, even transiently.
-        if !proof.validate(
-            identity_verify_key,
-            &self.link_id,
-            identity_ed25519_pub_bytes,
-        ) {
+        let valid_signature = if proof_data.len() == 96 {
+            proof.validate_legacy(
+                identity_verify_key,
+                &self.link_id,
+                identity_ed25519_pub_bytes,
+            )
+        } else {
+            proof.validate(
+                identity_verify_key,
+                &self.link_id,
+                identity_ed25519_pub_bytes,
+            )
+        };
+        if !valid_signature {
             self.state = LinkState::Closed;
             return Err(HandshakeError::InvalidSignature);
         }
@@ -354,7 +414,7 @@ impl Link {
 
         self.keepalive.update_from_rtt(rtt);
 
-        if proof.signalling.mtu > 0 {
+        if proof_data.len() == 96 + LINK_MTU_SIZE && proof.signalling.mtu > 0 {
             self.mtu = self.mtu.min(proof.signalling.mtu);
         }
         self.update_mdu();
@@ -500,6 +560,7 @@ impl Link {
             expected_rate: None,
             // Populated by the runtime from the LRRTT packet hops (Link.py:525).
             expected_hops: None,
+            rebalanced: None,
             destination_hash,
             remote_identity_pub: None,
             identified: false,
@@ -1485,6 +1546,73 @@ mod tests {
         assert!(link.is_initiator);
         assert_eq!(link.destination_hash, dest_hash);
         assert_eq!(request_data.len(), ECPUBSIZE + LINK_MTU_SIZE);
+    }
+
+    #[test]
+    fn local_proof_rebalance_authenticates_before_changing_state() {
+        let key = Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([0xaa; 16], 4);
+        let (_, proof) = Link::new_responder(&request, &key, [0xaa; 16], 1).unwrap();
+        let mut forged = proof.clone();
+        forged[0] ^= 1;
+        let mut wrong_mode = proof.clone();
+        wrong_mode[96] ^= 0x20;
+        for invalid in [&forged[..], &wrong_mode[..], &proof[..95], &proof[..97]] {
+            assert!(
+                link.validate_proof_with_hops(invalid, 2, &public, &public.to_bytes())
+                    .is_err()
+            );
+            assert_eq!(link.state, LinkState::Pending);
+            assert_eq!(link.expected_hops, Some(4));
+            assert!(link.rebalanced.is_none());
+        }
+        link.validate_proof_with_hops(&proof, 2, &public, &public.to_bytes())
+            .unwrap();
+        assert_eq!(link.state, LinkState::Active);
+        assert_eq!(link.expected_hops, Some(2));
+        let rebalanced = link.rebalanced;
+        assert!(rebalanced.is_some());
+        assert!(
+            link.validate_proof_with_hops(&proof, 5, &public, &public.to_bytes())
+                .is_err()
+        );
+        assert_eq!(link.expected_hops, Some(2));
+        assert_eq!(link.rebalanced, rebalanced);
+    }
+
+    #[test]
+    fn matching_local_proof_does_not_record_rebalance() {
+        let key = Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([0xbb; 16], 2);
+        let (_, proof) = Link::new_responder(&request, &key, [0xbb; 16], 1).unwrap();
+        link.validate_proof_with_hops(&proof, 2, &public, &public.to_bytes())
+            .unwrap();
+        assert!(link.rebalanced.is_none());
+        assert_eq!(link.expected_hops, Some(2));
+    }
+
+    #[test]
+    fn legacy_96_byte_proof_rebalances_with_its_actual_signed_payload() {
+        let key = Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([0xbb; 16], 4);
+        let (_, proof) = Link::new_responder(&request, &key, [0xbb; 16], 1).unwrap();
+        let mut legacy = proof[..96].to_vec();
+        let mut signed = link.link_id.to_vec();
+        signed.extend_from_slice(&legacy[64..96]);
+        signed.extend_from_slice(&public.to_bytes());
+        legacy[..64].copy_from_slice(&key.sign(&signed));
+        // Truncating a modern proof without re-signing is never accepted.
+        assert!(
+            link.validate_proof_with_hops(&proof[..96], 2, &public, &public.to_bytes())
+                .is_err()
+        );
+        link.validate_proof_with_hops(&legacy, 2, &public, &public.to_bytes())
+            .unwrap();
+        assert_eq!(link.expected_hops, Some(2));
+        assert_eq!(link.state, LinkState::Active);
     }
 
     #[test]

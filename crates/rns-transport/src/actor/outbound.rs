@@ -66,6 +66,18 @@ impl TransportActor {
             return;
         }
 
+        if let Some(&interface_id) = self.local_link_interfaces.get(&request.destination_hash) {
+            // Link frames use the established link-table chain, not a new
+            // destination path or a broadcast fallback after route changes.
+            if self.should_apply_delta(&parsed, interface_id) {
+                let mangled = self.mangle_hops(&request.raw, &parsed, false);
+                self.send_to_interface(interface_id, &mangled);
+            } else {
+                self.send_to_interface(interface_id, &request.raw);
+            }
+            return;
+        }
+
         match parsed.flags.destination_type {
             rns_wire::flags::DestinationType::Plain | rns_wire::flags::DestinationType::Group => {
                 self.broadcast_on_interfaces(&request.raw, None);

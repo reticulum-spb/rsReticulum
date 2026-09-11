@@ -249,12 +249,35 @@ impl LinkProofData {
         link_id: &[u8; 16],
         peer_ed25519_pub: &[u8; 32],
     ) -> bool {
+        self.validate_signature(identity_verify_key, link_id, peer_ed25519_pub, true)
+    }
+
+    /// Legacy 96-byte proof signatures do not include signalling bytes.
+    /// Use only when the original wire payload had exactly 96 bytes.
+    pub fn validate_legacy(
+        &self,
+        identity_verify_key: &Ed25519PublicKey,
+        link_id: &[u8; 16],
+        peer_ed25519_pub: &[u8; 32],
+    ) -> bool {
+        self.validate_signature(identity_verify_key, link_id, peer_ed25519_pub, false)
+    }
+
+    fn validate_signature(
+        &self,
+        identity_verify_key: &Ed25519PublicKey,
+        link_id: &[u8; 16],
+        peer_ed25519_pub: &[u8; 32],
+        has_signalling: bool,
+    ) -> bool {
         let sig_bytes = self.signalling.pack();
         let mut signed_data = Vec::with_capacity(16 + 32 + 32 + 3);
         signed_data.extend_from_slice(link_id);
         signed_data.extend_from_slice(&self.responder_x25519_pub);
         signed_data.extend_from_slice(peer_ed25519_pub);
-        signed_data.extend_from_slice(&sig_bytes);
+        if has_signalling {
+            signed_data.extend_from_slice(&sig_bytes);
+        }
 
         identity_verify_key
             .verify(&signed_data, &self.signature)

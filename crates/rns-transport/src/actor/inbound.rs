@@ -95,6 +95,14 @@ impl TransportActor {
             return;
         }
 
+        if self
+            .local_link_interfaces
+            .get(&parsed.destination_hash)
+            .is_some_and(|&bound| bound != packet.interface_id)
+        {
+            return;
+        }
+
         // An opt-in server client does not accumulate unrelated network state.
         // This admission filter runs before dedup and signature work; admitted
         // packets still go through the ordinary validation below.

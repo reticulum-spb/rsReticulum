@@ -39,12 +39,12 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.0 stamp default 16 | Реализовано в `discovery/constants.rs` и runtime | 1, сохранить |
 | 1.4.0 blocked IP ifstats | Отсутствует вместе с механизмом блокировок | 3, 7 |
 | 1.4.0 reduced log noise | Воспроизвести уровни на локальной нагрузке; Rust tracing не требует копирования Python сообщений | 7 |
-| 1.4.1 dynamic rebalance / gravity | Частично: gravity выбирает announce-путь; транзитный LRPROOF корректирует hops после аутентификации. Локальный pending Link и межъязыковые проверки ещё не закрыты | 2 |
+| 1.4.1 dynamic rebalance / gravity | Реализованы gravity selection, authenticated transit/local pending rebalance и привязка активного Link. Python↔Rust packet interop прошёл для 96/99-byte proofs; многодемонная сеть остаётся финальной интеграцией | 2 |
 | 1.4.1 set_max_request_size | Отсутствует в Destination и runtime request admission | 6 |
 | 1.4.1 max_response_size | Реализован `link_client.rs:request_with_metadata_limit`, включая Resource advertisement; сегменты проверить | 6, сохранить |
 | 1.4.1 autoconnect mode/gravity/to_internal, default_gravity, interface gravity/to_internal | YAML/normalized/factory/registration, autoconnect defaults, child metadata, RPC и API/UI реализованы; I2P live inheritance не подтверждено | 2 |
 | 1.4.1 rnstatus gravity display/sort | Gravity есть в runtime/local RPC/remote schema; вывод и сортировка CLI ещё не перенесены | 7 |
-| 1.4.1 boundary→boundary/gateway PR | Воспроизвести таблицу переходов `actor/outbound.rs` с recursive/internal flags | 2 |
+| 1.4.1 boundary→boundary/gateway PR | Реализовано; mode-матрицы с recursive/internal flags проходят в transport tests | 2 |
 | 1.4.1 I2P tasks garbage collection | Python GC причина неприменима к Tokio; прочие minor I2P fixes требуют локального воспроизведения | 5 |
 | 1.4.1 ingress burst active deadlock | Воспроизвести тайминги `ingress.rs` и maintenance без новых announces | 4 |
 | 1.4.1 memory efficiency / LOG_EXTREME | Воспроизвести нагрузку и числовые уровни, не переносить Python allocation детали без измерений | 5, 7 |
@@ -124,7 +124,8 @@ Discovery publication отдельно строится в `discovery_config_for
 - [x] Составлена матрица с привязкой пробелов к реализации и этапам.
 - [ ] Уточнить все строки «воспроизвести» целевыми проверками соответствующих этапов.
 - [x] Этап 1: YAML/runtime publication, internal mode, location_cmd, API/UI.
-- [ ] Этапы 2–7 и финальная интеграция.
+- [x] Этап 2: gravity/internal, transit/local Link rebalance, interface binding; границы interop ниже.
+- [ ] Этапы 3–7 и финальная интеграция.
 
 Уже выполненные команды:
 
@@ -228,3 +229,59 @@ reachable_on. Радиометаданные покрыты преобразов
 проверить наследование при нескольких таких серверах отдельно; этот пробел
 не выдаётся за закрытый. Sorting/display rnstatus остаются в этапе 7.
 Текущие route-матрицы основаны на чтении Python 1.5.2, а не на live interop.
+
+### Этап 2: локальные Links и завершение функциональной реализации
+
+Предыдущий остаток закрыт на уровне runtime/transport и изолированного packet
+interop. `Link::validate_proof_with_hops` проверяет подпись, длину и mode до
+изменения hop estimate. Неверный mismatched proof оставляет Link Pending;
+установленный Link повторно не перебалансируется. Runtime запрашивает
+нормализацию hops у actor (включая shared-instance исключения), подтверждает
+путь только после успешной аутентификации и привязывает Link к proof interface.
+Привязка сохраняется при смене destination-маршрута и потере интерфейса;
+второе подтверждение не меняет её. Чужой интерфейс отбрасывается до dedup.
+Завершение, отказ и отмена освобождают временную регистрацию; cleanup при
+заполненной очереди планируется в Tokio, а не теряется из-за try_send.
+
+Дополнительно найдены и исправлены:
+
+- 96-byte proof ранее разбирался, но проверялся как подписанный с signalling.
+  Теперь длина wire payload определяет подписанные байты; усечение 99-byte
+  proof без новой подписи отклоняется. Отсутствующий MTU signalling не меняет MTU.
+- I2P servers/children использовали ID/parent_id 0. Сервер получает уникальный
+  ID, а runtime передаёт заранее выделенный ID, сохраняя API teardown target.
+  Старый spawn API сохранён; child metadata привязана к правильному серверу.
+
+Interop: Python subprocess создаёт настоящий подписанный announce, Link ID,
+ECDH и LRPROOF, проверяет encrypted RTT и application data. Rust actor сначала
+учит путь в 4 hops, принимает proof в 2 hops, затем тот же announce с большей
+gravity меняет destination interface. Действующий Link продолжает обмен через
+старый интерфейс; Python→Rust encrypted reply успешно принят. Проверены
+96- и 99-byte proofs и предварительно подложенный forged proof.
+
+Ограничения: hop bytes/интерфейсы задаются тестовой топологией каналов, обмен с
+Python идёт по stdin/stdout без сетевых сокетов. Это проверка реальных пакетов
+и криптографии, не полный прогон нескольких Python/Rust демонов. Такой прогон
+остаётся в финальной интеграции; SAM-сеть и физические интерфейсы не запускались.
+
+Результаты проверок этой части:
+
+- `cargo test -p rns-link --lib --quiet`: 97 passed.
+- `cargo test -p rns-transport --lib --quiet`: 403 passed.
+- `cargo test -p rns-interface --lib --quiet`: 175 passed; тест unique/reserved
+  I2P IDs дополнительно перезапущен после расширения assertions, 1 passed.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 227 passed,
+  4 ignored (сетевые тесты выполнены с разрешёнными loopback-сокетами).
+- `cargo test -p rns-runtime --features api link_rebalance_and_active_route_binding --lib -- --ignored --nocapture`:
+  оба Python packet interop теста passed (96/99-byte proofs).
+- `cargo test -p rns-runtime --features api,serial,rnode-tcp,sqlite-bundled link_client --lib --quiet`:
+  12 passed, 2 interop ignored.
+- `cargo check -p rns-runtime --no-default-features --features client`: успешно.
+- `cargo check --workspace --all-targets`, `cargo fmt --all -- --check`,
+  `git diff --check`: успешно. Старые warnings database_path и
+  tracing_subscriber::prelude не изменялись.
+- Python reference HEAD остался ea98db4f, рабочее дерево чистое; используется
+  `python3.11 -B`, процессы не записывают bytecode в эталон.
+
+Следующий этап — Backbone fast-flapping (этап 3). Версия и полная заявленная
+совместимость 1.5.2 пока не меняются.

@@ -594,6 +594,19 @@ pub async fn spawn_i2p_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let parent_id = id_gen.fetch_add(1, Ordering::SeqCst);
+    spawn_i2p_server_with_id(config, parent_id, id_gen, transport_tx, handle_tx).await
+}
+
+/// Runtime variant using an ID already reserved from `id_gen`, so live API
+/// registration, metadata inheritance and teardown refer to the same server.
+pub async fn spawn_i2p_server_with_id(
+    config: I2PServerConfig,
+    parent_id: InterfaceId,
+    id_gen: Arc<AtomicU64>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    handle_tx: mpsc::Sender<InterfaceHandle>,
+) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let online = Arc::new(AtomicBool::new(false));
     let name = config.name.clone();
     let mode = config.mode;
@@ -761,7 +774,7 @@ pub async fn spawn_i2p_server(
 
                 let handle = InterfaceHandle {
                     id: client_id,
-                    parent_id: Some(0),
+                    parent_id: Some(parent_id),
                     name: client_name,
                     mode: config.mode,
                     direction: InterfaceDirection {
@@ -797,7 +810,7 @@ pub async fn spawn_i2p_server(
     });
 
     Ok(InterfaceHandle {
-        id: 0,
+        id: parent_id,
         parent_id: None,
         name,
         mode,
@@ -938,6 +951,51 @@ impl ReconnectPacer {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn server_handles_reserve_unique_parent_ids() {
+        use super::*;
+        let ids = Arc::new(AtomicU64::new(100));
+        let (transport, _rx) = mpsc::channel(8);
+        let (handles, _handles_rx) = mpsc::channel(8);
+        let first = spawn_i2p_server(
+            I2PServerConfig::new("first"),
+            ids.clone(),
+            transport.clone(),
+            handles.clone(),
+        )
+        .await
+        .unwrap();
+        let second = spawn_i2p_server(
+            I2PServerConfig::new("second"),
+            ids.clone(),
+            transport.clone(),
+            handles.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((first.id, second.id), (100, 101));
+        assert_eq!(ids.load(Ordering::SeqCst), 102);
+        let reserved = ids.fetch_add(1, Ordering::SeqCst);
+        let explicit = spawn_i2p_server_with_id(
+            I2PServerConfig::new("reserved"),
+            reserved,
+            ids.clone(),
+            transport,
+            handles,
+        )
+        .await
+        .unwrap();
+        assert_eq!(explicit.id, reserved);
+        assert_eq!(
+            ids.load(Ordering::SeqCst),
+            103,
+            "reserved IDs must not be allocated twice"
+        );
+        // Neither task is polled; this test does not open a SAM connection.
+        first.read_task.abort();
+        second.read_task.abort();
+        explicit.read_task.abort();
+    }
     use super::*;
 
     #[test]
