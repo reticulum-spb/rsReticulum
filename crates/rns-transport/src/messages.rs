@@ -73,9 +73,19 @@ pub trait InterfaceDiagnostics: Send + Sync {
     }
 }
 
+/// Actor-owned receive diagnostics, reset with the interface registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct InboundDiagnostics {
+    pub protocol_violations: u64,
+    pub ifac_violations: u64,
+    pub packet_filter_hits: u64,
+}
+
 /// Metadata and TX handle for one registered interface. The actor owns the
 /// sender; driver code holds only the matching receiver.
 pub struct InterfaceEntry {
+    pub inbound_diagnostics: InboundDiagnostics,
     pub diagnostics: Option<std::sync::Arc<dyn InterfaceDiagnostics>>,
     pub name: String,
     pub mode: InterfaceMode,
@@ -157,6 +167,7 @@ impl InterfaceEntry {
             rxb: None,
             txb: None,
             tx_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            inbound_diagnostics: Default::default(),
             ingress: IngressController::new(),
             announce_queue: Vec::new(),
             multipoint: false,
@@ -634,6 +645,7 @@ pub struct PathTableRpcEntry {
 
 #[derive(Debug, Clone)]
 pub struct InterfaceStatRpcEntry {
+    pub inbound_diagnostics: InboundDiagnostics,
     pub blocked_ips: u64,
     pub blocked_ip_list: Vec<String>,
     pub gravity: i64,

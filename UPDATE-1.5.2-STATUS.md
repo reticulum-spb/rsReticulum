@@ -686,3 +686,44 @@ runtime `api,serial,rnode-tcp,sqlite-bundled` прошли; форматиров
 Этап 4 остаётся частичным: ранние protocol/IFAC violation counters, MTU/filter
 семантика, ротация PR tags и оставшаяся traffic-flow статистика. Вывод очередей
 в `rnstatus-rs` и remote-management — ещё не выполненная часть этапа 7.
+
+## Этап 4 — ранние receive violation counters, частичное покрытие
+
+InterfaceEntry получил actor-owned InboundDiagnostics с тремя независимыми
+насыщаемыми u64: protocol_violations, ifac_violations, packet_filter_hits.
+Они передаются в transport query, shared-instance RPC, native JSON и Web API;
+UI показывает их в деталях интерфейса. Старые wire/JSON ответы без полей
+декодируются с нулями; у неактивных configured-only интерфейсов API выдаёт null.
+Удаление и новая регистрация интерфейса создают новые счётчики.
+
+Подключён учёт к существующим ранним отказам: IFAC, header unpack, wire hops,
+announce payload/signature и packet-hash dedup. До IFAC добавлена проверка
+длины <=2: это protocol violation, а не IFAC violation, как Python
+Transport.py:1752–1809. PR без tag считается нарушением; превышение 16-byte tag
+также считается, но tag по-прежнему усекается и обрабатывается. Payload <16
+и повторный PR tag не увеличивают эти счётчики (Transport.py:1830–1845).
+Blackhole, ingress hold, queue overflow и административная очистка не выдаются
+за protocol/IFAC/packet-filter нарушения. Held-release не повторяет IFAC учёт.
+
+Проверки:
+
+- Actor tests: разные типы отказов, независимость от queue drops, blackhole
+  без ложного protocol violation, сохранение counters при query, насыщение,
+  reset при новой регистрации, bad IFAC и held-release, tagless/overlong PR.
+- RPC round-trip сохраняет ненулевые counters; legacy wire/JSON без новых
+  полей принимаются. JSON сериализуется с плоскими Python-именами.
+- Async API regression: malformed frame → actor → query → interface JSON.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  4 ignored; с разрешением на loopback после 9 sandbox PermissionDenied.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  443 passed, 1 ignored.
+- `node --test crates/rns-runtime/web/app.test.js`: passed.
+- Workspace all-targets, runtime client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` успешно собираются. Существующие warnings
+  не затронуты. Python checkout остаётся чистым.
+- `cargo fmt --all -- --check` и `git diff --check`: успешно.
+
+Это **не полная packet_filter parity**. Следующие пункты этапа 4: MTU boundary
+checks, transport-address/PLAIN/GROUP/shared-client filter semantics,
+дополнительные dispatch-time violation sites, ротация PR tags и traffic flow.
+Диагностика CLI/remote-management остаётся этапом 7; версия не изменена.

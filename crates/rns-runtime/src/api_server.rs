@@ -1823,6 +1823,9 @@ fn merge_iface_json(
         "rx_rate":                      e.rx_rate,
         "tx_rate":                      e.tx_rate,
         "tx_drops":                     e.tx_drops,
+        "protocol_violations": e.inbound_diagnostics.protocol_violations,
+        "ifac_violations": e.inbound_diagnostics.ifac_violations,
+        "packet_filter_hits": e.inbound_diagnostics.packet_filter_hits,
         // ── announce / ingress ────────────────────────────────────────
         "announce_queue":               e.announce_queue,
         "held_announces":               e.held_announces,
@@ -1873,6 +1876,9 @@ fn config_only_iface_json(name: &str, section: &NormalizedSection) -> Value {
         "rx_rate": 0,
         "tx_rate": 0,
         "tx_drops": 0,
+        "protocol_violations": null,
+        "ifac_violations": null,
+        "packet_filter_hits": null,
         "announce_queue": 0,
         "held_announces": 0,
         "incoming_announce_frequency": 0,
@@ -2247,6 +2253,60 @@ fn visible_by_default(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn interface_json_exposes_actor_receive_diagnostics() {
+        use rns_transport::{actor::TransportActor, messages::InterfaceEntry};
+        let (mut actor, input, control) = TransportActor::new_with_control_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        actor.interfaces.insert(
+            1,
+            InterfaceEntry::new(
+                "diagnostics".into(),
+                rns_transport::constants::InterfaceMode::Full,
+                rns_transport::constants::InterfaceDirection::bidirectional(),
+                9600,
+                500,
+                tx,
+            ),
+        );
+        // Use the same FIFO input for the malformed frame and query to make
+        // ordering deterministic; the actor still runs priority-queue mode.
+        input
+            .send(TransportMessage::Inbound(
+                rns_transport::messages::InboundPacket {
+                    raw: bytes::Bytes::new(),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        input
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::GetInterfaceStats,
+                response_tx,
+            })
+            .await
+            .unwrap();
+        let task = tokio::spawn(actor.run());
+        let TransportQueryResponse::InterfaceStats(stats) = response_rx.await.unwrap() else {
+            panic!("wrong response")
+        };
+        let value = merge_iface_json(&stats[0], None, None);
+        assert_eq!(value["protocol_violations"], 1);
+        assert_eq!(value["ifac_violations"], 0);
+        assert_eq!(value["packet_filter_hits"], 0);
+        drop(input);
+        drop(control);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn queue_status_json_preserves_all_classes_and_unavailability() {
         use rns_transport::inbound_queue::{InboundQueueSnapshot, InboundQueueStats};

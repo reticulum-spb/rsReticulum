@@ -531,6 +531,7 @@ async fn register_shared_interface(
 ) -> Result<(), ReticulumError> {
     let id = interface.id;
     let entry = rns_transport::messages::InterfaceEntry {
+        inbound_diagnostics: Default::default(),
         diagnostics: interface.diagnostics,
         name: interface.name,
         mode: convert_mode(interface.mode),
@@ -596,6 +597,7 @@ fn interface_stats_to_transport_response(
         entries
             .into_iter()
             .map(|entry| InterfaceStatRpcEntry {
+                inbound_diagnostics: entry.inbound_diagnostics,
                 blocked_ips: entry.blocked_ips,
                 blocked_ip_list: entry.blocked_ip_list,
                 gravity: entry.gravity,

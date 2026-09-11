@@ -149,6 +149,8 @@ pub struct PathTableEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceStatEntry {
+    #[serde(default, flatten)]
+    pub inbound_diagnostics: rns_transport::messages::InboundDiagnostics,
     #[serde(default)]
     pub blocked_ips: u64,
     #[serde(default)]
@@ -597,6 +599,18 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                                 .unwrap_or(PyValue::None),
                         ),
                         ("tx_drops", PyValue::Int(i128::from(e.tx_drops))),
+                        (
+                            "protocol_violations",
+                            PyValue::Int(i128::from(e.inbound_diagnostics.protocol_violations)),
+                        ),
+                        (
+                            "ifac_violations",
+                            PyValue::Int(i128::from(e.inbound_diagnostics.ifac_violations)),
+                        ),
+                        (
+                            "packet_filter_hits",
+                            PyValue::Int(i128::from(e.inbound_diagnostics.packet_filter_hits)),
+                        ),
                     ])
                 })
                 .collect();
@@ -846,6 +860,15 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
         .map(|(idx, entry)| {
             let m = as_dict(entry)?;
             Ok(InterfaceStatEntry {
+                inbound_diagnostics: rns_transport::messages::InboundDiagnostics {
+                    protocol_violations: dict_get(m, "protocol_violations")
+                        .and_then(py_u64)
+                        .unwrap_or(0),
+                    ifac_violations: dict_get(m, "ifac_violations").and_then(py_u64).unwrap_or(0),
+                    packet_filter_hits: dict_get(m, "packet_filter_hits")
+                        .and_then(py_u64)
+                        .unwrap_or(0),
+                },
                 blocked_ips: dict_get(m, "blocked_ips").and_then(py_u64).unwrap_or(0),
                 blocked_ip_list: match dict_get(m, "blocked_ip_list") {
                     Some(PyValue::List(values)) => values.iter().filter_map(py_string).collect(),
@@ -1866,6 +1889,11 @@ mod tests {
 
     fn interface_stat_entry() -> InterfaceStatEntry {
         InterfaceStatEntry {
+            inbound_diagnostics: rns_transport::messages::InboundDiagnostics {
+                protocol_violations: 11,
+                ifac_violations: 12,
+                packet_filter_hits: 13,
+            },
             blocked_ips: 1,
             blocked_ip_list: vec!["127.0.0.1".into()],
             gravity: -42,
@@ -1912,6 +1940,10 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
                 assert_eq!(entry.gravity, -42);
+                assert_eq!(
+                    entry.inbound_diagnostics,
+                    interface_stat_entry().inbound_diagnostics
+                );
                 assert_eq!(entry.blocked_ips, 1);
                 assert_eq!(entry.blocked_ip_list, ["127.0.0.1"]);
                 assert_eq!(entry.announces_to_internal, Some(true));
@@ -1944,6 +1976,7 @@ mod tests {
             RpcResponse::InterfaceStats(entries) => {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
+                assert_eq!(entry.inbound_diagnostics, Default::default());
                 assert_eq!(entry.incoming_pr_frequency, 0.0);
                 assert_eq!(entry.gravity, 0);
                 assert_eq!(entry.blocked_ips, 0);
@@ -1957,6 +1990,24 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn interface_diagnostics_json_is_flat_and_accepts_older_peers() {
+        let mut value = serde_json::to_value(interface_stat_entry()).unwrap();
+        assert_eq!(value["protocol_violations"], 11);
+        assert_eq!(value["ifac_violations"], 12);
+        assert_eq!(value["packet_filter_hits"], 13);
+        assert!(value.get("inbound_diagnostics").is_none());
+        for key in [
+            "protocol_violations",
+            "ifac_violations",
+            "packet_filter_hits",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let decoded: InterfaceStatEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.inbound_diagnostics, Default::default());
     }
 
     #[test]

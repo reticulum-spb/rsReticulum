@@ -313,6 +313,7 @@ async fn process_rpc_request(
                     let rpc_entries = entries
                         .into_iter()
                         .map(|e| rpc::InterfaceStatEntry {
+                            inbound_diagnostics: e.inbound_diagnostics,
                             blocked_ips: e.blocked_ips,
                             blocked_ip_list: e.blocked_ip_list,
                             gravity: e.gravity,

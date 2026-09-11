@@ -129,6 +129,29 @@ unsigned MessagePack integer. Existing Rust interface-only RPC decoders retain
 their response shape and ignore these additional fields. `rnstatus-rs` display
 and remote-management propagation of queue metrics remain pending.
 
+### Receive violation diagnostics (partial 1.5.2 coverage)
+
+Runtime interface entries in shared-instance RPC and Web API expose
+`protocol_violations`, `ifac_violations` and `packet_filter_hits`; the interface
+details panel displays them. Counters are per registration, saturate at
+`u64::MAX`, and reset when an interface is removed and created again.
+Configured but inactive interfaces display unavailable values. Older RPC
+responses without these fields are accepted with zero defaults.
+
+Currently counted protocol violations: frames too short for IFAC processing,
+malformed headers, invalid wire hop counts, missing/malformed announce payloads,
+invalid announce signatures, tagless path requests and overlong PR tags. As in
+Python, overlong tags are counted but still truncated and processed; PR payloads
+shorter than 16 bytes are ignored without a violation. IFAC violations cover
+authentication failure, a missing required IFAC flag/tag and an unexpected IFAC
+flag on an unprotected interface. Packet-filter hits currently count early
+packet-hash duplicate rejection. Blackhole rejection, ingress policy, PR-tag
+deduplication and queue overflow are not counted as these filter hits.
+
+Coverage is not yet the full Python 1.5.2 packet filter: MTU boundaries,
+transport-address filtering, PLAIN/GROUP rules and dispatch-time violation
+sites remain to be completed. CLI and remote-management display are pending.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

@@ -1998,6 +1998,7 @@ mod tests {
     pub(super) fn make_test_interface(name: &str) -> (InterfaceEntry, mpsc::Receiver<Bytes>) {
         let (tx, rx) = mpsc::channel(64);
         let entry = InterfaceEntry {
+            inbound_diagnostics: Default::default(),
             name: name.to_string(),
             mode: InterfaceMode::Gateway,
             role: InterfaceRole::Normal,
@@ -4210,6 +4211,7 @@ mod tests {
             "unprotected wire packet must fail IFAC"
         );
         let prepared = actor.prepare_released_announce(packet(raw)).unwrap();
+        assert_eq!(actor.interfaces[&1].inbound_diagnostics.ifac_violations, 1);
         assert_eq!(prepared.traffic_class(), TrafficClass::IngressLimited);
         actor.enqueue_prepared_inbound(prepared);
         assert_eq!(actor.inbound_queues.snapshot().heights, [0, 0, 0, 1]);
@@ -4244,6 +4246,115 @@ mod tests {
         assert_eq!(actor.inbound_queues.snapshot().heights, [0, 0, 1, 0]);
         actor.deregister_interface(1);
         assert_eq!(actor.inbound_queues.snapshot().total, 0);
+    }
+
+    #[test]
+    fn inbound_diagnostics_distinguish_failures_and_reset_on_registration() {
+        use crate::messages::InboundDiagnostics;
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let (iface, _rx) = make_test_interface("source");
+        actor.interfaces.insert(1, iface);
+        let packet = |raw| InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        };
+        for raw in [
+            Bytes::new(),
+            Bytes::from_static(&[0, 0, 0]),
+            make_data_packet([9; 16], 128),
+        ] {
+            assert!(actor.prepare_inbound(packet(raw)).is_none());
+        }
+        let mut flagged = make_data_packet([9; 16], 0).to_vec();
+        flagged[0] |= 0x80;
+        assert!(actor.prepare_inbound(packet(flagged.into())).is_none());
+        let (raw, _) = make_valid_announce("test.diagnostics", 0);
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        assert!(actor.prepare_inbound(packet(raw.slice(..offset))).is_none());
+        let mut corrupt = raw.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(actor.prepare_inbound(packet(corrupt.into())).is_none());
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let identity =
+            rns_identity::announce::AnnounceData::unpack(&raw[offset..], header.flags.context_flag)
+                .unwrap()
+                .verify_signature(&header.destination_hash)
+                .unwrap();
+        actor.blackhole_table.add(identity.hash, None);
+        assert!(actor.prepare_inbound(packet(raw)).is_none());
+        let data = make_data_packet([9; 16], 0);
+        let admitted = actor.prepare_inbound(packet(data.clone())).unwrap();
+        actor.dispatch_inbound(admitted);
+        assert!(actor.prepare_inbound(packet(data)).is_none());
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics,
+            InboundDiagnostics {
+                protocol_violations: 5,
+                ifac_violations: 1,
+                packet_filter_hits: 1,
+            }
+        );
+        assert_eq!(actor.inbound_queues.snapshot().dropped, [0; 4]);
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!("wrong response")
+        };
+        assert_eq!(
+            stats[0].inbound_diagnostics,
+            actor.interfaces[&1].inbound_diagnostics
+        );
+        actor
+            .interfaces
+            .get_mut(&1)
+            .unwrap()
+            .inbound_diagnostics
+            .protocol_violations = u64::MAX;
+        assert!(actor.prepare_inbound(packet(Bytes::new())).is_none());
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            u64::MAX
+        );
+        actor.deregister_interface(1);
+        let (iface, _rx) = make_test_interface("replacement");
+        actor.interfaces.insert(1, iface);
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics,
+            InboundDiagnostics::default()
+        );
+    }
+
+    #[test]
+    fn path_request_tag_violations_are_counted_without_changing_truncation() {
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let (iface, _rx) = make_test_interface("source");
+        actor.interfaces.insert(1, iface);
+        assert!(actor.prepare_path_request(&[1; 15], 1).is_none());
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            0
+        );
+        assert!(actor.prepare_path_request(&[1; 16], 1).is_none());
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            1
+        );
+        assert!(actor.prepare_path_request(&[2; 49], 1).is_some());
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            2
+        );
+        assert!(
+            actor.prepare_path_request(&[2; 48], 1).is_none(),
+            "same truncated tag is deduplicated"
+        );
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+            0
+        );
     }
 
     #[test]
@@ -4312,6 +4423,11 @@ mod tests {
 
         // Path should NOT be learned (IFAC verification fails)
         assert!(!actor.path_table.has_path(&dest_hash));
+        assert_eq!(actor.interfaces[&1].inbound_diagnostics.ifac_violations, 1);
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            0
+        );
     }
 
     #[test]

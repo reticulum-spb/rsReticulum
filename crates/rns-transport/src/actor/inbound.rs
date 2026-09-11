@@ -40,6 +40,27 @@ impl PreparedInbound {
 }
 
 impl TransportActor {
+    pub(super) fn protocol_violation(&mut self, interface_id: InterfaceId) {
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            let counter = &mut entry.inbound_diagnostics.protocol_violations;
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    fn ifac_violation(&mut self, interface_id: InterfaceId) {
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            let counter = &mut entry.inbound_diagnostics.ifac_violations;
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    fn packet_filter_hit(&mut self, interface_id: InterfaceId) {
+        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            let counter = &mut entry.inbound_diagnostics.packet_filter_hits;
+            *counter = counter.saturating_add(1);
+        }
+    }
+
     fn client_wants_announce(
         &self,
         header: &rns_wire::header::PacketHeader,
@@ -103,6 +124,12 @@ impl TransportActor {
         self.traffic
             .record_rx(packet.interface_id, packet.raw.len() as u64);
 
+        // Python checks minimum framing before attempting IFAC processing.
+        if packet.raw.len() <= 2 {
+            self.protocol_violation(packet.interface_id);
+            return None;
+        }
+
         // Strip the IFAC tag if the interface gates membership on one; packets
         // that fail verification are silently dropped so a misconfigured peer
         // can't leak into a closed access group.
@@ -118,11 +145,13 @@ impl TransportActor {
                             interface_id = packet.interface_id,
                             "IFAC verification failed, dropping packet"
                         );
+                        self.ifac_violation(packet.interface_id);
                         return None;
                     }
                 }
             } else {
                 if crate::ifac::has_ifac_flag(&packet.raw) {
+                    self.ifac_violation(packet.interface_id);
                     return None;
                 }
                 packet.raw.clone()
@@ -141,6 +170,7 @@ impl TransportActor {
                     error = %e,
                     "inbound packet dropped: header parse failed"
                 );
+                self.protocol_violation(packet.interface_id);
                 return None;
             }
         };
@@ -155,6 +185,7 @@ impl TransportActor {
                 interface_id = packet.interface_id,
                 "inbound packet dropped: invalid hop count"
             );
+            self.protocol_violation(packet.interface_id);
             return None;
         }
 
@@ -217,6 +248,7 @@ impl TransportActor {
             {
             } else {
                 trace!("duplicate packet dropped");
+                self.packet_filter_hit(packet.interface_id);
                 return None;
             }
         }
@@ -348,6 +380,7 @@ impl TransportActor {
                     dest = hex::encode(header.destination_hash),
                     "announce missing payload, dropping"
                 );
+                self.protocol_violation(interface_id);
                 return None;
             }
 
@@ -387,6 +420,7 @@ impl TransportActor {
                                 error = %e,
                                 "announce validation failed, dropping"
                             );
+                            self.protocol_violation(interface_id);
                             return None;
                         }
                     }
@@ -399,6 +433,7 @@ impl TransportActor {
                         error = %e,
                         "announce unpack failed, dropping"
                     );
+                    self.protocol_violation(interface_id);
                     return None;
                 }
             }

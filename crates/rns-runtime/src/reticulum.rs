@@ -422,6 +422,7 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .map(|entry| InterfaceStatRpcEntry {
+                    inbound_diagnostics: entry.inbound_diagnostics,
                     blocked_ips: entry.blocked_ips,
                     blocked_ip_list: entry.blocked_ip_list,
                     gravity: entry.gravity,
@@ -1995,6 +1996,7 @@ async fn register_interface_handle_with_role_and_overrides(
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
+        inbound_diagnostics: Default::default(),
         diagnostics: handle.diagnostics,
         name: handle.name.clone(),
         mode: convert_mode(handle.mode),
@@ -2076,6 +2078,7 @@ async fn register_interface_with_post_init(
             },
         );
     let entry = rns_transport::messages::InterfaceEntry {
+        inbound_diagnostics: Default::default(),
         name: handle.name.clone(),
         diagnostics: handle.diagnostics,
         mode: convert_mode(handle.mode),

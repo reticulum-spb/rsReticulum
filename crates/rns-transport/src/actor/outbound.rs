@@ -345,6 +345,9 @@ impl TransportActor {
             None
         };
         let tag_bytes = if data.len() > 32 {
+            if data.len() > 48 {
+                self.protocol_violation(interface_id);
+            }
             Some(&data[32..data.len().min(48)])
         } else if data.len() > 16 {
             Some(&data[16..data.len().min(32)])
@@ -358,6 +361,7 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "ignoring tagless path request"
             );
+            self.protocol_violation(interface_id);
             return None;
         };
 
