@@ -231,6 +231,19 @@ exceptions, not a false signature-validation result.
 Exception-only diagnostics and path-MTU signalling still require further
 compatibility review. CLI and remote-management display are pending.
 
+### Local Link MTU negotiation (partial)
+
+Local Links currently retain the base 500-byte MTU cap; larger driver MTUs and
+`fixed_mtu` do not yet enable larger local Link payloads. The responder signs
+the same effective MTU in LRPROOF that it stores locally: a missing or zero
+offer means 500, and a positive offer is capped at 500. Its MDU is computed
+before the proof is returned and agrees with the initiator after validation.
+Offers too small to fit an encrypted payload produce an MDU of zero, not an
+unsigned underflow or the default payload capacity. This is defensive arithmetic,
+not a guarantee that handshake frames fit such a small offered MTU.
+Interface capability propagation, transit MTU clamping and the associated
+protocol-violation counters still remain pending.
+
 ### Path-request tag history
 
 Path requests are deduplicated by destination hash plus their truncated tag,

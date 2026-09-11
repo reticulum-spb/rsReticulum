@@ -496,9 +496,16 @@ impl Link {
         let request = LinkRequestData::unpack(request_data)?;
         let link_id = compute_link_id(&destination_hash, request_data);
 
-        let signalling =
-            SignallingData::new(request.signalling.mode, rns_wire::constants::MTU as u32)
-                .map_err(|error| HandshakeError::UnsupportedMode(error.0))?;
+        // Python treats a zero offer as the default MTU. Until the runtime
+        // supplies interface MTU capabilities, keep the existing 500-byte cap,
+        // but sign exactly the MTU that this responder will actually use.
+        let mtu = if request.signalling.mtu == 0 {
+            rns_wire::constants::MTU as u32
+        } else {
+            request.signalling.mtu.min(rns_wire::constants::MTU as u32)
+        };
+        let signalling = SignallingData::new(request.signalling.mode, mtu)
+            .map_err(|error| HandshakeError::UnsupportedMode(error.0))?;
 
         let responder_keys = EphemeralKeys::generate();
 
@@ -531,7 +538,7 @@ impl Link {
 
         let establishment_cost = request_data.len() + proof_data.len();
 
-        let link = Self {
+        let mut link = Self {
             link_id,
             state: LinkState::Handshake,
             is_initiator: false,
@@ -547,7 +554,7 @@ impl Link {
             activated_at: None,
             stale_since: None,
             keepalive: KeepaliveState::new(false),
-            mtu: request.signalling.mtu.min(rns_wire::constants::MTU as u32),
+            mtu,
             mdu: rns_wire::constants::ENCRYPTED_MDU,
             resource_strategy: ResourceStrategy::default(),
             pending_requests: Vec::new(),
@@ -579,6 +586,7 @@ impl Link {
             link_closed_callback: None,
         };
 
+        link.update_mdu();
         Ok((link, proof_data))
     }
 
@@ -1367,11 +1375,12 @@ impl Link {
         let mtu = self.mtu as usize;
         let overhead =
             1 + rns_wire::constants::HEADER_MINSIZE + rns_wire::constants::TOKEN_OVERHEAD;
-        if mtu > overhead {
-            self.mdu = ((mtu - overhead) / rns_wire::constants::AES128_BLOCKSIZE)
-                * rns_wire::constants::AES128_BLOCKSIZE
-                - 1;
-        }
+        // Maliciously small negotiated MTUs cannot fit an encrypted block.
+        // Rust's unsigned MDU represents that as zero, never a stale default
+        // or an underflow (Python's arithmetic can produce a negative MDU).
+        self.mdu = ((mtu.saturating_sub(overhead) / rns_wire::constants::AES128_BLOCKSIZE)
+            * rns_wire::constants::AES128_BLOCKSIZE)
+            .saturating_sub(1);
     }
 
     pub fn is_active(&self) -> bool {
@@ -1613,6 +1622,122 @@ mod tests {
             .unwrap();
         assert_eq!(link.expected_hops, Some(2));
         assert_eq!(link.state, LinkState::Active);
+    }
+
+    #[test]
+    #[ignore = "requires local Python reference checkout"]
+    fn responder_mtu_proofs_match_python() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let dest = [0xAD; 16];
+        let key = Ed25519PrivateKey::generate();
+        let mut input = String::new();
+        for offered in [
+            None,
+            Some(0),
+            Some(1),
+            Some(68),
+            Some(69),
+            Some(83),
+            Some(84),
+            Some(128),
+            Some(300),
+            Some(499),
+            Some(500),
+            Some(1064),
+            Some(0x1FFFFF),
+        ] {
+            let (_, mut request) = Link::new_initiator(dest, 1);
+            if let Some(mtu) = offered {
+                request[64..]
+                    .copy_from_slice(&SignallingData::new(DEFAULT_MODE, mtu).unwrap().pack());
+            } else {
+                request.truncate(64);
+            }
+            let (responder, proof) = Link::new_responder(&request, &key, dest, 1).unwrap();
+            input.push_str(&format!(
+                "{} {} {} {} {} {}\n",
+                hex::encode(request),
+                hex::encode(proof),
+                hex::encode(dest),
+                hex::encode(key.public_key().to_bytes()),
+                responder.mtu,
+                responder.mdu
+            ));
+        }
+        let mut child = Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .args([
+            "-B",
+            "-c",
+            include_str!("../tests/responder_mtu_reference.py"),
+        ])
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output().unwrap();
+        let written = writer.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.unwrap();
+    }
+
+    #[test]
+    fn responder_proof_mtu_matches_negotiated_state() {
+        let dest = [0xAE; 16];
+        let key = Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        for offered in [0, 1, 67, 68, 69, 83, 84, 128, 300, 499, 500, 1064, 0x1FFFFF] {
+            let (mut initiator, mut request) = Link::new_initiator(dest, 1);
+            let original_id = initiator.link_id;
+            request[64..]
+                .copy_from_slice(&SignallingData::new(DEFAULT_MODE, offered).unwrap().pack());
+            let (mut responder, proof) = Link::new_responder(&request, &key, dest, 1).unwrap();
+            let expected = if offered == 0 { 500 } else { offered.min(500) };
+            assert_eq!(responder.mtu, expected, "offered MTU {offered}");
+            assert_eq!(
+                responder.link_id, original_id,
+                "MTU changes must not change Link ID"
+            );
+            assert_eq!(
+                LinkProofData::unpack(&proof).unwrap().signalling.mtu,
+                expected,
+                "proof for offered MTU {offered}"
+            );
+            let expected_mdu = ((expected as usize).saturating_sub(68) / 16 * 16).saturating_sub(1);
+            assert_eq!(responder.mdu, expected_mdu, "MDU before RTT");
+            let rtt = initiator
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            responder.receive_rtt_packet(&rtt).unwrap();
+            assert_eq!(initiator.mtu, responder.mtu);
+            assert_eq!(initiator.mdu, expected_mdu);
+            assert_eq!(responder.mdu, expected_mdu);
+            assert_eq!(initiator.state, LinkState::Active);
+            assert_eq!(responder.state, LinkState::Active);
+            if expected_mdu > 0 {
+                let payload = vec![0x5A; expected_mdu];
+                let encrypted = initiator.encrypt(&payload).unwrap();
+                assert!(
+                    encrypted.len() + rns_wire::constants::HEADER_MINSIZE + 1 <= expected as usize
+                );
+                assert_eq!(responder.decrypt(&encrypted).unwrap(), payload);
+                let encrypted = responder.encrypt(&payload).unwrap();
+                assert!(
+                    encrypted.len() + rns_wire::constants::HEADER_MINSIZE + 1 <= expected as usize
+                );
+                assert_eq!(initiator.decrypt(&encrypted).unwrap(), payload);
+            }
+        }
     }
 
     #[test]

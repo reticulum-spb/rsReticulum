@@ -1066,3 +1066,49 @@ Actor-level смешанная нагрузка этапа 4 теперь про
 Прежние exception/MTU signalling границы и межпроцессная интеграция остаются
 открытыми, полный этап 4 и обновление до 1.5.2 не объявлены завершёнными.
 Версия и пользовательский план не менялись, push не выполнялся.
+
+## MTU signalling review — согласованность локального responder
+
+При проверке оставшихся MTU violation sites этапа 4 найден базовый дефект
+Link, который нужно устранить до расширенного MTU этапа 5. У responder
+локальный `mtu = min(request_mtu, 500)`, но подписанный LRPROOF всегда
+advertised 500. Нулевая offer сохранялась как 0 вместо Python fallback 500;
+MDU до получения RTT оставался стандартным. На диапазоне MTU 69–83 прежний
+`update_mdu` мог вычитать 1 из нуля с panic в debug/underflow в release.
+
+Исправлено в `rns-link`:
+
+- Один effective MTU для state и подписанного proof. Legacy/zero offer → 500,
+  остальные → min(offer, 500); существующий локальный cap пока сохранён.
+- MDU рассчитывается сразу при создании responder. При слишком маленьком
+  MTU unsigned MDU равен 0; это явная безопасная граница вместо отрицательного
+  значения, которое может получиться в Python, или stale/default MDU в Rust.
+- Link ID по-прежнему не зависит от signalling. Подпись покрывает фактические
+  signalling bytes; формат пакета и проверка допустимых mode не менялись.
+
+Проверки:
+
+- Новый regression test сначала воспроизвёл несовпадение zero-offer (0 вместо
+  500), после исправления проходит. Матрица 0/1/67/68/69/83/84/128/300/499/500/
+  1064/2097151 проверяет proof, state, MDU до и после RTT, полный Rust handshake
+  и совпадение Link ID. Для положительного MDU передаётся payload ровно MDU в
+  обоих направлениях с проверкой размера зашифрованного кадра.
+- `cargo test -p rns-link --quiet`: 98 passed, 1 ignored.
+- `cargo test -p rns-link --lib responder_mtu_proofs_match_python -- --ignored`:
+  1 passed, 13 variants, включая legacy 64-byte request. Python RNS разбирает
+  пакеты, вычисляет Link ID/signalling/MDU и проверяет Ed25519-подпись Rust
+  LRPROOF. Runtime RNS/сокеты не запускаются. Cap 500 явно указан в oracle:
+  это не проверка autoconfigure/fixed-MTU interfaces.
+- `cargo test -p rns-protocol --quiet`: 173 passed.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  5 ignored. Workspace all-targets, client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` собираются; новых warnings нет.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно.
+
+MTU counters на Transport.py:2086/2563 связаны с ветками clamp и возможностью
+signalling_bytes отказать для недопустимого mode. В Rust нет полноценной
+передачи AUTOCONFIGURE_MTU/FIXED_MTU capabilities в actor, а локальный Link
+ограничен 500. Эти сайты не имитируются без соответствующей MTU-семантики.
+Это локальная prerequisite-починка, не завершение этапов 4/5/6: transit clamp,
+увеличенный local MTU, dataplane control и прежние ограничения остаются.
+Обновлены границы в CONFIG.md; версия и пользовательский план не изменены.
