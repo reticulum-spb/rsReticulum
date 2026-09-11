@@ -5,6 +5,53 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
 #[tokio::test]
+async fn reader_mtu_allowance_accepts_boundary_rejects_overflow_and_resyncs() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = BackboneClientConfig::new(
+        "receive-mtu",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    config.bitrate = 100_000_000;
+    config.max_reconnect_tries = Some(1);
+    let (tx, mut events) = mpsc::channel(8);
+    let handle = spawn_backbone_client(config, 78, tx).await.unwrap();
+    let mut task = handle.read_task;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let limit = handle.mtu as usize + 64;
+        let valid = vec![hdlc::FLAG; limit];
+        peer.write_all(&hdlc::frame(&valid)).await.unwrap();
+        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+            panic!("boundary frame")
+        };
+        assert_eq!(packet.raw.as_ref(), valid);
+        peer.write_all(&hdlc::frame(&vec![hdlc::ESC; limit + 1]))
+            .await
+            .unwrap();
+        peer.write_all(&hdlc::frame(b"resynchronised"))
+            .await
+            .unwrap();
+        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+            panic!("resynchronised frame")
+        };
+        assert_eq!(packet.raw.as_ref(), b"resynchronised");
+        peer.shutdown().await.unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: 78 })
+        ));
+        (&mut task).await.unwrap();
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn listener_children_inherit_configured_bitrate_and_mtu() {
     for bitrate in [62_500, 100_000_000, 200_000_000, 1_000_000_000] {
         let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -76,6 +123,7 @@ async fn full_transport_fin_and_reset_cancel_unsent_frame() {
             online.clone(),
             Arc::new(AtomicU64::new(0)),
             ingress.clone(),
+            HW_MTU,
         ));
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             peer.write_all(&hdlc::frame(b"unsent~}")).await.unwrap();
@@ -131,6 +179,7 @@ async fn full_transport_recovers_without_losing_live_peer_frames() {
         Arc::new(AtomicBool::new(true)),
         Arc::new(AtomicU64::new(0)),
         ingress.clone(),
+        HW_MTU,
     ));
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         let mut wire = hdlc::frame(b"first~}");
@@ -251,6 +300,7 @@ async fn ungated_fin_still_delivers_buffered_complete_frames() {
             Arc::new(AtomicBool::new(true)),
             rxb.clone(),
             IngressControl::new(),
+            HW_MTU,
         ),
     )
     .await
@@ -422,6 +472,7 @@ async fn gated_close_does_not_consume_kernel_buffered_payload() {
         online.clone(),
         rxb.clone(),
         ingress.clone(),
+        HW_MTU,
     ));
     peer.write_all(&hdlc::frame(b"unread~}")).await.unwrap();
     peer.shutdown().await.unwrap();
@@ -457,6 +508,7 @@ async fn ingress_gate_pauses_reader_and_release_preserves_frames() {
         online.clone(),
         rxb.clone(),
         ingress.clone(),
+        HW_MTU,
     ));
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         peer.write_all(&hdlc::frame(b"first~}")).await.unwrap();

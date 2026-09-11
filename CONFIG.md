@@ -482,7 +482,16 @@ thresholds, matching Python 1.5.2. Backbone listeners and clients default to
 driver before startup; accepted peers inherit their listener's bitrate and
 computed MTU. Below 62500 bit/s the Rust driver retains a 500-byte fallback
 instead of a nullable hardware MTU. This does not remove the separate local
-Link cap or complete MTU capability propagation and receive-buffer validation.
+Link cap or complete MTU capability propagation.
+
+Backbone RX bounds decoded HDLC frames to the computed MTU plus a conservative
+64-byte IFAC allowance; the actor still enforces the actual configured IFAC
+size. The encoded accumulator permits twice that limit, excluding delimiters,
+so fully escaped valid frames also survive fragmented reads. Oversized frames
+are discarded and framing resumes at the next delimiter. These driver drops
+are debug-logged, but do not reach the actor's protocol-violation counters or
+RPC/UI diagnostics. Other drivers retain their existing deframer limits.
+Exact IFAC propagation and minimum/service-frame handling remain incomplete.
 
 TX combines already queued HDLC frames into encoded batches of at most 64 KiB,
 processing at most 64 frames per batch. It does not wait for more traffic to

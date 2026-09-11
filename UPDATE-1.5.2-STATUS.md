@@ -1677,3 +1677,38 @@ shared_medium/capabilities и Link clamp ещё не завершены. Вер�
 fmt/diff checks успешны после форматирования. В новом YAML assertion исправлен
 путь модуля: файл yaml_config.rs экспортируется как crate::config.
 Прежние warnings сохраняются; сетевые tests выполнены с loopback-разрешением.
+
+### Этап 5 — границы Backbone RX с учётом HDLC-экранирования
+
+Backbone reader теперь получает вычисленный MTU и ограничивает decoded frame
+размером MTU + 64 bytes. Драйвер пока не знает фактический IFAC size, поэтому
+64 — консервативный максимальный допуск; точный размер проверяется actor.
+Encoded accumulator ограничен удвоенным decoded limit без FLAG delimiters.
+Прежний общий encoded cap 524288 мог отбрасывать допустимые полностью
+экранированные крупные кадры. Другие драйверы сохраняют legacy limit через
+HdlcDeframer::new(); новая граница включена только для Backbone.
+
+Decoded overflow проверяется на завершённом кадре, encoded overflow — при
+накоплении. Переполнение отбрасывает кадр один раз, чтение восстанавливается
+на следующем FLAG. Это ограничение накопителя, не точный предел RSS: scratch,
+ёмкость Vec, очередь готовых кадров и kernel buffers учитываются отдельно.
+Decoder считает oversized frames; Backbone пишет debug log. Отброшенные здесь
+кадры не доходят до actor protocol-violation counters; RPC/UI ещё не дополнены.
+
+Тесты проверяют полностью экранированный кадр 512 KiB + 64 bytes при трёх
+размерах chunks, decoded/encoded overflow с восстановлением и reset, а также
+реальный loopback Backbone client на границе MTU + 64 и после превышения.
+Payload fixtures проверяют framing, а не криптографическую корректность IFAC.
+Отдельный ignored oracle использует локальный Python 1.5.2 HDLC.ReceiveBuffer:
+36 готовых кадров (четыре лимита, -1/0/+1 byte, plain/FLAG/ESC) совпали.
+
+Это не буквальная parity неполных Python frames: Python ограничивает незакрытый
+буфер через mtu * 2 без IFAC allowance. Rust намеренно допускает 2*(MTU+64)
+encoded bytes без delimiters, чтобы результат не зависел от дробления чтения.
+Minimum/service frames, точный IFAC в драйвере, capabilities/Link clamp,
+shared_medium, диагностика и multi-peer нагрузочные сравнения остаются открыты.
+Версия проекта и пользовательский план не изменены.
+
+Проверки: interface lib — 211 passed, 5 ignored; отдельный Python oracle —
+1 passed. Workspace all-targets и runtime client-only tests checks успешны;
+прежние warnings сохраняются. Сетевые тесты выполнены с loopback-разрешением.

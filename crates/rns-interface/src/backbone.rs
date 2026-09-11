@@ -164,6 +164,7 @@ async fn backbone_read_loop(
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
     ingress: Arc<IngressControl>,
+    mtu: u32,
 ) {
     struct ResetIngress(Arc<IngressControl>);
     impl Drop for ResetIngress {
@@ -172,8 +173,10 @@ async fn backbone_read_loop(
         }
     }
     let _reset = ResetIngress(ingress.clone());
-    let mut deframer = hdlc::HdlcDeframer::new();
-    // Large buffer to amortise syscalls; inbound capped by HdlcDeframer::MAX_FRAME_SIZE.
+    // Driver does not yet own the configured IFAC size. Admit at most the
+    // largest valid IFAC (64 bytes); actor enforces the exact registered size.
+    let mut deframer = hdlc::HdlcDeframer::with_max_decoded_size(mtu as usize + 64);
+    // Large read buffer amortises syscalls independently of frame boundaries.
     let mut buf = vec![0u8; 65536];
     'receive: loop {
         if !wait_ingress_or_closed(&reader, &ingress).await {
@@ -188,7 +191,17 @@ async fn backbone_read_loop(
             Ok(n) => {
                 rxb.fetch_add(n as u64, Ordering::Relaxed);
                 ingress.received_bytes(n);
-                for frame in deframer.feed(&buf[..n]) {
+                let rejected = deframer.oversized_frames();
+                let frames = deframer.feed(&buf[..n]);
+                if deframer.oversized_frames() != rejected {
+                    tracing::debug!(
+                        interface_id,
+                        mtu,
+                        dropped = deframer.oversized_frames() - rejected,
+                        "backbone oversized HDLC frames rejected"
+                    );
+                }
+                for frame in frames {
                     if frame.is_empty() {
                         continue;
                     }
@@ -587,7 +600,7 @@ pub async fn spawn_backbone_server(
                     };
                     let read_handle = tokio::spawn(async move {
                         tokio::select! {
-                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r, reader_ingress) => {},
+                            _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r, reader_ingress, mtu) => {},
                             _ = controlled_write_loop(writer, c_rx, c_online_w, c_txb_w, accounting) => {},
                         }
                         connection_online.store(false, Ordering::SeqCst);
@@ -805,6 +818,7 @@ pub async fn spawn_backbone_client(
                     c_online_r,
                     c_rxb,
                     reader_ingress.clone(),
+                    mtu,
                 );
                 let writing =
                     controlled_write_loop(writer, conn_rx, c_online_w, c_txb, accounting.clone());

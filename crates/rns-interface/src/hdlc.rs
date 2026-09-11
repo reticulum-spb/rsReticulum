@@ -98,6 +98,9 @@ pub fn frame(data: &[u8]) -> Vec<u8> {
 }
 
 pub struct HdlcDeframer {
+    max_encoded_size: usize,
+    max_decoded_size: Option<usize>,
+    oversized_frames: u64,
     buffer: Vec<u8>,
     in_frame: bool,
     /// Reusable scratch for unescape output to avoid per-frame allocation.
@@ -107,10 +110,28 @@ pub struct HdlcDeframer {
 impl HdlcDeframer {
     pub fn new() -> Self {
         Self {
+            max_encoded_size: MAX_FRAME_SIZE,
+            max_decoded_size: None,
+            oversized_frames: 0,
             buffer: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
             in_frame: false,
             unescape_scratch: Vec::with_capacity(DEFRAME_BUF_CAPACITY),
         }
+    }
+
+    /// Bound decoded payload independently from its worst-case HDLC expansion.
+    /// Delimiters are not stored in the encoded accumulator. Other drivers
+    /// keep the legacy encoded-size limit through `new()`.
+    pub fn with_max_decoded_size(limit: usize) -> Self {
+        Self {
+            max_encoded_size: limit.saturating_mul(2),
+            max_decoded_size: Some(limit),
+            ..Self::new()
+        }
+    }
+
+    pub fn oversized_frames(&self) -> u64 {
+        self.oversized_frames
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
@@ -125,7 +146,12 @@ impl HdlcDeframer {
                         if !self.buffer.is_empty() {
                             self.unescape_scratch.clear();
                             unescape_into(&self.buffer, &mut self.unescape_scratch);
-                            if !self.unescape_scratch.is_empty() {
+                            if self
+                                .max_decoded_size
+                                .is_some_and(|limit| self.unescape_scratch.len() > limit)
+                            {
+                                self.oversized_frames = self.oversized_frames.saturating_add(1);
+                            } else if !self.unescape_scratch.is_empty() {
                                 frames.push(std::mem::take(&mut self.unescape_scratch));
                                 // Restore capacity for the next frame.
                                 self.unescape_scratch = Vec::with_capacity(DEFRAME_BUF_CAPACITY);
@@ -147,11 +173,12 @@ impl HdlcDeframer {
         frames
     }
 
-    /// Append `chunk` to `self.buffer` while enforcing `MAX_FRAME_SIZE`. On
+    /// Append `chunk` to `self.buffer` while enforcing the encoded limit. On
     /// overflow the in-progress frame is dropped and we wait for the next FLAG
     /// to resync — matching the previous byte-loop behavior.
     fn append_in_frame(&mut self, chunk: &[u8]) {
-        if self.buffer.len() + chunk.len() > MAX_FRAME_SIZE {
+        if chunk.len() > self.max_encoded_size.saturating_sub(self.buffer.len()) {
+            self.oversized_frames = self.oversized_frames.saturating_add(1);
             self.buffer.clear();
             self.in_frame = false;
             return;
@@ -174,6 +201,113 @@ impl Default for HdlcDeframer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires local Python 1.5.2 source; RNS_PYTHON_ROOT/RNS_PYTHON_BIN override defaults"]
+    fn decoded_limits_match_python_complete_frames() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut input = String::new();
+        let mut expected = String::new();
+        for limit in [500, 564, 32784, 524352] {
+            for size in [limit - 1, limit, limit + 1] {
+                for byte in [42, FLAG, ESC] {
+                    let mut decoder = HdlcDeframer::with_max_decoded_size(limit);
+                    let payload = vec![byte; size];
+                    let frames = decoder.feed(&frame(&payload));
+                    if size <= limit {
+                        assert_eq!(frames, [payload]);
+                    }
+                    input.push_str(&format!("{limit} {size} {byte}\n"));
+                    expected.push_str(&format!(
+                        "{} {}\n",
+                        frames.len(),
+                        decoder.oversized_frames()
+                    ));
+                }
+            }
+        }
+        let mut child = Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .arg("-B")
+        .arg("-c")
+        .arg(
+            r#"
+import sys
+from pathlib import Path
+scope = {}
+source = Path(sys.argv[1]) / 'RNS/Interfaces/util/HDLC.py'
+exec(compile(source.read_text(), str(source), 'exec'), scope)
+for line in sys.stdin.readlines():
+    limit, size, byte = map(int, line.split())
+    frames, invalid = [], []
+    receiver = scope['ReceiveBuffer'](mtu=limit, min_frame_len=19, max_frame_len=limit,
+        on_frame=frames.append, on_invalid=invalid.append)
+    receiver.feed(b'\x7e' + scope['HDLC'].escape(bytes([byte])*size) + b'\x7e')
+    print(len(frames), len(invalid))
+"#,
+        )
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+
+    #[test]
+    fn decoded_limit_accepts_full_escaped_mtu_with_ifac_across_chunks() {
+        let limit = 524_288 + 64;
+        let payload = vec![FLAG; limit];
+        let wire = frame(&payload);
+        assert!(wire.len() > MAX_FRAME_SIZE);
+        for chunk_size in [1_023, 65_536, wire.len()] {
+            let mut decoder = HdlcDeframer::with_max_decoded_size(limit);
+            let mut frames = Vec::new();
+            for chunk in wire.chunks(chunk_size) {
+                frames.extend(decoder.feed(chunk));
+                assert!(decoder.buffer.len() <= 2 * limit);
+            }
+            assert_eq!(frames, [payload.clone()]);
+            assert_eq!(decoder.oversized_frames(), 0);
+        }
+    }
+
+    #[test]
+    fn decoded_and_encoded_overflow_drop_once_then_resynchronise() {
+        for payload in [vec![42; 101], vec![ESC; 101], vec![42; 1000]] {
+            let mut decoder = HdlcDeframer::with_max_decoded_size(100);
+            let mut frames = Vec::new();
+            for chunk in frame(&payload).chunks(7) {
+                frames.extend(decoder.feed(chunk));
+                assert!(decoder.buffer.len() <= 200);
+            }
+            assert!(frames.is_empty());
+            assert_eq!(decoder.oversized_frames(), 1);
+            assert_eq!(decoder.feed(&frame(&[FLAG; 100])), [vec![FLAG; 100]]);
+            assert_eq!(decoder.oversized_frames(), 1);
+            decoder.feed(&[FLAG, ESC]);
+            decoder.reset();
+            assert_eq!(
+                decoder.feed(&frame(b"after reset")),
+                [b"after reset".to_vec()]
+            );
+        }
+    }
 
     #[test]
     fn test_escape_unescape_roundtrip() {
