@@ -645,6 +645,7 @@ pub struct PathTableRpcEntry {
 
 #[derive(Debug, Clone)]
 pub struct InterfaceStatRpcEntry {
+    pub control_traffic: crate::traffic::ControlTraffic,
     pub inbound_diagnostics: InboundDiagnostics,
     pub blocked_ips: u64,
     pub blocked_ip_list: Vec<String>,

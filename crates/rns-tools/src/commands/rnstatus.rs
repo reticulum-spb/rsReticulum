@@ -1513,6 +1513,7 @@ mod tests {
         pr_burst_active: bool,
     ) -> rpc::InterfaceStatEntry {
         rpc::InterfaceStatEntry {
+            control_traffic: Default::default(),
             inbound_diagnostics: Default::default(),
             blocked_ips: 0,
             blocked_ip_list: Vec::new(),

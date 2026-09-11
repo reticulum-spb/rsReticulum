@@ -228,6 +228,11 @@ function setRuntimeState(state, heading, detail) {
   document.querySelector("#runtime-detail").textContent = detail;
 }
 
+function formatControlTraffic(packets, bytes) {
+  const valid = (value) => Number.isSafeInteger(value) && value >= 0;
+  return `${valid(packets) ? formatNumber(packets) : "—"} / ${valid(bytes) ? formatBytes(bytes) : "—"}`;
+}
+
 function formatBytes(value) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
@@ -460,6 +465,10 @@ function interfaceDetails(item) {
     detailItem("Held announces", formatNumber(item.held_announces)),
     detailItem("Incoming announces", formatFrequency(item.incoming_announce_frequency)),
     detailItem("Outgoing announces", formatFrequency(item.outgoing_announce_frequency)),
+    detailItem("Announce RX packets / bytes", formatControlTraffic(item.arxc, item.arxb)),
+    detailItem("Announce TX packets / bytes", formatControlTraffic(item.atxc, item.atxb)),
+    detailItem("Path request RX packets / bytes", formatControlTraffic(item.prxc, item.prxb)),
+    detailItem("Path request TX packets / bytes", formatControlTraffic(item.ptxc, item.ptxb)),
   );
   container.append(details);
   if (item.configured) {
@@ -1766,6 +1775,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     inboundQueueRows,
     formatBytes,
+    formatControlTraffic,
     formatDuration,
     formatFrequency,
     formatNumber,

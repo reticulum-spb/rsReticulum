@@ -129,6 +129,32 @@ unsigned MessagePack integer. Existing Rust interface-only RPC decoders retain
 their response shape and ignore these additional fields. `rnstatus-rs` display
 and remote-management propagation of queue metrics remain pending.
 
+### Announce and path-request traffic counters (partial 1.5.2 coverage)
+
+Interface entries in shared-instance RPC and Web API include `arxb`, `atxb`,
+`arxc`, `atxc` (announce RX/TX bytes and packet counts) and `prxb`, `ptxb`,
+`prxc`, `ptxc` (path-request equivalents). The interface details panel displays
+these totals. Sizes include the actual packet header, but exclude IFAC and
+driver framing. Counters saturate at `u64::MAX` and reset on re-registration.
+Inactive configured interfaces return `null`; older RPC responses default to
+zero. The UI marks unavailable or unsafe JavaScript integer values with `—`.
+
+RX announces count after signature/blackhole checks; PRs count after tag
+deduplication, before the inflight gate. Both count before class-queue admission,
+so queue overflow does not undo them. Dispatch does not recount a prepared
+packet. Like Python, a held announce re-entering preprocessing is counted again;
+these are processing counters, not unique on-wire packet counts.
+
+TX counts after successful admission to the driver's channel, including queued
+announces and forwarded path responses, using the post-mangling packet size.
+Full/closed TX channels and outbound-disabled interfaces do not increment it.
+This is not a physical-delivery acknowledgement: a driver can subsequently
+drop the packet. Python invokes its counters at separate outbound/announce-queue
+sites; Rust intentionally centralizes this accounting at channel admission.
+These counters are per registered endpoint; parent-interface aggregation,
+global external totals, class byte rates/composition and PPS remain pending.
+Existing frequency estimates and ingress/egress limits are unchanged.
+
 ### Receive violation diagnostics (partial 1.5.2 coverage)
 
 Runtime interface entries in shared-instance RPC and Web API expose

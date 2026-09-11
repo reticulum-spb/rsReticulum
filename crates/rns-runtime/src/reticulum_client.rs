@@ -597,6 +597,7 @@ fn interface_stats_to_transport_response(
         entries
             .into_iter()
             .map(|entry| InterfaceStatRpcEntry {
+                control_traffic: entry.control_traffic,
                 inbound_diagnostics: entry.inbound_diagnostics,
                 blocked_ips: entry.blocked_ips,
                 blocked_ip_list: entry.blocked_ip_list,

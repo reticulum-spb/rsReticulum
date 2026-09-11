@@ -73,6 +73,7 @@ impl TransportActor {
                             .and_then(|diagnostics| diagnostics.blocked_ip_list())
                             .unwrap_or_default();
                         InterfaceStatRpcEntry {
+                            control_traffic: entry.ingress.traffic,
                             inbound_diagnostics: entry.inbound_diagnostics,
                             blocked_ips: blocked_ip_list.len() as u64,
                             blocked_ip_list,

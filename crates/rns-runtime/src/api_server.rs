@@ -1844,6 +1844,18 @@ fn merge_iface_json(
         // ── config (null when not in config file) ─────────────────────
         "config":                       Value::Null,
     });
+    for (key, value) in [
+        ("arxb", e.control_traffic.arxb),
+        ("atxb", e.control_traffic.atxb),
+        ("arxc", e.control_traffic.arxc),
+        ("atxc", e.control_traffic.atxc),
+        ("prxb", e.control_traffic.prxb),
+        ("ptxb", e.control_traffic.ptxb),
+        ("prxc", e.control_traffic.prxc),
+        ("ptxc", e.control_traffic.ptxc),
+    ] {
+        v[key] = Value::from(value);
+    }
 
     if let Some(section) = section {
         v["config"] = iface_section_json(section);
@@ -1877,6 +1889,14 @@ fn config_only_iface_json(name: &str, section: &NormalizedSection) -> Value {
         "tx_rate": 0,
         "tx_drops": 0,
         "protocol_violations": null,
+        "arxb": null,
+        "atxb": null,
+        "arxc": null,
+        "atxc": null,
+        "prxb": null,
+        "ptxb": null,
+        "prxc": null,
+        "ptxc": null,
         "ifac_violations": null,
         "packet_filter_hits": null,
         "announce_queue": 0,
@@ -2292,13 +2312,37 @@ mod tests {
             .await
             .unwrap();
         let task = tokio::spawn(actor.run());
-        let TransportQueryResponse::InterfaceStats(stats) = response_rx.await.unwrap() else {
+        let TransportQueryResponse::InterfaceStats(mut stats) = response_rx.await.unwrap() else {
             panic!("wrong response")
         };
         let value = merge_iface_json(&stats[0], None, None);
         assert_eq!(value["protocol_violations"], 1);
         assert_eq!(value["ifac_violations"], 0);
         assert_eq!(value["packet_filter_hits"], 0);
+        assert_eq!(value["arxc"], 0);
+        stats[0].control_traffic = rns_transport::traffic::ControlTraffic {
+            arxb: 101,
+            atxb: 202,
+            arxc: 3,
+            atxc: 4,
+            prxb: 505,
+            ptxb: u64::MAX,
+            prxc: 7,
+            ptxc: 8,
+        };
+        let value = merge_iface_json(&stats[0], None, None);
+        for (key, expected) in [
+            ("arxb", 101),
+            ("atxb", 202),
+            ("arxc", 3),
+            ("atxc", 4),
+            ("prxb", 505),
+            ("ptxb", u64::MAX),
+            ("prxc", 7),
+            ("ptxc", 8),
+        ] {
+            assert_eq!(value[key], expected);
+        }
         drop(input);
         drop(control);
         tokio::time::timeout(std::time::Duration::from_secs(2), task)

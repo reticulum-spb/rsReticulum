@@ -914,3 +914,61 @@ hops и входящего интерфейса с маршрутом; отсу�
 Этап 4 остаётся частичным: traffic-flow статистика и итоговая проверка
 смешанной нагрузки; exception/MTU signalling coverage отмечено выше.
 Этапы 5–7 и финальная интеграция не завершены, версия не менялась.
+
+## Этап 4 — счётчики пакетов и байтов announce/PR
+
+Добавлен фиксированный `ControlTraffic` на регистрацию интерфейса: `arxb`,
+`atxb`, `arxc`, `atxc`, `prxb`, `ptxb`, `prxc`, `ptxc`. Все восемь счётчиков
+насыщаются на `u64::MAX`; отдельной таблицы по destination/packet hash нет.
+Удаление/замена регистрации не оставляет накопленные счётчики новому endpoint.
+
+RX подключён к существующим точкам preprocess: announce после проверки
+подписи/blackhole, PR после tag dedup до inflight gate. Размер — весь stripped
+пакет, включая Header1/Header2, без IFAC и framing. Учёт предшествует
+переполнению классовой очереди; queue drop не отменяет его. Dispatch уже
+подготовленного пакета не повторяет учёт. Повторный preprocess released held
+announce, как в Python, учитывается вновь; это не unique wire RX totals.
+
+TX централизован в успешной постановке `send_to_interface` в канал драйвера:
+включает local/forwarded/queued announces и PR, использует размер после
+hop/header mangling, до IFAC. Full/closed channel и запрет outbound не считаются
+передачей. Это сознательная архитектурная граница: Python вызывает счётчики
+в отдельных outbound/announce-queue местах, Rust считает channel admission,
+а не физическую доставку (драйвер может отбросить пакет позже). Existing
+frequency samples/ingress/egress thresholds не изменены. Константный PR
+destination hash кешируется через OnceLock, чтобы новая TX-классификация
+не вычисляла хеш имени для каждого DATA-пакета.
+
+Цепочка подключена: actor GetInterfaceStats → full/client runtime bridge →
+shared-instance MessagePack RPC → Web API → четыре поля карточки интерфейса.
+Wire/JSON ключи совпадают с Python Interface stats. Старые ответы без полей
+читаются с нулями; configured-only API возвращает null; UI не выдаёт null или
+небезопасные JS integers за точные значения. `u64::MAX` сохраняется в RPC/JSON.
+
+Проверки:
+
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  456 passed, 3 ignored. Новые tests: IFAC, Header1/Header2, уникальные теги
+  при уже занятом inflight gate, invalid signature, отсутствие recount на
+  dispatch, queue overflow всех классов, full TX/outbound disabled, query,
+  сброс регистрации, saturation.
+- `cargo test -p rns-runtime --features api --lib --quiet`:
+  236 passed, 5 ignored; loopback-тесты повторены с разрешением после EPERM.
+  Добавлены проверки API mapping, RPC round-trip и defaults старого JSON/RPC.
+- `cargo test -p rns-runtime --features api --lib control_traffic_rpc_matches_python_interface_counters -- --ignored`:
+  1 passed. Из AST эталонного Interface.py извлечены реальные четыре метода;
+  результаты сравниваются с Rust RPC, декодированным vendored umsgpack.
+  Проверяются суммы/число вызовов и wire keys; это не end-to-end нагрузочная
+  проверка транспортов и не проверка parent-interface aggregation.
+- `node --test crates/rns-runtime/web/app.test.js`: успешно, включая
+  нулевые/отсутствующие/слишком большие counter values.
+- Workspace all-targets, runtime client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` собираются; новых warnings нет.
+- `cargo fmt --all -- --check`, `git diff --check`: успешно.
+
+Этап 4 остаётся частичным: скорости/композиция traffic flow и итоговая
+смешанная нагрузка, ранее обозначенные exception/MTU signalling границы.
+Parent aggregation, глобальные внешние totals, PPS, CLI/remote presentation
+остаются для продолжения диагностики (этап 7); они не подменены простым
+суммированием новых endpoint counters. Этапы 5–7 и финальная интеграция не
+завершены. Версия и пользовательский план не изменены; push не выполнялся.

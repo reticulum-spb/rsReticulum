@@ -321,10 +321,22 @@ impl TransportActor {
     /// Local destination -> fire waiters so the owner re-announces.
     /// Known path + transport enabled -> replay the cached announce.
     /// Otherwise, on a transport node, forward the request on other interfaces.
+    #[cfg(test)]
     pub(super) fn prepare_path_request(
         &mut self,
         data: &[u8],
         interface_id: InterfaceId,
+    ) -> Option<PreparedPathRequest> {
+        // Payload-only helper for routing tests; production supplies the exact
+        // stripped frame length (HEADER_1 and HEADER_2 differ).
+        self.prepare_path_request_with_size(data, interface_id, 0)
+    }
+
+    pub(super) fn prepare_path_request_with_size(
+        &mut self,
+        data: &[u8],
+        interface_id: InterfaceId,
+        frame_size: usize,
     ) -> Option<PreparedPathRequest> {
         if data.len() < 16 {
             return None;
@@ -378,6 +390,7 @@ impl TransportActor {
         self.discovery_pr_tags.insert(unique_tag);
 
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ingress.traffic.received_path_request(frame_size);
             entry.ingress.received_path_request();
         }
 

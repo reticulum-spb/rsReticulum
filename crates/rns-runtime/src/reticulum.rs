@@ -422,6 +422,7 @@ fn rpc_response_to_transport_response(
             let entries = entries
                 .into_iter()
                 .map(|entry| InterfaceStatRpcEntry {
+                    control_traffic: entry.control_traffic,
                     inbound_diagnostics: entry.inbound_diagnostics,
                     blocked_ips: entry.blocked_ips,
                     blocked_ip_list: entry.blocked_ip_list,

@@ -150,6 +150,8 @@ pub struct PathTableEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceStatEntry {
     #[serde(default, flatten)]
+    pub control_traffic: rns_transport::traffic::ControlTraffic,
+    #[serde(default, flatten)]
     pub inbound_diagnostics: rns_transport::messages::InboundDiagnostics,
     #[serde(default)]
     pub blocked_ips: u64,
@@ -554,6 +556,14 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                         ("short_name", PyValue::String(e.name.clone())),
                         ("type", PyValue::String(e.role.clone())),
                         ("rxb", PyValue::Int(i128::from(e.rx_bytes))),
+                        ("arxb", PyValue::Int(i128::from(e.control_traffic.arxb))),
+                        ("atxb", PyValue::Int(i128::from(e.control_traffic.atxb))),
+                        ("arxc", PyValue::Int(i128::from(e.control_traffic.arxc))),
+                        ("atxc", PyValue::Int(i128::from(e.control_traffic.atxc))),
+                        ("prxb", PyValue::Int(i128::from(e.control_traffic.prxb))),
+                        ("ptxb", PyValue::Int(i128::from(e.control_traffic.ptxb))),
+                        ("prxc", PyValue::Int(i128::from(e.control_traffic.prxc))),
+                        ("ptxc", PyValue::Int(i128::from(e.control_traffic.ptxc))),
                         ("txb", PyValue::Int(i128::from(e.tx_bytes))),
                         ("rxs", PyValue::Int(i128::from(e.rx_rate))),
                         ("txs", PyValue::Int(i128::from(e.tx_rate))),
@@ -860,6 +870,16 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
         .map(|(idx, entry)| {
             let m = as_dict(entry)?;
             Ok(InterfaceStatEntry {
+                control_traffic: rns_transport::traffic::ControlTraffic {
+                    arxb: dict_get(m, "arxb").and_then(py_u64).unwrap_or(0),
+                    atxb: dict_get(m, "atxb").and_then(py_u64).unwrap_or(0),
+                    arxc: dict_get(m, "arxc").and_then(py_u64).unwrap_or(0),
+                    atxc: dict_get(m, "atxc").and_then(py_u64).unwrap_or(0),
+                    prxb: dict_get(m, "prxb").and_then(py_u64).unwrap_or(0),
+                    ptxb: dict_get(m, "ptxb").and_then(py_u64).unwrap_or(0),
+                    prxc: dict_get(m, "prxc").and_then(py_u64).unwrap_or(0),
+                    ptxc: dict_get(m, "ptxc").and_then(py_u64).unwrap_or(0),
+                },
                 inbound_diagnostics: rns_transport::messages::InboundDiagnostics {
                     protocol_violations: dict_get(m, "protocol_violations")
                         .and_then(py_u64)
@@ -1889,6 +1909,16 @@ mod tests {
 
     fn interface_stat_entry() -> InterfaceStatEntry {
         InterfaceStatEntry {
+            control_traffic: rns_transport::traffic::ControlTraffic {
+                arxb: 101,
+                atxb: 202,
+                arxc: 3,
+                atxc: 4,
+                prxb: 505,
+                ptxb: u64::MAX,
+                prxc: 7,
+                ptxc: 8,
+            },
             inbound_diagnostics: rns_transport::messages::InboundDiagnostics {
                 protocol_violations: 11,
                 ifac_violations: 12,
@@ -1930,6 +1960,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Python reference checkout"]
+    fn control_traffic_rpc_matches_python_interface_counters() {
+        let mut entry = interface_stat_entry();
+        entry.control_traffic = Default::default();
+        use rns_transport::traffic::ControlTraffic;
+        let methods: [fn(&mut ControlTraffic, usize); 4] = [
+            ControlTraffic::received_announce,
+            ControlTraffic::sent_announce,
+            ControlTraffic::received_path_request,
+            ControlTraffic::sent_path_request,
+        ];
+        for (index, method) in methods.into_iter().enumerate() {
+            for size in [0, 51 + index, 500 + index] {
+                method(&mut entry.control_traffic, size);
+            }
+        }
+        let encoded = encode_response(&RpcResponse::InterfaceStats(vec![entry])).unwrap();
+        let output = std::process::Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .args([
+            "-B",
+            "-c",
+            include_str!("../tests/control_traffic_rpc_receiver.py"),
+        ])
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .arg(hex::encode(encoded))
+        .output()
+        .expect("start reference Python");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn test_interface_stats_response_roundtrip_includes_125_fields() {
         let resp = RpcResponse::InterfaceStats(vec![interface_stat_entry()]);
         let encoded = encode_response(&resp).unwrap();
@@ -1940,6 +2007,10 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
                 assert_eq!(entry.gravity, -42);
+                assert_eq!(
+                    entry.control_traffic,
+                    interface_stat_entry().control_traffic
+                );
                 assert_eq!(
                     entry.inbound_diagnostics,
                     interface_stat_entry().inbound_diagnostics
@@ -1977,6 +2048,7 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 let entry = &entries[0];
                 assert_eq!(entry.inbound_diagnostics, Default::default());
+                assert_eq!(entry.control_traffic, Default::default());
                 assert_eq!(entry.incoming_pr_frequency, 0.0);
                 assert_eq!(entry.gravity, 0);
                 assert_eq!(entry.blocked_ips, 0);
@@ -1995,6 +2067,14 @@ mod tests {
     #[test]
     fn interface_diagnostics_json_is_flat_and_accepts_older_peers() {
         let mut value = serde_json::to_value(interface_stat_entry()).unwrap();
+        assert_eq!(value["arxb"], 101);
+        assert_eq!(value["ptxb"], u64::MAX);
+        assert!(value.get("control_traffic").is_none());
+        for key in [
+            "arxb", "atxb", "arxc", "atxc", "prxb", "ptxb", "prxc", "ptxc",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
         assert_eq!(value["protocol_violations"], 11);
         assert_eq!(value["ifac_violations"], 12);
         assert_eq!(value["packet_filter_hits"], 13);
@@ -2007,6 +2087,7 @@ mod tests {
             value.as_object_mut().unwrap().remove(key);
         }
         let decoded: InterfaceStatEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.control_traffic, Default::default());
         assert_eq!(decoded.inbound_diagnostics, Default::default());
     }
 

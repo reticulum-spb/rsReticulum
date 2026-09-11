@@ -6,6 +6,7 @@ const test = require("node:test");
 const {
   inboundQueueRows,
   formatBytes,
+  formatControlTraffic,
   formatDuration,
   formatFrequency,
   formatNumber,
@@ -32,6 +33,11 @@ test("allows editing schema-backed plugin interfaces", () => {
 });
 
 test("formats runtime metrics", () => {
+  assert.equal(formatControlTraffic(2, 1500), "2 / 1.5 kB");
+  assert.equal(formatControlTraffic(0, 0), "0 / 0 B");
+  for (const unavailable of [null, undefined, -1, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(formatControlTraffic(unavailable, unavailable), "— / —");
+  }
   assert.equal(formatBytes(0), "0 B");
   assert.equal(formatBytes(1500), "1.5 kB");
   assert.equal(formatRate(2500), "2.5 kB/s");

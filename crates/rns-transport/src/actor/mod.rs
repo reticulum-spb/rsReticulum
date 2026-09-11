@@ -1309,7 +1309,20 @@ impl TransportActor {
             Bytes::copy_from_slice(raw)
         };
         match entry.tx.try_send(data) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Count the actual frame after hop/header mangling, but before
+                // IFAC. Queue rejection is not a transmitted control packet.
+                if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(raw) {
+                    let traffic = &mut self.interfaces.get_mut(&id).unwrap().ingress.traffic;
+                    if header.flags.packet_type == rns_wire::flags::PacketType::Announce {
+                        traffic.sent_announce(raw.len());
+                    } else if header.flags.packet_type == rns_wire::flags::PacketType::Data
+                        && header.destination_hash == Self::path_request_dest_hash()
+                    {
+                        traffic.sent_path_request(raw.len());
+                    }
+                }
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let tx_drops = entry
                     .tx_drops
@@ -2267,6 +2280,105 @@ mod tests {
         assert!(
             !online.load(std::sync::atomic::Ordering::SeqCst),
             "driver-shared online flag must be false after deregister"
+        );
+    }
+
+    #[test]
+    fn control_traffic_tx_counts_only_accepted_frames_without_ifac() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _old_rx) = make_test_interface("flow");
+        let (tx, mut rx) = mpsc::channel(1);
+        entry.tx = tx;
+        let key = rns_identity::ifac::derive_ifac_key(Some("flow"), None).unwrap();
+        entry.ifac_key = Some(key);
+        entry.ifac_size = 4;
+        actor.interfaces.insert(1, entry);
+        let (announce, _) = make_valid_announce("test.flow.tx", 0);
+        actor.send_to_interface(1, &announce);
+        actor.send_to_interface(1, &announce); // full
+        assert_eq!(rx.try_recv().unwrap().len(), announce.len() + 4);
+        let pr = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+        actor.send_to_interface(1, &pr);
+        assert_eq!(rx.try_recv().unwrap().len(), pr.len() + 4);
+        actor.send_to_interface(1, &make_data_packet([7; 16], 0));
+        rx.try_recv().unwrap();
+        actor.interfaces.get_mut(&1).unwrap().direction = InterfaceDirection::inbound_only();
+        actor.send_to_interface(1, &announce);
+        actor.send_to_interface(1, &pr);
+        let traffic = actor.interfaces[&1].ingress.traffic;
+        assert_eq!(traffic.atxc, 1);
+        assert_eq!(traffic.atxb, announce.len() as u64);
+        assert_eq!(traffic.ptxc, 1);
+        assert_eq!(traffic.ptxb, pr.len() as u64);
+        let TransportQueryResponse::InterfaceStats(stats) =
+            actor.handle_query(TransportQuery::GetInterfaceStats)
+        else {
+            panic!()
+        };
+        assert_eq!(stats[0].control_traffic, traffic);
+        actor.deregister_interface(1);
+        let (replacement, _rx) = make_test_interface("replacement");
+        actor.interfaces.insert(1, replacement);
+        assert_eq!(actor.interfaces[&1].ingress.traffic, Default::default());
+    }
+
+    #[test]
+    fn control_traffic_rx_uses_full_stripped_frames_before_inflight_gate() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("flow");
+        let key = rns_identity::ifac::derive_ifac_key(Some("flow"), None).unwrap();
+        entry.ifac_key = Some(key);
+        entry.ifac_size = 4;
+        actor.interfaces.insert(1, entry);
+        let packet = |raw: &[u8]| InboundPacket {
+            raw: crate::ifac::ifac_sign(raw, &key, 4).into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        };
+        let pr = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+        let (mut header, _) = rns_wire::header::PacketHeader::unpack(&pr).unwrap();
+        let mut total = 0;
+        for tag in [1, 2] {
+            if tag == 2 {
+                header.flags.header_type = rns_wire::flags::HeaderType::Header2;
+                header.transport_id = Some([0; 16]);
+                actor.transport_identity_hash = Some([0; 16]);
+            }
+            let mut raw = header.pack().unwrap();
+            raw.extend_from_slice(&make_path_request_payload_with_tag(
+                [8; 16], None, [tag; 16],
+            ));
+            total += raw.len() as u64;
+            let prepared = actor.prepare_inbound(packet(&raw));
+            assert_eq!(
+                prepared.is_some(),
+                tag == 1,
+                "second tag hits inflight gate"
+            );
+            assert!(
+                actor.prepare_inbound(packet(&raw)).is_none(),
+                "duplicate tag"
+            );
+        }
+        assert_eq!(actor.interfaces[&1].ingress.traffic.prxc, 2);
+        assert_eq!(actor.interfaces[&1].ingress.traffic.prxb, total);
+        let (raw, _) = make_valid_announce("test.flow.rx", 0);
+        let prepared = actor.prepare_inbound(packet(&raw)).unwrap();
+        assert_eq!(actor.interfaces[&1].ingress.traffic.arxc, 1);
+        assert_eq!(actor.interfaces[&1].ingress.traffic.arxb, raw.len() as u64);
+        actor.dispatch_inbound(prepared);
+        assert_eq!(
+            actor.interfaces[&1].ingress.traffic.arxc, 1,
+            "dispatch must not recount"
+        );
+        let mut corrupt = raw.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(actor.prepare_inbound(packet(&corrupt)).is_none());
+        assert_eq!(
+            actor.interfaces[&1].ingress.traffic.arxc, 1,
+            "invalid signature"
         );
     }
 
@@ -4215,6 +4327,11 @@ mod tests {
         assert_eq!(stats.snapshot.total, 10);
         assert_eq!(stats.snapshot.dropped, [1; 4]);
         assert_eq!(actor.channel_drops, 4);
+        let regular_traffic = actor.interfaces[&1].ingress.traffic;
+        let limited_traffic = actor.interfaces[&2].ingress.traffic;
+        assert_eq!(regular_traffic.arxc, 3, "includes queue overflow");
+        assert_eq!(regular_traffic.prxc, 4, "includes queue overflow");
+        assert_eq!(limited_traffic.prxc, 5, "includes ingress-limited overflow");
         for class in TrafficClass::ALL {
             for _ in 0..sizes[class as usize] {
                 let prepared = actor.inbound_queues.pop().unwrap();
@@ -4223,6 +4340,18 @@ mod tests {
             }
         }
         assert_eq!(actor.inbound_queues.snapshot().total, 0);
+        assert_eq!(
+            actor.interfaces[&1].ingress.traffic.arxc,
+            regular_traffic.arxc
+        );
+        assert_eq!(
+            actor.interfaces[&1].ingress.traffic.prxc,
+            regular_traffic.prxc
+        );
+        assert_eq!(
+            actor.interfaces[&2].ingress.traffic.prxc,
+            limited_traffic.prxc
+        );
         let TransportQueryResponse::InboundQueueStats(Some(stats)) =
             actor.handle_query(TransportQuery::GetInboundQueueStats)
         else {

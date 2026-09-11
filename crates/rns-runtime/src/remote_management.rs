@@ -470,6 +470,7 @@ mod tests {
                     let resp = match query {
                         TransportQuery::GetInterfaceStats => {
                             let stats = vec![InterfaceStatRpcEntry {
+                                control_traffic: Default::default(),
                                 inbound_diagnostics: Default::default(),
                                 blocked_ips: 1,
                                 blocked_ip_list: vec!["127.0.0.1".into()],

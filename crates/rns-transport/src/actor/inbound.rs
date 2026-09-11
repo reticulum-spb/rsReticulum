@@ -322,7 +322,11 @@ impl TransportActor {
         let path_request = if parsed.flags.packet_type == rns_wire::flags::PacketType::Data
             && parsed.destination_hash == Self::path_request_dest_hash()
         {
-            Some(self.prepare_path_request(&raw[data_offset..], packet.interface_id)?)
+            Some(self.prepare_path_request_with_size(
+                &raw[data_offset..],
+                packet.interface_id,
+                raw.len(),
+            )?)
         } else {
             None
         };
@@ -507,6 +511,7 @@ impl TransportActor {
                 .discovery_path_requests
                 .contains_key(&header.destination_hash);
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
+            entry.ingress.traffic.received_announce(raw.len());
             entry.ingress.received_announce();
             if !is_from_local_client
                 && !announced_destination_known
@@ -926,10 +931,13 @@ impl TransportActor {
 
     /// Well-known PLAIN destination hash for path-request packets.
     pub(super) fn path_request_dest_hash() -> [u8; 16] {
-        rns_identity::destination::Destination::hash_from_name_and_identity(
-            "rnstransport.path.request",
-            None,
-        )
+        static HASH: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+        *HASH.get_or_init(|| {
+            rns_identity::destination::Destination::hash_from_name_and_identity(
+                "rnstransport.path.request",
+                None,
+            )
+        })
     }
 
     fn process_data(
