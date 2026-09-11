@@ -2163,3 +2163,30 @@ destination.receive; Rust ограничивает его при создани�
 4 ignored; workspace all-targets и runtime client-only tests checks успешны;
 fmt и diff check чистые. Прежние warnings без изменений. Далее — сетевые
 large-MTU проверки и измерения этапа 5. Этап открыт, версия остаётся 1.0.1.
+
+### Продолжение этапа 5: реальный TCP Link MTU round-trip
+
+Добавлен `crates/rns-runtime/tests/link_mtu_tcp.rs`: локальный TCP listener-peer
+с библиотечным Rust Link подключён к настоящему TcpClient driver, transport
+actor и runtime LinkManager responder. Матрица offer/cap/expected:
+32768/500/500, 32768/1196/1196, 524288/262144/262144,
+1196/262144/1196. IFAC выключен явно, порты выбираются ОС, общий deadline30s;
+задачи actor/driver отменяются guard-ом, включая panic/timeout.
+
+Проверяется LRPROOF signature, RTT handshake и совпадение MTU/MDU, затем
+payload1 и полный MDU в обе стороны через TCP с проверкой содержимого и
+wire packet length <= negotiated MTU. HDLC записывается частями997 bytes.
+Перед корректными данными отправляются полностью escaped frame cap+1 и
+валидно зашифрованный Link DATA packet выше receive cap; следующий допустимый
+пакет доставляется приложению, oversized payload не доставляется. При чтении
+ответа peer отделяет Link proofs и посторонний служебный трафик actor.
+
+Проверки: новый TCP test — 1 passed в default и 1 passed в client-only сборке
+(каждый включает четыре случая); существующий Python mixed TCP load/disconnect
+test — 1 passed с эталоном ea98db4f; workspace all-targets check успешен;
+fmt/diff check чистые, прежние warnings без изменений.
+
+Это responder-side сетевой regression, не полный runtime-to-runtime тест:
+инициатор задаёт offer библиотечным API, не использует async MTU discovery.
+Python large-MTU Link interop, transit/multi-peer сценарии и сопоставимые
+throughput/latency/drop/RSS измерения остаются. Этап 5 открыт, версия 1.0.1.

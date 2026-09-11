@@ -263,8 +263,13 @@ capabilities fall back to 500. The query, including channel admission, is
 bounded to one second and the caller's remaining budget. A legacy or zero-MTU
 proof reduces the initiator to at most 500. Synchronous preparation remains
 I/O-free and keeps its 500-byte offer. Runtime responder tests cover both signer
-paths, authenticated MTU agreement and in-memory encrypted payloads up to MDU;
-full large-packet transport tests are still pending. Applications constructing
+paths, authenticated MTU agreement and in-memory encrypted payloads up to MDU.
+`cargo test -p rns-runtime --test link_mtu_tcp` additionally exercises a real
+loopback TCP driver, actor and responder: MTU 500/1196/262144, full-MDU payloads
+in both directions and receive recovery after oversized frames. The peer uses
+the Rust Link library with an explicit offer; this does not cover async initiator
+discovery, Python large-MTU interop, transit paths or load/RSS benchmarks.
+Applications constructing
 LinkRequest events directly must now supply `max_mtu` (500 preserves the old cap).
 TCP, Backbone, Local and Auto expose negotiable MTU through driver metadata, separately
 from the raw receive limit. Transit Link Requests with exactly 64 key bytes plus
