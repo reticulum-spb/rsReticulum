@@ -481,8 +481,12 @@ processing at most 64 frames per batch. It does not wait for more traffic to
 fill a batch. Large frames span batches without changing wire framing. TX byte
 counters include framing and count bytes accepted by the socket, including
 partial writes, not confirmed remote delivery. The encoded batch limit is not
-a byte limit for the existing packet-count-bounded input queues. Adaptive
-backpressure and stalled-peer timeouts are not implemented yet.
+a byte limit for the existing packet-count-bounded input queues. Pending TX
+with no successful socket write for 12 seconds closes the connection through
+the normal disconnect/reconnect path. Idle connections are not timed out;
+any partial write renews the deadline. Unlike Python's once-per-second drain
+sampling, this deadline uses actual write progress and monotonic time.
+Adaptive queue-pressure gating is not implemented yet.
 
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |

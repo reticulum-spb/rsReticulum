@@ -10,6 +10,7 @@ struct Writer {
     max_write: usize,
     fail_after: Option<usize>,
     interrupt_once: bool,
+    interrupt_forever: bool,
     write_zero: bool,
 }
 
@@ -19,7 +20,7 @@ impl AsyncWrite for Writer {
         _: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.interrupt_once {
+        if self.interrupt_once || self.interrupt_forever {
             self.interrupt_once = false;
             return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
         }
@@ -55,8 +56,74 @@ fn writer(max_write: usize) -> Writer {
         max_write,
         fail_after: None,
         interrupt_once: false,
+        interrupt_forever: false,
         write_zero: false,
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn interruptions_neither_reset_deadline_nor_starve_other_tasks() {
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Bytes::from_static(b"packet")).await.unwrap();
+    let mut sink = writer(1);
+    sink.interrupt_forever = true;
+    let count = Arc::new(AtomicU64::new(0));
+    let online = Arc::new(AtomicBool::new(true));
+    let task = tokio::spawn(backbone_write_loop(sink, rx, online.clone(), count.clone()));
+    tokio::task::yield_now().await;
+    tokio::time::advance(TX_DEAD_TIME).await;
+    task.await.unwrap();
+    assert!(!online.load(Ordering::SeqCst));
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_output_expires_but_idle_connection_survives() {
+    let (tx, rx) = mpsc::channel(2);
+    let (sink, mut reader) = tokio::io::duplex(1);
+    let count = Arc::new(AtomicU64::new(0));
+    let online = Arc::new(AtomicBool::new(true));
+    let task = tokio::spawn(backbone_write_loop(sink, rx, online.clone(), count.clone()));
+    tokio::task::yield_now().await;
+    tokio::time::advance(TX_DEAD_TIME * 3).await;
+    assert!(!task.is_finished(), "idle is not stalled");
+    tx.send(Bytes::from_static(b"packet")).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    tokio::time::advance(TX_DEAD_TIME - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    task.await.unwrap();
+    assert!(!online.load(Ordering::SeqCst));
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    assert!(tx.send(Bytes::from_static(b"late")).await.is_err());
+    let mut received = Vec::new();
+    reader.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, [hdlc::FLAG]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_progress_renews_deadline_and_slow_reader_can_finish() {
+    let (tx, rx) = mpsc::channel(1);
+    let (sink, mut reader) = tokio::io::duplex(1);
+    let count = Arc::new(AtomicU64::new(0));
+    let online = Arc::new(AtomicBool::new(true));
+    let task = tokio::spawn(backbone_write_loop(sink, rx, online.clone(), count.clone()));
+    tx.send(Bytes::from_static(b"abc")).await.unwrap();
+    let expected = hdlc::frame(b"abc");
+    let mut received = Vec::new();
+    for index in 0..expected.len() {
+        tokio::task::yield_now().await;
+        assert_eq!(count.load(Ordering::Relaxed), (index + 1) as u64);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(!task.is_finished());
+        received.push(reader.read_u8().await.unwrap());
+    }
+    assert_eq!(received, expected);
+    assert!(online.load(Ordering::SeqCst));
+    drop(tx);
+    task.await.unwrap();
 }
 
 #[test]

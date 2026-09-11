@@ -1263,3 +1263,32 @@ Interrupted повторяется, zero write/error завершает writer; 
 ingress throttling, capabilities/MTU-семантика и связанные diagnostics,
 сетевая многопользовательская нагрузка с медленными peers и измерением памяти.
 Полный Python TransmitBuffer/controller parity этим изменением не заявляется.
+
+### Этап 5 — прекращение зависшего TX Backbone
+
+Общий writer Backbone теперь завершает соединение после 12 секунд без
+успешной записи при наличии pending encoded output. Значение взято из
+Python 1.5.2 `DP_EC_DEAD_TIME`. Пустое соединение, ожидающее `rx.recv()`,
+таймером не ограничивается. Каждая частичная запись продлевает deadline;
+Interrupted не продлевает его и уступает выполнение другим задачам.
+Timeout сохраняет точный TX counter и выставляет offline; существующий
+connection select отменяет reader и запускает штатный disconnect/reconnect
+путь. Обратный RX-трафик не считается прогрессом TX.
+
+Явное отличие от Python: здесь monotonic deadline от фактического write,
+а не проверка счётчиков раз в секунду. Порядок Python evaluate (dead check
+до обработки свежего drained sample) не воспроизводится. Это отдельная
+защита pending writer, не завершённый адаптивный egress controller.
+Queue-byte accounting, ETA gating/hysteresis и ingress control ещё впереди.
+
+Добавлены три теста с виртуальным временем Tokio (test-util только для tests):
+idle дольше 12 секунд и timeout ровно на границе с закрытием очереди;
+медленный reader с прогрессом каждые 11 секунд успешно получает целый кадр;
+непрерывный Interrupted не вызывает starvation и завершается по deadline.
+Целевые TX tests: 8 passed, 1 ignored. Проверка сетевого teardown нескольких
+конкурирующих peers под давлением остаётся задачей нагрузочных тестов этапа 5.
+
+Итоговые проверки: `cargo test -p rns-interface --lib --quiet` — 187 passed,
+1 ignored (с разрешением локальных сокетов); `cargo check --workspace --all-targets`,
+`cargo fmt --all -- --check` и `git diff --check` — успешно. Check сохраняет
+прежние предупреждения database_path и tracing_subscriber::prelude.

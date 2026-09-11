@@ -165,6 +165,9 @@ async fn backbone_read_loop(
 // one bounded encoded batch is held here; the existing mpsc provides backlog.
 const TX_COALESCE_TARGET: usize = 65536;
 const TX_COALESCE_FRAMES: usize = 64;
+// Python 1.5.2 DP_EC_DEAD_TIME. Only pending socket output is timed,
+// never an idle connection waiting for the next application frame.
+const TX_DEAD_TIME: Duration = Duration::from_secs(12);
 
 #[cfg(test)]
 #[path = "backbone_tx_tests.rs"]
@@ -258,8 +261,23 @@ async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin>(
             }
         }
         let mut sent = 0;
+        let mut deadline = tokio::time::Instant::now() + TX_DEAD_TIME;
         while sent < batch.len() {
-            match writer.write(&batch[sent..]).await {
+            // Check explicitly as an always-ready Interrupted writer must not
+            // defeat timeout_at's polling of the write future before its timer.
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("backbone TX made no progress for 12 seconds");
+                break 'transmit;
+            }
+            let result = match tokio::time::timeout_at(deadline, writer.write(&batch[sent..])).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("backbone TX made no progress for 12 seconds");
+                    break 'transmit;
+                }
+            };
+            match result {
                 Ok(0) => {
                     tracing::warn!("backbone write returned zero");
                     break 'transmit;
@@ -267,8 +285,12 @@ async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin>(
                 Ok(written) => {
                     sent += written;
                     txb.fetch_add(written as u64, Ordering::Relaxed);
+                    deadline = tokio::time::Instant::now() + TX_DEAD_TIME;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "backbone write error");
                     break 'transmit;
