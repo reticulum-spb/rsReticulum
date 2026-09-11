@@ -1974,6 +1974,7 @@ loopback matrix расширена на HDLC/KISS × default/fixed500/fixed52428
 проверяет boundary+IFAC allowance, два overflow варианта, recovery и EOF.
 Interface lib — 225 passed, 5 ignored; workspace all-targets, runtime
 client-only tests и fmt/diff checks успешны. Прежние warnings сохраняются.
+
 Этап 5 открыт; local Link cap 500, версия и пользовательский план не менялись.
 
 ### Этап 5 — точный TCP IFAC allowance
@@ -2044,3 +2045,21 @@ cap 500, версия проекта и пользовательский пла�
 
 Runtime API lib — 239 passed, 5 ignored; workspace all-targets, runtime
 client-only tests и fmt/diff checks успешны. Прежние warnings сохраняются.
+
+### Этап 5 — минимальная длина Local IPC
+
+Local reader теперь пропускает только decoded frames >HEADER_MINSIZE (19),
+как Python LocalInterface.ReceiveBuffer. Empty/short frames тихо отбрасываются
+до transport admission; physical rxb продолжает учитывать весь прочитанный
+поток. Actor violation counters не увеличиваются для этих driver drops.
+Upper bound 262144, IFAC поведение и local Link cap 500 не менялись.
+
+Новый duplex test подаёт escaped frames размеров 0..=20 chunks по 3 bytes
+в очередь capacity=1. Проверены единственный 20-byte inbound, physical total
+всего wire, EOF и offline. Local reconnect/roundtrip fixtures удлинены выше
+минимума; TX-only short reply fixture оставлен, поскольку новый фильтр — RX.
+Interface lib — 228 passed, 5 ignored. Этап 5 остаётся открытым; версия проекта
+и пользовательский план сохранены.
+
+Runtime API lib — 239 passed, 5 ignored; workspace all-targets, runtime
+client-only tests и fmt/diff checks успешны; прежние warnings сохраняются.

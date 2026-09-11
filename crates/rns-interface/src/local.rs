@@ -107,7 +107,9 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
             Ok(n) => {
                 rxb.fetch_add(n as u64, Ordering::Relaxed);
                 for frame in deframer.feed(&buf[..n]) {
-                    if frame.is_empty() {
+                    // Python Local ReceiveBuffer accepts only frames strictly
+                    // larger than HEADER_MINSIZE. Physical RX remains counted.
+                    if frame.len() <= rns_wire::constants::HEADER_MINSIZE {
                         continue;
                     }
                     let msg = TransportMessage::Inbound(InboundPacket {
@@ -596,6 +598,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn local_short_frames_are_filtered_but_physical_bytes_are_counted() {
+        let (reader, mut peer) = tokio::io::duplex(8192);
+        let (tx, mut events) = mpsc::channel(1);
+        let rxb = Arc::new(AtomicU64::new(0));
+        let online = Arc::new(AtomicBool::new(true));
+        let task = tokio::spawn(local_read_loop(reader, 1, tx, online.clone(), rxb.clone()));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut wire = Vec::new();
+            for size in 0..=20 {
+                wire.extend(hdlc::frame(&vec![hdlc::FLAG; size]));
+            }
+            for chunk in wire.chunks(3) {
+                peer.write_all(chunk).await.unwrap();
+            }
+            let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                panic!("boundary")
+            };
+            assert_eq!(packet.raw.as_ref(), [hdlc::FLAG; 20]);
+            peer.shutdown().await.unwrap();
+            assert!(events.recv().await.is_none());
+            assert_eq!(rxb.load(Ordering::Relaxed), wire.len() as u64);
+            assert!(!online.load(Ordering::SeqCst));
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn decoded_local_mtu_accepts_escaped_boundary_and_rejects_overflow() {
         let (reader, mut peer) = tokio::io::duplex(8192);
         let (tx, mut events) = mpsc::channel(2);
@@ -676,10 +708,13 @@ mod tests {
         .await
         .unwrap();
         let (mut first, _) = listener.accept().await.unwrap();
-        first.write_all(&hdlc::frame(b"first")).await.unwrap();
+        first
+            .write_all(&hdlc::frame(b"first local payload padding"))
+            .await
+            .unwrap();
         let packet = packets.recv().await.unwrap();
         assert!(
-            matches!(packet, TransportMessage::Inbound(p) if p.interface_id == 77 && &p.raw[..] == b"first")
+            matches!(packet, TransportMessage::Inbound(p) if p.interface_id == 77 && &p.raw[..] == b"first local payload padding")
         );
         let before = handle.rxb.as_ref().unwrap().load(Ordering::Relaxed);
         drop(first);
@@ -695,13 +730,16 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        second.write_all(&hdlc::frame(b"second")).await.unwrap();
+        second
+            .write_all(&hdlc::frame(b"second local payload padding"))
+            .await
+            .unwrap();
         let packet = tokio::time::timeout(std::time::Duration::from_secs(1), packets.recv())
             .await
             .unwrap()
             .unwrap();
         assert!(
-            matches!(packet, TransportMessage::Inbound(p) if p.interface_id == 77 && &p.raw[..] == b"second")
+            matches!(packet, TransportMessage::Inbound(p) if p.interface_id == 77 && &p.raw[..] == b"second local payload padding")
         );
         assert!(handle.online.load(Ordering::SeqCst));
         assert!(handle.rxb.as_ref().unwrap().load(Ordering::Relaxed) > before);
@@ -782,7 +820,7 @@ mod tests {
             );
         }
 
-        let payload = Bytes::from_static(b"local ipc test");
+        let payload = Bytes::from_static(b"local ipc test payload");
         client_handle.tx.send(payload.clone()).await.unwrap();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())
@@ -798,7 +836,7 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
 
-        let reply = Bytes::from_static(b"local ipc reply");
+        let reply = Bytes::from_static(b"local ipc reply payload");
         accepted.tx.send(reply.clone()).await.unwrap();
 
         let msg2 = tokio::time::timeout(std::time::Duration::from_secs(3), transport_rx.recv())

@@ -501,6 +501,9 @@ At least one of `listen_port` and `forward_port` is required.
 Local IPC handles and their Link MTU capability use 262144 bytes. The HDLC
 reader bounds decoded frames to this size without an IFAC allowance; fully
 escaped boundary frames are accepted and oversized frames are discarded.
+Empty frames and decoded frames of 1..=19 bytes are silently discarded before
+transport admission, matching Python Local's strict minimum. Physical RX byte
+totals still include them; actor violation counters do not.
 This interface MTU is separate from the current 500-byte local Link cap.
 Python's forced shared-instance bitrate/MTU override is not implemented here.
 
