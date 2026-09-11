@@ -122,6 +122,34 @@ fn child_mtu() -> u32 {
         .unwrap_or(rns_wire::constants::MTU as u32)
 }
 
+// Readable payload remains unread while gated. Polling is bounded because
+// readiness stays asserted for unread data; awaiting ready alone would spin.
+const GATED_CLOSE_POLL: Duration = Duration::from_millis(50);
+
+async fn wait_ingress_or_closed(
+    reader: &tokio::net::tcp::OwnedReadHalf,
+    ingress: &IngressControl,
+) -> bool {
+    loop {
+        tokio::select! {
+            biased;
+            _ = ingress.wait_open() => return true,
+            ready = reader.ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR) => {
+                match ready {
+                    Ok(ready) if ready.is_read_closed() || ready.is_error() => return false,
+                    Err(_) => return false,
+                    _ => {},
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = ingress.wait_open() => return true,
+            _ = tokio::time::sleep(GATED_CLOSE_POLL) => {},
+        }
+    }
+}
+
 async fn backbone_read_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     interface_id: InterfaceId,
@@ -140,8 +168,11 @@ async fn backbone_read_loop(
     let mut deframer = hdlc::HdlcDeframer::new();
     // Large buffer to amortise syscalls; inbound capped by HdlcDeframer::MAX_FRAME_SIZE.
     let mut buf = vec![0u8; 65536];
-    loop {
-        ingress.wait_open().await;
+    'receive: loop {
+        if !wait_ingress_or_closed(&reader, &ingress).await {
+            tracing::info!(interface_id, "backbone peer closed while ingress gated");
+            break;
+        }
         match reader.read(&mut buf).await {
             Ok(0) => {
                 tracing::info!(interface_id, "backbone read: EOF");
@@ -154,7 +185,13 @@ async fn backbone_read_loop(
                     if frame.is_empty() {
                         continue;
                     }
-                    ingress.wait_open().await;
+                    if !wait_ingress_or_closed(&reader, &ingress).await {
+                        tracing::info!(
+                            interface_id,
+                            "backbone peer closed with gated frames pending"
+                        );
+                        break 'receive;
+                    }
                     ingress.received_frame();
                     let msg = TransportMessage::Inbound(InboundPacket {
                         raw: Bytes::from(frame),

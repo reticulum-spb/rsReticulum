@@ -5,6 +5,214 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
 #[tokio::test]
+async fn ungated_fin_still_delivers_buffered_complete_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (reader, _writer) = stream.into_split();
+    let wire = hdlc::frame(b"before FIN~}");
+    peer.write_all(&wire).await.unwrap();
+    peer.shutdown().await.unwrap();
+    let (tx, mut events) = mpsc::channel(8);
+    let rxb = Arc::new(AtomicU64::new(0));
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        backbone_read_loop(
+            reader,
+            7,
+            tx,
+            Arc::new(AtomicBool::new(true)),
+            rxb.clone(),
+            IngressControl::new(),
+        ),
+    )
+    .await
+    .unwrap();
+    let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+        panic!("expected buffered frame")
+    };
+    assert_eq!(packet.raw.as_ref(), b"before FIN~}");
+    assert_eq!(rxb.load(Ordering::Relaxed), wire.len() as u64);
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn gated_peer_keeps_tx_and_other_peer_rx_live() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tx, mut events) = mpsc::channel(8);
+    let mut handles = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut peers = Vec::new();
+        for id in [75, 76] {
+            let mut config = BackboneClientConfig::new(
+                "two-peers",
+                "127.0.0.1",
+                listener.local_addr().unwrap().port(),
+            );
+            config.max_reconnect_tries = Some(1);
+            handles.push(spawn_backbone_client(config, id, tx.clone()).await.unwrap());
+            peers.push(listener.accept().await.unwrap().0);
+        }
+        while handles
+            .iter()
+            .any(|handle| !handle.online.load(Ordering::SeqCst))
+        {
+            tokio::task::yield_now().await;
+        }
+        handles[0]
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .dataplane_ingress()
+            .unwrap()
+            .gate(Duration::from_secs(3600));
+        peers[0].write_all(&hdlc::frame(b"blocked")).await.unwrap();
+        peers[1].write_all(&hdlc::frame(b"active")).await.unwrap();
+        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+            panic!("expected active peer data")
+        };
+        assert_eq!(
+            (packet.interface_id, packet.raw.as_ref()),
+            (76, b"active".as_slice())
+        );
+        handles[0]
+            .tx
+            .send(Bytes::from_static(b"outgoing~}"))
+            .await
+            .unwrap();
+        let expected = hdlc::frame(b"outgoing~}");
+        let mut received = vec![0; expected.len()];
+        peers[0].read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected);
+        peers[0].shutdown().await.unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(TransportMessage::DeregisterInterface { id: 75 })
+        ));
+        peers[1]
+            .write_all(&hdlc::frame(b"still active"))
+            .await
+            .unwrap();
+        let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+            panic!("expected surviving peer data")
+        };
+        assert_eq!(
+            (packet.interface_id, packet.raw.as_ref()),
+            (76, b"still active".as_slice())
+        );
+        assert!(handles[1].online.load(Ordering::SeqCst));
+    })
+    .await;
+    for handle in handles {
+        handle.read_task.abort();
+        let _ = handle.read_task.await;
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn gated_client_fin_and_reset_disconnect_without_release() {
+    for buffered in [false, true] {
+        for reset in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = BackboneClientConfig::new(
+                "gated-close",
+                "127.0.0.1",
+                listener.local_addr().unwrap().port(),
+            );
+            config.max_reconnect_tries = Some(1);
+            let (tx, mut events) = mpsc::channel(8);
+            let handle = spawn_backbone_client(config, 74, tx).await.unwrap();
+            let mut task = handle.read_task;
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                while !handle.online.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                let control = handle
+                    .diagnostics
+                    .as_ref()
+                    .unwrap()
+                    .dataplane_ingress()
+                    .unwrap();
+                control.gate(Duration::from_secs(3600));
+                if buffered {
+                    peer.write_all(&hdlc::frame(b"must not be delivered~}"))
+                        .await
+                        .unwrap();
+                }
+                // Allow the reader to enter its gate, including after an
+                // already-started read. No actor is present to release it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(control.snapshot(74, false).gated);
+                assert!(events.try_recv().is_err());
+                if reset {
+                    socket2::SockRef::from(&peer)
+                        .set_linger(Some(Duration::ZERO))
+                        .unwrap();
+                    drop(peer);
+                } else {
+                    peer.shutdown().await.unwrap();
+                    // Keep the peer's read half alive: FIN alone must suffice.
+                }
+                assert!(matches!(
+                    events.recv().await,
+                    Some(TransportMessage::DeregisterInterface { id: 74 })
+                ));
+                (&mut task).await.unwrap();
+                assert!(!handle.online.load(Ordering::SeqCst));
+                assert!(handle.tx.is_closed());
+                assert!(!control.snapshot(74, false).gated);
+                assert_eq!(control.snapshot(74, false).packets, 0);
+            })
+            .await;
+            if result.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            result.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn gated_close_does_not_consume_kernel_buffered_payload() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (reader, _writer) = stream.into_split();
+    let ingress = IngressControl::new();
+    ingress.gate(Duration::from_secs(3600));
+    let online = Arc::new(AtomicBool::new(true));
+    let rxb = Arc::new(AtomicU64::new(0));
+    let (tx, mut events) = mpsc::channel(8);
+    let mut task = tokio::spawn(backbone_read_loop(
+        reader,
+        7,
+        tx,
+        online.clone(),
+        rxb.clone(),
+        ingress.clone(),
+    ));
+    peer.write_all(&hdlc::frame(b"unread~}")).await.unwrap();
+    peer.shutdown().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+    result.unwrap().unwrap();
+    assert_eq!(rxb.load(Ordering::Relaxed), 0);
+    assert!(!online.load(Ordering::SeqCst));
+    assert!(!ingress.snapshot(7, false).gated);
+    assert!(events.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn ingress_gate_pauses_reader_and_release_preserves_frames() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut peer = TcpStream::connect(listener.local_addr().unwrap())

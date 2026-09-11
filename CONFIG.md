@@ -511,9 +511,14 @@ Reader pauses do not stop TX. Counters include all delivered frame classes,
 while the pressure signal is DATA only; announce/PR ingress settings are
 independent. Backbone requests a 32768-byte socket receive buffer (the OS can
 adjust it). An already pending read/send can finish before the gate takes
-effect; subsequent reads and frame deliveries wait for release. EOF detection
-while gated can be deferred until release. Multi-peer overload/teardown parity
-and ingress diagnostics in RPC/UI are still under validation.
+effect; subsequent reads and frame deliveries wait for release. While waiting
+on the gate, reader observes socket close/error readiness without consuming
+payload. With unread data, readiness is rechecked every 50 ms to avoid busy
+polling; gate release wakes it immediately. Closure while gated discards
+pending inbound frames and uses normal disconnect cleanup. Ungated EOF still
+delivers complete buffered frames first. This depends on platform socket
+readiness support and has been verified on Linux loopback. Multi-peer overload
+benchmarks and ingress diagnostics in RPC/UI are still under validation.
 
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |

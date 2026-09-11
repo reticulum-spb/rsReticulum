@@ -1542,3 +1542,43 @@ Python↔Rust mixed TCP memory/SQLite tests — 2 passed.
 Workspace all-targets и runtime client-only tests checks успешны, fmt/diff
 checks успешны, прежние warnings сохраняются. Сетевые проверки выполняются
 с loopback-разрешением.
+
+### Этап 5 — закрытие соединения во время ingress gate
+
+Backbone reader теперь ожидает либо release, либо close/error readiness
+сокета. При READ_CLOSED/error общий read loop завершается, очищает ingress
+state и online; connection select запускает штатный disconnect/reconnect
+и deregistration. Непрочитанные bytes не извлекаются ради обнаружения FIN/RST.
+
+Готовность к чтению может оставаться активной из-за unread data. Поэтому
+после такого события повторная проверка ограничена интервалом 50 ms, с
+немедленным пробуждением по release. Это не busy loop и не гарантированный
+wall-clock deadline teardown: задержка зависит также от runtime/OS readiness.
+Если gate открыт, приоритет имеет обычное чтение — buffered complete frames
+перед FIN доставляются как прежде. Если peer закрывается при gate, pending
+inbound frames отбрасываются без доставки в перегруженный transport.
+
+Проверки Linux loopback:
+
+- FIN и RST клиента при gate на час, с pending frame и без него: peer
+  закрывается/deregisters без actor release, gate очищается, delivery нет.
+- Gate до запуска reader + kernel-buffered payload + FIN: завершение без
+  чтения payload, rxb=0, transport channel пуст.
+- Два peers: gate первого не мешает его TX и RX второго; после FIN первого
+  второй продолжает доставлять данные. Это небольшой isolation test,
+  не throughput/latency/RSS benchmark с автоматическим actor pressure.
+- Обычный FIN без gate сохраняет доставку полного buffered escaped frame.
+
+В первом новом тесте найдена и исправлена гонка тестовой установки gate:
+accept ещё не означает, что клиент завершил свой startup ingress reset.
+Теперь тест явно ждёт online перед gate. Production startup не менялся.
+
+Снята ранее отмеченная задержка EOF именно в wait-on-gate. Уже ожидающий
+transport_tx.send при заполненном raw channel не заменён этим механизмом;
+его cancellation/backpressure остаётся отдельным сценарием перегрузки.
+Проверены Tokio close/error flags на Linux, не все поддерживаемые ОС и не
+буквальная эквивалентность Python EPOLLHUP при half-close.
+
+Итог: interface lib — 202 passed, 3 ignored; workspace all-targets и runtime
+client-only tests checks успешны; fmt/diff checks успешны. Прежние workspace
+warnings сохраняются. Сетевые тесты выполнены с loopback-разрешением.
