@@ -6,6 +6,12 @@ type VerifiedAnnounce = (
     rns_identity::identity::Identity,
 );
 
+enum TransitProofValidation {
+    Valid,
+    InvalidSignature,
+    Unavailable,
+}
+
 /// Admission result owned by the actor. No Clone: a packet must be dispatched
 /// once, without repeating IFAC, dedup, hop adjustment or ingress accounting.
 pub struct PreparedInbound {
@@ -554,6 +560,7 @@ impl TransportActor {
                 error = %e,
                 "announce validation failed, dropping"
             );
+            self.protocol_violation(interface_id);
             return;
         }
 
@@ -1370,8 +1377,17 @@ impl TransportActor {
                     let hops_match = header.hops == expected_hops;
                     let rebalance = !hops_match && !link_entry.validated;
                     if (hops_match || rebalance) && _interface_id == outbound_interface {
-                        if !self.validate_transit_lrproof(raw, header, link_entry) {
-                            return;
+                        match self.validate_transit_lrproof(raw, header, link_entry) {
+                            TransitProofValidation::Valid => {}
+                            TransitProofValidation::InvalidSignature => {
+                                // Python logs unsuccessful rebalance attempts,
+                                // but counts bad signatures on the claimed route.
+                                if hops_match {
+                                    self.protocol_violation(_interface_id);
+                                }
+                                return;
+                            }
+                            TransitProofValidation::Unavailable => return,
                         }
                         let pkt_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
                         if !self.packet_hashlist.insert(pkt_hash) {
@@ -1532,6 +1548,7 @@ impl TransportActor {
         packet_kind: &'static str,
     ) -> bool {
         if header.flags.destination_type != rns_wire::flags::DestinationType::Link
+            || header.context == rns_wire::context::PacketContext::Lrproof
             || self.local_destinations.contains(&header.destination_hash)
         {
             return false;
@@ -1552,6 +1569,11 @@ impl TransportActor {
             || self.is_local_client_interface(entry.interface_id);
         if !self.is_transport_enabled && !shared_client_path {
             return false;
+        }
+
+        if !entry.validated {
+            self.protocol_violation(interface_id);
+            return true;
         }
 
         let target_interface = if entry.interface_id == entry.receiving_interface {
@@ -1651,7 +1673,7 @@ impl TransportActor {
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
         link_entry: &crate::link_table::LinkEntry,
-    ) -> bool {
+    ) -> TransitProofValidation {
         let payload_offset = header.size();
         if raw.len() < payload_offset {
             warn!(
@@ -1659,7 +1681,7 @@ impl TransportActor {
                 raw_len = raw.len(),
                 "link proof missing payload, not transporting"
             );
-            return false;
+            return TransitProofValidation::Unavailable;
         }
 
         let proof_data = &raw[payload_offset..];
@@ -1669,7 +1691,7 @@ impl TransportActor {
                 proof_len = proof_data.len(),
                 "malformed link request proof length, not transporting"
             );
-            return false;
+            return TransitProofValidation::Unavailable;
         }
 
         let mut signature = [0u8; 64];
@@ -1691,7 +1713,7 @@ impl TransportActor {
                 destination = hex::encode(link_entry.destination_hash),
                 "link request proof has no known destination identity, not transporting"
             );
-            return false;
+            return TransitProofValidation::Unavailable;
         };
 
         let mut destination_ed25519 = [0u8; 32];
@@ -1706,7 +1728,7 @@ impl TransportActor {
                         error = %err,
                         "link request proof destination identity is invalid, not transporting"
                     );
-                    return false;
+                    return TransitProofValidation::Unavailable;
                 }
             };
 
@@ -1717,14 +1739,14 @@ impl TransportActor {
         signed_data.extend_from_slice(signalling);
 
         if verify_key.verify(&signed_data, &signature).is_ok() {
-            true
+            TransitProofValidation::Valid
         } else {
             warn!(
                 link_id = hex::encode(header.destination_hash),
                 destination = hex::encode(link_entry.destination_hash),
                 "invalid link request proof signature, not transporting"
             );
-            false
+            TransitProofValidation::InvalidSignature
         }
     }
 }

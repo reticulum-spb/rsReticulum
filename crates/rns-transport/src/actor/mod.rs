@@ -3316,7 +3316,7 @@ mod tests {
         let last = proof.len() - 1;
         proof[last] ^= 0x01;
         relay.on_inbound(InboundPacket {
-            raw: Bytes::from(proof),
+            raw: Bytes::from(proof.clone()),
             interface_id: 2,
             rssi: None,
             snr: None,
@@ -3330,6 +3330,36 @@ mod tests {
         assert!(
             !relay.link_table.get(&link_id).unwrap().validated,
             "invalid LRPROOF must not mark link-table entry validated"
+        );
+        assert_eq!(
+            relay.interfaces[&2].inbound_diagnostics.protocol_violations,
+            1
+        );
+        // A failed rebalance attempt and a proof on the wrong interface are
+        // logged/dropped in Python, but not counted as signature violations.
+        proof[1] = 1;
+        relay.on_inbound(InboundPacket {
+            raw: proof.clone().into(),
+            interface_id: 2,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        proof[1] = 0;
+        relay.on_inbound(InboundPacket {
+            raw: proof.into(),
+            interface_id: 1,
+            rssi: None,
+            snr: None,
+            q: None,
+        });
+        assert_eq!(
+            relay.interfaces[&2].inbound_diagnostics.protocol_violations,
+            1
+        );
+        assert_eq!(
+            relay.interfaces[&1].inbound_diagnostics.protocol_violations,
+            0
         );
     }
 
@@ -3373,6 +3403,10 @@ mod tests {
         assert!(
             rx1.try_recv().is_err(),
             "LRPROOF without known destination identity must not be forwarded"
+        );
+        assert_eq!(
+            relay.interfaces[&2].inbound_diagnostics.protocol_violations,
+            0
         );
         assert!(!relay.link_table.get(&link_id).unwrap().validated);
     }
@@ -3420,6 +3454,10 @@ mod tests {
             assert!(
                 rx1.try_recv().is_err(),
                 "malformed LRPROOF length {payload_len} must not be forwarded"
+            );
+            assert_eq!(
+                relay.interfaces[&2].inbound_diagnostics.protocol_violations,
+                0
             );
             assert!(!relay.link_table.get(&link_id).unwrap().validated);
         }
@@ -3475,6 +3513,119 @@ mod tests {
             .try_recv()
             .expect("destination link data should route to initiator side");
         assert_eq!(to_initiator[1], 1);
+    }
+
+    #[test]
+    fn unvalidated_transit_link_blocks_data_and_proofs_without_poisoning_retry() {
+        use rns_wire::{context::PacketContext, flags::PacketType};
+        for kind in [PacketType::Data, PacketType::Proof] {
+            for context in [PacketContext::None, PacketContext::Keepalive] {
+                let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+                actor.is_transport_enabled = true;
+                let (iface, _rx) = make_test_interface("source");
+                let (out, mut rx) = make_test_interface("target");
+                actor.interfaces.insert(1, iface);
+                actor.interfaces.insert(2, out);
+                let link_id = [0xD3; 16];
+                let destination_identity = rns_identity::identity::Identity::new();
+                insert_announce_for(&mut actor, [0xD4; 16], &destination_identity);
+                actor.link_table.insert(
+                    link_id,
+                    crate::link_table::LinkEntry {
+                        timestamp: 1.0,
+                        next_hop: None,
+                        interface_id: 2,
+                        remaining_hops: 1,
+                        destination_hash: [0xD4; 16],
+                        established: false,
+                        validated: true,
+                        proof_timeout: now_f64() + 120.0,
+                        receiving_interface: 1,
+                        taken_hops: 1,
+                    },
+                );
+                let raw = make_link_data_packet_with_context(link_id, 0, context);
+                let (mut header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                header.flags.packet_type = kind;
+                let mut frame = header.pack().unwrap();
+                frame.extend_from_slice(&raw[offset..]);
+                let hash = rns_wire::hash::packet_hash(&frame, header.flags.header_type);
+                let packet = || InboundPacket {
+                    raw: frame.clone().into(),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                };
+                let prepared = actor.prepare_inbound(packet()).unwrap();
+                actor.link_table.get_mut(&link_id).unwrap().validated = false;
+                actor.dispatch_inbound(prepared);
+                assert!(rx.try_recv().is_err());
+                assert!(!actor.packet_hashlist.contains(&hash));
+                assert_eq!(actor.link_table.get(&link_id).unwrap().timestamp, 1.0);
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                    1
+                );
+                actor.on_inbound(InboundPacket {
+                    raw: make_lrproof_packet(link_id, 0, &destination_identity, None),
+                    interface_id: 2,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                });
+                assert!(actor.link_table.get(&link_id).unwrap().validated);
+                let prepared = actor.prepare_inbound(packet()).unwrap();
+                actor.dispatch_inbound(prepared);
+                assert!(rx.try_recv().is_ok());
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                    1
+                );
+                assert_eq!(actor.inbound_queues.snapshot().dropped, [0; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn announce_binding_failure_is_counted_at_dispatch_not_admission() {
+        let (mut actor, _input, _control) = TransportActor::new_with_control_channel();
+        let (mut iface, _rx) = make_test_interface("binding");
+        iface.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, iface);
+        let (raw, dest) = make_valid_announce("test.dispatch.binding", 0);
+        let prepared = actor
+            .prepare_inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            })
+            .unwrap();
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            0
+        );
+        // A conflicting first-seen identity can appear while admission waits
+        // for dispatch or SQLite cache preparation.
+        let other = rns_identity::identity::Identity::new();
+        insert_announce_for(&mut actor, dest, &other);
+        actor.dispatch_inbound(prepared);
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+            1
+        );
+        assert!(!actor.path_table.has_path(&dest));
+        assert_eq!(
+            actor.recent_announces.get(&dest).unwrap().public_key,
+            Some(other.get_public_key())
+        );
+        assert_eq!(actor.interfaces[&1].inbound_diagnostics.ifac_violations, 0);
+        assert_eq!(
+            actor.interfaces[&1].inbound_diagnostics.packet_filter_hits,
+            0
+        );
     }
 
     #[test]
@@ -8288,6 +8439,12 @@ mod tests {
                 q: None,
             });
             assert_eq!(actor.tunnel_table.len(), usize::from(valid));
+            // Python's handler counts exceptions, not a normal False result
+            // from signature validation. Rust's ordinary rejection is silent.
+            assert_eq!(
+                actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                0
+            );
         }
     }
 

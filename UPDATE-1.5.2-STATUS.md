@@ -860,3 +860,57 @@ DISCOVERY_PR_TAG_RETENTION удалён; MAX_DISCOVERY_PR_TAGS теперь оз
 Этап 4 остаётся частичным: дополнительные dispatch-time violation sites,
 оставшаяся traffic-flow статистика и итоговая проверка смешанной нагрузки.
 Этапы 5–7 и финальная интеграция ещё не завершены; версия не менялась.
+
+## Этап 4 — dispatch violations и запрет transit traffic до валидации Link
+
+В route_link_packet_via_link_table добавлен отсутствовавший validated gate:
+DATA и обычные proofs через transit Link не пересылаются до его подтверждения,
+включая keepalive/context-exempt traffic. Отказ увеличивает protocol_violations
+на входящем интерфейсе, не записывает hash и не обновляет timestamp Link.
+Проверяется актуальная запись при dispatch; LRPROOF context обрабатывается
+своей веткой, а не этой маршрутизацией. Локальные Link endpoints по-прежнему
+обрабатываются собственным runtime. Основание: Transport.py:2122–2128.
+
+Full destination/key binding failure announce теперь увеличивает счётчик при
+dispatch, после ранней signature validation (Transport.py:2173). Это важно
+при изменении first-seen cache во время ожидания, включая SQLite preparation.
+
+Результат validate_transit_lrproof разделён на Valid, InvalidSignature и
+Unavailable. Bad signature считается protocol violation только при совпадении
+hops и входящего интерфейса с маршрутом; отсутствие identity, неверная длина,
+чужой интерфейс и неудачная rebalance-попытка не получают этот счётчик. Это
+разные ветки Python Transport.py:2608–2673, а не один bool failure category.
+
+Остальные просмотренные sites не перенесены механически:
+
+- Tunnel handler считает исключения, но не обычный False от signature
+  validation; Rust bad-signature rejection оставлен без counter и закреплён
+  тестом (Python 2790–2810).
+- Missing random blob не является отдельным состоянием Rust AnnounceData:
+  поле фиксированного размера, укороченный payload отклоняется раньше.
+- Generic processing exception и MTU-signalling exceptions требуют отдельной
+  сверки с Result/Option и path-MTU реализацией. Отсутствие исключения в Rust
+  не выдано за эквивалентный protocol violation; полный паритет не заявляется.
+
+Проверки:
+
+- Новый тест DATA/PROOF × normal/keepalive: изменение validated после admission,
+  отсутствие пересылки/hash/timestamp до валидации, затем настоящий корректный
+  LRPROOF и успешный повтор того же пакета.
+- Новый тест signature admission → conflicting first-seen cache → binding
+  rejection с ровно одним counter, без замены кеша/создания пути.
+- Transit proof tests дополнены checks счётчиков для invalid signature,
+  bad rebalance, wrong interface, missing identity и malformed length.
+- `cargo test -p rns-transport --features sqlite-bundled --lib --quiet`:
+  453 passed, 3 ignored.
+- `cargo test -p rns-runtime --features api --lib --quiet`: 236 passed,
+  4 ignored; повтор с loopback-разрешением после sandbox PermissionDenied.
+- `cargo fmt --all -- --check` и `git diff --check`: успешно.
+- `cargo test -p rns-runtime --features api link_rebalance_and_active_route_binding --lib -- --ignored`:
+  2 Python packet interop passed.
+- Workspace all-targets, runtime client-only и runtime
+  `api,serial,rnode-tcp,sqlite-bundled` собираются; новых warnings нет.
+
+Этап 4 остаётся частичным: traffic-flow статистика и итоговая проверка
+смешанной нагрузки; exception/MTU signalling coverage отмечено выше.
+Этапы 5–7 и финальная интеграция не завершены, версия не менялась.

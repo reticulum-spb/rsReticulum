@@ -175,8 +175,22 @@ control changes while a packet is queued cannot prematurely record an overheard
 packet. LRPROOF deferral applies to PROOF type, not arbitrary packets with that
 context. Existing context exemptions remain unchanged.
 
-Full receive-diagnostics coverage still requires additional dispatch-time
-violation sites. CLI and remote-management display are pending.
+At dispatch, transit Link traffic is blocked until the Link table entry is
+validated, including ordinary proofs and context-exempt traffic such as
+keepalive. This increments `protocol_violations` without recording the packet
+hash or refreshing the Link timestamp, allowing a retry after a valid LRPROOF.
+The current validation state is checked at dispatch, not assumed at admission.
+
+Full announce destination/key-binding failure also counts as a protocol
+violation. For transit LRPROOF, an invalid signature counts only on the claimed
+interface with matching hops. A missing cached identity, unsupported proof
+length, wrong interface or failed rebalance attempt is not counted as an invalid
+signature, matching Python's distinction between these paths. Ordinary tunnel
+signature rejection likewise does not count: the Python tunnel handler counts
+exceptions, not a false signature-validation result.
+
+Exception-only diagnostics and path-MTU signalling still require further
+compatibility review. CLI and remote-management display are pending.
 
 ### Path-request tag history
 
