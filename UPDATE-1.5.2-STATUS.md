@@ -1614,3 +1614,33 @@ workspace all-targets, runtime client-only tests check, fmt/diff checks —
 успешны. Прежние warnings сохраняются, сетевые тесты выполнены с разрешением
 loopback. Этап 5 остаётся открытым: multi-peer нагрузочные сравнения,
 MTU/capabilities, служебные кадры и оставшаяся диагностика не завершены.
+
+### Этап 5 — включительные пороги автоматического MTU
+
+Исправлен общий `traits::optimise_mtu`: девять сравнений `>` заменены на
+`>=`, как в Python 1.5.2 Interface.optimise_mtu. Верхняя ступень 1 Gbit/s уже
+была включительной. Изменение влияет только на значения ровно на порогах:
+62500 bit/s теперь даёт 1024, 1/2/5/10/100/200/400/750 Mbit/s — соответствующую
+старшую ступень. Между порогами и при >=1 Gbit/s результаты не изменяются.
+
+Backbone peer estimate 100 Mbit/s теперь выбирает 32768 bytes вместо 16384.
+Тест child_mtu усилен до точного равенства; прежний неверный комментарий
+про 64 KiB исправлен. Все общие TCP/Backbone callers используют эту же
+таблицу. Fallback ниже минимального bitrate и fixed_mtu callers не изменены.
+
+Boundary test проверяет каждую из десяти ступеней на -1/0/+1 bit/s, а также
+0 и u64::MAX. Ignored oracle AST-извлекает настоящий optimise_mtu из локального
+Python Interface.py с AUTOCONFIGURE_MTU=True; 32 граничных/крайних и 1024
+детерминированных дополнительных значения (всего 1056) совпали.
+
+Это не полная MTU-миграция. Python Backbone listener имеет другую исходную
+bitrate guess и в конце spawn копирует HW_MTU родителя поверх вычисленного
+child MTU. Наследование/overrides, shared_medium hints, driver receive limits,
+IFAC allowance и transport capability/Link clamp ещё требуют отдельных
+изменений. Local Link cap 500 и версия проекта не изменены.
+
+Проверки: `cargo test -p rns-interface mtu_ -- --include-ignored --nocapture` —
+3 passed, включая Python oracle; полный interface lib — 206 passed, 4 ignored.
+Workspace all-targets, runtime client-only tests check и fmt/diff checks
+успешны; прежние warnings сохраняются. Полный interface suite выполнен с
+loopback-разрешением.

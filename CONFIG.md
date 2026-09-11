@@ -476,6 +476,11 @@ At least one of `listen_port` and `forward_port` is required.
 
 ## `type: backbone`
 
+The shared automatic MTU curve used by TCP/Backbone has inclusive bitrate
+thresholds, matching Python 1.5.2. Backbone's current 100 Mbit/s peer estimate
+selects 32768 bytes (32 KiB), including at exactly that bitrate. This does not
+remove the separate local Link cap or complete MTU capability propagation.
+
 TX combines already queued HDLC frames into encoded batches of at most 64 KiB,
 processing at most 64 frames per batch. It does not wait for more traffic to
 fill a batch. Large frames span batches without changing wire framing. TX byte

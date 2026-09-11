@@ -82,23 +82,23 @@ pub struct InterfaceDirection {
 pub fn optimise_mtu(bitrate: u64) -> Option<u32> {
     if bitrate >= 1_000_000_000 {
         Some(524_288)
-    } else if bitrate > 750_000_000 {
+    } else if bitrate >= 750_000_000 {
         Some(262_144)
-    } else if bitrate > 400_000_000 {
+    } else if bitrate >= 400_000_000 {
         Some(131_072)
-    } else if bitrate > 200_000_000 {
+    } else if bitrate >= 200_000_000 {
         Some(65_536)
-    } else if bitrate > 100_000_000 {
+    } else if bitrate >= 100_000_000 {
         Some(32_768)
-    } else if bitrate > 10_000_000 {
+    } else if bitrate >= 10_000_000 {
         Some(16_384)
-    } else if bitrate > 5_000_000 {
+    } else if bitrate >= 5_000_000 {
         Some(8_192)
-    } else if bitrate > 2_000_000 {
+    } else if bitrate >= 2_000_000 {
         Some(4_096)
-    } else if bitrate > 1_000_000 {
+    } else if bitrate >= 1_000_000 {
         Some(2_048)
-    } else if bitrate > 62_500 {
+    } else if bitrate >= 62_500 {
         Some(1_024)
     } else {
         None
@@ -159,12 +159,106 @@ pub enum InterfaceError {
 mod tests {
     use super::*;
 
+    fn mtu_steps() -> [(u64, u32); 10] {
+        [
+            (62_500, 1024),
+            (1_000_000, 2048),
+            (2_000_000, 4096),
+            (5_000_000, 8192),
+            (10_000_000, 16384),
+            (100_000_000, 32768),
+            (200_000_000, 65536),
+            (400_000_000, 131072),
+            (750_000_000, 262144),
+            (1_000_000_000, 524288),
+        ]
+    }
+
+    #[test]
+    fn mtu_thresholds_are_inclusive_at_every_step() {
+        let mut previous = None;
+        for (bitrate, mtu) in mtu_steps() {
+            assert_eq!(optimise_mtu(bitrate - 1), previous, "below {bitrate}");
+            assert_eq!(optimise_mtu(bitrate), Some(mtu), "at {bitrate}");
+            assert_eq!(optimise_mtu(bitrate + 1), Some(mtu), "above {bitrate}");
+            previous = Some(mtu);
+        }
+        assert_eq!(optimise_mtu(0), None);
+        assert_eq!(optimise_mtu(u64::MAX), Some(524288));
+    }
+
+    #[test]
+    #[ignore = "requires local Python 1.5.2 source; RNS_PYTHON_ROOT/RNS_PYTHON_BIN override defaults"]
+    fn mtu_curve_matches_python_152() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut rates = vec![0, u64::MAX];
+        for (rate, _) in mtu_steps() {
+            rates.extend([rate - 1, rate, rate + 1]);
+        }
+        let mut seed = 0x152u64;
+        for _ in 0..1024 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            rates.push(seed % 1_500_000_001);
+        }
+        let input = rates.iter().map(|r| format!("{r}\n")).collect::<String>();
+        let mut child = Command::new(
+            std::env::var("RNS_PYTHON_BIN").unwrap_or_else(|_| "/usr/bin/python3.11".into()),
+        )
+        .arg("-B")
+        .arg("-c")
+        .arg(
+            r#"
+import ast, sys
+from pathlib import Path
+from types import SimpleNamespace
+source = Path(sys.argv[1]) / 'RNS/Interfaces/Interface.py'
+tree = ast.parse(source.read_text())
+cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Interface')
+method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'optimise_mtu')
+env = {'RNS': SimpleNamespace(log=lambda *args: None, LOG_EXTREME=0)}
+exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), env)
+for line in sys.stdin.readlines():
+    peer = SimpleNamespace(AUTOCONFIGURE_MTU=True, bitrate=int(line), HW_MTU=None)
+    env['optimise_mtu'](peer)
+    print(peer.HW_MTU if peer.HW_MTU is not None else 'none')
+"#,
+        )
+        .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(actual.lines().count(), rates.len());
+        for (rate, actual) in rates.into_iter().zip(actual.lines()) {
+            let expected = optimise_mtu(rate).map_or_else(|| "none".into(), |mtu| mtu.to_string());
+            assert_eq!(actual, expected, "bitrate {rate}");
+        }
+    }
+
     #[test]
     fn test_optimise_mtu() {
         assert_eq!(optimise_mtu(1_000_000_000), Some(524_288));
         assert_eq!(optimise_mtu(100_000_001), Some(32_768));
         assert_eq!(optimise_mtu(10_000_001), Some(16_384));
-        assert_eq!(optimise_mtu(62_500), None);
+        assert_eq!(optimise_mtu(62_499), None);
+        assert_eq!(optimise_mtu(62_500), Some(1_024));
         assert_eq!(optimise_mtu(62_501), Some(1_024));
     }
 

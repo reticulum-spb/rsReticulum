@@ -31,7 +31,7 @@ pub const HW_MTU: u32 = 1_048_576;
 /// Listener-side bitrate guess advertised on the parent handle.
 pub const BITRATE_GUESS: u64 = 1_000_000_000;
 
-/// Per-peer guess (100 Mbps) — drives [`crate::traits::optimise_mtu`] → 64 KiB MTU.
+/// Per-peer guess (100 Mbps) — drives [`crate::traits::optimise_mtu`] → 32 KiB MTU.
 pub const CHILD_BITRATE_GUESS: u64 = 100_000_000;
 
 pub const RECONNECT_WAIT: u64 = 5;
@@ -985,9 +985,8 @@ mod tests {
 
     #[test]
     fn test_child_mtu_uses_100mbps_curve() {
-        // optimise_mtu(100 Mbps) is one of the step values; verify the
-        // result lands inside the HW_MTU ceiling.
         let mtu = child_mtu();
+        assert_eq!(mtu, 32_768);
         assert!(mtu <= HW_MTU);
         assert!(mtu >= rns_wire::constants::MTU as u32 / 2);
     }
