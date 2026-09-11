@@ -732,7 +732,7 @@ async fn spawn_plugin_interface_with_library(
         online,
         rxb: Some(rxb),
         txb: Some(txb),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }

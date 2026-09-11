@@ -5036,7 +5036,7 @@ mod tests {
             online: Arc::new(AtomicBool::new(true)),
             rxb: None,
             txb: None,
-            tx,
+            tx: tx.into(),
             read_task: tokio::spawn(async {}),
         }
     }

@@ -18,7 +18,7 @@ pub struct PreparedInbound {
     pub(super) raw: bytes::Bytes,
     pub(super) header: rns_wire::header::PacketHeader,
     pub(super) data_offset: usize,
-    admitted_on: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    admitted_on: Option<crate::tx_queue::InterfaceTx>,
     pub(super) interface_id: InterfaceId,
     announce: Option<VerifiedAnnounce>,
     path_request: Option<super::outbound::PreparedPathRequest>,

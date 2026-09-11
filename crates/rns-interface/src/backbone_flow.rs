@@ -1,7 +1,7 @@
 //! Python 1.5.2 Backbone egress policy, independent of socket/queue ownership.
 //!
-//! Not yet wired into the driver: callers must supply a complete encoded-byte
-//! backlog, including queued frames, rather than only the current write batch.
+//! The driver supplies a complete encoded-byte backlog, including queued
+//! frames and the current write batch, through shared TX reservations.
 //! This is separate from announce/path-request ingress and egress control.
 
 use std::time::Duration;

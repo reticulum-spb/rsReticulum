@@ -1335,7 +1335,7 @@ impl TransportActor {
                         queue_remaining = entry.tx.capacity(),
                         queue_max = entry.tx.max_capacity(),
                         tx_drops,
-                        "PACKET DROPPED: interface TX channel full"
+                        "PACKET DROPPED: interface TX queue full or egress gated"
                     );
                 }
             }
@@ -2021,7 +2021,7 @@ mod tests {
             direction: InterfaceDirection::bidirectional(),
             bitrate: 115200,
             mtu: 500,
-            tx,
+            tx: tx.into(),
             ifac_key: None,
             ifac_size: 0,
             announce_cap: ANNOUNCE_CAP,
@@ -2587,11 +2587,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_egress_rejections_count_drops_not_control_traffic() {
+        let (mut actor, _) = TransportActor::new();
+        let (mut entry, _) = make_test_interface("managed");
+        let (tx, mut rx, accounting) =
+            crate::tx_queue::byte_channel(4, 1024, |raw| raw.len() as u64 + 2);
+        entry.tx = tx;
+        actor.interfaces.insert(1, entry);
+        let pr = make_data_packet(TransportActor::path_request_dest_hash(), 0);
+        accounting.set_gated(true);
+        actor.send_to_interface(1, &pr);
+        assert_eq!(
+            actor.interfaces[&1]
+                .tx_drops
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(actor.interfaces[&1].ingress.traffic.ptxc, 0);
+        assert!(rx.try_recv().is_err());
+        accounting.set_gated(false);
+        actor.send_to_interface(1, &pr);
+        assert_eq!(rx.try_recv().unwrap().raw.as_ref(), &pr[..]);
+        assert_eq!(actor.interfaces[&1].ingress.traffic.ptxc, 1);
+        assert_eq!(accounting.snapshot().buffered, 0);
+    }
+
+    #[test]
     fn control_traffic_tx_counts_only_accepted_frames_without_ifac() {
         let (mut actor, _tx) = TransportActor::new();
         let (mut entry, _old_rx) = make_test_interface("flow");
         let (tx, mut rx) = mpsc::channel(1);
-        entry.tx = tx;
+        entry.tx = tx.into();
         let key = rns_identity::ifac::derive_ifac_key(Some("flow"), None).unwrap();
         entry.ifac_key = Some(key);
         entry.ifac_size = 4;

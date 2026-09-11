@@ -480,13 +480,25 @@ TX combines already queued HDLC frames into encoded batches of at most 64 KiB,
 processing at most 64 frames per batch. It does not wait for more traffic to
 fill a batch. Large frames span batches without changing wire framing. TX byte
 counters include framing and count bytes accepted by the socket, including
-partial writes, not confirmed remote delivery. The encoded batch limit is not
-a byte limit for the existing packet-count-bounded input queues. Pending TX
+partial writes, not confirmed remote delivery. A separate 4 MiB admission
+limit covers outstanding encoded bytes across the input/forwarding queues and
+writer. A frame that would exceed the limit is rejected whole. Partial writes
+release byte reservations; dropped frames release their unwritten remainder.
+This is not a 4 MiB process RSS limit: retained raw payloads, the encoded batch,
+queue metadata and kernel socket buffers consume additional memory. Pending TX
 with no successful socket write for 12 seconds closes the connection through
 the normal disconnect/reconnect path. Idle connections are not timed out;
 any partial write renews the deadline. Unlike Python's once-per-second drain
 sampling, this deadline uses actual write progress and monotonic time.
-Adaptive queue-pressure gating is not implemented yet.
+Additionally, a once-per-second egress controller gates new frames when backlog
+exceeds 128 KiB and estimated drain time exceeds 10 seconds, or after three
+samples without progress above that watermark. It releases the gate below a
+5-second estimate or at/below 128 KiB. Existing output continues draining while
+gated. The sampled controller can also request disconnect after 12 seconds
+without sampled progress; its boundary ordering follows Python 1.5.2 and is
+separate from the actual-write deadline. Actor admission rejections increment
+`tx_drops`; byte-drop snapshots are available on the driver TX handle but not
+yet exposed through RPC/UI. These thresholds are fixed, not YAML settings.
 
 | Field | Type | Default | Constraints |
 | --- | --- | --- | --- |

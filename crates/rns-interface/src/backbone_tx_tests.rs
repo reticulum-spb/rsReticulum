@@ -4,6 +4,125 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
+#[tokio::test(start_paused = true)]
+async fn abort_releases_all_reservations_and_gate() {
+    let (tx, rx, accounting) = byte_channel(4, HIGH_WATERMARK, encoded_len);
+    let (sink, _reader) = tokio::io::duplex(1);
+    tx.try_send(Bytes::from(vec![42; 200_000])).unwrap();
+    tx.try_send(Bytes::from_static(b"queued")).unwrap();
+    let task = tokio::spawn(controlled_write_loop(
+        sink,
+        rx,
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicU64::new(0)),
+        accounting.clone(),
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(EVALUATE_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert!(accounting.snapshot().gated);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(accounting.snapshot().buffered, 0);
+    assert!(!accounting.snapshot().gated);
+    assert!(tx.is_closed());
+}
+
+#[tokio::test]
+async fn reconnect_keeps_accounting_and_accepts_new_output() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = BackboneClientConfig::new(
+        "managed-reconnect",
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+    );
+    let (transport_tx, _events) = mpsc::channel(8);
+    let handle = spawn_backbone_client(config, 73, transport_tx)
+        .await
+        .unwrap();
+    let accounting = handle.tx.accounting().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        for payload in [b"first".as_slice(), b"second~}".as_slice()] {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            handle.tx.try_send(Bytes::copy_from_slice(payload)).unwrap();
+            let expected = hdlc::frame(payload);
+            let mut received = vec![0; expected.len()];
+            peer.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            assert_eq!(accounting.snapshot().buffered, 0);
+            assert!(!accounting.snapshot().gated);
+            drop(peer);
+        }
+    })
+    .await;
+    handle.read_task.abort();
+    let _ = handle.read_task.await;
+    assert!(
+        handle.tx.is_closed(),
+        "abort must not orphan the forwarding receiver"
+    );
+    assert_eq!(accounting.snapshot().buffered, 0);
+    result.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn managed_backlog_gates_recovers_and_counts_partial_writes() {
+    let (tx, rx, accounting) = byte_channel(4, HIGH_WATERMARK, encoded_len);
+    let (sink, mut reader) = tokio::io::duplex(7);
+    let count = Arc::new(AtomicU64::new(0));
+    let task = tokio::spawn(controlled_write_loop(
+        sink,
+        rx,
+        Arc::new(AtomicBool::new(true)),
+        count.clone(),
+        accounting.clone(),
+    ));
+    let payload = Bytes::from(vec![hdlc::FLAG; 200_000]);
+    tx.try_send(payload.clone()).unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(accounting.snapshot().buffered, encoded_len(&payload) - 7);
+    assert_eq!(accounting.snapshot().sent, 7);
+    tokio::time::advance(EVALUATE_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert!(accounting.snapshot().gated);
+    assert!(tx.try_send(Bytes::new()).is_err());
+    let mut actual = vec![0; encoded_len(&payload) as usize];
+    reader.read_exact(&mut actual).await.unwrap();
+    assert_eq!(actual, hdlc::frame(&payload));
+    assert_eq!(accounting.snapshot().buffered, 0);
+    assert_eq!(accounting.snapshot().sent, count.load(Ordering::Relaxed));
+    tokio::time::advance(EVALUATE_INTERVAL).await;
+    tokio::task::yield_now().await;
+    assert!(!accounting.snapshot().gated);
+    tx.try_send(Bytes::new()).unwrap();
+    drop(tx);
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail).await.unwrap();
+    task.await.unwrap();
+    assert_eq!(tail, hdlc::frame(&[]));
+    assert_eq!(accounting.snapshot().buffered, 0);
+}
+
+#[tokio::test]
+async fn managed_error_releases_queued_and_encoded_reservations() {
+    let (tx, rx, accounting) = byte_channel(4, HIGH_WATERMARK, encoded_len);
+    for _ in 0..3 {
+        tx.try_send(Bytes::from(vec![hdlc::ESC; 100_000])).unwrap();
+    }
+    let mut sink = writer(3);
+    sink.fail_after = Some(17);
+    backbone_write_loop(
+        sink,
+        rx,
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await;
+    assert_eq!(accounting.snapshot().buffered, 0);
+    assert_eq!(accounting.snapshot().sent, 17);
+    assert!(tx.is_closed());
+}
+
 #[tokio::test]
 #[ignore = "real loopback no-drain deadline; takes at least 12 seconds"]
 async fn client_stalled_socket_closes_and_deregisters() {
@@ -24,10 +143,17 @@ async fn client_stalled_socket_closes_and_deregisters() {
         socket2::SockRef::from(&peer)
             .set_recv_buffer_size(4096)
             .unwrap();
-        let payload = Bytes::from(vec![42; HW_MTU as usize]);
+        let payload = Bytes::from(vec![42; HW_MTU as usize - 2]);
+        let mut rejected = 0;
         for _ in 0..32 {
-            handle.tx.try_send(payload.clone()).unwrap();
+            if handle.tx.try_send(payload.clone()).is_err() {
+                rejected += 1;
+            }
         }
+        assert!(
+            rejected > 0,
+            "full encoded-byte quota rejects excess frames"
+        );
         // Do not read or close either peer half. Only the TX no-progress
         // deadline can end the connection; leave the sender alive too.
         assert!(matches!(
@@ -233,7 +359,7 @@ fn encoded_chunks_are_bounded_and_match_legacy_hdlc() {
         vec![0x7D; 1_048_576],
     ] {
         let expected = hdlc::frame(&payload);
-        let mut cursor = TxFrame::new(payload.into());
+        let mut cursor = TxFrame::new(Bytes::from(payload));
         let mut actual = Vec::new();
         loop {
             let mut chunk = Vec::with_capacity(TX_COALESCE_TARGET);
@@ -251,7 +377,7 @@ fn encoded_chunks_are_bounded_and_match_legacy_hdlc() {
 
 #[tokio::test]
 async fn ready_frames_coalesce_without_changing_wire_bytes() {
-    let (tx, rx) = mpsc::channel(128);
+    let (tx, rx) = mpsc::channel::<Bytes>(128);
     let mut expected = Vec::new();
     for index in 0..128u8 {
         let payload = vec![index, hdlc::FLAG, hdlc::ESC];
@@ -277,7 +403,7 @@ async fn ready_frames_coalesce_without_changing_wire_bytes() {
 
 #[tokio::test]
 async fn fragmented_writes_preserve_large_and_small_frame_order() {
-    let (tx, rx) = mpsc::channel(4);
+    let (tx, rx) = mpsc::channel::<Bytes>(4);
     let mut expected = Vec::new();
     for payload in [
         vec![hdlc::FLAG; 100000],
@@ -338,7 +464,7 @@ async fn compare_coalesced_and_legacy_writes() {
 #[tokio::test]
 async fn partial_writes_errors_and_zero_count_only_accepted_bytes() {
     for zero in [false, true] {
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel::<Bytes>(2);
         let payload = vec![hdlc::FLAG; 100];
         tx.try_send(payload.clone().into()).unwrap();
         drop(tx);

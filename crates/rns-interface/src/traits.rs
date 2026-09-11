@@ -1,9 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use bytes::Bytes;
-use tokio::sync::mpsc;
-
 pub type InterfaceId = u64;
 
 /// Handle returned by every `spawn_*`: write channel, status flag, and read task.
@@ -21,7 +18,7 @@ pub struct InterfaceHandle {
     pub online: Arc<AtomicBool>,
     pub rxb: Option<Arc<AtomicU64>>,
     pub txb: Option<Arc<AtomicU64>>,
-    pub tx: mpsc::Sender<Bytes>,
+    pub tx: rns_transport::tx_queue::InterfaceTx,
     pub read_task: tokio::task::JoinHandle<()>,
 }
 

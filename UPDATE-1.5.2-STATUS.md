@@ -1372,3 +1372,68 @@ last_drain/previous_sent. Oracle проверяет policy, не реальны�
 освобождение backlog при partial writes/drop/reconnect, подключение gate и
 drop counters. Ограничивать только encoded batch writer было бы неполным
 учётом: клиент сейчас имеет также внешнюю и forwarding mpsc queues.
+
+### Этап 5 — byte-accounted TX и подключение адаптивного gate
+
+`InterfaceHandle.tx` и `InterfaceEntry.tx` теперь используют `InterfaceTx`:
+обычные драйверы оборачивают прежний Sender<Bytes> через `.into()` и сохраняют
+его поведение; Backbone использует managed byte channel. Конструктор
+InterfaceEntry::new принимает оба варианта. Это изменение Rust API для
+потребителей, создающих struct literals: полю tx нужен `.into()`.
+Проверка same_channel для prepared inbound сохраняет идентичность регистрации.
+
+Для клиента и accepted Backbone peers включён общий лимит 4 MiB outstanding
+encoded bytes. Полный HDLC-размер (включая IFAC, если actor его добавил,
+escaping и delimiters) резервируется атомарно до enqueue. Gate, byte quota
+или packet slots отклоняют кадр целиком. Managed send отклоняет давление
+немедленно, как Python process_outgoing, а не ждёт; Plain send по-прежнему
+ожидает свободный slot. Sender clones разделяют один budget.
+
+RAII lease сопровождает кадр через внешнюю/forwarding очереди и writer.
+Batch хранит leases своих сегментов: каждый успешный partial write уменьшает
+reserved remainder и увеличивает sent. Drop/ошибка/отмена освобождает только
+незаписанный остаток, без двойного вычитания. Предел ограничивает outstanding
+wire bytes, не RSS: удерживаемые raw payloads с уже записанным префиксом,
+batch до 64 KiB, metadata, внешние Bytes clones и kernel buffers учитываются
+отдельно. Полный memory/throughput benchmark остаётся впереди.
+
+Подключён проверенный EgressController с интервалом 1 s: он видит полный
+backlog обоих каналов и batch; все принятые Rust-кадры считаются sendable,
+отдельного скрытого Python coalescing tail нет. Gate запрещает новые кадры,
+но не останавливает draining. Controller создаётся заново на connection,
+беря baseline накопленного sent. Его sampled Disconnect работает вместе с
+предыдущим actual-write deadline; это всё ещё оговоренное отличие от одного
+Python sampled timer. При disconnect gate освобождается; остаток внешней
+клиентской очереди сохраняется для reconnect, как раньше, вместе с резервами.
+
+Forwarding клиента теперь future внутри connection task, а не отдельная
+spawned task: abort не оставляет orphan receiver с удержанным budget. Конец
+forwarding сам по себе не обрывает writer — принятые кадры дописываются.
+Порядок read/write disconnect и reconnect остаётся прежним.
+
+Actor учитывает отказы managed admission в существующем tx_drops и не
+увеличивает control TX traffic. Managed accounting дополнительно хранит
+число отклонённых кадров и их полный encoded size; эти snapshots доступны
+через TX handle, но RPC/UI для byte-drop diagnostics ещё не добавлен.
+Drops при teardown не выдаются за admission rejections.
+
+Новые проверки: конкурирующие producers не превышают quota; packet-slot/gate
+отказы не оставляют резерв; partial progress/drop освобождают правильный
+остаток; duplex gate/recovery с escaped payload сохраняет wire bytes;
+write error и abort освобождают queues/batch; loopback reconnect сохраняет
+accounting и принимает новые кадры; actor rejection не считается control TX.
+Длительный stopped-reader TCP test адаптирован к quota: избыток отклоняется,
+принятый prefix сохраняет HDLC и точные TX bytes.
+
+Проверки: interface lib — 197 passed, 3 ignored; целевые queue tests — 3 passed,
+actor admission test — 1 passed. Финальный Transport SQLite/include-ignored
+suite: 472 unit + 1 Python integration passed (sqlite_crash_fixture исключён
+из прямого запуска и проверяется через parent test).
+Финальный stopped-reader TCP run — 1 passed, 23.66 s с draining после timeout.
+Python↔Rust mixed TCP tests с memory/SQLite — 2 passed. Workspace all-targets
+и runtime client-only tests checks успешны, прежние warnings сохраняются;
+fmt/diff check успешны. Сетевые проверки выполнены с loopback-разрешением.
+
+Этап 5 не закрыт: ingress dataplane control, MTU/capabilities/служебные кадры,
+расширенные drop diagnostics и multi-peer throughput/latency/RSS сравнение
+на одинаковой нагрузке ещё требуют работы.

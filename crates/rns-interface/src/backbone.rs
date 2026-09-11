@@ -15,10 +15,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::backbone_flap::{FastFlapConfig, FastFlapProtection, FastFlapTable};
+use crate::backbone_flow::{
+    EVALUATE_INTERVAL, EgressController, EgressDecision, EgressSample, HIGH_WATERMARK,
+};
 use crate::hdlc;
 use crate::socket_tuning::{iface_addr_for, set_keepalive_tuned, set_socket_buffers};
 use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceMode};
 use rns_transport::messages::{InboundPacket, TransportMessage};
+use rns_transport::tx_queue::{OutboundFrame, TxAccounting, TxLease, byte_channel};
 
 /// 1 MiB MTU — also the SO_RCVBUF/SNDBUF target (kernel clamps).
 pub const HW_MTU: u32 = 1_048_576;
@@ -175,14 +179,17 @@ mod tx_tests;
 
 struct TxFrame {
     raw: Bytes,
+    lease: Option<Arc<TxLease>>,
     offset: usize,
     started: bool,
 }
 
 impl TxFrame {
-    fn new(raw: Bytes) -> Self {
+    fn new(frame: impl Into<OutboundFrame>) -> Self {
+        let frame = frame.into();
         Self {
-            raw,
+            raw: frame.raw,
+            lease: frame.lease,
             offset: 0,
             started: false,
         }
@@ -232,22 +239,30 @@ impl TxFrame {
     }
 }
 
-async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin>(
+async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin, T: Into<OutboundFrame>>(
     mut writer: W,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<T>,
     online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
 ) {
     let mut pending: Option<TxFrame> = None;
     let mut batch = Vec::with_capacity(TX_COALESCE_TARGET);
+    let mut segments = std::collections::VecDeque::new();
     'transmit: loop {
         if pending.is_none() {
             let Some(raw) = rx.recv().await else { break };
             pending = Some(TxFrame::new(raw));
         }
         batch.clear();
+        segments.clear();
         for _ in 0..TX_COALESCE_FRAMES {
-            if !pending.as_mut().unwrap().append(&mut batch) {
+            let frame = pending.as_mut().unwrap();
+            let start = batch.len();
+            let complete = frame.append(&mut batch);
+            if batch.len() > start {
+                segments.push_back((frame.lease.clone(), batch.len() - start));
+            }
+            if !complete {
                 break;
             }
             pending = None;
@@ -285,6 +300,19 @@ async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin>(
                 Ok(written) => {
                     sent += written;
                     txb.fetch_add(written as u64, Ordering::Relaxed);
+                    let mut credit = written;
+                    while credit > 0 {
+                        let (lease, remaining) = segments.front_mut().unwrap();
+                        let part = credit.min(*remaining);
+                        if let Some(lease) = lease {
+                            lease.written(part as u64);
+                        }
+                        *remaining -= part;
+                        credit -= part;
+                        if *remaining == 0 {
+                            segments.pop_front();
+                        }
+                    }
                     deadline = tokio::time::Instant::now() + TX_DEAD_TIME;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
@@ -299,6 +327,59 @@ async fn backbone_write_loop<W: tokio::io::AsyncWrite + Unpin>(
         }
         // A ready writer and a permanently full input must still yield to peers.
         tokio::task::yield_now().await;
+    }
+    online.store(false, Ordering::SeqCst);
+}
+
+fn encoded_len(raw: &[u8]) -> u64 {
+    raw.len() as u64
+        + 2
+        + raw
+            .iter()
+            .filter(|&&b| b == hdlc::FLAG || b == hdlc::ESC)
+            .count() as u64
+}
+
+async fn controlled_write_loop<W: tokio::io::AsyncWrite + Unpin>(
+    writer: W,
+    rx: mpsc::Receiver<OutboundFrame>,
+    online: Arc<AtomicBool>,
+    txb: Arc<AtomicU64>,
+    accounting: Arc<TxAccounting>,
+) {
+    struct ReleaseGate(Arc<TxAccounting>);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            self.0.set_gated(false);
+        }
+    }
+    let _release = ReleaseGate(accounting.clone());
+    let origin = tokio::time::Instant::now();
+    let mut controller = EgressController::new(Duration::ZERO, accounting.snapshot().sent);
+    let monitor = async {
+        let mut timer = tokio::time::interval_at(origin + EVALUATE_INTERVAL, EVALUATE_INTERVAL);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let snapshot = accounting.snapshot();
+            let decision = controller.evaluate(
+                origin.elapsed(),
+                EgressSample {
+                    buffered: snapshot.buffered,
+                    sendable: snapshot.buffered,
+                    sent: snapshot.sent,
+                },
+            );
+            accounting.set_gated(controller.stalled());
+            if decision == EgressDecision::Disconnect {
+                tracing::warn!("backbone sampled egress controller requested disconnect");
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = backbone_write_loop(writer, rx, online.clone(), txb) => {},
+        _ = monitor => {},
     }
     online.store(false, Ordering::SeqCst);
 }
@@ -413,7 +494,8 @@ pub async fn spawn_backbone_server(
                     let c_online = Arc::new(AtomicBool::new(true));
                     let c_rxb = Arc::new(AtomicU64::new(0));
                     let c_txb = Arc::new(AtomicU64::new(0));
-                    let (c_tx, c_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
+                    let (c_tx, c_rx, accounting) =
+                        byte_channel(TX_CHANNEL_DEPTH, HIGH_WATERMARK, encoded_len);
                     let (reader, writer) = stream.into_split();
 
                     let c_online_w = c_online.clone();
@@ -433,7 +515,7 @@ pub async fn spawn_backbone_server(
                     let read_handle = tokio::spawn(async move {
                         tokio::select! {
                             _ = backbone_read_loop(reader, client_id, transport_tx2, c_online_r, c_rxb_r) => {},
-                            _ = backbone_write_loop(writer, c_rx, c_online_w, c_txb_w) => {},
+                            _ = controlled_write_loop(writer, c_rx, c_online_w, c_txb_w, accounting) => {},
                         }
                         connection_online.store(false, Ordering::SeqCst);
                         // Record before notifying the runtime, so an immediate
@@ -497,7 +579,7 @@ pub async fn spawn_backbone_server(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }
@@ -522,7 +604,7 @@ pub async fn spawn_backbone_client(
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
     let online = Arc::new(AtomicBool::new(false));
     let online2 = online.clone();
-    let (tx, rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
+    let (tx, rx, accounting) = byte_channel(TX_CHANNEL_DEPTH, HIGH_WATERMARK, encoded_len);
     let name = config.name.clone();
     let mode = config.mode;
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -618,32 +700,42 @@ pub async fn spawn_backbone_client(
             let c_online = Arc::new(AtomicBool::new(true));
             let (reader, writer) = stream.into_split();
 
-            let (conn_tx, conn_rx) = mpsc::channel::<Bytes>(TX_CHANNEL_DEPTH);
+            let (conn_tx, conn_rx) = mpsc::channel::<OutboundFrame>(TX_CHANNEL_DEPTH);
             let c_online_w = c_online.clone();
             let c_txb = task_txb.clone();
 
             let rx_ref = rx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                let mut guard = rx_ref.lock().await;
-                while let Some(data) = guard.recv().await {
-                    if conn_tx.send(data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
             let c_online_r = c_online.clone();
             let c_rxb = task_rxb.clone();
             // Either half ending must close the whole connection. In particular,
             // a TX deadline must not leave us waiting on a silent peer's reader.
-            tokio::select! {
-                _ = backbone_read_loop(reader, id, transport_tx.clone(), c_online_r, c_rxb) => {},
-                _ = backbone_write_loop(writer, conn_rx, c_online_w, c_txb) => {},
+            {
+                // Keep forwarding in this task so cancellation cannot orphan
+                // a receiver and retain queued reservations indefinitely.
+                let forward = async move {
+                    let mut guard = rx_ref.lock().await;
+                    while let Some(data) = guard.recv().await {
+                        if conn_tx.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let reading =
+                    backbone_read_loop(reader, id, transport_tx.clone(), c_online_r, c_rxb);
+                let writing =
+                    controlled_write_loop(writer, conn_rx, c_online_w, c_txb, accounting.clone());
+                tokio::pin!(forward, reading, writing);
+                let mut forwarded = false;
+                loop {
+                    tokio::select! {
+                        _ = &mut reading => break,
+                        _ = &mut writing => break,
+                        _ = &mut forward, if !forwarded => { forwarded = true; },
+                    }
+                }
             }
 
             online2.store(false, Ordering::SeqCst);
-            fwd_handle.abort();
-            let _ = fwd_handle.await;
 
             if let Some(max) = max_tries {
                 tries += 1;
@@ -680,7 +772,7 @@ pub async fn spawn_backbone_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }

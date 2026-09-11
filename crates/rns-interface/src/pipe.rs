@@ -204,7 +204,7 @@ pub async fn spawn_pipe_interface(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }

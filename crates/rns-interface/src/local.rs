@@ -206,7 +206,7 @@ where
         online,
         rxb: Some(rxb),
         txb: Some(txb),
-        tx,
+        tx: tx.into(),
         read_task,
     }
 }
@@ -236,7 +236,7 @@ fn server_listener_handle(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
-        tx,
+        tx: tx.into(),
         read_task,
     }
 }
@@ -575,7 +575,7 @@ pub async fn spawn_reconnecting_local_client(
         online,
         rxb: Some(rxb),
         txb: Some(txb),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }

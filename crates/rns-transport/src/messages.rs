@@ -93,7 +93,7 @@ pub struct InterfaceEntry {
     pub direction: InterfaceDirection,
     pub bitrate: u64,
     pub mtu: u32,
-    pub tx: mpsc::Sender<Bytes>,
+    pub tx: crate::tx_queue::InterfaceTx,
     pub ifac_key: Option<[u8; 64]>,
     pub ifac_size: usize,
     pub announce_cap: f64,
@@ -109,7 +109,7 @@ pub struct InterfaceEntry {
     pub online: Option<Arc<AtomicBool>>,
     pub rxb: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub txb: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Incremented when an outbound `try_send` cannot enqueue — surfaced in
+    /// Incremented when outbound admission rejects capacity or egress gating — surfaced in
     /// interface stats to flag a driver whose receiver is falling behind.
     pub tx_drops: Arc<std::sync::atomic::AtomicU64>,
     pub ingress: IngressController,
@@ -145,7 +145,7 @@ impl InterfaceEntry {
         direction: InterfaceDirection,
         bitrate: u64,
         mtu: u32,
-        tx: mpsc::Sender<Bytes>,
+        tx: impl Into<crate::tx_queue::InterfaceTx>,
     ) -> Self {
         Self {
             diagnostics: None,
@@ -155,7 +155,7 @@ impl InterfaceEntry {
             direction,
             bitrate,
             mtu,
-            tx,
+            tx: tx.into(),
             ifac_key: None,
             ifac_size: 0,
             announce_cap: crate::constants::ANNOUNCE_CAP,

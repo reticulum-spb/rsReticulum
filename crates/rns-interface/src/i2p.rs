@@ -582,7 +582,7 @@ pub async fn spawn_i2p_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }
@@ -790,7 +790,7 @@ pub async fn spawn_i2p_server_with_id(
                     online: c_online,
                     rxb: Some(c_rxb),
                     txb: Some(c_txb),
-                    tx: c_tx,
+                    tx: c_tx.into(),
                     read_task: c_read_task,
                 };
 
@@ -828,7 +828,7 @@ pub async fn spawn_i2p_server_with_id(
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
-        tx,
+        tx: tx.into(),
         read_task,
     })
 }
