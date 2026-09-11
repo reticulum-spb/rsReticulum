@@ -2026,7 +2026,7 @@ fn build_link_request_packet(dest_hash: [u8; 16], request_data: &[u8]) -> Bytes 
         destination_hash: dest_hash,
         context: rns_wire::context::PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(request_data);
     Bytes::from(raw)
 }
@@ -2049,7 +2049,7 @@ fn build_proof_packet(
         destination_hash: link_id,
         context,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(body);
     Bytes::from(raw)
 }
@@ -2072,7 +2072,7 @@ fn build_data_packet(
         destination_hash: link_id,
         context,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(body);
     Bytes::from(raw)
 }
@@ -2328,7 +2328,7 @@ mod tests {
                     // application packet proofs.
                     context: rns_wire::context::PacketContext::None,
                 };
-                let mut raw = header.pack();
+                let mut raw = header.pack().expect("locally constructed header");
                 raw.extend_from_slice(&proof);
                 event_tx
                     .send(DestinationEvent::InboundPacket {

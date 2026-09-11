@@ -2774,7 +2774,7 @@ fn build_announce_packet(
         destination_hash: dest_hash,
         context: rns_wire::context::PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().map_err(|error| error.to_string())?;
     raw.extend_from_slice(&announce.pack());
     Ok(raw)
 }
@@ -4172,7 +4172,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(body);
         bytes::Bytes::from(raw)
     }

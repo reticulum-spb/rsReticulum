@@ -1536,7 +1536,7 @@ async fn send_client_channel_data(
         destination_hash: link_id,
         context: rns_wire::context::PacketContext::Channel,
     };
-    let mut raw = channel_header.pack();
+    let mut raw = channel_header.pack().expect("locally constructed header");
     raw.extend_from_slice(data);
     let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
     channel.track_outbound_packet_hash(packet_hash, sequence);
@@ -1833,7 +1833,7 @@ async fn send_link_packet_proof(
         destination_hash: link_id,
         context,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(proof_data);
     transport_tx
         .send(TransportMessage::Outbound(OutboundRequest {
@@ -1868,7 +1868,7 @@ fn build_link_request_packet(dest_hash: [u8; 16], request_data: &[u8]) -> Bytes 
         destination_hash: dest_hash,
         context: rns_wire::context::PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(request_data);
     Bytes::from(raw)
 }
@@ -1891,7 +1891,7 @@ fn build_data_packet(
         destination_hash: link_id,
         context,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(body);
     Bytes::from(raw)
 }
@@ -1928,7 +1928,7 @@ fn build_announce_packet(identity: &Identity, app_name: &str) -> Result<Vec<u8>,
         destination_hash: dest_hash,
         context: rns_wire::context::PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(&announce.pack());
     Ok(raw)
 }

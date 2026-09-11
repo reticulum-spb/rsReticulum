@@ -820,7 +820,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Lrproof,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0; 96]);
         let message = inbound(Bytes::from(raw));
 

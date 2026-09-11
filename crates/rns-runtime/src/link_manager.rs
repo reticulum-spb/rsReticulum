@@ -634,7 +634,7 @@ impl LinkManager {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Lrproof,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().expect("locally constructed header");
         proof_raw.extend_from_slice(&proof_data);
 
         tracing::info!(
@@ -862,7 +862,8 @@ impl LinkManager {
                                 destination_hash: link_id,
                                 context: rns_wire::context::PacketContext::Keepalive,
                             };
-                            let mut resp_raw = resp_header.pack();
+                            let mut resp_raw =
+                                resp_header.pack().expect("locally constructed header");
                             resp_raw.push(rns_link::constants::KEEPALIVE_RESPONSE);
                             active.link.record_tx_keepalive(1);
                             let _ = self.transport_tx.try_send(TransportMessage::Outbound(
@@ -1080,7 +1081,8 @@ impl LinkManager {
                                             destination_hash: link_id,
                                             context: rns_wire::context::PacketContext::ResourceReq,
                                         };
-                                        let mut req_raw = req_header.pack();
+                                        let mut req_raw =
+                                            req_header.pack().expect("locally constructed header");
                                         req_raw.extend_from_slice(&encrypted);
                                         let _ = self.transport_tx.try_send(
                                             TransportMessage::Outbound(OutboundRequest {
@@ -1171,7 +1173,8 @@ impl LinkManager {
                                     destination_hash: link_id,
                                     context,
                                 };
-                                let mut hmu_raw = hmu_header.pack();
+                                let mut hmu_raw =
+                                    hmu_header.pack().expect("locally constructed header");
                                 hmu_raw.extend_from_slice(&encrypted);
                                 active.link.record_tx(encrypted.len());
                                 let _ = self.transport_tx.try_send(TransportMessage::Outbound(
@@ -1220,7 +1223,8 @@ impl LinkManager {
                                         destination_hash: link_id,
                                         context: rns_wire::context::PacketContext::ResourcePrf,
                                     };
-                                    let mut prf_raw = prf_header.pack();
+                                    let mut prf_raw =
+                                        prf_header.pack().expect("locally constructed header");
                                     prf_raw.extend_from_slice(&proof);
                                     active.link.record_tx(proof.len());
                                     let _ = self.transport_tx.try_send(TransportMessage::Outbound(
@@ -1466,7 +1470,8 @@ impl LinkManager {
                                         destination_hash: link_id,
                                         context,
                                     };
-                                    let mut raw = part_header.pack();
+                                    let mut raw =
+                                        part_header.pack().expect("locally constructed header");
                                     raw.extend_from_slice(&body);
                                     active.link.record_tx(body.len());
                                     let _ = self.transport_tx.try_send(TransportMessage::Outbound(
@@ -1602,7 +1607,8 @@ impl LinkManager {
                                         destination_hash: link_id,
                                         context,
                                     };
-                                    let mut req_raw = req_header.pack();
+                                    let mut req_raw =
+                                        req_header.pack().expect("locally constructed header");
                                     req_raw.extend_from_slice(&encrypted);
                                     active.link.record_tx(encrypted.len());
                                     let _ = self.transport_tx.try_send(TransportMessage::Outbound(
@@ -1756,7 +1762,8 @@ impl LinkManager {
                                     destination_hash: link_id,
                                     context: rns_wire::context::PacketContext::LinkProof,
                                 };
-                                let mut proof_raw = proof_header.pack();
+                                let mut proof_raw =
+                                    proof_header.pack().expect("locally constructed header");
                                 proof_raw.extend_from_slice(&proof_data);
                                 // Proofs to a link count into txbytes (Link.py:388, Packet.py:291).
                                 active.link.record_tx(proof_data.len());
@@ -1839,7 +1846,7 @@ impl LinkManager {
                             destination_hash: link_id,
                             context: rns_wire::context::PacketContext::Response,
                         };
-                        let mut resp_raw = resp_header.pack();
+                        let mut resp_raw = resp_header.pack().expect("locally constructed header");
                         resp_raw.extend_from_slice(&encrypted);
                         active.link.record_tx(encrypted.len());
                         let _ = self.transport_tx.try_send(TransportMessage::Outbound(
@@ -2008,7 +2015,7 @@ impl LinkManager {
                             destination_hash: *link_id,
                             context: rns_wire::context::PacketContext::LinkClose,
                         };
-                        let mut td_raw = td_header.pack();
+                        let mut td_raw = td_header.pack().expect("locally constructed header");
                         td_raw.extend_from_slice(teardown_data);
                         let _ = self.transport_tx.try_send(TransportMessage::Outbound(
                             OutboundRequest {
@@ -2060,7 +2067,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         active.link.record_tx(encrypted.len());
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
@@ -2145,7 +2152,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context: rns_wire::context::PacketContext::LinkClose,
         };
-        let mut td_raw = td_header.pack();
+        let mut td_raw = td_header.pack().expect("locally constructed header");
         td_raw.extend_from_slice(teardown_data);
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(td_raw),
@@ -2167,7 +2174,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context: rns_wire::context::PacketContext::Keepalive,
         };
-        let mut ka_raw = ka_header.pack();
+        let mut ka_raw = ka_header.pack().expect("locally constructed header");
         ka_raw.push(rns_link::constants::KEEPALIVE_REQUEST);
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(ka_raw),
@@ -2194,7 +2201,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().expect("locally constructed header");
         proof_raw.extend_from_slice(proof_data);
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(proof_raw),
@@ -2221,7 +2228,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context: rns_wire::context::PacketContext::Channel,
         };
-        let mut raw = channel_header.pack();
+        let mut raw = channel_header.pack().expect("locally constructed header");
         raw.extend_from_slice(data);
         let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
@@ -2428,7 +2435,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context: rns_wire::context::PacketContext::Channel,
         };
-        let mut raw = channel_header.pack();
+        let mut raw = channel_header.pack().expect("locally constructed header");
         raw.extend_from_slice(&prepared.data);
 
         let packet_hash = rns_wire::hash::packet_hash(&raw, channel_header.flags.header_type);
@@ -2484,7 +2491,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
 
@@ -2727,7 +2734,7 @@ impl LinkManager {
             destination_hash: *link_id,
             context: rns_wire::context::PacketContext::ResourceAdv,
         };
-        let mut raw = adv_header.pack();
+        let mut raw = adv_header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         active.link.record_tx(encrypted.len());
         let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
@@ -2865,7 +2872,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(request_data);
         raw
     }
@@ -2986,7 +2993,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::LinkClose,
         };
-        let mut close_raw = close_header.pack();
+        let mut close_raw = close_header.pack().expect("locally constructed header");
         close_raw.extend_from_slice(&close_body);
 
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
@@ -3081,7 +3088,7 @@ mod tests {
             destination_hash: [0xDD; 16],
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xAA; 67]);
 
         lm.handle_link_request(&raw, 1);
@@ -3267,7 +3274,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Lrrtt,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&rtt_data);
 
         lm.handle_inbound_packet(&raw, 1);
@@ -3323,7 +3330,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Lrrtt,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&rtt_data);
 
         lm.handle_inbound_packet(&raw, 1);
@@ -3433,7 +3440,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&request_data);
 
         lm.handle_link_request(&raw, 1);
@@ -3494,7 +3501,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Channel,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
         let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
 
@@ -3823,7 +3830,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
 
@@ -3889,7 +3896,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Channel,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
 
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
@@ -3958,7 +3965,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Channel,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
 
         let (transport_tx, mut transport_rx) = mpsc::channel(16);
@@ -4057,7 +4064,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().expect("locally constructed header");
         proof_raw.extend_from_slice(&proof_data);
 
         lm.handle_inbound_packet(&proof_raw, 1);
@@ -4126,7 +4133,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().expect("locally constructed header");
         proof_raw.extend_from_slice(&proof_data);
         lm.handle_inbound_packet(&proof_raw, 1);
 
@@ -4196,7 +4203,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::ResourcePrf,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().expect("locally constructed header");
         proof_raw.extend_from_slice(&proof_data);
         lm.handle_inbound_packet(&proof_raw, 1);
 
@@ -4296,7 +4303,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().expect("locally constructed header");
         proof_raw.extend_from_slice(&proof_data);
 
         assert!(
@@ -4402,7 +4409,7 @@ mod tests {
                 destination_hash: link_id,
                 context: rns_wire::context::PacketContext::ResourceAdv,
             };
-            let mut adv_raw = adv_header.pack();
+            let mut adv_raw = adv_header.pack().expect("locally constructed header");
             adv_raw.extend_from_slice(&encrypted_adv);
             lm.handle_inbound_packet(&adv_raw, 1);
 
@@ -4430,7 +4437,7 @@ mod tests {
                     destination_hash: link_id,
                     context: rns_wire::context::PacketContext::Resource,
                 };
-                let mut part_raw = part_header.pack();
+                let mut part_raw = part_header.pack().expect("locally constructed header");
                 part_raw.extend_from_slice(part);
                 lm.handle_inbound_packet(&part_raw, 1);
             }
@@ -4543,7 +4550,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::ResourceAdv,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         lm.handle_inbound_packet(&raw, 1);
 
@@ -4618,7 +4625,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::ResourceAdv,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         lm.handle_inbound_packet(&raw, 1);
 
@@ -4670,7 +4677,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::ResourceAdv,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&encrypted);
         lm.handle_inbound_packet(&raw, 1);
 
@@ -4705,7 +4712,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&request_data);
 
         lm.handle_link_request(&raw, 1);

@@ -22,7 +22,7 @@ fn fixture(identity: &rns_identity::identity::Identity) -> (RecentAnnounce, Vec<
         destination_hash: dest,
         context: rns_wire::context::PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(&payload);
     let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
     (

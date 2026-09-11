@@ -43,7 +43,7 @@ impl Packet {
 
     /// Build a packet from a header and payload, precomputing its hashes.
     pub fn new(header: PacketHeader, data: Vec<u8>) -> Result<Self, PacketError> {
-        let mut raw = header.pack();
+        let mut raw = header.pack()?;
         let data_offset = raw.len();
         raw.extend_from_slice(&data);
 

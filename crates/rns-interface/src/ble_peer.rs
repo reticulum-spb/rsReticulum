@@ -6712,7 +6712,7 @@ mod tests {
             destination_hash: [0xAA; 16],
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0x55; 64]);
         assert_eq!(raw[0], FragmentType::Continue as u8);
 
@@ -6901,7 +6901,7 @@ mod tests {
             destination_hash: [0xAA; 16],
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0x55; 64]);
         assert_eq!(raw[0], FragmentType::Continue as u8);
 
@@ -6926,7 +6926,7 @@ mod tests {
                 destination_hash: [0x11; 16],
                 context: rns_wire::context::PacketContext::None,
             };
-            let mut raw = header.pack();
+            let mut raw = header.pack().expect("locally constructed header");
             raw.extend_from_slice(&[0x22; 64]);
             raw
         };
@@ -7101,7 +7101,7 @@ mod tests {
             destination_hash: [0x44; 16],
             context,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xAA; 96]);
         raw
     }

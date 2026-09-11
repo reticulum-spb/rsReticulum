@@ -995,7 +995,7 @@ impl TransportActor {
                 destination_hash: header.destination_hash,
                 context: header.context,
             };
-            let mut forwarded = new_header.pack();
+            let mut forwarded = new_header.pack().ok()?;
             forwarded.extend_from_slice(&raw[payload_offset..]);
             Some(forwarded)
         } else if path.hops == 1
@@ -1016,7 +1016,7 @@ impl TransportActor {
                 destination_hash: header.destination_hash,
                 context: header.context,
             };
-            let mut forwarded = new_header.pack();
+            let mut forwarded = new_header.pack().ok()?;
             forwarded.extend_from_slice(&raw[payload_offset..]);
             Some(forwarded)
         } else {

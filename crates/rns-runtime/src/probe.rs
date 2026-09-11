@@ -160,7 +160,7 @@ pub async fn spawn_probe_responder(
                 destination_hash: trunc_hash,
                 context: PacketContext::None,
             };
-            let mut proof_raw = proof_header.pack();
+            let mut proof_raw = proof_header.pack().expect("locally constructed header");
             proof_raw.extend_from_slice(&proof_payload);
 
             if transport_tx
@@ -341,7 +341,7 @@ pub async fn probe_once(
         destination_hash: dest_hash,
         context: PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().expect("locally constructed header");
     raw.extend_from_slice(&ciphertext);
 
     if raw.len() > MTU {
@@ -588,7 +588,7 @@ mod tests {
             destination_hash: dest_hash,
             context: PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xEE; 32]);
         let (expected_full, expected_trunc) = packet_hash_pair(&raw, HeaderType::Header1);
 
@@ -722,7 +722,7 @@ mod tests {
             destination_hash: dest_hash,
             context: PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xAB; 64]);
 
         delivery_tx

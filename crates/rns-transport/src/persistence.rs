@@ -1796,7 +1796,7 @@ mod tests {
             destination_hash: [fill; 16],
             context,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[fill; 32]);
         raw
     }

@@ -247,7 +247,7 @@ pub fn build_tunnel_synthesis_packet(
         context: rns_wire::context::PacketContext::None,
     };
 
-    let mut raw = header.pack();
+    let mut raw = header.pack().ok()?;
     raw.extend_from_slice(&payload);
     Some(raw)
 }

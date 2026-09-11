@@ -535,7 +535,7 @@ impl TransportActor {
                         destination_hash,
                         context: rns_wire::context::PacketContext::CacheRequest,
                     };
-                    let mut raw = header.pack();
+                    let mut raw = header.pack().expect("locally constructed header");
                     raw.extend_from_slice(&packet_hash);
                     self.broadcast_on_interfaces(&raw, None);
                 }
@@ -798,7 +798,7 @@ impl TransportActor {
                 destination_hash: header.destination_hash,
                 context: header.context,
             };
-            let mut out = new_header.pack();
+            let mut out = new_header.pack().expect("locally constructed header");
             out.extend_from_slice(&raw[header.size()..]);
             return out;
         }
@@ -990,7 +990,7 @@ impl TransportActor {
             destination_hash,
             context,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&cached_raw[payload_offset..]);
         raw
     }
@@ -1474,7 +1474,7 @@ impl TransportActor {
             destination_hash,
             context: rns_wire::context::PacketContext::PathResponse,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&cached_raw[payload_offset..]);
         Some(raw)
     }
@@ -1689,7 +1689,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
         (Bytes::from(raw), dest_hash)
     }
@@ -1736,7 +1736,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
         (Bytes::from(raw), dest_hash)
     }
@@ -1770,7 +1770,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         // Add some payload to meet minimum packet requirements
         raw.extend_from_slice(&[0u8; 32]);
         Bytes::from(raw)
@@ -1791,7 +1791,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xDD; 32]);
         Bytes::from(raw)
     }
@@ -1811,7 +1811,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xCC; 64]);
         Bytes::from(raw)
     }
@@ -1843,7 +1843,7 @@ mod tests {
             destination_hash: link_id,
             context,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xDA; 32]);
         Bytes::from(raw)
     }
@@ -1863,7 +1863,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xEE; 32]);
         Bytes::from(raw)
     }
@@ -1883,7 +1883,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::LinkProof,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xEF; 32]);
         Bytes::from(raw)
     }
@@ -2555,7 +2555,7 @@ mod tests {
             destination_hash: [0x33; 16],
             context: rns_wire::context::PacketContext::None,
         };
-        let raw = header.pack();
+        let raw = header.pack().expect("locally constructed header");
 
         let paths_before = actor.path_table.is_empty();
         let interfaces_before = actor.interfaces.len();
@@ -2875,7 +2875,7 @@ mod tests {
             destination_hash: link_id,
             context: rns_wire::context::PacketContext::Lrproof,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(payload);
         Bytes::from(raw)
     }
@@ -3444,7 +3444,7 @@ mod tests {
             destination_hash: [0x66; 16],
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xFF; 20]);
 
         actor.on_outbound(OutboundRequest {
@@ -3908,7 +3908,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::PathResponse,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(b"not_an_announce");
 
         actor.on_inbound(InboundPacket {
@@ -4369,7 +4369,7 @@ mod tests {
             destination_hash: wrong_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
 
         actor.on_inbound(InboundPacket {
@@ -4405,7 +4405,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(payload);
         Bytes::from(raw)
     }
@@ -4430,7 +4430,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(payload);
         Bytes::from(raw)
     }
@@ -4463,7 +4463,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
         (Bytes::from(raw), dest_hash, identity)
     }
@@ -4645,7 +4645,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(payload);
 
         actor.on_outbound(OutboundRequest {
@@ -4699,7 +4699,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xAB; 50]); // substantial payload
 
         actor.on_outbound(OutboundRequest {
@@ -4988,7 +4988,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(payload);
 
         actor.on_outbound(OutboundRequest {
@@ -5196,7 +5196,7 @@ mod tests {
             destination_hash: client_dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut announce_raw = announce_header.pack();
+        let mut announce_raw = announce_header.pack().expect("locally constructed header");
         announce_raw.extend_from_slice(&announce_payload);
 
         // Inject the announce into the hub.
@@ -5255,7 +5255,7 @@ mod tests {
             destination_hash: client_dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut data_raw = data_header.pack();
+        let mut data_raw = data_header.pack().expect("locally constructed header");
         data_raw.extend_from_slice(lxmf_ciphertext);
 
         // Peer sends outbound.
@@ -5445,7 +5445,7 @@ mod tests {
                 destination_hash: dest,
                 context: rns_wire::context::PacketContext::None,
             };
-            let mut raw = header.pack();
+            let mut raw = header.pack().expect("locally constructed header");
             raw.extend_from_slice(payload);
             raw
         };
@@ -5466,7 +5466,7 @@ mod tests {
                 destination_hash: dest,
                 context: rns_wire::context::PacketContext::None,
             };
-            let mut raw = header.pack();
+            let mut raw = header.pack().expect("locally constructed header");
             raw.extend_from_slice(payload);
             raw
         };
@@ -6287,7 +6287,7 @@ mod tests {
             destination_hash: dest_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&[0xDD; 32]);
         Bytes::from(raw)
     }
@@ -6957,7 +6957,7 @@ mod tests {
             destination_hash: [0x00; 16], // CacheRequest dest doesn't matter for lookup
             context: rns_wire::context::PacketContext::CacheRequest,
         };
-        let mut cr_raw = cr_header.pack();
+        let mut cr_raw = cr_header.pack().expect("locally constructed header");
         cr_raw.extend_from_slice(&packet_hash); // 32-byte payload
 
         // Process the cache request
@@ -6993,7 +6993,7 @@ mod tests {
             destination_hash: [0x00; 16],
             context: rns_wire::context::PacketContext::CacheRequest,
         };
-        let mut cr_raw = cr_header.pack();
+        let mut cr_raw = cr_header.pack().expect("locally constructed header");
         cr_raw.extend_from_slice(&[0xFF; 32]);
 
         actor.handle_cache_request(&cr_raw, &cr_header, 1);
@@ -7017,7 +7017,7 @@ mod tests {
             destination_hash: [0x00; 16],
             context: rns_wire::context::PacketContext::CacheRequest,
         };
-        let mut cr_raw = cr_header.pack();
+        let mut cr_raw = cr_header.pack().expect("locally constructed header");
         cr_raw.extend_from_slice(&[0xFF; 16]);
 
         actor.handle_cache_request(&cr_raw, &cr_header, 1);
@@ -9456,7 +9456,7 @@ mod tests {
             destination_hash: dest_hash,
             context,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(&payload);
         (Bytes::from(raw), dest_hash)
     }

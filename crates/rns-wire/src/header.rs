@@ -7,15 +7,17 @@ use crate::constants::{HEADER_MAXSIZE, HEADER_MINSIZE, TRUNCATED_HASHLENGTH};
 use crate::context::PacketContext;
 use crate::flags::{HeaderType, PacketFlags};
 
-/// Errors surfaced by header parsing.
+/// Errors surfaced by header parsing and serialization.
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum HeaderError {
     #[error("raw packet too short: {0} bytes (minimum {HEADER_MINSIZE})")]
     TooShort(usize),
+    #[error("HEADER_2 requires a transport ID")]
+    MissingTransportId,
 }
 
-/// Parsed packet header. `transport_id` is `Some` exactly for Header2 packets.
+/// Packet header. HEADER_2 requires `transport_id`; HEADER_1 ignores it.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketHeader {
@@ -27,17 +29,26 @@ pub struct PacketHeader {
 }
 
 impl PacketHeader {
-    /// Serialize the header to wire bytes.
-    pub fn pack(&self) -> Vec<u8> {
+    /// Serialize the header to wire bytes, rejecting HEADER_2 without an ID.
+    /// Like Python, HEADER_1 ignores a transport ID supplied by the caller.
+    pub fn pack(&self) -> Result<Vec<u8>, HeaderError> {
+        let transport_id = match self.flags.header_type {
+            HeaderType::Header1 => None,
+            HeaderType::Header2 => Some(
+                self.transport_id
+                    .as_ref()
+                    .ok_or(HeaderError::MissingTransportId)?,
+            ),
+        };
         let mut out = Vec::with_capacity(HEADER_MAXSIZE);
         out.push(self.flags.pack());
         out.push(self.hops);
-        if let Some(ref tid) = self.transport_id {
+        if let Some(tid) = transport_id {
             out.extend_from_slice(tid);
         }
         out.extend_from_slice(&self.destination_hash);
         out.push(self.context.to_byte());
-        out
+        Ok(out)
     }
 
     /// Parse a header from the start of `raw`.
@@ -102,12 +113,11 @@ impl PacketHeader {
         }
     }
 
-    /// Serialized header size.
+    /// Wire size selected by the header type. `pack` still validates the ID.
     pub fn size(&self) -> usize {
-        if self.transport_id.is_some() {
-            HEADER_MAXSIZE
-        } else {
-            HEADER_MINSIZE
+        match self.flags.header_type {
+            HeaderType::Header1 => HEADER_MINSIZE,
+            HeaderType::Header2 => HEADER_MAXSIZE,
         }
     }
 }
@@ -133,7 +143,7 @@ mod tests {
             destination_hash: [0xAA; 16],
             context: PacketContext::None,
         };
-        let packed = hdr.pack();
+        let packed = hdr.pack().expect("locally constructed header");
         assert_eq!(packed.len(), HEADER_MINSIZE);
         assert_eq!(packed[0], 0x00);
         assert_eq!(packed[1], 0x00);
@@ -156,7 +166,7 @@ mod tests {
             destination_hash: [0xCC; 16],
             context: PacketContext::None,
         };
-        let packed = hdr.pack();
+        let packed = hdr.pack().expect("locally constructed header");
         assert_eq!(packed.len(), HEADER_MAXSIZE);
         assert_eq!(&packed[2..18], &[0xBB; 16]);
         assert_eq!(&packed[18..34], &[0xCC; 16]);
@@ -194,7 +204,7 @@ mod tests {
             destination_hash: [0x12; 16],
             context: PacketContext::Channel,
         };
-        let packed = hdr.pack();
+        let packed = hdr.pack().expect("locally constructed header");
         let (unpacked, _) = PacketHeader::unpack(&packed).unwrap();
         assert_eq!(hdr, unpacked);
     }
@@ -230,10 +240,10 @@ mod tests {
                 destination_hash,
                 context: PacketContext::from_byte(context_byte),
             };
-            let packed = header.pack();
+            let packed = header.pack().expect("locally constructed header");
             let (unpacked, _offset) = PacketHeader::unpack(&packed).unwrap();
             prop_assert_eq!(&header, &unpacked);
-            prop_assert_eq!(unpacked.pack(), packed);
+            prop_assert_eq!(unpacked.pack().unwrap(), packed);
         }
 
         #[test]

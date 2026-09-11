@@ -114,7 +114,8 @@ impl TransportActor {
                                 destination_hash: parsed.destination_hash,
                                 context: parsed.context,
                             };
-                            let mut new_raw = new_header.pack();
+                            let mut new_raw =
+                                new_header.pack().expect("locally constructed header");
                             new_raw.extend_from_slice(
                                 &request.raw[rns_wire::constants::HEADER_MINSIZE..],
                             );
@@ -561,7 +562,7 @@ impl TransportActor {
             destination_hash: pr_dest,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut raw = pr_header.pack();
+        let mut raw = pr_header.pack().expect("locally constructed header");
         raw.extend_from_slice(&request_data);
         raw
     }

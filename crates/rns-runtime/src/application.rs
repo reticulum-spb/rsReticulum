@@ -347,7 +347,7 @@ impl RegisteredDestination {
             destination_hash,
             context: PacketContext::None,
         };
-        let mut raw = header.pack();
+        let mut raw = header.pack().map_err(|_| ApplicationError::InvalidPacket)?;
         raw.extend_from_slice(&proof);
         self.send_raw(raw, destination_hash, Some(interface_id))
             .await
@@ -471,7 +471,7 @@ pub async fn send_packet(
         destination_hash,
         context: PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().map_err(|_| ApplicationError::InvalidPacket)?;
     raw.extend_from_slice(&payload);
     if raw.len() > MTU {
         return Err(ApplicationError::MtuExceeded {
@@ -694,7 +694,7 @@ fn build_pre_encrypted_packet(
         destination_hash,
         context: PacketContext::None,
     };
-    let mut raw = header.pack();
+    let mut raw = header.pack().map_err(|_| ApplicationError::InvalidPacket)?;
     raw.extend_from_slice(payload);
     if raw.len() > MTU {
         return Err(ApplicationError::MtuExceeded {

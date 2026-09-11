@@ -772,7 +772,7 @@ impl Destination {
             context,
         };
 
-        let mut raw = header.pack();
+        let mut raw = header.pack().expect("locally constructed header");
         raw.extend_from_slice(announce_data);
         raw
     }
