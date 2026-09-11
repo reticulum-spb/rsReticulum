@@ -72,6 +72,11 @@ pub trait InterfaceDiagnostics: Send + Sync {
     fn link_mtu(&self) -> Option<u32> {
         None
     }
+    /// Automatic MTU selection found no hardware MTU (Python HW_MTU=None).
+    /// Unlike absence of an upgrade capability, this removes local LR signalling.
+    fn mtu_is_unknown(&self) -> bool {
+        false
+    }
     /// Optional Backbone dataplane control, independent of announce/PR limits.
     fn dataplane_ingress(&self) -> Option<&crate::backbone_ingress::IngressControl> {
         None
@@ -89,6 +94,8 @@ pub struct LinkMtuDiagnostics {
 }
 
 impl LinkMtuDiagnostics {
+    /// Automatic/fixed-MTU driver metadata. None explicitly represents an
+    /// unknown hardware MTU, rather than a driver without upgrade support.
     pub fn new(mtu: Option<u32>, inner: Option<Arc<dyn InterfaceDiagnostics>>) -> Arc<Self> {
         Arc::new(Self { mtu, inner })
     }
@@ -97,6 +104,9 @@ impl LinkMtuDiagnostics {
 impl InterfaceDiagnostics for LinkMtuDiagnostics {
     fn link_mtu(&self) -> Option<u32> {
         self.mtu
+    }
+    fn mtu_is_unknown(&self) -> bool {
+        self.mtu.is_none()
     }
     fn dataplane_ingress(&self) -> Option<&crate::backbone_ingress::IngressControl> {
         self.inner.as_ref()?.dataplane_ingress()

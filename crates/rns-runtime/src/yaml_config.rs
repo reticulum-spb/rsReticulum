@@ -133,6 +133,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), YamlConfigError> {
+        if self.reticulum.force_shared_instance_bitrate == Some(0) {
+            return Err(YamlConfigError::Validation(
+                "reticulum.force_shared_instance_bitrate must be positive".into(),
+            ));
+        }
         if rns_transport::inbound_queue::InboundQueueLimits::new([
             self.reticulum.qlen_in_data,
             self.reticulum.qlen_in_announce,

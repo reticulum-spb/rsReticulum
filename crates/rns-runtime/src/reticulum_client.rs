@@ -76,6 +76,7 @@ pub struct ReticulumConfig {
     pub rpc_key: Option<Vec<u8>>,
     pub use_implicit_proof: bool,
     pub link_mtu_discovery: bool,
+    pub force_shared_instance_bitrate: Option<u64>,
     pub inbound_queue_limits: rns_transport::inbound_queue::InboundQueueLimits,
 }
 
@@ -90,6 +91,7 @@ impl Default for ReticulumConfig {
             rpc_key: None,
             use_implicit_proof: true,
             link_mtu_discovery: true,
+            force_shared_instance_bitrate: None,
             inbound_queue_limits: Default::default(),
         }
     }
@@ -103,6 +105,20 @@ impl ReticulumConfig {
         };
         result.inbound_queue_limits =
             crate::normalized_config::parse_inbound_queue_limits(section)?;
+        result.force_shared_instance_bitrate = section
+            .get("force_shared_instance_bitrate")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| ConfigError::InvalidValue {
+                        section: "reticulum".into(),
+                        key: "force_shared_instance_bitrate".into(),
+                        message: "expected positive bits per second".into(),
+                    })
+            })
+            .transpose()?;
         if let Some(value) = section.get_bool("share_instance") {
             result.share_instance = value;
         }
@@ -427,15 +443,15 @@ async fn connect_shared_inner(
     let interface_id = id_gen.fetch_add(1, Ordering::Relaxed);
     let interface = match config.shared_instance_type {
         SharedInstanceType::Tcp => {
-            let interface_config = rns_interface::tcp::TcpClientConfig::new(
-                "SharedInstanceClient",
-                "127.0.0.1",
-                config.shared_instance_port,
-            );
-            rns_interface::tcp::spawn_tcp_client(
+            let interface_config = rns_interface::local::LocalClientConfig {
+                name: "SharedInstanceClient".into(),
+                socket_path: format!("tcp://127.0.0.1:{}", config.shared_instance_port),
+            };
+            rns_interface::local::spawn_reconnecting_local_client_with_bitrate(
                 interface_config,
                 interface_id,
                 interface_transport_tx.clone(),
+                config.force_shared_instance_bitrate,
             )
             .await
             .map_err(|error| ReticulumError::SharedInstanceUnavailable(error.to_string()))?
@@ -445,10 +461,11 @@ async fn connect_shared_inner(
                 socket_path: shared_instance_socket_path(&config.instance_name, &socket_base),
                 name: "SharedInstanceClient".to_string(),
             };
-            rns_interface::local::spawn_reconnecting_local_client(
+            rns_interface::local::spawn_reconnecting_local_client_with_bitrate(
                 interface_config,
                 interface_id,
                 interface_transport_tx.clone(),
+                config.force_shared_instance_bitrate,
             )
             .await
             .map_err(|error| ReticulumError::SharedInstanceUnavailable(error.to_string()))?
@@ -665,7 +682,7 @@ mod tests {
     #[test]
     fn client_config_reads_shared_endpoint_without_full_runtime() {
         let config = crate::config::Config::parse(
-            "reticulum:\n  share_instance: true\n  instance_name: lxmf\n  shared_instance_type: tcp\n  shared_instance_port: 41234\n  instance_control_port: 41235\n",
+            "reticulum:\n  share_instance: true\n  instance_name: lxmf\n  shared_instance_type: tcp\n  shared_instance_port: 41234\n  instance_control_port: 41235\n  force_shared_instance_bitrate: 1000000\n",
             "config.yaml",
         )
         .unwrap()
@@ -677,6 +694,7 @@ mod tests {
         assert_eq!(client.shared_instance_type, SharedInstanceType::Tcp);
         assert_eq!(client.shared_instance_port, 41234);
         assert_eq!(client.control_port, 41235);
+        assert_eq!(client.force_shared_instance_bitrate, Some(1_000_000));
     }
 
     #[test]

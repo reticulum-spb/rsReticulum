@@ -1129,17 +1129,48 @@ impl TransportActor {
         if self.local_destinations.contains(&header.destination_hash)
             && link_request_for_this_instance
         {
+            let diagnostics = self
+                .interfaces
+                .get(&interface_id)
+                .and_then(|entry| entry.diagnostics.as_ref());
+            let max_mtu = diagnostics
+                .and_then(|d| d.link_mtu())
+                .filter(|mtu| *mtu >= 500)
+                .unwrap_or(500);
+            let unknown_mtu = diagnostics.is_some_and(|d| d.mtu_is_unknown());
+            let mut local_raw = raw.clone();
+            if let Ok((_, offset)) = rns_wire::header::PacketHeader::unpack(raw) {
+                if raw.len() == offset + 67 {
+                    let signal = offset + 64;
+                    let offer = u32::from_be_bytes([
+                        0,
+                        raw[signal] & 0x1f,
+                        raw[signal + 1],
+                        raw[signal + 2],
+                    ]);
+                    if offer != 0 {
+                        if unknown_mtu {
+                            local_raw = raw.slice(..signal);
+                        } else if offer > max_mtu {
+                            let mode = raw[signal] >> 5;
+                            if !rns_wire::constants::LINK_ENABLED_MODES.contains(&mode) {
+                                self.protocol_violation(interface_id);
+                                return;
+                            }
+                            let mut clamped = raw.to_vec();
+                            let encoded = max_mtu.to_be_bytes();
+                            clamped[signal] = (raw[signal] & 0xe0) | encoded[1];
+                            clamped[signal + 1..signal + 3].copy_from_slice(&encoded[2..]);
+                            local_raw = clamped.into();
+                        }
+                    }
+                }
+            }
             if let Some(tx) = self.destination_channels.get(&header.destination_hash) {
                 if let Err(e) = tx.try_send(crate::link_messages::DestinationEvent::LinkRequest {
-                    raw: raw.clone(),
+                    raw: local_raw,
                     interface_id,
-                    max_mtu: self
-                        .interfaces
-                        .get(&interface_id)
-                        .and_then(|entry| entry.diagnostics.as_ref())
-                        .and_then(|diagnostics| diagnostics.link_mtu())
-                        .filter(|mtu| *mtu >= 500)
-                        .unwrap_or(500),
+                    max_mtu,
                 }) {
                     self.channel_drops += 1;
                     error!(dest = hex::encode(header.destination_hash), drops = self.channel_drops, err = %e,
@@ -1184,7 +1215,16 @@ impl TransportActor {
                         .and_then(|entry| entry.diagnostics.as_ref())
                         .and_then(|capabilities| capabilities.link_mtu());
                     if let Some(next) = next.filter(|mtu| *mtu > 0) {
-                        let previous = self.interfaces.get(&interface_id).map(|entry| entry.mtu);
+                        let previous = self
+                            .interfaces
+                            .get(&interface_id)
+                            .filter(|entry| {
+                                !entry
+                                    .diagnostics
+                                    .as_ref()
+                                    .is_some_and(|d| d.mtu_is_unknown())
+                            })
+                            .map(|entry| entry.mtu);
                         let clamped = offer.min(next).min(previous.unwrap_or(offer));
                         // Python signalling_bytes validates the mode only when
                         // clamping actually rewrites the offer. Do not invent

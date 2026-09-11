@@ -1,5 +1,5 @@
-//! Shared-instance IPC. Unix domain sockets where available, TCP on
-//! 127.0.0.1 as fallback. HDLC-framed.
+//! Shared-instance IPC. Unix domain sockets or explicit TCP endpoints,
+//! with loopback TCP as the non-Unix fallback. HDLC-framed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +13,46 @@ use crate::traits::{InterfaceDirection, InterfaceHandle, InterfaceId, InterfaceM
 use rns_transport::messages::{InboundPacket, TransportMessage};
 
 pub const LOCAL_MTU: u32 = 262_144;
+
+#[derive(Clone, Copy)]
+struct LocalSettings {
+    bitrate: u64,
+    link_mtu: Option<u32>,
+    forced: bool,
+}
+
+impl LocalSettings {
+    fn new(forced_bitrate: Option<u64>) -> Result<Self, crate::traits::InterfaceError> {
+        if forced_bitrate == Some(0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "force_shared_instance_bitrate must be positive",
+            )
+            .into());
+        }
+        Ok(Self {
+            bitrate: forced_bitrate.unwrap_or(1_000_000_000),
+            link_mtu: forced_bitrate
+                .map(crate::traits::optimise_mtu)
+                .unwrap_or(Some(LOCAL_MTU)),
+            forced: forced_bitrate.is_some(),
+        })
+    }
+
+    fn receive_mtu(self) -> u32 {
+        // Keep a bounded Rust receive limit even when Python has HW_MTU=None.
+        self.link_mtu.unwrap_or(rns_wire::constants::MTU as u32)
+    }
+
+    fn accepted(self) -> Self {
+        // Python LocalServer copies bitrate/_force_bitrate, but accepted
+        // LocalClient keeps its constructor's 262144 MTU (no optimise_mtu call).
+        Self {
+            link_mtu: Some(LOCAL_MTU),
+            ..self
+        }
+    }
+}
 
 /// Default filesystem socket path for non-Linux fallback use.
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/rns_reticulum.sock";
@@ -57,7 +97,7 @@ fn display_socket_path(path: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub struct LocalServerConfig {
-    /// Unix socket path (ignored on non-Unix).
+    /// Unix socket path or `tcp://host:port`; non-Unix defaults to loopback TCP.
     pub socket_path: String,
     pub name: String,
 }
@@ -92,11 +132,12 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
     transport_tx: mpsc::Sender<TransportMessage>,
     online: Arc<AtomicBool>,
     rxb: Arc<AtomicU64>,
+    mtu: u32,
 ) {
     let mut buf = [0u8; 8192];
     // Local IPC has no IFAC allowance. Bound decoded data independently from
     // HDLC expansion, matching the Python default hardware MTU.
-    let mut deframer = hdlc::HdlcDeframer::with_max_decoded_size(LOCAL_MTU as usize);
+    let mut deframer = hdlc::HdlcDeframer::with_max_decoded_size(mtu as usize);
 
     loop {
         match reader.read(&mut buf).await {
@@ -140,8 +181,15 @@ async fn local_write_loop<W: AsyncWriteExt + Unpin>(
     rx: &mut mpsc::Receiver<Bytes>,
     online: Arc<AtomicBool>,
     txb: Arc<AtomicU64>,
+    settings: LocalSettings,
 ) {
     while let Some(data) = rx.recv().await {
+        if settings.forced {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(
+                data.len() as f64 * 8.0 / settings.bitrate as f64,
+            ))
+            .await;
+        }
         let framed = hdlc::frame(&data);
         if let Err(e) = writer.write_all(&framed).await {
             tracing::warn!(error = %e, "local write error");
@@ -163,6 +211,7 @@ fn wire_local_stream<R, W>(
     writer: W,
     transport_tx: mpsc::Sender<TransportMessage>,
     dereg_on_disconnect: bool,
+    settings: LocalSettings,
 ) -> InterfaceHandle
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -181,8 +230,8 @@ where
     let txb_w = txb.clone();
     let read_task = tokio::spawn(async move {
         tokio::select! {
-            _ = local_read_loop(reader, id, transport_tx, online_r, rxb_r) => {},
-            _ = local_write_loop(writer, &mut rx, online_w, txb_w) => {},
+            _ = local_read_loop(reader, id, transport_tx, online_r, rxb_r, settings.receive_mtu()) => {},
+            _ = local_write_loop(writer, &mut rx, online_w, txb_w, settings) => {},
         }
         if dereg_on_disconnect {
             tracing::info!(name = %task_name, "local client disconnected");
@@ -197,7 +246,7 @@ where
         id,
         parent_id,
         diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
-            Some(LOCAL_MTU),
+            settings.link_mtu,
             None,
         )),
         name,
@@ -208,8 +257,8 @@ where
             forward: false,
             repeat: false,
         },
-        bitrate: 1_000_000_000,
-        mtu: LOCAL_MTU,
+        bitrate: settings.bitrate,
+        mtu: settings.receive_mtu(),
         online,
         rxb: Some(rxb),
         txb: Some(txb),
@@ -225,12 +274,13 @@ fn server_listener_handle(
     online: Arc<AtomicBool>,
     tx: mpsc::Sender<Bytes>,
     read_task: tokio::task::JoinHandle<()>,
+    settings: LocalSettings,
 ) -> InterfaceHandle {
     InterfaceHandle {
         id: 0,
         parent_id: None,
         diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
-            Some(LOCAL_MTU),
+            settings.link_mtu,
             None,
         )),
         name,
@@ -241,8 +291,8 @@ fn server_listener_handle(
             forward: false,
             repeat: false,
         },
-        bitrate: 1_000_000_000,
-        mtu: LOCAL_MTU,
+        bitrate: settings.bitrate,
+        mtu: settings.receive_mtu(),
         online,
         rxb: Some(Arc::new(AtomicU64::new(0))),
         txb: Some(Arc::new(AtomicU64::new(0))),
@@ -250,6 +300,9 @@ fn server_listener_handle(
         read_task,
     }
 }
+
+trait LocalStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> LocalStream for T {}
 
 #[cfg(unix)]
 mod platform {
@@ -324,7 +377,18 @@ mod platform {
         id_gen: Arc<AtomicU64>,
         transport_tx: mpsc::Sender<TransportMessage>,
         handle_tx: mpsc::Sender<InterfaceHandle>,
+        settings: LocalSettings,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+        if config.socket_path.starts_with("tcp://") {
+            return super::tcp_platform::spawn_local_server_impl(
+                config,
+                id_gen,
+                transport_tx,
+                handle_tx,
+                settings,
+            )
+            .await;
+        }
         let listener = bind_unix_listener(&config.socket_path)?;
         tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local server listening");
 
@@ -350,6 +414,7 @@ mod platform {
                             writer,
                             transport_tx.clone(),
                             true,
+                            settings.accepted(),
                         );
                         if handle_tx.send(handle).await.is_err() {
                             tracing::warn!("local handle registry closed");
@@ -365,24 +430,30 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        Ok(server_listener_handle(name, online, tx, read_task))
+        Ok(server_listener_handle(
+            name, online, tx, read_task, settings,
+        ))
     }
 
     pub(super) async fn connect_client_stream(
         config: &LocalClientConfig,
-    ) -> Result<UnixStream, crate::traits::InterfaceError> {
-        Ok(connect_unix_stream(&config.socket_path).await?)
+    ) -> Result<Box<dyn LocalStream>, crate::traits::InterfaceError> {
+        if config.socket_path.starts_with("tcp://") {
+            return super::tcp_platform::connect_client_stream(config).await;
+        }
+        Ok(Box::new(connect_unix_stream(&config.socket_path).await?))
     }
 
     pub async fn spawn_local_client_impl(
         config: LocalClientConfig,
         id: InterfaceId,
         transport_tx: mpsc::Sender<TransportMessage>,
+        settings: LocalSettings,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-        let stream = connect_unix_stream(&config.socket_path).await?;
+        let stream = connect_client_stream(&config).await?;
         tracing::info!(name = %config.name, path = %display_socket_path(&config.socket_path), "local client connected");
 
-        let (reader, writer) = stream.into_split();
+        let (reader, writer) = tokio::io::split(stream);
         Ok(wire_local_stream(
             id,
             config.name.clone(),
@@ -391,12 +462,15 @@ mod platform {
             writer,
             transport_tx,
             false,
+            settings,
         ))
     }
 }
 
 #[cfg(not(unix))]
-mod platform {
+use tcp_platform as platform;
+
+mod tcp_platform {
     use super::*;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -416,6 +490,7 @@ mod platform {
         id_gen: Arc<AtomicU64>,
         transport_tx: mpsc::Sender<TransportMessage>,
         handle_tx: mpsc::Sender<InterfaceHandle>,
+        settings: LocalSettings,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
         let addr = fallback_tcp_addr(&config.socket_path);
         let listener = TcpListener::bind(&addr).await?;
@@ -444,6 +519,7 @@ mod platform {
                             writer,
                             transport_tx.clone(),
                             true,
+                            settings.accepted(),
                         );
                         if handle_tx.send(handle).await.is_err() {
                             tracing::warn!("local handle registry closed");
@@ -459,19 +535,25 @@ mod platform {
             online2.store(false, Ordering::SeqCst);
         });
 
-        Ok(server_listener_handle(name, online, tx, read_task))
+        Ok(server_listener_handle(
+            name, online, tx, read_task, settings,
+        ))
     }
 
     pub(super) async fn connect_client_stream(
         config: &LocalClientConfig,
-    ) -> Result<TcpStream, crate::traits::InterfaceError> {
-        Ok(TcpStream::connect(fallback_tcp_addr(&config.socket_path)).await?)
+    ) -> Result<Box<dyn LocalStream>, crate::traits::InterfaceError> {
+        Ok(Box::new(
+            TcpStream::connect(fallback_tcp_addr(&config.socket_path)).await?,
+        ))
     }
 
+    #[cfg(not(unix))]
     pub async fn spawn_local_client_impl(
         config: LocalClientConfig,
         id: InterfaceId,
         transport_tx: mpsc::Sender<TransportMessage>,
+        settings: LocalSettings,
     ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
         let addr = fallback_tcp_addr(&config.socket_path);
         let stream = TcpStream::connect(&addr).await?;
@@ -486,6 +568,7 @@ mod platform {
             writer,
             transport_tx,
             false,
+            settings,
         ))
     }
 }
@@ -502,7 +585,26 @@ pub async fn spawn_local_server(
     transport_tx: mpsc::Sender<TransportMessage>,
     handle_tx: mpsc::Sender<InterfaceHandle>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    platform::spawn_local_server_impl(config, id_gen, transport_tx, handle_tx).await
+    spawn_local_server_with_bitrate(config, id_gen, transport_tx, handle_tx, None).await
+}
+
+/// Shared server with an optional simulated bitrate, inherited by accepted peers.
+/// A `tcp://host:port` socket path selects TCP on every platform.
+pub async fn spawn_local_server_with_bitrate(
+    config: LocalServerConfig,
+    id_gen: Arc<AtomicU64>,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    handle_tx: mpsc::Sender<InterfaceHandle>,
+    forced_bitrate: Option<u64>,
+) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    platform::spawn_local_server_impl(
+        config,
+        id_gen,
+        transport_tx,
+        handle_tx,
+        LocalSettings::new(forced_bitrate)?,
+    )
+    .await
 }
 
 #[tracing::instrument(
@@ -516,7 +618,7 @@ pub async fn spawn_local_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
-    platform::spawn_local_client_impl(config, id, transport_tx).await
+    platform::spawn_local_client_impl(config, id, transport_tx, LocalSettings::new(None)?).await
 }
 
 /// Shared-instance connection with a stable interface id, TX channel and
@@ -526,6 +628,17 @@ pub async fn spawn_reconnecting_local_client(
     id: InterfaceId,
     transport_tx: mpsc::Sender<TransportMessage>,
 ) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    spawn_reconnecting_local_client_with_bitrate(config, id, transport_tx, None).await
+}
+
+/// As above, applying forced bitrate and automatic MTU to every reconnection.
+pub async fn spawn_reconnecting_local_client_with_bitrate(
+    config: LocalClientConfig,
+    id: InterfaceId,
+    transport_tx: mpsc::Sender<TransportMessage>,
+    forced_bitrate: Option<u64>,
+) -> Result<InterfaceHandle, crate::traits::InterfaceError> {
+    let settings = LocalSettings::new(forced_bitrate)?;
     let mut stream = platform::connect_client_stream(&config).await?;
     let online = Arc::new(AtomicBool::new(true));
     let rxb = Arc::new(AtomicU64::new(0));
@@ -537,11 +650,11 @@ pub async fn spawn_reconnecting_local_client(
     let name = config.name.clone();
     let read_task = tokio::spawn(async move {
         loop {
-            let (reader, writer) = stream.into_split();
+            let (reader, writer) = tokio::io::split(stream);
             task_online.store(true, Ordering::SeqCst);
             tokio::select! {
-                _ = local_read_loop(reader, id, transport_tx.clone(), task_online.clone(), task_rxb.clone()) => {},
-                _ = local_write_loop(writer, &mut rx, task_online.clone(), task_txb.clone()) => {},
+                _ = local_read_loop(reader, id, transport_tx.clone(), task_online.clone(), task_rxb.clone(), settings.receive_mtu()) => {},
+                _ = local_write_loop(writer, &mut rx, task_online.clone(), task_txb.clone(), settings) => {},
             }
             task_online.store(false, Ordering::SeqCst);
             let mut backoff = 1;
@@ -572,7 +685,7 @@ pub async fn spawn_reconnecting_local_client(
         id,
         parent_id: None,
         diagnostics: Some(rns_transport::messages::LinkMtuDiagnostics::new(
-            Some(LOCAL_MTU),
+            settings.link_mtu,
             None,
         )),
         name,
@@ -583,8 +696,8 @@ pub async fn spawn_reconnecting_local_client(
             forward: false,
             repeat: false,
         },
-        bitrate: 1_000_000_000,
-        mtu: LOCAL_MTU,
+        bitrate: settings.bitrate,
+        mtu: settings.receive_mtu(),
         online,
         rxb: Some(rxb),
         txb: Some(txb),
@@ -597,13 +710,76 @@ pub async fn spawn_reconnecting_local_client(
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn forced_local_bitrate_selects_mtu_and_paces_raw_bytes() {
+        assert!(LocalSettings::new(Some(0)).is_err());
+        for (rate, mtu) in [
+            (None, Some(262144)),
+            (Some(62500), Some(1024)),
+            (Some(1_000_000), Some(2048)),
+            (Some(1_000_000_000), Some(524288)),
+            (Some(8000), None),
+        ] {
+            let settings = LocalSettings::new(rate).unwrap();
+            assert_eq!(settings.link_mtu, mtu);
+            assert_eq!(settings.receive_mtu(), mtu.unwrap_or(500));
+            assert_eq!(settings.accepted().link_mtu, Some(LOCAL_MTU));
+            assert_eq!(settings.accepted().bitrate, settings.bitrate);
+        }
+        let (writer, mut peer) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::channel(1);
+        let count = Arc::new(AtomicU64::new(0));
+        let written = count.clone();
+        let payload = vec![hdlc::FLAG; 1000];
+        let expected = hdlc::frame(&payload);
+        tx.send(payload.into()).await.unwrap();
+        drop(tx);
+        let task = tokio::spawn(async move {
+            local_write_loop(
+                writer,
+                &mut rx,
+                Arc::new(AtomicBool::new(true)),
+                written,
+                LocalSettings::new(Some(8000)).unwrap(),
+            )
+            .await;
+        });
+        let mut received = vec![0; expected.len()];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(999),
+                peer.read_exact(&mut received)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            peer.read_exact(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, expected);
+        task.await.unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), expected.len() as u64);
+    }
+
     #[tokio::test]
     async fn local_short_frames_are_filtered_but_physical_bytes_are_counted() {
         let (reader, mut peer) = tokio::io::duplex(8192);
         let (tx, mut events) = mpsc::channel(1);
         let rxb = Arc::new(AtomicU64::new(0));
         let online = Arc::new(AtomicBool::new(true));
-        let task = tokio::spawn(local_read_loop(reader, 1, tx, online.clone(), rxb.clone()));
+        let task = tokio::spawn(local_read_loop(
+            reader,
+            1,
+            tx,
+            online.clone(),
+            rxb.clone(),
+            LOCAL_MTU,
+        ));
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let mut wire = Vec::new();
             for size in 0..=20 {
@@ -638,6 +814,7 @@ mod tests {
             tx,
             online,
             Arc::new(AtomicU64::new(0)),
+            LOCAL_MTU,
         ));
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let payload = vec![hdlc::FLAG; LOCAL_MTU as usize];

@@ -612,11 +612,11 @@ pub fn shared_instance_rpc_socket_path(instance_name: &str, socket_base: &Path) 
     shared_unix_rpc_socket_path(instance_name, socket_base)
 }
 
-fn shared_tcp_client_config(port: u16) -> rns_interface::tcp::TcpClientConfig {
-    let mut config =
-        rns_interface::tcp::TcpClientConfig::new("SharedInstanceClient", "127.0.0.1", port);
-    config.receive_ifac_size = Some(0);
-    config
+fn shared_tcp_client_config(port: u16) -> rns_interface::local::LocalClientConfig {
+    rns_interface::local::LocalClientConfig {
+        name: "SharedInstanceClient".into(),
+        socket_path: format!("tcp://127.0.0.1:{port}"),
+    }
 }
 
 async fn detect_shared_tcp_server(port: u16) -> bool {
@@ -660,8 +660,7 @@ pub struct ReticulumConfig {
     pub enable_remote_management: bool,
     pub remote_management_allowed: Vec<Vec<u8>>,
     pub rpc_key: Option<Vec<u8>>,
-    /// Python `force_shared_instance_bitrate` (bps). Caps announce rate /
-    /// token bucket regardless of real link bitrate.
+    /// Simulated shared-instance bitrate (bps): Local TX pacing and automatic MTU.
     pub force_shared_instance_bitrate: Option<u64>,
     pub default_ar_target: Option<u64>,
     pub default_ar_penalty: Option<u64>,
@@ -992,6 +991,13 @@ impl ReticulumConfig {
             }
             rc.force_shared_instance_bitrate =
                 config_uint("reticulum", sec, "force_shared_instance_bitrate")?;
+            if rc.force_shared_instance_bitrate == Some(0) {
+                return Err(crate::normalized_config::ConfigError::InvalidValue {
+                    section: "reticulum".into(),
+                    key: "force_shared_instance_bitrate".into(),
+                    message: "must be positive".into(),
+                });
+            }
             if let Some(v) = config_uint("reticulum", sec, "default_ar_target")? {
                 rc.default_ar_target = (v > 0).then_some(v);
             }
@@ -1223,10 +1229,11 @@ pub async fn init_with_options(
             if live_server_detected {
                 let client_config = shared_tcp_client_config(rc.shared_instance_port);
                 let client_id = next_id(&id_gen);
-                match rns_interface::tcp::spawn_tcp_client(
+                match rns_interface::local::spawn_reconnecting_local_client_with_bitrate(
                     client_config,
                     client_id,
                     interface_transport_tx.clone(),
+                    rc.force_shared_instance_bitrate,
                 )
                 .await
                 {
@@ -1242,19 +1249,16 @@ pub async fn init_with_options(
                     Err(_) => InstanceMode::Standalone,
                 }
             } else {
-                let mut server_config = rns_interface::tcp::TcpServerConfig::new(
-                    "SharedInstanceServer",
-                    "127.0.0.1",
-                    rc.shared_instance_port,
-                );
-                server_config.receive_ifac_size = Some(0);
-                let server_id = next_id(&id_gen);
-                match rns_interface::tcp::spawn_tcp_server(
+                let server_config = rns_interface::local::LocalServerConfig {
+                    name: "SharedInstanceServer".into(),
+                    socket_path: format!("tcp://127.0.0.1:{}", rc.shared_instance_port),
+                };
+                match rns_interface::local::spawn_local_server_with_bitrate(
                     server_config,
-                    server_id,
                     id_gen.clone(),
                     interface_transport_tx.clone(),
                     handle_tx.clone(),
+                    rc.force_shared_instance_bitrate,
                 )
                 .await
                 {
@@ -1272,10 +1276,11 @@ pub async fn init_with_options(
                         if detect_shared_tcp_server(rc.shared_instance_port).await {
                             let client_config = shared_tcp_client_config(rc.shared_instance_port);
                             let client_id = next_id(&id_gen);
-                            match rns_interface::tcp::spawn_tcp_client(
+                            match rns_interface::local::spawn_reconnecting_local_client_with_bitrate(
                                 client_config,
                                 client_id,
                                 interface_transport_tx.clone(),
+                                rc.force_shared_instance_bitrate,
                             )
                             .await
                             {
@@ -1332,10 +1337,11 @@ pub async fn init_with_options(
                     name: "SharedInstanceClient".to_string(),
                 };
                 let client_id = next_id(&id_gen);
-                match rns_interface::local::spawn_reconnecting_local_client(
+                match rns_interface::local::spawn_reconnecting_local_client_with_bitrate(
                     client_config,
                     client_id,
                     interface_transport_tx.clone(),
+                    rc.force_shared_instance_bitrate,
                 )
                 .await
                 {
@@ -1355,11 +1361,12 @@ pub async fn init_with_options(
                     socket_path: socket_path.clone(),
                     name: "SharedInstanceServer".to_string(),
                 };
-                match rns_interface::local::spawn_local_server(
+                match rns_interface::local::spawn_local_server_with_bitrate(
                     server_config,
                     id_gen.clone(),
                     interface_transport_tx.clone(),
                     handle_tx.clone(),
+                    rc.force_shared_instance_bitrate,
                 )
                 .await
                 {
@@ -1379,10 +1386,11 @@ pub async fn init_with_options(
                             name: "SharedInstanceClient".to_string(),
                         };
                         let client_id = next_id(&id_gen);
-                        match rns_interface::local::spawn_reconnecting_local_client(
+                        match rns_interface::local::spawn_reconnecting_local_client_with_bitrate(
                             client_config,
                             client_id,
                             interface_transport_tx.clone(),
+                            rc.force_shared_instance_bitrate,
                         )
                         .await
                         {
@@ -5148,12 +5156,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_tcp_client_config_has_no_reconnect_cap() {
+    fn test_shared_tcp_client_config_uses_local_wire_endpoint() {
         let config = shared_tcp_client_config(12345);
         assert_eq!(config.name, "SharedInstanceClient");
-        assert_eq!(config.target_host, "127.0.0.1");
-        assert_eq!(config.target_port, 12345);
-        assert_eq!(config.max_reconnect_tries, None);
+        assert_eq!(config.socket_path, "tcp://127.0.0.1:12345");
     }
 
     #[test]
@@ -5818,7 +5824,7 @@ mod tests {
         std::fs::create_dir_all(&dir_c).unwrap();
         let rpc_key_hex = "4242424242424242424242424242424242424242424242424242424242424242";
         let cfg = format!(
-            "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control_port}\n  rpc_key: {rpc_key_hex}\n  enable_transport: false\ninterfaces: []\n"
+            "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control_port}\n  rpc_key: {rpc_key_hex}\n  force_shared_instance_bitrate: 1000000\n  enable_transport: false\ninterfaces: []\n"
         );
         std::fs::write(dir_a.join("config.yaml"), &cfg).unwrap();
         std::fs::write(dir_b.join("config.yaml"), &cfg).unwrap();
@@ -5897,6 +5903,17 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         };
+        for entry in &server_entries {
+            assert_eq!(entry.bitrate, 1_000_000);
+            assert_eq!(
+                entry.mtu,
+                if entry.role == "shared_server" {
+                    2048
+                } else {
+                    262144
+                }
+            );
+        }
         let roles: Vec<String> = server_entries
             .iter()
             .map(|entry| entry.role.clone())
@@ -5954,6 +5971,11 @@ mod tests {
             .expect("client local stats should respond");
         let client_roles: Vec<String> = match client_stats {
             rns_transport::messages::TransportQueryResponse::InterfaceStats(entries) => {
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| entry.bitrate == 1_000_000 && entry.mtu == 2048)
+                );
                 entries.into_iter().map(|entry| entry.role).collect()
             }
             other => panic!("unexpected client stats response: {other:?}"),

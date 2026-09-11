@@ -3884,6 +3884,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_link_request_clamps_strips_and_counts_invalid_rewrite() {
+        for (unknown, mode, offer, rejected) in [
+            (false, 1u32, 32768u32, false),
+            (false, 7, 32768, true),
+            (false, 7, 500, false),
+            (true, 7, 32768, false),
+            (true, 7, 0, false),
+        ] {
+            let (mut actor, _) = TransportActor::new();
+            let (mut entry, _) = make_test_interface("local clamp");
+            entry.diagnostics = Some(crate::messages::LinkMtuDiagnostics::new(
+                if unknown { None } else { Some(1196) },
+                None,
+            ));
+            actor.interfaces.insert(1, entry);
+            let dest = [0x55; 16];
+            actor.local_destinations.insert(dest);
+            let (tx, mut events) = mpsc::channel(1);
+            actor.destination_channels.insert(dest, tx);
+            actor.transport_identity_hash = Some([0xAA; 16]);
+            let mut payload = vec![0x42; 64];
+            payload.extend_from_slice(&(offer | mode << 21).to_be_bytes()[1..]);
+            let raw = make_header2_link_request_packet([0xAA; 16], dest, 0, &payload);
+            let link_id =
+                rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
+            assert_eq!(
+                actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                u64::from(rejected)
+            );
+            if rejected {
+                assert!(events.try_recv().is_err());
+                continue;
+            }
+            let crate::link_messages::DestinationEvent::LinkRequest { raw, .. } =
+                events.try_recv().unwrap()
+            else {
+                panic!("request");
+            };
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            assert_eq!(
+                rns_wire::hash::link_id_from_raw(&raw, header.flags.header_type),
+                link_id
+            );
+            assert_eq!(&raw[offset..offset + 64], &payload[..64]);
+            if unknown && offer != 0 {
+                assert_eq!(raw.len(), offset + 64);
+            } else {
+                let expected = if offer > 1196 { 1196 } else { offer };
+                assert_eq!(
+                    &raw[offset + 64..],
+                    &(expected | mode << 21).to_be_bytes()[1..]
+                );
+            }
+        }
+    }
+
     fn make_lrproof_packet_with_payload(link_id: [u8; 16], hops: u8, payload: &[u8]) -> Bytes {
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,

@@ -67,7 +67,7 @@ interfaces: []
 | `enable_remote_management` | boolean | `false` | Enable remote-management handlers. |
 | `remote_management_allowed` | sequence of strings | `[]` | Allowed identity hashes. Each value is exactly 32 hexadecimal characters (16 bytes). |
 | `rpc_key` | string or null | `null` | Hexadecimal RPC authentication key. When absent, runtime derives the normal key. |
-| `force_shared_instance_bitrate` | integer or null | `null` | Optional shared-instance bitrate cap in bits/s. |
+| `force_shared_instance_bitrate` | integer or null | `null` | Positive simulated shared-instance bitrate in bits/s; affects Local TX pacing and automatic MTU. Zero is rejected. |
 | `default_ar_target` | integer or null | `null` | Default announce-rate target. `0` disables the target after normalization. |
 | `default_ar_penalty` | integer or null | `null` | Default announce-rate penalty. |
 | `default_ar_grace` | integer or null | `null` | Default announce-rate grace, `0..=4294967295`. |
@@ -240,11 +240,16 @@ on the peer. This is not a claim that every processing path is panic-free.
 Path-MTU signalling diagnostics remain incomplete.
 CLI and remote-management display are pending.
 
-### Local Link MTU negotiation (partial)
+### Local Link MTU negotiation
 
 Runtime responders use the incoming interface's negotiable MTU capability,
 passed by the actor in `DestinationEvent::LinkRequest.max_mtu`; unknown or invalid
-capabilities fall back to 500. The responder signs
+capabilities fall back to 500. Before local delivery, an explicitly unknown
+hardware MTU removes nonzero MTU signalling; a known interface without upgrade
+support clamps it to 500. Rewriting signalling validates the mode and counts an
+invalid mode as an incoming protocol violation. Unchanged/zero signalling is
+left to the Link handshake validator. Link ID and key bytes are unchanged.
+The responder signs
 the same effective MTU in LRPROOF that it stores locally: a missing or zero
 offer means 500, and a positive offer is capped at the interface limit. Its MDU is computed
 before the proof is returned and agrees with the initiator after validation.
@@ -299,9 +304,11 @@ TCP uses its automatic MTU or explicit `fixed_mtu`; Backbone uses its automatic
 curve (no upgrade below its minimum bitrate). Local IPC uses the Python default
 262144 bytes, not the automatic curve's 524288-byte result at 1 Gbit/s; Auto
 advertises its fixed 1196-byte MTU regardless of configured bitrate. Remaining
-drivers conservatively disable transit upgrades. Full nullable hardware MTU,
-external next-hop MTU RPC and larger local Links remain
-unfinished. Advertising a capability does not remove existing driver RX limits.
+drivers conservatively disable transit upgrades. Automatic drivers explicitly
+report unknown hardware MTU separately from missing upgrade support. Raw Rust
+receive limits remain bounded integers; unknown incoming MTU is not treated as
+a known path limit during transit clamping. External next-hop MTU RPC is not
+provided. Advertising a capability does not remove driver RX limits.
 In-process callers can use `ReticulumHandle::next_hop_mtu(destination)` to
 query the local actor's next-hop capability. It returns `None` for unknown
 paths or unsupported interfaces, and uses the shared-server interface for a
@@ -542,14 +549,30 @@ At least one of `listen_port` and `forward_port` is required.
 | --- | --- | --- | --- |
 | `port` | integer | `37428` | Local shared-instance port, `1..=65535`. |
 
-Local IPC handles and their Link MTU capability use 262144 bytes. The HDLC
+By default Local IPC handles and their Link MTU capability use 262144 bytes. The HDLC
 reader bounds decoded frames to this size without an IFAC allowance; fully
 escaped boundary frames are accepted and oversized frames are discarded.
 Empty frames and decoded frames of 1..=19 bytes are silently discarded before
 transport admission, matching Python Local's strict minimum. Physical RX byte
 totals still include them; actor violation counters do not.
-This interface MTU is separate from the current 500-byte local Link cap.
-Python's forced shared-instance bitrate/MTU override is not implemented here.
+Local Links negotiate MTU as described above; they are not fixed at 500 bytes.
+
+For automatically created shared-instance endpoints, the global
+`reticulum.force_shared_instance_bitrate` applies in full and client-only builds,
+over Unix sockets and loopback TCP. It sets advertised bitrate and delays each
+outbound packet by `raw_bytes * 8 / bitrate` using a cancellable Tokio timer
+before HDLC/socket writing. The default has no artificial delay. This follows
+Python's ordinary Local backend; Rust also enforces pacing when using its async
+backend, whereas Python's epoll TX path bypasses the simulated delay.
+The shared listener and connecting client select MTU from the automatic bitrate
+curve (for example 1 Mbit/s → 2048, 1 Gbit/s → 524288). Below 62500 bit/s the
+capability is unknown and upgrades are disabled; Rust retains a 500-byte receive
+bound instead of an unbounded/nullable buffer. Accepted server-side Local clients
+inherit bitrate and pacing but retain their constructor MTU of 262144, matching
+Python LocalServer's inheritance. Reconnecting clients retain their settings.
+Explicit `type: local` interfaces keep their default behavior; the global setting
+targets the runtime's shared-instance endpoints. Existing Local spawn APIs and
+config structs remain usable unchanged; optional-bitrate spawn variants are added.
 
 ## `type: i2p`
 

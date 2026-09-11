@@ -2741,3 +2741,59 @@ Python ea98db4f не изменён. CONFIG содержит команду, н�
 Transport-level churn с восстановлением проверен на64 раундах. Сравнение
 старой/текущей цепочки с transport actor и многочасовой soak остаются.
 Этап 5 открыт, версия 1.0.1.
+
+### Завершение функциональных пунктов этапа 5: Local MTU и forced bitrate
+
+По указанию пользователя работа возвращена к функционалу; длительные тесты
+и дальнейшее расширение нагрузочных сценариев отложены.
+
+- InterfaceDiagnostics теперь различает отсутствие поддержки MTU upgrade и
+  явно неизвестный hardware MTU. Существующие реализации trait совместимы
+  через default-метод; LinkMtuDiagnostics(None) сообщает unknown.
+- Локальный LinkRequest до доставки приложению удаляет ненулевое signalling
+  при unknown MTU либо ограничивает offer известным cap (без upgrade —500).
+  Недопустимый mode при фактическом rewrite учитывается как protocol violation
+  входного интерфейса, пакет не доставляется. Zero/unchanged offers по-прежнему
+  проверяет handshake. Ключи и Link ID сохраняются. Transit больше не принимает
+  резервный raw receive limit за известный MTU предыдущего hop.
+- force_shared_instance_bitrate подключён от YAML/normalized config к
+  автоматически создаваемым shared endpoints в full и client-only runtime.
+  Положительное значение определяет bitrate, automatic MTU и сериализованную
+  задержку raw_bytes*8/bitrate до HDLC write через отменяемый Tokio timer.
+  Ноль отвергается схемой, runtime parser и новым driver API до подключения.
+- Shared-instance TCP использует Local HDLC driver через tcp:// endpoint,
+  как и Unix IPC, вместо обычного сетевого TCP driver. Без override default
+  bitrate1G/MTU262144 соответствует Python Local; connecting clients сохраняют
+  настройки и стабильный канал при reconnect. Listener/connecting-client MTU
+  с override берётся из общей автоматической кривой. Accepted Local clients
+  наследуют bitrate/pacing, но сохраняют constructor MTU262144 — именно так
+  работает Python LocalServer, который не вызывает optimise_mtu на child.
+- Старые LocalConfig structs и spawn API сохранены; добавлены варианты
+  spawn_local_server_with_bitrate/spawn_reconnecting_local_client_with_bitrate.
+  Client-only ReticulumConfig дополнен force_shared_instance_bitrate.
+
+Обоснованные границы: Rust сохраняет bounded integer RX limits вместо
+nullable/unbounded буфера (500 при неизвестном Local MTU), не воспроизводит
+ошибку Python min(nh_mtu, None), не передаёт усечённые oversized KISS frames.
+Forced Local pacing действует и в async backend Rust; Python epoll TX путь
+пропускает artificial delay, обычный Local backend задерживает. Эти отличия
+явно описаны в CONFIG. shared_medium не переносится как неиспользуемое ядром
+Python поле. Weave не добавляется; внешняя next-hop MTU RPC/расширенная
+диагностика не объявляются реализованными.
+
+Короткие целевые проверки: Local MTU/pacing с виртуальным временем,
+матрица local LinkRequest strip/clamp/mode, существующий runtime shared TCP
+server+2 clients с forced1M, RPC metadata и передачей данных — успешны.
+В последнем проверены server MTU2048, connecting client2048 и children262144,
+bitrate1M на всех. Workspace all-targets и client-only checks успешны;
+старые warnings database_path/tracing prelude сохраняются. Python ea98db4f чист.
+
+Финальные короткие targets: Local9 passed (1.00s), LinkRequest10 passed
+(0.01s), client-only reticulum3 passed (0.77s). Shared TCP runtime сценарий
+1 passed (0.52s); fmt/diff checks чистые. Новых нагрузочных тестов нет.
+
+Функциональная часть этапа 5 закрыта с перечисленными границами применимости.
+Дополнительное before/after через весь actor и многочасовой soak остаются
+отложенной валидацией, а не блокируют переход к функционалу этапа 6.
+Это не завершение всего обновления: этапы6/7 и итоговая интеграционная
+проверка впереди; версия остаётся1.0.1.
