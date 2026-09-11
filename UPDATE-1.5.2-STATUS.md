@@ -1930,3 +1930,22 @@ resynchronisation и deregistration после EOF. Используются str
 не криптографические IFAC packets. Interface lib — 223 passed, 5 ignored;
 workspace all-targets, runtime client-only tests и fmt/diff checks успешны.
 Прежние warnings сохраняются; этап 5 открыт, версия не менялась.
+
+### Этап 5 — TCP KISS control frames не являются transport data
+
+TCP KISS reader раньше игнорировал возвращённую команду (_cmd) и пересылал
+любое непустое содержимое actor. Теперь допускается только CMD_DATA после
+удаления port nibble общим KissDeframer. Non-DATA и empty frames отбрасываются
+до record_rx и channel send; значения RX packet/byte totals их не включают.
+Это соответствует command gate в Python TCPInterface.read_loop. Raw/extended
+KISS для RNode и обработка команд остальных драйверов не изменены.
+
+Новый loopback test использует transport capacity=1 и feed chunks по 3 bytes:
+15 non-DATA команд для каждого из портов 0/1/7 (45 control frames), пустые
+delimiters/пустые DATA и три escaped DATA. Проверены только три доставки,
+правильные payload/interface_id, rx_packets=3, rx_bytes=12 и offline после EOF.
+Interface lib — 224 passed, 5 ignored; workspace all-targets и runtime
+client-only tests checks успешны; fmt/diff checks успешны. Прежние warnings
+сохраняются. Python command gate сверено статически, отдельный oracle не
+запускался. KISS decoded-MTU limits и точный TCP IFAC allowance ещё открыты;
+local Link cap 500 и версия проекта не менялись. Этап 5 не завершён.

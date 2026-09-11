@@ -449,6 +449,11 @@ admission, then framing resynchronises. The exact IFAC size is not yet passed
 to TCP; KISS still uses its existing deframer limits. This is not an RSS limit
 or permission to allocate arbitrarily large frames safely.
 
+In TCP KISS mode, only nonempty `CMD_DATA` frames reach transport and RX
+packet/byte counters. The TNC port nibble is ignored; control commands and
+empty frames are discarded. This does not add KISS decoded-MTU bounds or
+change command handling in serial/RNode drivers.
+
 ## `type: tcp_server`
 
 | Field | Type | Default | Constraints |

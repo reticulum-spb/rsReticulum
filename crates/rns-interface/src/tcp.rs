@@ -196,8 +196,10 @@ async fn tcp_read_loop(
                     break;
                 }
                 Ok(n) => {
-                    for (_cmd, frame) in deframer.feed(&buf[..n]) {
-                        if frame.is_empty() {
+                    for (cmd, frame) in deframer.feed(&buf[..n]) {
+                        // KissDeframer already strips the port nibble. Python
+                        // TCP forwards only nonempty CMD_DATA, never TNC control.
+                        if cmd != kiss::CMD_DATA || frame.is_empty() {
                             continue;
                         }
                         state.record_rx(frame.len());
@@ -638,6 +640,52 @@ pub async fn spawn_tcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn kiss_control_frames_never_reach_transport_or_rx_totals() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, _writer) = socket.into_split();
+        let (tx, mut events) = mpsc::channel(1);
+        let state = TcpInterfaceState::new();
+        state.online.store(true, Ordering::SeqCst);
+        let task = tokio::spawn(tcp_read_loop(reader, 7, tx, state.clone(), true, 16384));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for port in [0, 1, 7] {
+                let mut wire = vec![kiss::FEND; 2];
+                wire.extend(kiss::frame_with_command(port << 4, &[]));
+                // Every non-DATA low-nibble command, with escaped payload.
+                for command in 1..=15 {
+                    wire.extend(kiss::frame_with_command(
+                        (port << 4) | command,
+                        &[kiss::FEND, kiss::FESC, 42],
+                    ));
+                }
+                let payload = [port, kiss::FEND, kiss::FESC, 42];
+                wire.extend(kiss::frame_with_command(port << 4, &payload));
+                for chunk in wire.chunks(3) {
+                    peer.write_all(chunk).await.unwrap();
+                }
+                let Some(TransportMessage::Inbound(packet)) = events.recv().await else {
+                    panic!("only DATA may occupy the single transport slot")
+                };
+                assert_eq!(packet.interface_id, 7);
+                assert_eq!(packet.raw.as_ref(), payload);
+            }
+            peer.shutdown().await.unwrap();
+            assert!(events.recv().await.is_none());
+            assert_eq!(state.rx_packets.load(Ordering::Relaxed), 3);
+            assert_eq!(state.rx_bytes.load(Ordering::Relaxed), 12);
+            assert!(!state.online.load(Ordering::SeqCst));
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        result.unwrap();
+    }
 
     #[tokio::test]
     async fn hdlc_reader_uses_fixed_mtu_with_escape_and_ifac_allowance() {
