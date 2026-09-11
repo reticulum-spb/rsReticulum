@@ -1975,3 +1975,29 @@ loopback matrix расширена на HDLC/KISS × default/fixed500/fixed52428
 Interface lib — 225 passed, 5 ignored; workspace all-targets, runtime
 client-only tests и fmt/diff checks успешны. Прежние warnings сохраняются.
 Этап 5 открыт; local Link cap 500, версия и пользовательский план не менялись.
+
+### Этап 5 — точный TCP IFAC allowance
+
+TcpClientConfig/TcpServerConfig получили receive_ifac_size: Some(0..=64)
+задаёт wire allowance, None сохраняет 64 для прямых callers. Размер >64
+отвергается до bind/connect. Это настройка bounds, а не включение IFAC;
+существующие constructors совместимы, struct literals дополнены новым полем.
+
+Runtime передаёт active IFAC size до spawn из YAML/normalized factory и
+административных helpers, используя общий с Backbone wire_ifac_size. Нет
+активного ключа — zero, иначе explicit size или class default 16. Shared TCP
+fallback явно использует zero. Listener передаёт размер accepted children;
+client сохраняет его при reconnect. Оба формата HDLC/KISS применяют одинаковый
+decoded limit MTU+IFAC. Actor продолжает независимую аутентификацию.
+
+TCP loopback matrix: None/0/1/16/64 × HDLC/KISS × default/fixed500/fixed524288,
+boundary/overflow/recovery/EOF. Отдельно invalid sizes 65/usize::MAX отклонены
+до spawn. Server roundtrip с allowance=0 проверяет, что child отбрасывает
+MTU+1 (раньше он попадал в +64 допуск). YAML matrix расширена с Backbone на
+TCP client/server: absent credentials, size-only, default и explicit size.
+Это structural framing tests, не новые криптографические interop tests.
+
+Interface lib — 226 passed, 5 ignored; runtime API lib — 239 passed, 5 ignored.
+Workspace all-targets, runtime client-only tests и fmt/diff checks успешны;
+прежние warnings сохраняются.
+Этап 5 не завершён; local Link cap 500 и версия проекта сохранены.

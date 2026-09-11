@@ -600,7 +600,10 @@ pub fn shared_instance_rpc_socket_path(instance_name: &str, socket_base: &Path) 
 }
 
 fn shared_tcp_client_config(port: u16) -> rns_interface::tcp::TcpClientConfig {
-    rns_interface::tcp::TcpClientConfig::new("SharedInstanceClient", "127.0.0.1", port)
+    let mut config =
+        rns_interface::tcp::TcpClientConfig::new("SharedInstanceClient", "127.0.0.1", port);
+    config.receive_ifac_size = Some(0);
+    config
 }
 
 async fn detect_shared_tcp_server(port: u16) -> bool {
@@ -1226,11 +1229,12 @@ pub async fn init_with_options(
                     Err(_) => InstanceMode::Standalone,
                 }
             } else {
-                let server_config = rns_interface::tcp::TcpServerConfig::new(
+                let mut server_config = rns_interface::tcp::TcpServerConfig::new(
                     "SharedInstanceServer",
                     "127.0.0.1",
                     rc.shared_instance_port,
                 );
+                server_config.receive_ifac_size = Some(0);
                 let server_id = next_id(&id_gen);
                 match rns_interface::tcp::spawn_tcp_server(
                     server_config,
@@ -3324,7 +3328,8 @@ pub async fn spawn_tcp_client_runtime_with_ifac(
         .id_gen
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
-    let config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
+    let mut config = rns_interface::tcp::TcpClientConfig::new(name, host, port);
+    config.receive_ifac_size = Some(post_init.as_ref().map(wire_ifac_size).unwrap_or(0));
     let iface_handle =
         rns_interface::tcp::spawn_tcp_client(config, id, handle.interface_transport_tx.clone())
             .await
@@ -3373,7 +3378,8 @@ pub async fn spawn_tcp_server_runtime_with_ifac(
 ) -> Result<u64, String> {
     let id = next_id(&handle.id_gen);
     let post_init = runtime_ifac_post_init(ifac, 16)?;
-    let config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
+    let mut config = rns_interface::tcp::TcpServerConfig::new(name, listen_ip, port);
+    config.receive_ifac_size = Some(post_init.as_ref().map(wire_ifac_size).unwrap_or(0));
     let iface_handle = rns_interface::tcp::spawn_tcp_server(
         config,
         id,
@@ -4101,13 +4107,17 @@ async fn spawn_interface(
 ) -> Result<Vec<rns_interface::traits::InterfaceHandle>, String> {
     match iface_config {
         interface_factory::InterfaceConfig::TcpClient(c) => {
-            rns_interface::tcp::spawn_tcp_client(c.clone(), id, transport_tx)
+            let mut config = c.clone();
+            config.receive_ifac_size = Some(receive_ifac_size);
+            rns_interface::tcp::spawn_tcp_client(config, id, transport_tx)
                 .await
                 .map(|h| vec![h])
                 .map_err(|e| format!("TCP client: {e}"))
         }
         interface_factory::InterfaceConfig::TcpServer(c) => {
-            rns_interface::tcp::spawn_tcp_server(c.clone(), id, id_gen, transport_tx, handle_tx)
+            let mut config = c.clone();
+            config.receive_ifac_size = Some(receive_ifac_size);
+            rns_interface::tcp::spawn_tcp_server(config, id, id_gen, transport_tx, handle_tx)
                 .await
                 .map(|h| vec![h])
                 .map_err(|e| format!("TCP server: {e}"))
@@ -4580,9 +4590,14 @@ mod tests {
             ("    ifac_network_name: net\n    ifac_size: 1\n", 1),
             ("    ifac_passphrase: secret\n    ifac_size: 64\n", 64),
         ] {
-            for endpoint in ["listen_on", "target_host"] {
+            for (kind, endpoint, port_key) in [
+                ("backbone", "listen_on", "port"),
+                ("backbone", "target_host", "port"),
+                ("tcp_client", "target_host", "target_port"),
+                ("tcp_server", "listen_ip", "listen_port"),
+            ] {
                 let yaml = format!(
-                    "interfaces:\n  - type: backbone\n    name: relay\n    {endpoint}: 127.0.0.1\n    port: 4242\n{extra}"
+                    "interfaces:\n  - type: {kind}\n    name: relay\n    {endpoint}: 127.0.0.1\n    {port_key}: 4242\n{extra}"
                 );
                 let typed = crate::config::Config::parse(&yaml, "config.yaml").unwrap();
                 let config = typed.to_runtime_config().unwrap();

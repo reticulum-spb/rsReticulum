@@ -441,20 +441,24 @@ interfaces:
 | `max_reconnect_tries` | integer or null | `null` | Retry limit; `null` retries indefinitely. |
 | `fixed_mtu` | integer or null | `null` | Fixed MTU metadata, `500..=4294967295`; does not imply receive-buffer or local Link support for the entire range. |
 
-TCP HDLC and KISS readers use the handle MTU plus a conservative 64-byte IFAC allowance
+TCP HDLC and KISS readers use the handle MTU plus the active IFAC size
 as the decoded frame limit, permitting twice that many encoded bytes (excluding
 delimiters). Clients use `fixed_mtu` when configured; accepted peers use their
 automatic MTU. Oversized frames are debug-logged and discarded before actor
-admission, then framing resynchronises. The exact IFAC size is not yet passed
-to TCP. KISS command bytes are excluded from the payload limit. This is not an RSS limit
+admission, then framing resynchronises. Runtime supplies the size before spawn;
+accepted peers inherit their listener's allowance. Without active credentials
+the allowance is zero, even if `ifac_size` is set. Direct Rust callers may set
+`receive_ifac_size: Some(0..=64)`; its default `None` retains the conservative
+64-byte allowance. It is not a YAML key and does not enable authentication.
+KISS command bytes are excluded from the payload limit. This is not an RSS limit
 or permission to allocate arbitrarily large frames safely.
 
 In TCP KISS mode, only nonempty `CMD_DATA` frames reach transport and RX
 packet/byte counters. The TNC port nibble is ignored; control commands and
 empty frames are discarded. Serial/RNode deframer limits and command handling
 are unchanged. Unlike Python's older TCP KISS loop, oversized payloads are
-discarded whole instead of forwarding a truncated prefix. The conservative
-IFAC allowance also differs from that loop's plain hardware-MTU bound.
+discarded whole instead of forwarding a truncated prefix. Including the IFAC
+allowance also differs from that loop's plain hardware-MTU bound.
 
 ## `type: tcp_server`
 
