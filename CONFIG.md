@@ -467,7 +467,15 @@ LinkManager also sends `RESOURCE_RCL` before removing an exhausted inbound
 transfer. The caller's overall response deadline is unchanged and is not
 extended by retries.
 
-This does not complete sender-side watchdog parity: advertisement retries,
+Sender advertisement retries are now driven by LinkSession's one-second timer
+and LinkManager's existing tick: `RTT * TRAFFIC_TIMEOUT_FACTOR(6) +
+PROCESSING_GRACE(1s)`, up to four retries after the initial advertisement.
+The first valid Resource request ends this retry phase. Exhaustion emits
+encrypted `RESOURCE_ICL`; the manager releases the active transfer and queued
+split tail, while the session returns an error. No unsolicited parts are sent
+by this timer. The caller's overall deadline still takes precedence.
+
+This does not complete sender-side watchdog parity:
 lost final-proof recovery and signalling on the caller's overall deadline still
 need separate review. The rncp resource-proof wait also retains its existing
 120-second cap at this point.

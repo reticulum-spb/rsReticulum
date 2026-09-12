@@ -3008,3 +3008,27 @@ wait cap120s. Наличие констант MAX_ADV_RETRIES/PROOF_TIMEOUT_FACT
 реализованным runtime-поведением. Этап6 открыт, версия1.0.1.
 Workspace all-targets check, fmt check и diff check успешны; прежние warnings
 database_path/tracing prelude сохраняются.
+
+### Этап 6: повтор Resource advertisement
+
+Добавлен отдельный OutboundTransfer::check_advertisement_timeout, не tick
+старого push-window режима: он не отправляет незапрошенные части. Состояние
+Advertised получает timestamp первого ADV и отдельный счётчик повторов.
+Окно RTT*TRAFFIC_TIMEOUT_FACTOR6+PROCESSING_GRACE1 соответствует текущей Rust
+модели Link и Python default. После первоначального ADV допускаются четыре
+повтора; затем SendCancel(ICL). После valid RESOURCE_REQ повтор ADV прекращается.
+
+LinkSession вызывает проверку раз в секунду, не продлевая общий deadline;
+LinkManager — в существующем tick. Оба шлют encrypted ADV/ICL; при exhaustion
+manager освобождает очередь split tail, session завершает Result/error и
+не отправляет следующие сегменты. Существующие публичные конструкторы сохранены.
+
+Один новый inline test проверяет идентичность ADV, четыре повтора, отсутствие
+push-parts, сброс времени ожидания, exhaustion и прекращение после запроса.
+`cargo test -p rns-protocol --lib advertisement_watchdog --quiet`: 1 passed,
+0.00s. Существующий `cargo test -p rns-runtime --lib malformed_resource_request_sends_cancel --quiet`:
+1 passed, 0.02s. Новых test-only файлов нет, длительные тесты не запускались.
+Финальный proof/cache recovery, sender inactivity, общий deadline cleanup и
+rncp proof cap120s ещё требуют переноса/аудита. Этап6 открыт, версия1.0.1.
+Workspace all-targets check, fmt check и diff check успешны; Python reference
+ea98db4f чист. Прежние warnings database_path/tracing prelude сохраняются.

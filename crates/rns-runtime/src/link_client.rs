@@ -1326,7 +1326,30 @@ impl LinkSession {
 
         let link_id = self.id();
         let future = async {
-            while let Some(event) = self.event_rx.recv().await {
+            let mut timer = tokio::time::interval(Duration::from_secs(1));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let event = tokio::select! {
+                    _ = timer.tick() => {
+                        match transfer.check_advertisement_timeout() {
+                            TransferAction::SendAdvertisement(payload) => {
+                                send_link_data(&self.transport_tx, &self.link, link_id,
+                                    rns_wire::context::PacketContext::ResourceAdv, &payload, true)?;
+                            }
+                            TransferAction::SendCancel(_, hash) => {
+                                send_link_data(&self.transport_tx, &self.link, link_id,
+                                    rns_wire::context::PacketContext::ResourceIcl, &hash, true)?;
+                                return Err(LinkClientError::Resource("resource advertisement retries exhausted".into()));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    event = self.event_rx.recv() => match event {
+                        Some(event) => event,
+                        None => break,
+                    },
+                };
                 let DestinationEvent::InboundPacket { raw, .. } = event else {
                     continue;
                 };

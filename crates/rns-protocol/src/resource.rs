@@ -1267,6 +1267,8 @@ pub struct OutboundTransfer {
     pub sent_parts: usize,
     sent_part_indices: HashSet<usize>,
     req_hashlist: HashSet<[u8; 32]>,
+    advertised_at: Option<Instant>,
+    advertisement_retries: usize,
 }
 
 impl OutboundTransfer {
@@ -1316,6 +1318,8 @@ impl OutboundTransfer {
             sent_parts: 0,
             sent_part_indices: HashSet::new(),
             req_hashlist: HashSet::new(),
+            advertised_at: None,
+            advertisement_retries: 0,
         }
     }
 
@@ -1331,6 +1335,7 @@ impl OutboundTransfer {
 
         if !self.advertised {
             self.advertised = true;
+            self.advertised_at = Some(Instant::now());
             self.resource.state = ResourceState::Advertised;
             return TransferAction::SendAdvertisement(self.create_advertisement());
         }
@@ -1389,6 +1394,29 @@ impl OutboundTransfer {
         }
 
         TransferAction::None
+    }
+
+    /// Retry only the advertisement; unlike `tick`, this never pushes parts
+    /// that have not been requested by the receiver.
+    pub fn check_advertisement_timeout(&mut self) -> TransferAction {
+        if self.resource.state != ResourceState::Advertised {
+            return TransferAction::None;
+        }
+        let wait =
+            self.rtt.as_secs_f64() * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR + PROCESSING_GRACE;
+        if !self
+            .advertised_at
+            .is_some_and(|sent| sent.elapsed().as_secs_f64() >= wait)
+        {
+            return TransferAction::None;
+        }
+        if self.advertisement_retries >= MAX_ADV_RETRIES {
+            self.resource.state = ResourceState::Failed;
+            return TransferAction::SendCancel(CancelType::Icl, self.resource.resource_hash);
+        }
+        self.advertisement_retries += 1;
+        self.advertised_at = Some(Instant::now());
+        TransferAction::SendAdvertisement(self.create_advertisement())
     }
 
     /// Consume a hashmap-update frame from the receiver.
@@ -3984,6 +4012,50 @@ mod tests {
         assert!(matches!(
             actions.as_slice(),
             [TransferAction::SendCancel(CancelType::Icl, rh)] if *rh == sender.resource.resource_hash
+        ));
+    }
+
+    #[test]
+    fn advertisement_watchdog_retries_and_exhausts() {
+        let mut sender =
+            OutboundTransfer::new(vec![42; 100], false, Duration::from_millis(500)).unwrap();
+        let TransferAction::SendAdvertisement(original) = sender.tick() else {
+            panic!("advertisement")
+        };
+        assert!(matches!(
+            sender.check_advertisement_timeout(),
+            TransferAction::None
+        ));
+        for _ in 0..MAX_ADV_RETRIES {
+            sender.advertised_at = Some(Instant::now() - Duration::from_secs(5));
+            let TransferAction::SendAdvertisement(retry) = sender.check_advertisement_timeout()
+            else {
+                panic!("retry")
+            };
+            assert_eq!(retry, original);
+            assert_eq!(sender.sent_parts, 0);
+            assert!(matches!(
+                sender.check_advertisement_timeout(),
+                TransferAction::None
+            ));
+        }
+        sender.advertised_at = Some(Instant::now() - Duration::from_secs(5));
+        assert!(
+            matches!(sender.check_advertisement_timeout(), TransferAction::SendCancel(CancelType::Icl, hash) if hash == sender.resource.resource_hash)
+        );
+        assert_eq!(sender.resource.state, ResourceState::Failed);
+
+        let mut sender =
+            OutboundTransfer::new(vec![42; 100], false, Duration::from_millis(500)).unwrap();
+        sender.tick();
+        let mut request = vec![HASHMAP_IS_NOT_EXHAUSTED];
+        request.extend_from_slice(&sender.resource.resource_hash);
+        request.extend_from_slice(&sender.resource.map_hashes[0]);
+        sender.handle_request(&request);
+        sender.advertised_at = Some(Instant::now() - Duration::from_secs(5));
+        assert!(matches!(
+            sender.check_advertisement_timeout(),
+            TransferAction::None
         ));
     }
 

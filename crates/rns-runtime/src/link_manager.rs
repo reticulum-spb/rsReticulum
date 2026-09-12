@@ -1932,6 +1932,36 @@ impl LinkManager {
         let mut to_remove = Vec::new();
 
         for (link_id, active) in &mut self.active_links {
+            let outbound_actions: Vec<_> = active
+                .outbound_resources
+                .values_mut()
+                .map(OutboundTransfer::check_advertisement_timeout)
+                .filter(|action| !matches!(action, TransferAction::None))
+                .collect();
+            for action in outbound_actions {
+                match action {
+                    TransferAction::SendAdvertisement(payload) => {
+                        Self::send_resource_control_packet(
+                            &self.transport_tx,
+                            active,
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceAdv,
+                            &payload,
+                        )
+                    }
+                    TransferAction::SendCancel(_, hash) => {
+                        Self::send_resource_control_packet(
+                            &self.transport_tx,
+                            active,
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceIcl,
+                            &hash,
+                        );
+                        Self::remove_outbound_resource(active, &hash);
+                    }
+                    _ => {}
+                }
+            }
             let inbound_actions: Vec<_> = active
                 .inbound_resources
                 .iter_mut()
