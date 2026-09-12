@@ -1258,6 +1258,47 @@ impl LinkSession {
             .await
     }
 
+    /// Send an unknown-length stream by spooling it to an anonymous temporary
+    /// file before advertising. `max_size` limits source bytes (not metadata),
+    /// additionally capped by protocol limits. An oversized source consumes at
+    /// most one byte beyond that limit, then fails without advertising.
+    ///
+    /// The deadline covers spooling and all segment proofs. The spool is closed
+    /// automatically on success, error, timeout or future cancellation. This
+    /// uses temporary disk space, not a whole-source memory buffer.
+    pub async fn send_resource_stream<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        max_size: usize,
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<[u8; 32], LinkClientError> {
+        let metadata_size = metadata
+            .as_ref()
+            .map_or(Some(0), |m| m.len().checked_add(3))
+            .filter(|size| *size <= MAX_EFFICIENT_SIZE)
+            .ok_or_else(|| LinkClientError::Resource("stream metadata exceeds limits".into()))?;
+        if self.link.session_keys().is_none() {
+            return Err(LinkClientError::LinkCrypto("missing resource keys".into()));
+        }
+        let limit = max_size
+            .min(rns_protocol::resource::MAX_RESOURCE_SIZE)
+            .min(MAX_EFFICIENT_SIZE * rns_protocol::resource::MAX_SEGMENTS - metadata_size);
+        let expires = Instant::now() + deadline;
+        let (mut spool, size) = timeout(deadline, spool_resource_stream(reader, limit))
+            .await
+            .map_err(|_| LinkClientError::Timeout("resource stream source"))??;
+        self.send_resource_reader(
+            &mut spool,
+            size,
+            metadata,
+            auto_compress,
+            time_remaining(expires)?,
+        )
+        .await
+    }
+
     /// Send exactly `data_size` bytes from a reader, retaining only one segment
     /// at a time. No seek is required. Extra bytes remain unread; premature EOF
     /// is an error. The deadline includes source reads and all segment proofs.
@@ -1626,6 +1667,37 @@ impl Drop for LinkSession {
             armed: true,
         };
     }
+}
+
+/// Flush before rewinding: Tokio file writes may still be in flight when the
+/// copy completes. Anonymous tempfile ownership also cleans up cancelled reads.
+async fn spool_resource_stream<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<(tokio::fs::File, usize), LinkClientError> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    let file = tokio::task::spawn_blocking(tempfile::tempfile)
+        .await
+        .map_err(|error| LinkClientError::Resource(format!("create stream spool: {error}")))?
+        .map_err(|error| LinkClientError::Resource(format!("create stream spool: {error}")))?;
+    let mut spool = tokio::fs::File::from_std(file);
+    let copied = tokio::io::copy(&mut reader.take(limit as u64 + 1), &mut spool)
+        .await
+        .map_err(|error| LinkClientError::Resource(format!("spool resource source: {error}")))?;
+    if copied > limit as u64 {
+        return Err(LinkClientError::Resource(
+            "stream resource exceeds size limits".into(),
+        ));
+    }
+    spool
+        .flush()
+        .await
+        .map_err(|error| LinkClientError::Resource(format!("flush stream spool: {error}")))?;
+    spool
+        .rewind()
+        .await
+        .map_err(|error| LinkClientError::Resource(format!("rewind stream spool: {error}")))?;
+    Ok((spool, copied as usize))
 }
 
 async fn send_transport(
@@ -2532,6 +2604,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn resource_stream_spool_flushes_rewinds_and_bounds_input() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let writing = async {
+            writer.write_all(b"stream data").await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let (prepared, ()) = tokio::join!(spool_resource_stream(&mut reader, 11), writing);
+        let (mut spool, size) = prepared.unwrap();
+        assert_eq!(size, 11);
+        let mut restored = Vec::new();
+        spool.read_to_end(&mut restored).await.unwrap();
+        assert_eq!(restored, b"stream data");
+
+        let mut excessive = b"123456".as_slice();
+        assert!(matches!(
+            spool_resource_stream(&mut excessive, 3).await,
+            Err(LinkClientError::Resource(_))
+        ));
+        assert_eq!(excessive, b"56", "only one excess byte is consumed");
+        let (_, size) = spool_resource_stream(&mut tokio::io::empty(), 0)
+            .await
+            .unwrap();
+        assert_eq!(size, 0);
+    }
+
+    #[tokio::test]
     async fn reader_resource_preserves_segment_size_and_source_position() {
         use rns_wire::context::PacketContext;
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
@@ -2605,6 +2704,18 @@ mod tests {
         assert!(
             output.try_recv().is_err(),
             "early EOF must not advertise a partial segment"
+        );
+        let mut excessive = b"123456".as_slice();
+        assert!(matches!(
+            session
+                .send_resource_stream(&mut excessive, 3, None, false, Duration::from_secs(1))
+                .await,
+            Err(LinkClientError::Resource(_))
+        ));
+        assert_eq!(excessive, b"56");
+        assert!(
+            output.try_recv().is_err(),
+            "oversized stream must not advertise"
         );
     }
 

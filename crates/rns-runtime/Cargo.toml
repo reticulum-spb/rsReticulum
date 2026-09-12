@@ -43,6 +43,7 @@ serde_json = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
 nix = { workspace = true }
+tempfile = "3"
 
 # Optional REST API (feature = "api")
 axum = { version = "0.8", features = ["json"], optional = true }

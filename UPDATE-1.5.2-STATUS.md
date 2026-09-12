@@ -3211,3 +3211,30 @@ File handle читается с нуля; snapshot/locking не добавлен
 database_path/tracing prelude сохраняются. Python reference чист.
 Новых test-only файлов нет; длительные тесты и Python interop не запускались.
 Этап 6 открыт, версия 1.0.1 сохранена.
+
+### Этап 6: поток неизвестной длины в API ядра Resource
+
+Добавлен LinkSession::send_resource_stream(reader, max_size, metadata,
+auto_compress, deadline). Это перенос stream proxy из RNS/Resource.py 1.5.2:
+поток сохраняется во временный файл, выполняются flush/rewind, затем работает
+существующий send_resource_reader с одним сегментом за раз. Буфера всего потока
+в RAM нет. Используется anonymous tempfile с удалением ОС при закрытии
+последнего handle; Tokio blocking I/O может завершиться уже после отмены future.
+tempfile добавлен как production dependency, версия уже присутствовала в lock.
+
+В отличие от неограниченного Python data.read(), Rust требует max_size,
+дополнительно ограниченный protocol size/segment caps с учётом metadata.
+До advertisement вход целиком проверяется на лимит; для определения превышения
+читается максимум один лишний байт. Spool и отправка используют общий deadline.
+Пустой поток допустим. Изменений утилит нет: rncp и этап 7 не затрагивались.
+
+Две короткие inline проверки: non-seekable duplex → spool → точные bytes после
+flush/rewind, пустой/избыточный поток; existing reader admission/proof fixture
+дополнен отказом публичного stream API без advertisement при превышении лимита.
+`cargo test -p rns-runtime --lib resource_stream_spool --offline --quiet`:
+1 passed, 0.00s; `cargo test -p rns-runtime --lib reader_resource_preserves
+--offline --quiet`: 1 passed, 0.14s. Workspace all-targets check успешен;
+прежние warnings database_path/tracing prelude сохраняются. Новых test-only
+файлов нет, длительные тесты не запускались. Python reference ea98db4f чист.
+Этап 6 остаётся открыт: приёмная буферизация больших Resources ещё не перенесена
+на файловый путь; итоговая сверка покрытия этапа не завершена. Версия 1.0.1.

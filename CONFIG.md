@@ -463,10 +463,19 @@ before reading. All reads and segment transfers share one deadline.
 Each advertisement repeats the total original size; the original hash is the
 first segment's hash, as in Python. Errors after preparation attempt ICL, and
 the Rust receiver can release split state by original hash between segments.
-Existing Vec APIs remain available. Unknown-length sources still require the
-caller to determine/spool the length: automatic temporary-file proxying is not
-implemented. No equivalent Python temporary-file `flush`/`seek` path is
-introduced by this implementation.
+Existing Vec APIs remain available.
+
+`LinkSession::send_resource_stream(reader, max_size, metadata, auto_compress,
+deadline)` handles an unknown-length `AsyncRead + Unpin` source. Before any
+advertisement it copies the stream into an anonymous temporary file, flushes
+and rewinds it, then uses the same segmented reader path. `max_size` bounds
+source bytes, additionally capped by protocol size/segment limits including
+metadata. Oversized input consumes at most one excess byte and fails without
+advertising. Spooling and all proofs share the deadline. This requires temporary
+disk space up to the effective limit plus one byte, but no whole-source memory
+buffer. The OS removes the spool when its last handle closes, including errors
+and cancellation (already-running Tokio file I/O may finish first). Callers with
+a known length should use `send_resource_reader` to avoid the disk copy.
 
 CLI `rncp-rs` send now opens the file, takes its length from that open handle,
 and calls `rncp_send_reader(RncpSendReaderRequest)`. That runtime path also
@@ -490,8 +499,7 @@ preparations/unread tails; a process-wide semaphore caps blocking preparations
 at 32. Link closure drops sources and queued work; an already-running blocking
 read finishes its current segment. Handles are read from offset zero and must
 not be concurrently read/seeked by their caller. Files are not snapshotted or
-locked. Receiver buffering and automatic spooling of unknown-length sources
-remain unchanged.
+locked. Receiver buffering remains unchanged.
 
 ### Resource receive watchdog
 
