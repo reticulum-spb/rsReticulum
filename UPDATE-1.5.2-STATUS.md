@@ -2923,3 +2923,30 @@ database_path/tracing prelude сохраняются.
 Новых test-only файлов нет, длительные тесты не запускались. Python reference
 ea98db4f чист. Пункт Channel/Buffer перенесён; далее — оставшиеся Resource
 исправления и Link/watchdog/ratchet/blackholed API. Этап6 открыт, версия1.0.1.
+
+### Этап 6: отмена Resource и освобождение split-state
+
+Исправлены конкретные расхождения с Link.py/Resource.py1.5.2:
+LinkSession при отправке больше не принимает любой пакет контекста RCL за
+отмену: требуется успешный decrypt и hash текущего сегмента. Чужой hash,
+короткий payload и невалидный ciphertext игнорируются. Последовательная
+отправка split Resource останавливается через существующий Result/error path.
+
+При ожидании ответа matching RESOURCE_ICL теперь завершает запрос с ошибкой
+и отправляет encrypted RESOURCE_RCL; локальные transfers/coordinator целиком
+освобождаются при выходе. Link остаётся пригодным к использованию.
+LinkManager при RCL освобождает не только активный outbound segment, но и
+очередь оставшихся сегментов по original_hash. ICL использует единый inbound
+cleanup, включая tracking отменённого сегмента (ранее очищались лишь siblings),
+и отвечает RCL для активной передачи, как Python Resource.cancel.
+
+Один новый inline test проверяет удаление queued tail/tracking и отсутствие
+изменений при чужом hash. Существующий response-admission test дополнен
+ICL текущего/чужого сегмента, проверкой encrypted RCL и invalid/short cancel.
+`cargo test -p rns-runtime --lib resource_cancel --quiet`: 1 passed, 0.01s;
+`cargo test -p rns-runtime --lib response_size_limit_uses_total --quiet`:
+1 passed, 0.03s. Новых test-only файлов нет; длительные тесты не запускались.
+Python reference ea98db4f чист. Resource-аудит остаётся открытым: индексы и
+перепривязка частей, потоковые источники, регрессия1.5.2 и оставшиеся таймеры.
+Workspace all-targets check и diff check успешны; прежние warnings
+database_path/tracing prelude сохраняются.

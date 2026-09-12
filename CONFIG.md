@@ -430,6 +430,21 @@ retained, so a very large Link MDU does not imply a single arbitrary-size Buffer
 frame. Buffer factories snapshot the budget at creation. The separate rnsh
 application stream chunking is unchanged.
 
+### Resource cancellation
+
+LinkSession accepts `RESOURCE_RCL` during sending only after successful Link
+decryption and a match against the current segment's full 32-byte hash. Invalid
+or unrelated cancel packets are ignored. While waiting for a Resource response,
+matching `RESOURCE_ICL` ends the request with an error, releases all response
+segments and sends encrypted `RESOURCE_RCL`, without closing the Link.
+
+LinkManager drops the queued unsent tail of an outbound split Resource when
+its active segment is rejected. Inbound cancellation removes the coordinator,
+sibling transfers and Link resource tracking, and acknowledges an active
+transfer's `RESOURCE_ICL` with `RESOURCE_RCL`, as Python does. Unrelated
+transfers are retained. These changes cover remote cancellation; they do not
+add a new application cancellation API or complete the Resource timer audit.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

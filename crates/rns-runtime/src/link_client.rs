@@ -1379,9 +1379,11 @@ impl LinkSession {
                         }
                     }
                     rns_wire::context::PacketContext::ResourceRcl => {
-                        return Err(LinkClientError::Resource(
-                            "resource rejected by receiver".into(),
-                        ));
+                        if resource_cancel_hash(&self.link, body) == Some(resource_hash) {
+                            return Err(LinkClientError::Resource(
+                                "resource rejected by receiver".into(),
+                            ));
+                        }
                     }
                     rns_wire::context::PacketContext::LinkClose => {
                         return Err(LinkClientError::HandshakeFailed(
@@ -2165,6 +2167,25 @@ async fn wait_for_response(
                                 _ => {}
                             }
                         }
+                        rns_wire::context::PacketContext::ResourceIcl => {
+                            if let Some(resource_hash) = resource_cancel_hash(link, body)
+                                && inbound_resources.contains_key(&resource_hash)
+                            {
+                                send_link_data(
+                                    transport_tx,
+                                    link,
+                                    link_id,
+                                    rns_wire::context::PacketContext::ResourceRcl,
+                                    &resource_hash,
+                                    true,
+                                )?;
+                                // Returning drops all active segments and the
+                                // response coordinator, not merely this segment.
+                                return Err(LinkClientError::Resource(
+                                    "resource response cancelled by sender".into(),
+                                ));
+                            }
+                        }
                         rns_wire::context::PacketContext::LinkClose
                             if link.receive_teardown(body) =>
                         {
@@ -2185,6 +2206,12 @@ async fn wait_for_response(
     timeout(deadline, fut)
         .await
         .map_err(|_| LinkClientError::Timeout("response"))?
+}
+
+/// Cancel controls are encrypted and identify one transfer by a full hash.
+fn resource_cancel_hash(link: &Link, body: &[u8]) -> Option<[u8; 32]> {
+    let plaintext = link.decrypt(body).ok()?;
+    plaintext.get(..32)?.try_into().ok()
 }
 
 fn send_link_data(
@@ -2300,7 +2327,7 @@ mod tests {
     #[tokio::test]
     async fn response_size_limit_uses_total_advertised_size() {
         use rns_wire::context::PacketContext;
-        for limit in [31, 32, 33] {
+        for (limit, cancel) in [(31, false), (32, false), (33, false), (32, true)] {
             let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
             let public = key.public_key();
             let (mut client, request) = Link::new_initiator([7; 16], 1);
@@ -2310,6 +2337,11 @@ mod tests {
                 .unwrap();
             server.receive_rtt_packet(&rtt).unwrap();
             let link_id = client.link_id;
+            assert_eq!(resource_cancel_hash(&client, &[1; 32]), None);
+            assert_eq!(
+                resource_cancel_hash(&client, &server.encrypt(&[1; 31]).unwrap()),
+                None
+            );
             let request_id = [8; 16];
             let (tx, mut outbound) = mpsc::channel(8);
             let (events, mut rx) = mpsc::channel(8);
@@ -2346,6 +2378,21 @@ mod tests {
                     .await
                     .unwrap();
             }
+            if cancel {
+                for hash in [[9; 32], [2; 32]] {
+                    events
+                        .send(DestinationEvent::InboundPacket {
+                            raw: build_data_packet(
+                                link_id,
+                                PacketContext::ResourceIcl,
+                                &server.encrypt(&hash).unwrap(),
+                            ),
+                            interface_id: 0,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
             events
                 .send(DestinationEvent::LinkClosed { link_id })
                 .await
@@ -2372,10 +2419,17 @@ mod tests {
                 assert_eq!(header.context, PacketContext::ResourceRcl);
                 assert_eq!(server.decrypt(&packet.raw[offset..]).unwrap(), [1; 32]);
             } else {
-                assert!(
-                    matches!(result, Err(LinkClientError::HandshakeFailed(_))),
-                    "{result:?}"
-                );
+                if cancel {
+                    assert!(
+                        matches!(result, Err(LinkClientError::Resource(_))),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(LinkClientError::HandshakeFailed(_))),
+                        "{result:?}"
+                    );
+                }
                 for _ in 0..2 {
                     let TransportMessage::Outbound(packet) = outbound.try_recv().unwrap() else {
                         panic!("outbound")
@@ -2388,6 +2442,14 @@ mod tests {
                         PacketContext::ResourceReq
                     );
                 }
+            }
+            if cancel {
+                let TransportMessage::Outbound(packet) = outbound.try_recv().unwrap() else {
+                    panic!("outbound")
+                };
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                assert_eq!(header.context, PacketContext::ResourceRcl);
+                assert_eq!(server.decrypt(&packet.raw[offset..]).unwrap(), [2; 32]);
             }
             assert!(outbound.try_recv().is_err());
         }

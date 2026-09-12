@@ -1529,41 +1529,19 @@ impl LinkManager {
                             rh.copy_from_slice(&plaintext[..32]);
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 transfer.handle_cancel();
+                                Self::send_resource_control_packet(
+                                    &self.transport_tx,
+                                    active,
+                                    &link_id,
+                                    rns_wire::context::PacketContext::ResourceRcl,
+                                    &rh,
+                                );
                                 tracing::debug!(
                                     link_id = hex::encode(link_id),
                                     "RESOURCE_ICL — inbound transfer cancelled"
                                 );
                             }
-                            active.inbound_resources.remove(&rh);
-
-                            // Sender-cancel of a split-segment tears down the whole
-                            // reassembly state (coordinator + sibling segments) so
-                            // the coordinator isn't orphaned forever.
-                            if let Some(route) = active.segment_routing.remove(&rh) {
-                                let oh = route.original_hash;
-                                active.inbound_split_resources.remove(&oh);
-                                let siblings: Vec<[u8; 32]> = active
-                                    .segment_routing
-                                    .iter()
-                                    .filter_map(|(seg_rh, r)| {
-                                        if r.original_hash == oh {
-                                            Some(*seg_rh)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                for sibling_rh in siblings {
-                                    active.segment_routing.remove(&sibling_rh);
-                                    active.inbound_resources.remove(&sibling_rh);
-                                    active.link.untrack_resource(&sibling_rh);
-                                }
-                                tracing::debug!(
-                                    link_id = hex::encode(link_id),
-                                    original = hex::encode(&oh[..8]),
-                                    "split-resource cancelled by sender — coordinator + siblings dropped"
-                                );
-                            }
+                            Self::remove_inbound_resource(active, &rh);
                         }
                     }
                 }
@@ -1584,7 +1562,7 @@ impl LinkManager {
                                     "RESOURCE_RCL — outbound transfer rejected"
                                 );
                             }
-                            active.outbound_resources.remove(&rh);
+                            Self::remove_outbound_resource(active, &rh);
                         }
                     }
                 }
@@ -2132,6 +2110,18 @@ impl LinkManager {
             active.segment_routing.remove(&sibling_hash);
             active.inbound_resources.remove(&sibling_hash);
             active.link.untrack_resource(&sibling_hash);
+        }
+    }
+
+    fn remove_outbound_resource(active: &mut ActiveLink, resource_hash: &[u8; 32]) {
+        let Some(transfer) = active.outbound_resources.remove(resource_hash) else {
+            return;
+        };
+        active.link.untrack_resource(resource_hash);
+        // Queued segments share the original hash; dropping only the active
+        // segment would retain the entire unsent tail for the lifetime of Link.
+        if let Some(original_hash) = transfer.resource.original_hash {
+            active.outbound_split_queues.remove(&original_hash);
         }
     }
 
@@ -4802,6 +4792,38 @@ mod tests {
             sender.decrypt(&request.raw[offset..]).unwrap(),
             adv.resource_hash
         );
+    }
+
+    #[test]
+    fn resource_cancel_releases_unsent_split_tail() {
+        let (_, mut link) = handshaken_link_pair();
+        let mut first =
+            OutboundTransfer::new(vec![1; 16], false, std::time::Duration::from_millis(10))
+                .unwrap();
+        let second =
+            OutboundTransfer::new(vec![2; 16], false, std::time::Duration::from_millis(10))
+                .unwrap();
+        let original = [0x44; 32];
+        first.resource.original_hash = Some(original);
+        let hash = first.resource.resource_hash;
+        link.track_outgoing_resource(hash);
+        let mut active = ActiveLink {
+            link,
+            _interface_id: 1,
+            channel: None,
+            inbound_resources: HashMap::new(),
+            outbound_resources: HashMap::from([(hash, first)]),
+            outbound_split_queues: HashMap::from([(original, VecDeque::from([second]))]),
+            inbound_split_resources: HashMap::new(),
+            segment_routing: HashMap::new(),
+        };
+        LinkManager::remove_outbound_resource(&mut active, &[0; 32]);
+        assert_eq!(active.outbound_split_queues.len(), 1);
+        LinkManager::remove_outbound_resource(&mut active, &hash);
+        assert!(active.outbound_resources.is_empty());
+        assert!(active.outbound_split_queues.is_empty());
+        assert!(active.link.outgoing_resources.is_empty());
+        assert_eq!(active.link.state, LinkState::Active);
     }
 
     // 1.3.9: an inbound request-resource is ignored (no transfer opened, link
