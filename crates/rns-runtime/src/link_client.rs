@@ -140,6 +140,11 @@ enum LinkSessionCommand {
         deadline: Duration,
         result_tx: oneshot::Sender<Result<ReceivedResource, LinkClientError>>,
     },
+    ReceiveResourceFile {
+        max_size: usize,
+        expires: Instant,
+        result_tx: oneshot::Sender<Result<ReceivedFileResource, LinkClientError>>,
+    },
     SendResource {
         data: Vec<u8>,
         auto_compress: bool,
@@ -350,6 +355,32 @@ impl LinkSessionHandle {
         recv_command_result(result_rx).await
     }
 
+    /// Receive into an anonymous temporary file through the session worker.
+    /// `max_size` includes wire metadata. The deadline also covers waiting for
+    /// establishment/earlier commands and queue capacity. A cancelled queued
+    /// call is skipped; an already-started receive finishes or reaches its
+    /// original deadline, then drops the file if its caller is gone.
+    pub async fn recv_resource_file(
+        &self,
+        max_size: usize,
+        deadline: Duration,
+    ) -> Result<ReceivedFileResource, LinkClientError> {
+        let expires = Instant::now() + deadline;
+        let operation = async {
+            let (result_tx, result_rx) = oneshot::channel();
+            self.send_command(LinkSessionCommand::ReceiveResourceFile {
+                max_size,
+                expires,
+                result_tx,
+            })
+            .await?;
+            recv_command_result(result_rx).await
+        };
+        timeout(deadline, operation)
+            .await
+            .map_err(|_| LinkClientError::Timeout("resource file command"))?
+    }
+
     pub async fn close(&self) -> Result<(), LinkClientError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.send_command(LinkSessionCommand::Close { result_tx })
@@ -405,6 +436,18 @@ async fn run_established_link_session(
                         result_tx,
                     } => {
                         let _ = result_tx.send(session.recv_resource(deadline).await);
+                    }
+                    LinkSessionCommand::ReceiveResourceFile {
+                        max_size, expires, result_tx,
+                    } => {
+                        if result_tx.is_closed() {
+                            continue;
+                        }
+                        let result = match time_remaining(expires) {
+                            Ok(remaining) => session.recv_resource_file(max_size, remaining).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = result_tx.send(result);
                     }
                     LinkSessionCommand::SendResource {
                         data,
@@ -2781,7 +2824,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn resource_file_receives_segments_and_rejects_oversize() {
+    async fn resource_file_handle_receives_segments_and_rejects_oversize() {
         use rns_wire::context::PacketContext;
         use tokio::io::AsyncReadExt;
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
@@ -2793,7 +2836,7 @@ mod tests {
         let link_id = link.link_id;
         let (tx, mut output) = mpsc::channel(8);
         let (events, rx) = mpsc::channel(8);
-        let mut session = LinkSession {
+        let session = LinkSession {
             transport_tx: tx,
             identity: Arc::new(Identity::new()),
             link,
@@ -2803,6 +2846,31 @@ mod tests {
             pending_packets: VecDeque::new(),
             pending_resource_packets: VecDeque::new(),
         };
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (inbound_tx, inbound_rx) = mpsc::channel(4);
+        let handle = LinkSessionHandle {
+            link_id,
+            command_tx,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
+        };
+        let worker = tokio::spawn(run_established_link_session(
+            session, command_rx, inbound_tx,
+        ));
+        // A command that expired in the queue must not start receiving.
+        let (result_tx, result_rx) = oneshot::channel();
+        handle
+            .send_command(LinkSessionCommand::ReceiveResourceFile {
+                max_size: 13,
+                expires: Instant::now() - Duration::from_secs(1),
+                result_tx,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            recv_command_result(result_rx).await,
+            Err(LinkClientError::Timeout(_))
+        ));
+        assert!(output.try_recv().is_err());
         let sending = async {
             let mut original = None;
             let mut first_adv = None;
@@ -2869,7 +2937,7 @@ mod tests {
             (original.unwrap(), first_adv.unwrap())
         };
         let (received, (root, adv)) = tokio::join!(
-            session.recv_resource_file(13, Duration::from_secs(2)),
+            handle.recv_resource_file(13, Duration::from_secs(2)),
             sending,
         );
         let mut received = received.unwrap();
@@ -2887,7 +2955,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            session.recv_resource_file(12, Duration::from_secs(1)).await,
+            handle.recv_resource_file(12, Duration::from_secs(1)).await,
             Err(LinkClientError::Resource(_))
         ));
         let TransportMessage::Outbound(cancel) = output.recv().await.unwrap() else {
@@ -2895,6 +2963,8 @@ mod tests {
         };
         let (header, _) = rns_wire::header::PacketHeader::unpack(&cancel.raw).unwrap();
         assert_eq!(header.context, PacketContext::ResourceRcl);
+        handle.close().await.unwrap();
+        worker.await.unwrap();
     }
 
     #[tokio::test]

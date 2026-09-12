@@ -489,9 +489,13 @@ only after verification and successful file write/flush. Python's repeated
 metadata flag on later segments is accepted without stripping another prefix.
 The receive loop drives retries and sends best-effort RCL on errors/timeouts.
 Partial temporary files are released on error/cancellation; no application file
-is overwritten. This API is currently on direct `LinkSession`, not the command
-handle or LinkManager completion channel. Existing byte-returning APIs retain
-their in-memory result representation.
+is overwritten. The same operation is available on `LinkSessionHandle` through
+the session worker. Its deadline includes establishment, queue capacity and
+earlier commands; expired or cancelled queued calls do not start receiving.
+If the caller drops an already-started call, reception continues until completion
+or its original deadline and the undeliverable temporary-file result is dropped.
+The LinkManager completion channel is unchanged. Existing byte-returning APIs
+retain their in-memory result representation.
 
 CLI `rncp-rs` send now opens the file, takes its length from that open handle,
 and calls `rncp_send_reader(RncpSendReaderRequest)`. That runtime path also
