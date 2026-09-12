@@ -3238,3 +3238,32 @@ flush/rewind, пустой/избыточный поток; existing reader admi
 файлов нет, длительные тесты не запускались. Python reference ea98db4f чист.
 Этап 6 остаётся открыт: приёмная буферизация больших Resources ещё не перенесена
 на файловый путь; итоговая сверка покрытия этапа не завершена. Версия 1.0.1.
+
+### Этап 6: файловый приём Resource в LinkSession
+
+Добавлен recv_resource_file(max_size, deadline) → ReceivedFileResource с
+открытым anonymous tempfile, data_size, metadata и resource_hash. Проверенный
+сегмент записывается/flush до proof; предыдущие сегменты в RAM не сохраняются.
+Готовый файл перематывается на начало. max_size включает metadata, возвращаемый
+data_size — только payload. Проверяются advertisement и фактический размер,
+последовательность индексов, общий hash/count/d; последний размер должен точно
+совпадать с объявленным. Старый recv_resource с Vec сохранён.
+
+Общий receive loop теперь вызывает watchdog и отправляет best-effort RCL
+активным передачам при ошибке/timeout; обработаны ICL и отмена через HMU.
+Python оставляет has_metadata на последующих сегментах, но metadata prefix там
+уже нет: флаг очищается перед декодированием этих сегментов, как в LinkManager.
+Файл удаляется ОС после закрытия последнего handle, в том числе при ошибке или
+отмене future; уже запущенное Tokio file I/O может закончиться позже.
+
+Один короткий inline test resource_file_receives_segments_and_rejects_oversize
+передаёт два маленьких сегмента с parts и проверенными proofs, повторённым
+metadata flag, проверяет файл/metadata/hash и отказ RCL до REQ по лимиту.
+1 passed, 0.01s. Это не большой transfer/interop test; длительные тесты не
+запускались, новых test-only файлов нет. Workspace all-targets check успешен,
+прежние warnings database_path/tracing prelude сохраняются.
+
+Граница: файловый путь доступен напрямую через LinkSession; command handle,
+LinkManager completion channel и request/response API пока возвращают bytes.
+Их память этим изменением не перестроена. Утилиты не затрагивались.
+Этап 6 остаётся открыт до итоговой сверки покрытия; версия 1.0.1 сохранена.

@@ -158,6 +158,16 @@ pub struct ReceivedResource {
     pub resource_hash: [u8; 32],
 }
 
+/// A verified Resource backed by an anonymous temporary file, positioned at zero.
+/// Closing the last file handle removes its temporary storage.
+#[derive(Debug)]
+pub struct ReceivedFileResource {
+    pub file: tokio::fs::File,
+    pub data_size: usize,
+    pub metadata: Option<Vec<u8>>,
+    pub resource_hash: [u8; 32],
+}
+
 /// Response payload and optional Resource metadata returned by a Link request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkResponse {
@@ -1012,17 +1022,74 @@ impl LinkSession {
         &mut self,
         deadline: Duration,
     ) -> Result<ReceivedResource, LinkClientError> {
+        self.recv_resource_inner(deadline, None, usize::MAX).await
+    }
+
+    /// Receive sequential Resource segments into a temporary file without
+    /// retaining previously verified segments in RAM. `max_size` includes wire
+    /// metadata; advertisements and actual decoded sizes are both checked.
+    /// Proofs follow successful writes/flushes, not merely receipt of parts.
+    /// The deadline includes file creation and reception. Errors/timeouts drop
+    /// the partial file; no application destination path is overwritten.
+    pub async fn recv_resource_file(
+        &mut self,
+        max_size: usize,
+        deadline: Duration,
+    ) -> Result<ReceivedFileResource, LinkClientError> {
+        let expires = Instant::now() + deadline;
+        let file = timeout(deadline, tokio::task::spawn_blocking(tempfile::tempfile))
+            .await
+            .map_err(|_| LinkClientError::Timeout("resource file creation"))?
+            .map_err(|e| LinkClientError::Resource(format!("resource file: {e}")))?
+            .map_err(|e| LinkClientError::Resource(format!("resource file: {e}")))?;
+        let mut file = tokio::fs::File::from_std(file);
+        let received = self
+            .recv_resource_inner(time_remaining(expires)?, Some(&mut file), max_size)
+            .await?;
+        // The receiver has flushed and rewound before acknowledging completion.
+        let data_size = timeout(time_remaining(expires)?, file.metadata())
+            .await
+            .map_err(|_| LinkClientError::Timeout("resource file metadata"))?
+            .map_err(|e| LinkClientError::Resource(format!("resource file metadata: {e}")))?
+            .len() as usize;
+        Ok(ReceivedFileResource {
+            file,
+            data_size,
+            metadata: received.metadata,
+            resource_hash: received.resource_hash,
+        })
+    }
+
+    async fn recv_resource_inner(
+        &mut self,
+        deadline: Duration,
+        mut file: Option<&mut tokio::fs::File>,
+        max_size: usize,
+    ) -> Result<ReceivedResource, LinkClientError> {
         let link_id = self.id();
+        let mut transfers: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
         let future = async {
-            let mut transfers: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
             let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
             let mut multi: Option<MultiSegmentInbound> = None;
+            let mut file_layout = None;
+            let mut next_segment = 1;
+            let mut file_bytes = 0usize;
+            let mut file_metadata: Option<Vec<u8>> = None;
+            let mut watchdog = tokio::time::interval(Duration::from_secs(1));
+            watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let raw = if let Some(raw) = self.pending_resource_packets.pop_front() {
                     raw
                 } else {
                     loop {
-                        match self.event_rx.recv().await {
+                        let event = tokio::select! {
+                            event = self.event_rx.recv() => event,
+                            _ = watchdog.tick() => {
+                                retry_response_resources(&self.transport_tx, &self.link, link_id, &mut transfers)?;
+                                continue;
+                            }
+                        };
+                        match event {
                             Some(DestinationEvent::InboundPacket { raw, .. }) => break raw,
                             Some(DestinationEvent::LinkClosed { link_id })
                                 if link_id == self.id() =>
@@ -1071,15 +1138,48 @@ impl LinkSession {
                             ))
                         })?;
                         let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+                        if transfers.contains_key(&adv.resource_hash) {
+                            continue;
+                        }
+                        if file.is_some() {
+                            let layout = (adv.original_hash, adv.total_segments, adv.data_size);
+                            if adv.data_size > max_size
+                                || adv.total_segments == 0
+                                || adv.total_segments > rns_protocol::resource::MAX_SEGMENTS
+                                || adv.segment_index > adv.total_segments
+                                || adv.segment_index != next_segment
+                                || !transfers.is_empty()
+                                || file_layout.is_some_and(|expected| expected != layout)
+                            {
+                                let _ = send_link_data(
+                                    &self.transport_tx,
+                                    &self.link,
+                                    link_id,
+                                    rns_wire::context::PacketContext::ResourceRcl,
+                                    &adv.resource_hash,
+                                    true,
+                                );
+                                return Err(LinkClientError::Resource(
+                                    "file Resource size or segment sequence mismatch".into(),
+                                ));
+                            }
+                            file_layout = Some(layout);
+                        }
                         let length = adv.random_hash.len().min(random_hash.len());
                         random_hash[..length].copy_from_slice(&adv.random_hash[..length]);
+                        // Python repeats the metadata flag on later segments,
+                        // but only the first segment contains the metadata prefix.
+                        let mut transfer_flags = adv.flags;
+                        if adv.total_segments > 1 && adv.segment_index > 1 {
+                            transfer_flags.has_metadata = false;
+                        }
                         let mut transfer = InboundTransfer::from_advertisement(
                             adv.num_parts,
                             adv.transfer_size,
                             adv.data_size,
                             random_hash,
                             adv.resource_hash,
-                            adv.flags,
+                            transfer_flags,
                             adv.get_map_hashes(),
                             self.link.rtt.unwrap_or(Duration::from_millis(500)),
                         )
@@ -1100,7 +1200,7 @@ impl LinkSession {
                             adv.resource_hash,
                             (adv.original_hash, adv.segment_index, adv.total_segments),
                         );
-                        if adv.total_segments > 1 && multi.is_none() {
+                        if file.is_none() && adv.total_segments > 1 && multi.is_none() {
                             multi = Some(MultiSegmentInbound::new(
                                 adv.total_segments,
                                 adv.original_hash,
@@ -1153,6 +1253,55 @@ impl LinkSession {
                                     ))
                                 })?;
                             let metadata = transfer.resource.metadata.clone();
+                            if let Some(file) = file.as_mut() {
+                                use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+                                let (original_hash, index, total) = segment_info[&resource_hash];
+                                let advertised_size =
+                                    file_layout.expect("accepted file advertisement").2;
+                                if index == 1 {
+                                    file_metadata = metadata;
+                                }
+                                file_bytes += data.len();
+                                let wire_size =
+                                    file_bytes + file_metadata.as_ref().map_or(0, |m| m.len() + 3);
+                                if wire_size > advertised_size
+                                    || wire_size > max_size
+                                    || (index == total && wire_size != advertised_size)
+                                {
+                                    return Err(LinkClientError::Resource(
+                                        "decoded file Resource size mismatch".into(),
+                                    ));
+                                }
+                                file.write_all(&data).await.map_err(|e| {
+                                    LinkClientError::Resource(format!("resource file write: {e}"))
+                                })?;
+                                file.flush().await.map_err(|e| {
+                                    LinkClientError::Resource(format!("resource file flush: {e}"))
+                                })?;
+                                if index == total {
+                                    file.rewind().await.map_err(|e| {
+                                        LinkClientError::Resource(format!(
+                                            "resource file rewind: {e}"
+                                        ))
+                                    })?;
+                                }
+                                send_link_proof(&self.transport_tx, link_id, &proof)?;
+                                transfers.remove(&resource_hash);
+                                segment_info.remove(&resource_hash);
+                                next_segment += 1;
+                                if index == total {
+                                    return Ok(ReceivedResource {
+                                        data: Vec::new(),
+                                        metadata: file_metadata,
+                                        resource_hash: if total > 1 {
+                                            original_hash
+                                        } else {
+                                            resource_hash
+                                        },
+                                    });
+                                }
+                                continue;
+                            }
                             send_link_proof(&self.transport_tx, link_id, &proof)?;
                             let (original_hash, segment_index, total_segments) = segment_info
                                 .remove(&resource_hash)
@@ -1204,18 +1353,33 @@ impl LinkSession {
                                     ))
                                 },
                             )?;
-                        if let Some(transfer) = transfers.get_mut(&resource_hash)
-                            && let TransferAction::SendRequest(request) =
-                                transfer.hashmap_update(segment, &hashmap)
+                        if let Some(transfer) = transfers.get_mut(&resource_hash) {
+                            match transfer.hashmap_update(segment, &hashmap) {
+                                TransferAction::SendRequest(request) => send_link_data(
+                                    &self.transport_tx,
+                                    &self.link,
+                                    link_id,
+                                    rns_wire::context::PacketContext::ResourceReq,
+                                    &request,
+                                    true,
+                                )?,
+                                TransferAction::SendCancel { .. } | TransferAction::Failed(_) => {
+                                    return Err(LinkClientError::Resource(
+                                        "resource hashmap cancelled reception".into(),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    rns_wire::context::PacketContext::ResourceIcl => {
+                        if let Some(hash) = resource_cancel_hash(&self.link, body)
+                            && (transfers.contains_key(&hash)
+                                || file_layout.is_some_and(|layout| layout.0 == hash))
                         {
-                            send_link_data(
-                                &self.transport_tx,
-                                &self.link,
-                                link_id,
-                                rns_wire::context::PacketContext::ResourceReq,
-                                &request,
-                                true,
-                            )?;
+                            return Err(LinkClientError::Resource(
+                                "sender cancelled Resource".into(),
+                            ));
                         }
                     }
                     rns_wire::context::PacketContext::LinkClose => {
@@ -1227,9 +1391,22 @@ impl LinkSession {
                 }
             }
         };
-        timeout(deadline, future)
+        let result = timeout(deadline, future)
             .await
-            .map_err(|_| LinkClientError::Timeout("resource"))?
+            .unwrap_or(Err(LinkClientError::Timeout("resource")));
+        if result.is_err() {
+            for hash in transfers.keys() {
+                let _ = send_link_data(
+                    &self.transport_tx,
+                    &self.link,
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceRcl,
+                    hash,
+                    true,
+                );
+            }
+        }
+        result
     }
 
     /// Send a Resource and wait for its delivery proof.
@@ -2602,6 +2779,123 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resource_file_receives_segments_and_rejects_oversize() {
+        use rns_wire::context::PacketContext;
+        use tokio::io::AsyncReadExt;
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([7; 16], 1);
+        let (peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        link.validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        let link_id = link.link_id;
+        let (tx, mut output) = mpsc::channel(8);
+        let (events, rx) = mpsc::channel(8);
+        let mut session = LinkSession {
+            transport_tx: tx,
+            identity: Arc::new(Identity::new()),
+            link,
+            event_rx: rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+        let sending = async {
+            let mut original = None;
+            let mut first_adv = None;
+            for (index, data) in [(1, b"first".as_slice()), (2, b"tail".as_slice())] {
+                let encrypt = |data: &[u8]| peer.encrypt(data).unwrap();
+                let mut resource = OutboundResource::with_options(
+                    data.to_vec(),
+                    false,
+                    (index == 1).then_some(vec![0x80]),
+                    None,
+                    Some(&encrypt),
+                )
+                .unwrap();
+                let root = *original.get_or_insert(resource.resource_hash);
+                resource.flags.split = true;
+                // Python retains this flag even on segments without the prefix.
+                resource.flags.has_metadata = true;
+                resource.segment_index = index;
+                resource.total_segments = 2;
+                resource.original_hash = Some(root);
+                resource.advertisement_data_size = 13;
+                let mut transfer =
+                    OutboundTransfer::from_prebuilt(resource, Duration::from_millis(500));
+                let TransferAction::SendAdvertisement(adv) = transfer.tick() else {
+                    panic!("ADV")
+                };
+                let raw = build_data_packet(
+                    link_id,
+                    PacketContext::ResourceAdv,
+                    &peer.encrypt(&adv).unwrap(),
+                );
+                first_adv.get_or_insert(raw.clone());
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw,
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+                let TransportMessage::Outbound(request) = output.recv().await.unwrap() else {
+                    panic!("REQ")
+                };
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+                assert_eq!(header.context, PacketContext::ResourceReq);
+                assert_eq!(transfer.resource.parts.len(), 1);
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(
+                            link_id,
+                            PacketContext::Resource,
+                            &transfer.resource.parts[0],
+                        ),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+                let TransportMessage::Outbound(proof) = output.recv().await.unwrap() else {
+                    panic!("proof")
+                };
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
+                assert_eq!(header.context, PacketContext::ResourcePrf);
+                assert!(transfer.resource.validate_proof(&proof.raw[offset..]));
+            }
+            (original.unwrap(), first_adv.unwrap())
+        };
+        let (received, (root, adv)) = tokio::join!(
+            session.recv_resource_file(13, Duration::from_secs(2)),
+            sending,
+        );
+        let mut received = received.unwrap();
+        assert_eq!(received.resource_hash, root);
+        assert_eq!(received.metadata, Some(vec![0x80]));
+        assert_eq!(received.data_size, 9);
+        let mut bytes = Vec::new();
+        received.file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"firsttail");
+        events
+            .send(DestinationEvent::InboundPacket {
+                raw: adv,
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.recv_resource_file(12, Duration::from_secs(1)).await,
+            Err(LinkClientError::Resource(_))
+        ));
+        let TransportMessage::Outbound(cancel) = output.recv().await.unwrap() else {
+            panic!("RCL")
+        };
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&cancel.raw).unwrap();
+        assert_eq!(header.context, PacketContext::ResourceRcl);
+    }
 
     #[tokio::test]
     async fn resource_stream_spool_flushes_rewinds_and_bounds_input() {

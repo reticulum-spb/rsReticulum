@@ -477,6 +477,22 @@ buffer. The OS removes the spool when its last handle closes, including errors
 and cancellation (already-running Tokio file I/O may finish first). Callers with
 a known length should use `send_resource_reader` to avoid the disk copy.
 
+`LinkSession::recv_resource_file(max_size, deadline)` receives a Resource into
+an anonymous temporary file and returns `ReceivedFileResource { file, data_size,
+metadata, resource_hash }`. The file is flushed and positioned at zero. Unlike
+the existing `recv_resource` byte-vector API, this path does not retain earlier
+segments in RAM. It accepts sequential segments with consistent original hash,
+segment count and total size; only one segment is active at a time. `max_size`
+includes metadata on the wire, whereas returned `data_size` counts payload only.
+Both advertisements and actual decoded sizes are checked. A segment is proved
+only after verification and successful file write/flush. Python's repeated
+metadata flag on later segments is accepted without stripping another prefix.
+The receive loop drives retries and sends best-effort RCL on errors/timeouts.
+Partial temporary files are released on error/cancellation; no application file
+is overwritten. This API is currently on direct `LinkSession`, not the command
+handle or LinkManager completion channel. Existing byte-returning APIs retain
+their in-memory result representation.
+
 CLI `rncp-rs` send now opens the file, takes its length from that open handle,
 and calls `rncp_send_reader(RncpSendReaderRequest)`. That runtime path also
 prepares one encrypted segment at a time and waits for its proof before reading
