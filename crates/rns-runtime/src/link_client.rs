@@ -745,6 +745,7 @@ impl LinkSession {
             let raw = match event {
                 DestinationEvent::InboundPacket { raw, .. } => raw,
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
+                    self.link.mark_closed(CloseReason::DestinationClosed);
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
                 _ => continue,
@@ -820,6 +821,7 @@ impl LinkSession {
             };
             match event {
                 DestinationEvent::LinkClosed { link_id } if link_id == self.id() => {
+                    self.link.mark_closed(CloseReason::DestinationClosed);
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
                 DestinationEvent::InboundPacket { raw, .. } => {
@@ -1219,6 +1221,7 @@ impl LinkSession {
                             Some(DestinationEvent::LinkClosed { link_id })
                                 if link_id == self.id() =>
                             {
+                                self.link.mark_closed(CloseReason::DestinationClosed);
                                 return Err(LinkClientError::HandshakeFailed(
                                     "link closed during resource".into(),
                                 ));
@@ -1529,7 +1532,9 @@ impl LinkSession {
                             ));
                         }
                     }
-                    rns_wire::context::PacketContext::LinkClose => {
+                    rns_wire::context::PacketContext::LinkClose
+                        if self.link.receive_teardown(body) =>
+                    {
                         return Err(LinkClientError::HandshakeFailed(
                             "link closed during resource".into(),
                         ));
@@ -1805,8 +1810,15 @@ impl LinkSession {
                         None => break,
                     },
                 };
-                let DestinationEvent::InboundPacket { raw, .. } = event else {
-                    continue;
+                let raw = match event {
+                    DestinationEvent::InboundPacket { raw, .. } => raw,
+                    DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
+                        self.link.mark_closed(CloseReason::DestinationClosed);
+                        return Err(LinkClientError::HandshakeFailed(
+                            "link closed during resource send".into(),
+                        ));
+                    }
+                    _ => continue,
                 };
                 let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                     Ok(value) => value,
@@ -1884,7 +1896,9 @@ impl LinkSession {
                             ));
                         }
                     }
-                    rns_wire::context::PacketContext::LinkClose => {
+                    rns_wire::context::PacketContext::LinkClose
+                        if self.link.receive_teardown(body) =>
+                    {
                         return Err(LinkClientError::HandshakeFailed(
                             "link closed during resource send".into(),
                         ));
@@ -2253,6 +2267,7 @@ async fn wait_for_proof(
         while let Some(ev) = rx.recv().await {
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
+                    link.mark_closed(CloseReason::DestinationClosed);
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
                 DestinationEvent::InboundPacket { raw, interface_id } => {
@@ -2390,6 +2405,7 @@ async fn wait_for_response(
             };
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
+                    link.mark_closed(CloseReason::DestinationClosed);
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
                 }
                 DestinationEvent::InboundPacket { raw, .. } => {
@@ -3116,7 +3132,10 @@ mod tests {
     #[tokio::test]
     async fn delivery_proof_recovers_stale_link_and_observes_close() {
         use rns_wire::context::PacketContext;
-        for remote_close in [false, true] {
+        for (remote_close, receive_kind) in [false, true]
+            .into_iter()
+            .flat_map(|closed| (0..4).map(move |kind| (closed, kind)))
+        {
             let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
             let public = key.public_key();
             let (mut link, request) = Link::new_initiator([7; 16], 1);
@@ -3183,11 +3202,33 @@ mod tests {
             } else {
                 DestinationEvent::LinkClosed { link_id }
             };
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_data_packet(link_id, PacketContext::LinkClose, &[0; 32]),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
             events.send(closed).await.unwrap();
-            assert!(
-                matches!(session.recv_delivery_proof(Duration::from_secs(1)).await,
-                Err(LinkClientError::HandshakeFailed(message)) if message.contains("link closed"))
-            );
+            let result = match receive_kind {
+                0 => session
+                    .recv_delivery_proof(Duration::from_secs(1))
+                    .await
+                    .map(|_| ()),
+                1 => session.recv().await.map(|_| ()),
+                2 => session
+                    .recv_resource(Duration::from_secs(1))
+                    .await
+                    .map(|_| ()),
+                _ => session
+                    .send_resource(vec![1; 16], false, Duration::from_secs(1))
+                    .await
+                    .map(|_| ()),
+            };
+            assert!(matches!(result,
+                Err(LinkClientError::HandshakeFailed(message)) if message.contains("link closed")));
+            assert_eq!(session.link.state, LinkState::Closed);
+            assert!(session.send(b"after close").await.is_err());
         }
     }
 

@@ -98,7 +98,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
-| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py и interface guards сверены. RequestReceipt: адресное завершение, отказ после ACK, cleanup response wait и отмены/ранних ошибок LinkSession исправлены; размер проверяется до принятия ответа. Остальные Link receive/error paths ещё требуют сверки | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py/interface guards и RequestReceipt сверены. LinkClosed теперь закрывает локальный Link в receive/wait путях; Resource teardown проверяется криптографически. Остальные Link receive/error paths, включая keepalive admission, ещё требуют сверки | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -3887,3 +3887,29 @@ transport channel, отмену ожидания ответа, отмену Reso
 `session_request_cleans_receipt_on_send_error_and_cancellation`: 1 passed (0.08s);
 существующие runtime `response_`: 13 passed (0.04s). Default runtime и client-only
 cargo checks, fmt/diff checks прошли. Длительные тесты не запускались.
+
+## Финальная сверка: закрытие Link во время receive/wait
+
+Внутренний DestinationEvent::LinkClosed ранее часто только возвращал ошибку,
+оставляя локальный Link Active с доступными session keys. Теперь собственное
+событие закрытия вызывает mark_closed перед возвратом: packet recv, delivery
+proof wait, handshake proof wait, response wait, Resource receive и Resource send.
+Чужие Link IDs по-прежнему игнорируются. Ключи очищаются штатным Link::close;
+последующая send через такую сессию завершается ошибкой.
+
+При расширении короткой проверки на Resource обнаружен ещё один пропуск:
+ветки Resource receive/send прерывались по одному контексту LinkClose, без
+проверки payload и без перехода в Closed. Теперь они используют receive_teardown,
+как остальные authenticated-close пути: поддельное закрытие игнорируется,
+проверенное завершает Link. Это не меняет формат teardown и не добавляет
+доверия к произвольным сетевым пакетам; внутреннее событие остаётся уведомлением
+от runtime manager, а сетевой teardown должен пройти проверку ключом Link.
+
+Проверка расширена в существующем production-модуле: четыре receive/send режима
+× internal/remote close, поддельный teardown перед настоящим, Closed и отказ
+последующей send. Первый запуск выявил Resource-пропуск, исправление внесено
+в тот же блок. Новых test-only файлов нет. Keepalive admission и остальные
+ещё не классифицированные Link error paths остаются в финальной сверке.
+
+Повторный targeted test: 1 passed (0.11s); runtime `response_`: 13 passed
+(0.04s). Fmt/diff checks прошли; длительные тесты не запускались.
