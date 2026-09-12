@@ -3317,3 +3317,40 @@ tick. После proof ожидание следующего advertisement ог�
 database_path/tracing prelude сохраняются. Новых test-only файлов нет,
 длительные тесты не запускались. Этап 6 открыт до итоговой сверки покрытия;
 request/response APIs по-прежнему возвращают bytes. Версия 1.0.1 сохранена.
+
+### Этап 6: итоговая сверка и остаток файловых ответов
+
+Сверены пункты плана с локальным Python ea98db4f (reference чист) и кодом:
+
+| Пункт | Результат сверки |
+|---|---|
+| medium_path_timeout | Расчёт actor, runtime API, RPC и shared forwarding перенесены; first_hop_timeout сохранён. |
+| Применение таймаутов CLI | Сделано ранее, explicit timeout сохраняет приоритет; в этой сверке утилиты не менялись. |
+| Destination.max_request_size | API и проверки packet/Resource запросов до приёма присутствуют. |
+| max_response_size | Проверяются повторённый total d и собранный размер с metadata; прежняя Rust-семантика packet bytes сохранена. |
+| Channel/Buffer | Согласованный Link MDU применяется в runtime и разбиении Buffer, не только в getter. |
+| Resource | RCL/ICL, индексы, watchdog/proof retry и stream/file API перенесены; raw file response остаётся функциональным пробелом ниже. |
+| Link/ratchet/blackhole | Inbound-based stale, keepalive при одностороннем трафике, retained cleanup и blackhole validation API присутствуют. |
+
+Во время сверки исправлены ещё три места в LinkSession:
+- обычный recv_resource теперь проверяет total/index до выделения coordinator,
+  как файловый путь; превышение MAX_SEGMENTS отклоняется через RCL;
+- wait_for_response больше не разбирает повторённый Python has_metadata flag
+  как новый metadata prefix после первого сегмента;
+- ICL по original hash завершает обычный приём и ожидание ответа также между
+  сегментами, когда активный transfer предыдущего сегмента уже удалён.
+
+Одна новая inline проверка передаёт два сегмента packed response с metadata и
+реальными proofs, затем проверяет ранний отказ обычного recv_resource по cap.
+Повторно запущена существующая короткая проверка response size/cancellation.
+Команды response_split_metadata_flag и response_size_limit_uses_total:
+по 1 passed, 0.01/0.03s. Workspace all-targets check успешен; прежние warnings
+database_path/tracing prelude сохраняются. Новых test-only файлов нет.
+
+Остаток по существу: Python Link.response_resource_concluded трактует Resource
+с metadata как raw file response и использует request_id из advertisement;
+Rust wait_for_response всё ещё требует packed [request_id, data]. Нужно
+перенести этот путь, явно разрешив совместимость с существующими Rust metadata
+responses; простое переключение всех metadata ответов на raw изменит их контракт.
+Полная Python↔Rust матрица/длительные проверки отложены по указанию пользователя,
+а не объявлены пройденными. Этап 6 пока открыт, версия 1.0.1.

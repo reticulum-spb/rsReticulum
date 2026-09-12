@@ -1184,6 +1184,25 @@ impl LinkSession {
                         if transfers.contains_key(&adv.resource_hash) {
                             continue;
                         }
+                        // Guard every receive API before allocating segment slots,
+                        // including the legacy byte-returning path.
+                        if adv.total_segments == 0
+                            || adv.total_segments > rns_protocol::resource::MAX_SEGMENTS
+                            || adv.segment_index == 0
+                            || adv.segment_index > adv.total_segments
+                        {
+                            send_link_data(
+                                &self.transport_tx,
+                                &self.link,
+                                link_id,
+                                rns_wire::context::PacketContext::ResourceRcl,
+                                &adv.resource_hash,
+                                true,
+                            )?;
+                            return Err(LinkClientError::Resource(
+                                "invalid Resource segment count/index".into(),
+                            ));
+                        }
                         if file.is_some() {
                             let layout = (adv.original_hash, adv.total_segments, adv.data_size);
                             if adv.data_size > max_size
@@ -1418,6 +1437,9 @@ impl LinkSession {
                     rns_wire::context::PacketContext::ResourceIcl => {
                         if let Some(hash) = resource_cancel_hash(&self.link, body)
                             && (transfers.contains_key(&hash)
+                                || multi
+                                    .as_ref()
+                                    .is_some_and(|coordinator| coordinator.original_hash == hash)
                                 || file_layout.is_some_and(|layout| layout.0 == hash))
                         {
                             return Err(LinkClientError::Resource(
@@ -2380,13 +2402,18 @@ async fn wait_for_response(
                             random_hash[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
 
                             let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
+                            let mut transfer_flags = adv.flags;
+                            if adv.total_segments > 1 && adv.segment_index > 1 {
+                                // Python repeats the flag but not the metadata prefix.
+                                transfer_flags.has_metadata = false;
+                            }
                             let mut transfer = InboundTransfer::from_advertisement(
                                 adv.num_parts,
                                 adv.transfer_size,
                                 adv.data_size,
                                 random_hash,
                                 adv.resource_hash,
-                                adv.flags,
+                                transfer_flags,
                                 adv.get_map_hashes(),
                                 rtt,
                             )
@@ -2619,7 +2646,10 @@ async fn wait_for_response(
                         }
                         rns_wire::context::PacketContext::ResourceIcl => {
                             if let Some(resource_hash) = resource_cancel_hash(link, body)
-                                && inbound_resources.contains_key(&resource_hash)
+                                && (inbound_resources.contains_key(&resource_hash)
+                                    || multi.as_ref().is_some_and(|coordinator| {
+                                        coordinator.original_hash == resource_hash
+                                    }))
                             {
                                 send_link_data(
                                     transport_tx,
@@ -3190,6 +3220,137 @@ mod tests {
             }
         }
         assert_eq!(session.link.state, LinkState::Active);
+    }
+
+    #[tokio::test]
+    async fn response_split_metadata_flag_and_receive_segment_cap() {
+        use rns_wire::context::PacketContext;
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut client, request) = Link::new_initiator([7; 16], 1);
+        let (server, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        client
+            .validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        let link_id = client.link_id;
+        let request_id = [8; 16];
+        let payload = Link::pack_response(&request_id, b"reply").unwrap();
+        let (tx, mut output) = mpsc::channel(8);
+        let (events, mut rx) = mpsc::channel(8);
+        let mut original = None;
+        let mut resources = Vec::new();
+        for (index, data) in [(1, &payload[..5]), (2, &payload[5..])] {
+            let encrypt = |data: &[u8]| server.encrypt(data).unwrap();
+            let mut resource = OutboundResource::with_options(
+                data.to_vec(),
+                false,
+                (index == 1).then_some(vec![0x80]),
+                None,
+                Some(&encrypt),
+            )
+            .unwrap();
+            let root = *original.get_or_insert(resource.resource_hash);
+            resource.flags.split = true;
+            resource.flags.is_response = true;
+            resource.flags.has_metadata = true;
+            resource.request_id = Some(request_id.to_vec());
+            resource.original_hash = Some(root);
+            resource.segment_index = index;
+            resource.total_segments = 2;
+            resource.advertisement_data_size = payload.len() + 4;
+            let mut transfer =
+                OutboundTransfer::from_prebuilt(resource, Duration::from_millis(500));
+            let TransferAction::SendAdvertisement(adv) = transfer.tick() else {
+                panic!("ADV")
+            };
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_data_packet(
+                        link_id,
+                        PacketContext::ResourceAdv,
+                        &server.encrypt(&adv).unwrap(),
+                    ),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+            assert_eq!(transfer.resource.parts.len(), 1);
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_data_packet(
+                        link_id,
+                        PacketContext::Resource,
+                        &transfer.resource.parts[0],
+                    ),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+            resources.push(transfer.resource);
+        }
+        let response = wait_for_response(
+            &tx,
+            &mut rx,
+            &mut client,
+            link_id,
+            request_id,
+            Duration::from_secs(1),
+            payload.len() + 4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.data, b"reply");
+        assert_eq!(response.metadata, Some(vec![0x80]));
+        for mut resource in resources {
+            let _request = output.try_recv().unwrap();
+            let TransportMessage::Outbound(proof) = output.try_recv().unwrap() else {
+                panic!("proof")
+            };
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
+            assert_eq!(header.context, PacketContext::ResourcePrf);
+            assert!(resource.validate_proof(&proof.raw[offset..]));
+        }
+        let mut session = LinkSession {
+            transport_tx: tx,
+            identity: Arc::new(Identity::new()),
+            link: client,
+            event_rx: rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+        let mut adv = ResourceAdvertisement::new(
+            16,
+            32,
+            1,
+            [3; 32],
+            vec![0; 4],
+            rns_protocol::resource::ResourceFlags::default(),
+            &[[3; 4]],
+            rns_wire::constants::ENCRYPTED_MDU,
+        );
+        adv.total_segments = rns_protocol::resource::MAX_SEGMENTS + 1;
+        events
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    link_id,
+                    PacketContext::ResourceAdv,
+                    &server.encrypt(&adv.pack()).unwrap(),
+                ),
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.recv_resource(Duration::from_secs(1)).await,
+            Err(LinkClientError::Resource(_))
+        ));
+        let TransportMessage::Outbound(cancel) = output.try_recv().unwrap() else {
+            panic!("RCL")
+        };
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&cancel.raw).unwrap();
+        assert_eq!(header.context, PacketContext::ResourceRcl);
     }
 
     #[tokio::test]
