@@ -362,6 +362,29 @@ unconditional `max` even for explicit waits. Older daemons that do not support
 the new query retain the existing CLI defaults/fallback behavior. Resource
 transfer timers are separate and are not comprehensively changed by this setting.
 
+### Incoming request size limit
+
+`Destination::set_max_request_size(bytes)` stores the incoming request policy;
+`max_request_size()` returns `Option<usize>` and `clear_max_request_size()`
+restores the unlimited default. The limit includes the entire packed request
+(timestamp, path hash and data), not only the application body. Zero rejects
+every nonempty packed request.
+
+For runtime responders, configure `LinkManager::set_max_request_size(bytes)`:
+it updates the manager's owned destination, when present, and applies to all
+existing and future links. Setting an unrelated `Destination` does not configure
+the manager. Its getter and clear method have the same semantics.
+Ordinary REQUEST packets exceeding the limit are silently ignored after
+decryption and before MessagePack parsing. Request Resource advertisements are
+checked against their original data size (`d`, not transfer size `t`); oversized
+ones receive encrypted `RESOURCE_RCL` before transfer or split state allocation.
+The link remains usable. Without a request handler, request Resources retain
+the existing ignore behavior. Completed request Resources are checked again
+against their actual packed length before application dispatch. Advertisement
+checks trust the declared size and are not a general decompression memory cap.
+Responses and non-request Resources are unaffected; this is an API policy,
+not a new YAML configuration key.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

@@ -205,6 +205,7 @@ pub struct LinkManager {
     identity_key: Option<Ed25519PrivateKey>,
     pub destination_hash: [u8; 16],
     destination: Option<Destination>,
+    max_request_size: Option<usize>,
     identity: Option<Identity>,
     /// `(link_id, path_hash, data) -> Option<response>`.
     request_handler: Option<RequestHandler>,
@@ -256,6 +257,7 @@ impl LinkManager {
             identity_key,
             destination_hash,
             destination: None,
+            max_request_size: None,
             identity: None,
             request_handler: None,
             request_handler_ex: None,
@@ -306,6 +308,7 @@ impl LinkManager {
             identity_key,
             destination_hash,
             destination: dest,
+            max_request_size: None,
             identity: manager_identity,
             request_handler: None,
             request_handler_ex: None,
@@ -967,6 +970,7 @@ impl LinkManager {
                 // Rust-specific segment-metadata guards below stay a silent reject so
                 // a peer cannot kill an established link by racing bad split metadata.
                 let mut teardown_link = false;
+                let max_request_size = self.max_request_size();
                 if let Some(active) = self.active_links.get_mut(&link_id) {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
@@ -996,6 +1000,22 @@ impl LinkManager {
                                 tracing::debug!(
                                     link_id = hex::encode(link_id),
                                     "ignoring inbound request-resource: no request handlers registered"
+                                );
+                                break 'adv;
+                            }
+
+                            if adv.flags.is_request
+                                && max_request_size.is_some_and(|limit| adv.data_size > limit)
+                            {
+                                // Python ResourceAdvertisement.read_size reads `d`,
+                                // the original data size, not compressed transfer bytes.
+                                // Reject before split coordination or transfer allocation.
+                                Self::send_resource_control_packet(
+                                    &self.transport_tx,
+                                    active,
+                                    &link_id,
+                                    rns_wire::context::PacketContext::ResourceRcl,
+                                    &adv.resource_hash,
                                 );
                                 break 'adv;
                             }
@@ -1382,7 +1402,10 @@ impl LinkManager {
                         }
                     }
                 }
-                if let Some(packed) = completed_request {
+                if let Some(packed) = completed_request.filter(|packed| {
+                    self.max_request_size()
+                        .is_none_or(|limit| packed.len() <= limit)
+                }) {
                     if let Ok((request_id, path_hash, _, data)) = Link::unpack_request(&packed) {
                         self.respond_to_request(link_id, request_id, path_hash, data);
                     }
@@ -1687,10 +1710,15 @@ impl LinkManager {
                 }
             }
             rns_wire::context::PacketContext::Request => {
+                let max_request_size = self.max_request_size();
                 let parsed = self.active_links.get_mut(&link_id).and_then(|active| {
                     active.link.record_inbound();
                     active.link.record_rx(data.len());
-                    active.link.handle_request(data).ok()
+                    let packed = active.link.decrypt(data).ok()?;
+                    if max_request_size.is_some_and(|limit| packed.len() > limit) {
+                        return None;
+                    }
+                    Link::unpack_request(&packed).ok()
                 });
                 if let Some((_, path_hash, _, data)) = parsed {
                     let request_id =
@@ -2308,6 +2336,29 @@ impl LinkManager {
                 link_id,
                 packet_hash,
             });
+        }
+    }
+
+    /// Apply a destination-wide packed-request limit to existing and future links.
+    /// Includes request envelope bytes; Resource advertisements are rejected early.
+    pub fn set_max_request_size(&mut self, bytes: usize) {
+        self.max_request_size = Some(bytes);
+        if let Some(destination) = &mut self.destination {
+            destination.set_max_request_size(bytes);
+        }
+    }
+
+    pub fn max_request_size(&self) -> Option<usize> {
+        self.destination
+            .as_ref()
+            .and_then(Destination::max_request_size)
+            .or(self.max_request_size)
+    }
+
+    pub fn clear_max_request_size(&mut self) {
+        self.max_request_size = None;
+        if let Some(destination) = &mut self.destination {
+            destination.clear_max_request_size();
         }
     }
 
@@ -4644,6 +4695,111 @@ mod tests {
         assert!(
             active.inbound_resources.is_empty(),
             "no per-segment transfer must be opened for a rejected ADV"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_max_request_size_packet_and_resource() {
+        use rns_protocol::resource::ResourceFlags;
+        use rns_protocol::resource_adv::ResourceAdvertisement;
+        use rns_wire::{context::PacketContext, flags::HeaderType, header::PacketHeader};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        let (mut sender, receiver) = handshaken_link_pair();
+        let link_id = receiver.link_id;
+        let (transport_tx, mut transport_rx) = mpsc::channel(64);
+        let (_event_tx, event_rx) = mpsc::channel(16);
+        let mut lm = LinkManager::new(transport_tx, event_rx, [0xCC; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        lm.set_request_handler(move |_, _, _| {
+            handler_calls.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let (packed, _) = sender
+            .prepare_request("size", Some(b"payload"), Duration::from_secs(10))
+            .unwrap();
+        let packet = |context, payload: &[u8]| {
+            let header = PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context,
+            };
+            let mut raw = header.pack().unwrap();
+            raw.extend_from_slice(&sender.encrypt(payload).unwrap());
+            raw
+        };
+        assert_eq!(lm.max_request_size(), None);
+        for (limit, expected) in [
+            (packed.len() - 1, 0),
+            (packed.len(), 1),
+            (packed.len() + 1, 2),
+            (0, 2),
+        ] {
+            lm.set_max_request_size(limit);
+            lm.handle_inbound_packet(&packet(PacketContext::Request, &packed), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), expected);
+        }
+        lm.clear_max_request_size();
+        lm.handle_inbound_packet(&packet(PacketContext::Request, &packed), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        while transport_rx.try_recv().is_ok() {}
+
+        lm.set_max_request_size(32);
+        let adv = ResourceAdvertisement::with_metadata_size(
+            16,
+            33,
+            1,
+            [0x42; 32],
+            vec![0x11; 4],
+            ResourceFlags {
+                is_request: true,
+                ..Default::default()
+            },
+            &[],
+            rns_wire::constants::ENCRYPTED_MDU,
+            0,
+        );
+        lm.handle_inbound_packet(&packet(PacketContext::ResourceAdv, &adv.pack()), 1);
+        let active = lm.active_links.get(&link_id).expect("link kept");
+        assert!(active.inbound_resources.is_empty());
+        assert!(active.inbound_split_resources.is_empty());
+        assert!(active.segment_routing.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let TransportMessage::Outbound(request) = transport_rx.try_recv().expect("RESOURCE_RCL")
+        else {
+            panic!("expected outbound packet")
+        };
+        let (header, offset) = PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.context, PacketContext::ResourceRcl);
+        assert_eq!(
+            sender.decrypt(&request.raw[offset..]).unwrap(),
+            adv.resource_hash
         );
     }
 

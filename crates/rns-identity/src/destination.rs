@@ -131,6 +131,8 @@ pub struct Destination {
 
     // Keyed by SHA-256(path)[:16].
     request_handlers: HashMap<[u8; 16], RequestHandler>,
+    /// Limit for the complete packed request, not just its application data.
+    max_request_size: Option<usize>,
 
     pub links: Vec<[u8; 16]>,
 
@@ -197,6 +199,7 @@ impl Destination {
                     link_established_callback: None,
                     proof_requested_callback: None,
                     request_handlers: HashMap::new(),
+                    max_request_size: None,
                     links: Vec::new(),
                     accept_link_requests: true,
                     default_app_data: None,
@@ -228,6 +231,7 @@ impl Destination {
                     link_established_callback: None,
                     proof_requested_callback: None,
                     request_handlers: HashMap::new(),
+                    max_request_size: None,
                     links: Vec::new(),
                     accept_link_requests: true,
                     default_app_data: None,
@@ -257,6 +261,7 @@ impl Destination {
                     link_established_callback: None,
                     proof_requested_callback: None,
                     request_handlers: HashMap::new(),
+                    max_request_size: None,
                     links: Vec::new(),
                     accept_link_requests: true,
                     default_app_data: None,
@@ -435,6 +440,20 @@ impl Destination {
         if let Some(ref cb) = self.link_established_callback {
             cb(link_id);
         }
+    }
+
+    /// Set the maximum accepted packed request size in bytes. Zero denies
+    /// nonempty requests; the default is unlimited. Runtime receivers enforce it.
+    pub fn set_max_request_size(&mut self, bytes: usize) {
+        self.max_request_size = Some(bytes);
+    }
+
+    pub fn max_request_size(&self) -> Option<usize> {
+        self.max_request_size
+    }
+
+    pub fn clear_max_request_size(&mut self) {
+        self.max_request_size = None;
     }
 
     /// Register a request handler. Returns `false` if `path` is empty.

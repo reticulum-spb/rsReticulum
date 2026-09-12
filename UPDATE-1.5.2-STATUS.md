@@ -2836,3 +2836,32 @@ database_path/tracing prelude сохраняются. Python reference чист,
 Первые два функциональных пункта этапа6 выполнены. Далее — Destination
 max_request_size и отказ от слишком большого Resource до его приёма,
 затем аудит Channel/Buffer/Resource. Этап6 открыт, версия1.0.1.
+
+### Этап 6: Destination.max_request_size
+
+Добавлены Destination::set_max_request_size / max_request_size /
+clear_max_request_size: None по умолчанию, usize в байтах, 0 допустим.
+LinkManager предоставляет те же методы и применяет лимит ко всем своим
+существующим и будущим links, синхронизируя принадлежащий ему Destination.
+Отдельно созданный Destination не конфигурирует чужой LinkManager.
+
+Обычный REQUEST проверяется после decrypt, до unpack: учитывается весь
+MessagePack envelope, а не только пользовательские данные. Превышение
+игнорируется без закрытия link. Для request Resource проверяется поле d
+объявления (Python ResourceAdvertisement.read_size), не transfer_size/t.
+Превышение вызывает encrypted RESOURCE_RCL с resource hash до создания
+transfer/split state. Без request handler сохранено прежнее игнорирование.
+Перед dispatch завершённого Resource дополнительно проверяется реальная
+длина packed request. Это не общий memory cap для недостоверных объявлений
+или распаковки. Ответы и обычные Resource лимитом не затрагиваются.
+
+Один inline test покрывает packet ниже/на/выше лимита, 0, clear, early
+RESOURCE_RCL с проверкой payload и отсутствия transfer/split state.
+`cargo test -p rns-runtime --lib max_request_size --quiet`: 1 passed, 0.01s.
+`cargo check --workspace --all-targets --quiet`: успешно, прежние warnings
+database_path/tracing prelude. Новых test-only файлов нет, длительные тесты
+не запускались. Сопоставлено с чистым Python reference ea98db4f.
+
+Третий функциональный пункт этапа6 выполнен. Далее — существующий
+request_with_metadata_limit/max_response_size, затем Channel/Buffer и
+Resource-исправления. Этап6 ещё открыт, версия1.0.1.
