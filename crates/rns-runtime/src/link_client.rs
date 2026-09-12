@@ -774,10 +774,9 @@ impl LinkSession {
             if header.flags.packet_type == rns_wire::flags::PacketType::Data
                 && header.context == rns_wire::context::PacketContext::None
             {
-                let packet = self
-                    .link
-                    .decrypt(&raw[offset..])
-                    .map_err(|error| LinkClientError::LinkCrypto(format!("packet: {error:?}")))?;
+                let Ok(packet) = self.link.decrypt(&raw[offset..]) else {
+                    continue;
+                };
                 self.link.record_inbound();
                 self.link.record_rx(raw.len() - offset);
                 self.link.keepalive.record_data();
@@ -865,9 +864,9 @@ impl LinkSession {
                     if header.flags.packet_type == rns_wire::flags::PacketType::Data
                         && header.context == rns_wire::context::PacketContext::None
                     {
-                        let packet = self.link.decrypt(&raw[offset..]).map_err(|error| {
-                            LinkClientError::LinkCrypto(format!("packet: {error:?}"))
-                        })?;
+                        let Ok(packet) = self.link.decrypt(&raw[offset..]) else {
+                            continue;
+                        };
                         self.link.keepalive.record_data();
                         self.prove_application_packet(&raw, header.flags.header_type)
                             .await?;
@@ -1267,9 +1266,9 @@ impl LinkSession {
                     rns_wire::context::PacketContext::None
                         if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
                     {
-                        let packet = self.link.decrypt(body).map_err(|error| {
-                            LinkClientError::LinkCrypto(format!("packet: {error:?}"))
-                        })?;
+                        let Ok(packet) = self.link.decrypt(body) else {
+                            continue;
+                        };
                         self.prove_application_packet(&raw, header.flags.header_type)
                             .await?;
                         self.pending_packets.push_back(packet);
@@ -2465,9 +2464,8 @@ async fn wait_for_response(
                                     }
                                 }
                                 Err(e) => {
-                                    return Err(LinkClientError::LinkCrypto(format!(
-                                        "response decrypt: {e:?}"
-                                    )));
+                                    tracing::debug!(error = ?e, "ignoring malformed Link response");
+                                    continue;
                                 }
                             }
                         }
@@ -3035,6 +3033,123 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_link_messages_do_not_abort_receive_or_response() {
+        use rns_wire::context::PacketContext;
+        for mode in 0..5 {
+            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+            let public = key.public_key();
+            let (mut link, request) = Link::new_initiator([7; 16], 1);
+            let (mut peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+            let rtt = link
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            peer.receive_rtt_packet(&rtt).unwrap();
+            let link_id = link.link_id;
+            let (tx, _out) = mpsc::channel(8);
+            let (events, rx) = mpsc::channel(8);
+            let context = if mode < 3 {
+                PacketContext::None
+            } else {
+                PacketContext::Response
+            };
+            let mut bodies = vec![vec![0; 32]];
+            if mode >= 3 {
+                bodies.push(peer.encrypt(&[0xc1]).unwrap());
+            }
+            if mode < 3 {
+                bodies.push(peer.encrypt(b"good data").unwrap());
+            }
+            if mode == 3 {
+                bodies.push(peer.create_response(&[9; 16], b"unrelated").unwrap());
+                bodies.push(peer.create_response(&[8; 16], b"good response").unwrap());
+            }
+            for body in bodies {
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(link_id, context, &body),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
+            if mode == 1 {
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_proof_packet(
+                            link_id,
+                            PacketContext::LinkProof,
+                            &peer.prove_packet_with_link_key(&[42; 32]).unwrap(),
+                        ),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            } else if mode == 2 {
+                events
+                    .send(DestinationEvent::LinkClosed { link_id })
+                    .await
+                    .unwrap();
+            }
+            let mut session = LinkSession {
+                transport_tx: tx,
+                identity: Arc::new(Identity::new()),
+                link,
+                event_rx: rx,
+                channel: None,
+                channel_packets: Vec::new(),
+                pending_packets: VecDeque::new(),
+                pending_resource_packets: VecDeque::new(),
+            };
+            match mode {
+                0 => assert_eq!(session.recv().await.unwrap(), b"good data"),
+                1 => {
+                    assert_eq!(
+                        session
+                            .recv_delivery_proof(Duration::from_secs(1))
+                            .await
+                            .unwrap(),
+                        [42; 32]
+                    );
+                    assert_eq!(session.pending_packets.pop_front().unwrap(), b"good data");
+                }
+                2 => {
+                    assert!(matches!(
+                        session.recv_resource(Duration::from_secs(1)).await,
+                        Err(LinkClientError::HandshakeFailed(_))
+                    ));
+                    assert_eq!(session.pending_packets.pop_front().unwrap(), b"good data");
+                }
+                _ => {
+                    let result = wait_for_response(
+                        &session.transport_tx,
+                        &mut session.event_rx,
+                        &mut session.link,
+                        link_id,
+                        [8; 16],
+                        Duration::from_millis(10),
+                        100,
+                        ResourceResponseMode::Packed,
+                    )
+                    .await;
+                    if mode == 3 {
+                        assert_eq!(result.unwrap().data, b"good response");
+                    } else {
+                        assert!(matches!(result, Err(LinkClientError::Timeout("response"))));
+                    }
+                }
+            }
+            assert_eq!(
+                session.link.state,
+                if mode == 2 {
+                    LinkState::Closed
+                } else {
+                    LinkState::Active
+                }
+            );
+        }
+    }
 
     #[tokio::test]
     async fn resource_advertisement_error_closes_only_authenticated_peer() {

@@ -3970,3 +3970,32 @@ authenticated invalid MessagePack; проверяет Closed, отказ сле�
 Новых test-only файлов и длительных тестов нет. Далее остаётся обработка
 ошибок decrypt/parse обычных Link DATA/Response сообщений; общая готовность
 релиза пока не заявляется.
+
+## Финальная сверка: повреждённые Link DATA и packet Response
+
+Python Link.receive не прекращает работу после ошибки приёма, а обычная DATA
+доставляется приложению только при успешной расшифровке. В клиентской сессии
+ошибка decrypt DATA раньше возвращалась наружу и обрывала текущую операцию.
+Теперь recv, recv_delivery_proof и recv_resource игнорируют такую DATA и
+продолжают ожидание. Повреждённому сообщению не отправляется delivery proof;
+следующее корректное сообщение доставляется/сохраняется обычным путём.
+
+Packet Response wait также продолжает ожидание после ошибки decrypt или
+decode msgpack envelope. Неизвестный request ID остаётся игнорируемым.
+Лимит размера применяется к корректному ответу своего запроса и по-прежнему
+вызывает явный отказ; общий timeout оборачивает весь wait, а не каждый кадр,
+поэтому malformed traffic не продлевает срок операции. Ошибки локальной
+отправки proof и подтверждённое закрытие Link не скрываются этим изменением.
+
+Короткая inline проверка охватывает DATA recv, proof wait, Resource receive,
+ответ после corrupted ciphertext/invalid MessagePack/чужого request ID и
+timeout при отсутствии корректного ответа. Используются настоящие session
+keys и полный handshake обеих сторон. Новых test-only файлов нет.
+
+Граница блока: это packet DATA/Response, не изменение обработки собранного
+Resource response или служебных ResourceReq/HMU. Эти оставшиеся Resource
+receive/error ветки требуют отдельной сверки; обновление ещё не объявлено готовым.
+
+Итог: targeted test — 1 passed (0.06s), существующие runtime response_ —
+13 passed (0.04s). Client-only check и fmt/diff checks прошли.
+Длительные тесты не запускались.
