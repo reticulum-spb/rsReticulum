@@ -75,7 +75,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.1 ingress burst active deadlock | Перенесён порог снятия burst: IC_DEQUE_MIN_SAMPLE вместо IC_BURST_MIN_SAMPLES. Также перенесены sustained hold и PR cooldown из 1.5.2; 22 коротких ingress tests прошли. Maintenance выпускает held announces независимо от burst-флага | 4 / закрыто |
 | 1.4.1 memory efficiency / LOG_EXTREME | Воспроизвести нагрузку и числовые уровни, не переносить Python allocation детали без измерений | 5, 7 |
 | 1.4.1 historical discovery blackhole cleanup | Закрыто: list_with_blackholes удаляет записи по network_id/transport_id; runtime и autoconnect используют актуальный control snapshot, expired TTL исключены | 1 / финальная сверка |
-| 1.4.2 zero-bitrate recursive PR | Воспроизвести незапущенный RNode и bitrate=0 без аппаратуры | 2 |
+| 1.4.2 zero-bitrate recursive PR | Перенесён upstream offline guard (4760103a): recursive PR не ставится в очередь и не резервирует announce cap до online. Короткий actor case проверяет offline/bitrate=0 → online; аппаратная проверка не заявляется | 2 / закрыто |
 | 1.4.2 Android slow blackhole filtering | Общее фильтрование discovery перенесено через HashSet snapshot; Python runtime-specific slowdown/60s cache не копируется. Android hardware/performance не проверялись | 1 / граница платформенной проверки |
 | 1.5.0 discovery operator LXMF | Wire/runtime реализованы; YAML отсутствует | 1 |
 | 1.5.0 prioritized inbound / configurable four queue lengths | Отсутствуют: `TransportActor::new` создаёт один mpsc для control и inbound | 4 |
@@ -4051,3 +4051,25 @@ burst после старой активации, PR cooldown и его сбро
 при ещё активном burst. `cargo test -p rns-transport --lib ingress::tests
 --offline --quiet`: 22 passed (0.00s). Изменены только production module с
 inline tests и этот журнал; отдельных test-only файлов нет.
+
+## Финальная сверка: offline recursive PR и relay proof timeout
+
+Исправление RNode из Python 1.4.2 (`4760103a`) состоит в исключении offline
+интерфейсов из recursive discovery. В Rust проверка добавлена непосредственно
+в `send_path_request` перед egress limiter, резервированием announce cap,
+отправкой и обновлением path_requests. Это также покрывает прямые внутренние
+вызовы этой функции. Отсутствующий online flag сохраняет прежний смысл
+«не отмечен offline»; нерекурсивные запросы не меняются. Существующий inline
+case проверяет отсутствие отправки/резерва для offline интерфейса с bitrate=0
+и нормальный recursive discovery после online с рабочим bitrate.
+
+При сверке bitrate найдено связанное расхождение relay Link Request:
+`extra_link_proof_timeout` в 1.5.2 (`bde5611a`) добавляет время передачи одного
+базового MTU только при ненулевой скорости. Rust использовал длину LR и
+`bitrate.max(1)`. Теперь добавка равна `MTU * 8 / bitrate`, а для нулевой
+скорости — нулю. Базовый per-hop timeout и negotiated link MTU не изменены.
+Существующий forwarding case проверяет расчёт и реальную пересылку при
+скоростях 0, 1, 1200 и 115200 бит/с.
+
+Короткие проверки: `recursive_path_request_` — 5 passed, Link Request
+forwarding — 1 passed; обе группы 0.00s. Новых test-only файлов нет.

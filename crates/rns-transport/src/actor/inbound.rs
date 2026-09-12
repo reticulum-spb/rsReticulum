@@ -1275,9 +1275,14 @@ impl TransportActor {
             let link_id = rns_wire::hash::link_id_from_raw(raw, header.flags.header_type);
             let now = now_f64();
             let base_timeout = 60.0 * (remaining_hops.max(1) as f64);
-            let extra_timeout = if let Some(iface) = self.interfaces.get(&target_interface) {
-                let bitrate = iface.bitrate.max(1) as f64;
-                (raw.len() as f64 * 8.0) / bitrate
+            let extra_timeout = if let Some(iface) = self
+                .interfaces
+                .get(&target_interface)
+                .filter(|iface| iface.bitrate > 0)
+            {
+                // Python extra_link_proof_timeout budgets one full base MTU,
+                // not the LR size. Unknown bitrate adds no serialization time.
+                (rns_wire::constants::MTU as f64 * 8.0) / iface.bitrate as f64
             } else {
                 0.0
             };

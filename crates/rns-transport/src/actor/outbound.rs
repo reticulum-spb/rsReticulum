@@ -784,6 +784,12 @@ impl TransportActor {
             }
 
             if recursive {
+                // An uninitialised/reconnecting driver can still be registered
+                // with bitrate zero. Do not queue PRs or reserve airtime until
+                // it is online (Python 1.4.2 recursive discovery guard).
+                if interface_marked_offline(entry) {
+                    return;
+                }
                 if entry.ingress.should_egress_limit_pr() {
                     trace!(
                         dest = %hex::encode(destination_hash),

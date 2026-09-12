@@ -3786,41 +3786,53 @@ mod tests {
 
     #[test]
     fn test_link_request_forwarding() {
-        let (mut actor, _tx) = TransportActor::new();
-        actor.is_transport_enabled = true;
-        let transport_id = [0xAA; 16];
-        actor.transport_identity_hash = Some(transport_id);
+        for bitrate in [0, 1, 1200, 115200] {
+            let (mut actor, _tx) = TransportActor::new();
+            actor.is_transport_enabled = true;
+            let transport_id = [0xAA; 16];
+            actor.transport_identity_hash = Some(transport_id);
 
-        let (entry1, _rx1) = make_test_interface("iface1");
-        let (entry2, mut rx2) = make_test_interface("iface2");
-        actor.interfaces.insert(1, entry1);
-        actor.interfaces.insert(2, entry2);
+            let (entry1, _rx1) = make_test_interface("iface1");
+            let (mut entry2, mut rx2) = make_test_interface("iface2");
+            entry2.bitrate = bitrate;
+            actor.interfaces.insert(1, entry1);
+            actor.interfaces.insert(2, entry2);
 
-        // Insert a path pointing to interface 2
-        let dest_hash = [0x55; 16];
-        let path_entry =
-            crate::path_table::PathEntry::new(Some([0xBB; 16]), 1, 2, InterfaceMode::Gateway);
-        actor.path_table.insert(dest_hash, path_entry);
+            // Insert a path pointing to interface 2
+            let dest_hash = [0x55; 16];
+            let path_entry =
+                crate::path_table::PathEntry::new(Some([0xBB; 16]), 1, 2, InterfaceMode::Gateway);
+            actor.path_table.insert(dest_hash, path_entry);
 
-        // Inject in-transport link request on interface 1
-        let raw = make_header2_link_request_packet(transport_id, dest_hash, 0, &[0x42; 64]);
-        actor.on_inbound(InboundPacket {
-            raw,
-            interface_id: 1,
-            rssi: None,
-            snr: None,
-            q: None,
-        });
+            // Inject in-transport link request on interface 1
+            let raw = make_header2_link_request_packet(transport_id, dest_hash, 0, &[0x42; 64]);
+            let link_id =
+                rns_wire::hash::link_id_from_raw(&raw, rns_wire::flags::HeaderType::Header2);
+            actor.on_inbound(InboundPacket {
+                raw,
+                interface_id: 1,
+                rssi: None,
+                snr: None,
+                q: None,
+            });
 
-        // Interface 2 should have received the forwarded link request
-        let forwarded = rx2.try_recv().unwrap();
-        assert_eq!(forwarded[1], 1); // raw 0 -> inbound-adjusted 1
-        let (forwarded_header, _) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
-        assert_eq!(
-            forwarded_header.flags.header_type,
-            rns_wire::flags::HeaderType::Header1
-        );
-        assert_eq!(forwarded_header.transport_id, None);
+            // Interface 2 should have received the forwarded link request
+            let forwarded = rx2.try_recv().unwrap();
+            assert_eq!(forwarded[1], 1); // raw 0 -> inbound-adjusted 1
+            let (forwarded_header, _) = rns_wire::header::PacketHeader::unpack(&forwarded).unwrap();
+            assert_eq!(
+                forwarded_header.flags.header_type,
+                rns_wire::flags::HeaderType::Header1
+            );
+            assert_eq!(forwarded_header.transport_id, None);
+            let link = actor.link_table.get(&link_id).expect("relay proof state");
+            let extra = if bitrate == 0 {
+                0.0
+            } else {
+                (rns_wire::constants::MTU as f64 * 8.0) / bitrate as f64
+            };
+            assert!((link.proof_timeout - link.timestamp - 60.0 - extra).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -11260,9 +11272,19 @@ mod tests {
         let (mut requestor, _requestor_rx) = make_test_interface("requestor");
         requestor.mode = InterfaceMode::Gateway;
         actor.interfaces.insert(1, requestor);
-        let (outbound, mut outbound_rx) = make_test_interface("outbound");
+        let (mut outbound, mut outbound_rx) = make_test_interface("outbound");
+        let online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        outbound.online = Some(online.clone());
+        outbound.bitrate = 0;
         actor.interfaces.insert(2, outbound);
 
+        actor.send_path_request([0xE7; 16], 2, None, true);
+        assert!(outbound_rx.try_recv().is_err());
+        assert_eq!(actor.interfaces.get(&2).unwrap().announce_allowed_at, 0.0);
+        assert!(!actor.path_requests.contains_key(&[0xE7; 16]));
+
+        online.store(true, std::sync::atomic::Ordering::SeqCst);
+        actor.interfaces.get_mut(&2).unwrap().bitrate = 115200;
         actor.handle_inbound_path_request(&make_path_request_payload([0xE7; 16], None), 1);
 
         outbound_rx
