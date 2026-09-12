@@ -2950,3 +2950,35 @@ Python reference ea98db4f чист. Resource-аудит остаётся отк�
 перепривязка частей, потоковые источники, регрессия1.5.2 и оставшиеся таймеры.
 Workspace all-targets check и diff check успешны; прежние warnings
 database_path/tracing prelude сохраняются.
+
+### Этап 6: индексы частей и протокольная отмена
+
+Сопоставлены точные Python fixes65222e0d (receive_part/request_next index),
+0c410277 (не перепривязывать data при создании частей), c1d7c12b/6bc0481c
+(stream proxy, flush/seek, регрессия1.5.2). Rust consecutive_completed хранит
+число завершённых подряд частей, а не индекс последней: receive_part и
+request_next начинают с одного первого незавершённого слота. Разбиение blob
+на parts через chunks не перепривязывает исходные данные. Эти fixes уже
+покрыты текущей архитектурой, повторная реализация не нужна.
+
+Stream proxy в Rust отсутствует: Resource API принимает Vec<u8>, rncp читает
+файл целиком. Ошибка Python temporary-file flush/seek здесь неприменима,
+но полноценный bounded-memory reader/file source остаётся отсутствующей
+возможностью, а не выполненным потоковым переносом.
+
+Найден и закрыт runtime gap: SendCancel из протокольного handler больше не
+игнорируется LinkSession. Некорректный exhausted request вызывает encrypted
+ICL и немедленный Result/error вместо ожидания proof timeout. Cancelling HMU
+в ожидании ответа вызывает RCL и завершает операцию, освобождая coordinator.
+LinkManager в обоих случаях освобождает transfer/split-state. Проверка hash
+в OutboundTransfer::handle_request не позволяет чужому запросу менять state.
+
+Существующий inline test non-boundary exhausted request дополнен чужим hash:
+`cargo test -p rns-protocol --lib test_exhausted_request_non_boundary_cancels --quiet`
+— 1 passed, 0.01s. Добавлен один inline runtime scenario с handshake и
+проверкой encrypted ICL; отдельных test-only файлов нет. Длительные тесты
+не запускались. Python reference ea98db4f чист. Resource-таймеры и общий
+оставшийся аудит этапа6 ещё открыты; версия1.0.1.
+`cargo test -p rns-runtime --lib malformed_resource_request_sends_cancel --quiet`:
+1 passed, 0.01s. Workspace all-targets check и diff check успешны, прежние
+warnings database_path/tracing prelude сохраняются.

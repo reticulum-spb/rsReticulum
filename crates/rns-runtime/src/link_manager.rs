@@ -1440,6 +1440,9 @@ impl LinkManager {
                                     })
                                     .unwrap_or_default();
                                 for action in actions {
+                                    if let TransferAction::SendCancel(_, hash) = &action {
+                                        Self::remove_outbound_resource(active, hash);
+                                    }
                                     let (context, body) = match action {
                                         TransferAction::SendPart(idx, part_data) => {
                                             tracing::trace!(
@@ -1577,6 +1580,9 @@ impl LinkManager {
                         {
                             if let Some(transfer) = active.inbound_resources.get_mut(&rh) {
                                 let action = transfer.hashmap_update(segment, &hashmap);
+                                if matches!(&action, TransferAction::SendCancel(_, _)) {
+                                    Self::remove_inbound_resource(active, &rh);
+                                }
                                 // A solicited HMU may either request the next parts or
                                 // cancel the transfer (RESOURCE_RCL) on an empty/invalid
                                 // update (1.3.9).

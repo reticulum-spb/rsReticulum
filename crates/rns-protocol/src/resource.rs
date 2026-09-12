@@ -1513,6 +1513,16 @@ impl OutboundTransfer {
         if request_data.is_empty() || self.resource.state == ResourceState::Failed {
             return Vec::new();
         }
+        let resource_offset = if request_data[0] == HASHMAP_IS_EXHAUSTED {
+            1 + MAPHASH_LEN
+        } else {
+            1
+        };
+        if request_data.get(resource_offset..resource_offset + 32)
+            != Some(self.resource.resource_hash.as_slice())
+        {
+            return Vec::new();
+        }
 
         // Refine the RTT estimate using the elapsed time since startup.
         let elapsed = self.started_at.elapsed();
@@ -3962,6 +3972,12 @@ mod tests {
         request_data.push(HASHMAP_IS_EXHAUSTED);
         request_data.extend_from_slice(&sender.resource.map_hashes[0]);
         request_data.extend_from_slice(&sender.resource.resource_hash);
+
+        let original_state = sender.resource.state;
+        let mut unrelated = request_data.clone();
+        unrelated[1 + MAPHASH_LEN] ^= 0xFF;
+        assert!(sender.handle_request(&unrelated).is_empty());
+        assert_eq!(sender.resource.state, original_state);
 
         let actions = sender.handle_request(&request_data);
         assert_eq!(sender.resource.state, ResourceState::Failed);

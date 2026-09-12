@@ -1369,6 +1369,27 @@ impl LinkSession {
                                 TransferAction::Failed(reason) => {
                                     return Err(LinkClientError::Resource(reason));
                                 }
+                                TransferAction::SendCancel(cancel_type, hash) => {
+                                    let context = match cancel_type {
+                                        rns_protocol::resource::CancelType::Icl => {
+                                            rns_wire::context::PacketContext::ResourceIcl
+                                        }
+                                        rns_protocol::resource::CancelType::Rcl => {
+                                            rns_wire::context::PacketContext::ResourceRcl
+                                        }
+                                    };
+                                    send_link_data(
+                                        &self.transport_tx,
+                                        &self.link,
+                                        link_id,
+                                        context,
+                                        &hash,
+                                        true,
+                                    )?;
+                                    return Err(LinkClientError::Resource(
+                                        "resource request cancelled transfer".into(),
+                                    ));
+                                }
                                 _ => {}
                             }
                         }
@@ -2163,6 +2184,9 @@ async fn wait_for_response(
                                         &resource_hash,
                                         true,
                                     )?;
+                                    return Err(LinkClientError::Resource(
+                                        "resource hashmap update cancelled response".into(),
+                                    ));
                                 }
                                 _ => {}
                             }
@@ -2323,6 +2347,67 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_resource_request_sends_cancel_without_waiting() {
+        use rns_wire::context::PacketContext;
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([7; 16], 1);
+        let (mut peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        let rtt = link
+            .validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        peer.receive_rtt_packet(&rtt).unwrap();
+        let link_id = link.link_id;
+        let transfer =
+            OutboundTransfer::new(vec![42; 2000], false, Duration::from_millis(10)).unwrap();
+        let hash = transfer.resource.resource_hash;
+        let mut invalid_request = vec![rns_protocol::resource::HASHMAP_IS_EXHAUSTED];
+        invalid_request.extend_from_slice(&transfer.resource.map_hashes[0]);
+        invalid_request.extend_from_slice(&hash);
+        let (tx, mut outbound) = mpsc::channel(8);
+        let (events, rx) = mpsc::channel(8);
+        events
+            .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(
+                    link_id,
+                    PacketContext::ResourceReq,
+                    &peer.encrypt(&invalid_request).unwrap(),
+                ),
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+        let mut session = LinkSession {
+            transport_tx: tx,
+            identity: Arc::new(Identity::new()),
+            link,
+            event_rx: rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+        let result = session
+            .send_resource_transfer(transfer, Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(result, Err(LinkClientError::Resource(_))),
+            "{result:?}"
+        );
+        for context in [PacketContext::ResourceAdv, PacketContext::ResourceIcl] {
+            let TransportMessage::Outbound(packet) = outbound.try_recv().unwrap() else {
+                panic!("outbound")
+            };
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+            assert_eq!(header.context, context);
+            if context == PacketContext::ResourceIcl {
+                assert_eq!(peer.decrypt(&packet.raw[offset..]).unwrap(), hash);
+            }
+        }
+        assert_eq!(session.link.state, LinkState::Active);
+    }
 
     #[tokio::test]
     async fn response_size_limit_uses_total_advertised_size() {

@@ -445,6 +445,17 @@ transfer's `RESOURCE_ICL` with `RESOURCE_RCL`, as Python does. Unrelated
 transfers are retained. These changes cover remote cancellation; they do not
 add a new application cancellation API or complete the Resource timer audit.
 
+Protocol-driven cancellation also terminates runtime work: an invalid exhausted
+hashmap request emits encrypted `RESOURCE_ICL` and ends the sender operation;
+a cancelling hashmap update emits `RESOURCE_RCL` and ends response reception.
+LinkManager releases the corresponding transfer and split state in both cases.
+Resource requests naming a different full hash do not advance a sender's state.
+
+Resource send APIs currently accept in-memory `Vec<u8>` data; `rncp-rs` reads
+the file before sending. The Python 1.5.2 stream-proxy `flush`/`seek` fix has no
+equivalent temporary-file path here. This is not a claim of streaming parity:
+bounded-memory reader/file-source Resource sending remains unimplemented.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept
