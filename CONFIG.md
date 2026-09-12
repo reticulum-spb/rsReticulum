@@ -456,6 +456,22 @@ the file before sending. The Python 1.5.2 stream-proxy `flush`/`seek` fix has no
 equivalent temporary-file path here. This is not a claim of streaming parity:
 bounded-memory reader/file-source Resource sending remains unimplemented.
 
+### Resource receive watchdog
+
+While waiting for a Resource-backed response, LinkSession checks the existing
+adaptive receive timeout once per second, including during network silence.
+Expired windows resend encrypted `RESOURCE_REQ`; the interval skips missed
+ticks instead of issuing a burst. Retry exhaustion sends `RESOURCE_RCL` for
+active response segments and returns an error, releasing response state.
+LinkManager also sends `RESOURCE_RCL` before removing an exhausted inbound
+transfer. The caller's overall response deadline is unchanged and is not
+extended by retries.
+
+This does not complete sender-side watchdog parity: advertisement retries,
+lost final-proof recovery and signalling on the caller's overall deadline still
+need separate review. The rncp resource-proof wait also retains its existing
+120-second cap at this point.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

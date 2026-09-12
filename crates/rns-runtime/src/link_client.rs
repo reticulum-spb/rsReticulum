@@ -1854,8 +1854,20 @@ async fn wait_for_response(
         let mut response_shape = None;
         let mut seen_segments = HashMap::new();
         let mut assembled_bytes = 0usize;
+        let mut resource_timer = tokio::time::interval(Duration::from_secs(1));
+        resource_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        while let Some(ev) = rx.recv().await {
+        loop {
+            let ev = tokio::select! {
+                _ = resource_timer.tick() => {
+                    retry_response_resources(transport_tx, link, link_id, &mut inbound_resources)?;
+                    continue;
+                }
+                event = rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
             match ev {
                 DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
                     return Err(LinkClientError::HandshakeFailed("link closed".into()));
@@ -2232,6 +2244,44 @@ async fn wait_for_response(
         .map_err(|_| LinkClientError::Timeout("response"))?
 }
 
+/// Drive the existing receive watchdog without extending the request deadline.
+fn retry_response_resources(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link: &Link,
+    link_id: [u8; 16],
+    resources: &mut HashMap<[u8; 32], InboundTransfer>,
+) -> Result<(), LinkClientError> {
+    for transfer in resources.values_mut() {
+        match transfer.check_timeout() {
+            TransferAction::SendRequest(payload) => send_link_data(
+                transport_tx,
+                link,
+                link_id,
+                rns_wire::context::PacketContext::ResourceReq,
+                &payload,
+                true,
+            )?,
+            TransferAction::Failed(reason) => {
+                // The caller drops the complete response coordinator on error.
+                // Cancel every active segment, not only the exhausted one.
+                for hash in resources.keys() {
+                    let _ = send_link_data(
+                        transport_tx,
+                        link,
+                        link_id,
+                        rns_wire::context::PacketContext::ResourceRcl,
+                        hash,
+                        true,
+                    );
+                }
+                return Err(LinkClientError::Resource(reason));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Cancel controls are encrypted and identify one transfer by a full hash.
 fn resource_cancel_hash(link: &Link, body: &[u8]) -> Option<[u8; 32]> {
     let plaintext = link.decrypt(body).ok()?;
@@ -2347,6 +2397,54 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_resource_timer_retries_then_cancels() {
+        use rns_wire::context::PacketContext;
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([7; 16], 1);
+        let (peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        link.validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        let hash = [0xa5; 32];
+        let mut transfer = InboundTransfer::from_advertisement(
+            1,
+            64,
+            64,
+            [0xb6; 4],
+            hash,
+            rns_protocol::resource::ResourceFlags::default(),
+            vec![[0xc7; 4]],
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        transfer.request_next();
+        let mut resources = HashMap::from([(hash, transfer)]);
+        let (tx, mut rx) = mpsc::channel(8);
+        for (retries, context) in [
+            (1, PacketContext::ResourceReq),
+            (0, PacketContext::ResourceRcl),
+        ] {
+            let transfer = resources.get_mut(&hash).unwrap();
+            transfer.retries_left = retries;
+            transfer.last_activity = Instant::now() - Duration::from_secs(60);
+            let result = retry_response_resources(&tx, &link, link.link_id, &mut resources);
+            assert_eq!(result.is_err(), retries == 0);
+            let TransportMessage::Outbound(packet) = rx.try_recv().unwrap() else {
+                panic!("outbound")
+            };
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+            assert_eq!(header.context, context);
+            let plaintext = peer.decrypt(&packet.raw[offset..]).unwrap();
+            if retries == 0 {
+                assert_eq!(plaintext, hash);
+            } else {
+                assert_eq!(&plaintext[1..33], &hash);
+            }
+        }
+        assert_eq!(link.state, LinkState::Active);
+    }
 
     #[tokio::test]
     async fn malformed_resource_request_sends_cancel_without_waiting() {

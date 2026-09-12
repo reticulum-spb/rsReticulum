@@ -1958,6 +1958,13 @@ impl LinkManager {
                             reason,
                             "inbound resource transfer timed out"
                         );
+                        Self::send_resource_control_packet(
+                            &self.transport_tx,
+                            active,
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceRcl,
+                            &resource_hash,
+                        );
                         Self::remove_inbound_resource(active, &resource_hash);
                     }
                     _ => {}
@@ -4340,9 +4347,9 @@ mod tests {
 
     #[test]
     fn tick_removes_timed_out_inbound_resource() {
-        let (_initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
+        let (initiator_link, responder_link, _identity_key) = handshaken_link_pair_with_identity();
         let link_id = responder_link.link_id;
-        let (transport_tx, _transport_rx) = mpsc::channel(16);
+        let (transport_tx, mut transport_rx) = mpsc::channel(16);
         let (_event_tx, event_rx) = mpsc::channel(16);
         let mut lm = LinkManager::new(transport_tx, event_rx, [0xC3; 16], None);
 
@@ -4382,6 +4389,21 @@ mod tests {
         );
 
         lm.tick();
+
+        let TransportMessage::Outbound(packet) =
+            transport_rx.try_recv().expect("timeout cancellation")
+        else {
+            panic!("outbound")
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceRcl
+        );
+        assert_eq!(
+            initiator_link.decrypt(&packet.raw[offset..]).unwrap(),
+            resource_hash
+        );
 
         let active = lm.active_links.get(&link_id).expect("link remains active");
         assert!(

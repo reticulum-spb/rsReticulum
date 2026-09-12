@@ -2982,3 +2982,29 @@ LinkManager в обоих случаях освобождает transfer/split-s
 `cargo test -p rns-runtime --lib malformed_resource_request_sends_cancel --quiet`:
 1 passed, 0.01s. Workspace all-targets check и diff check успешны, прежние
 warnings database_path/tracing prelude сохраняются.
+
+### Этап 6: watchdog приёма Resource-ответа
+
+Обнаружен пропущенный вызов существующего InboundTransfer::check_timeout:
+LinkSession::wait_for_response раньше только ожидал события до общего deadline.
+Добавлен select с периодическим tick1s (Python WATCHDOG_MAX_SLEEP1), missed
+ticks пропускаются. При истечении адаптивного окна отправляется encrypted
+RESOURCE_REQ. Формула EIFR/RTT/HMU wait/retry backoff не продублирована и не
+заменена фиксированным timeout. Исчерпание retries отменяет все активные
+сегменты ответа через RCL и завершает операцию с освобождением coordinator.
+LinkManager теперь также отправляет RCL перед удалением inbound по timeout.
+Общий deadline пользователя остаётся прежним и не продлевается повтором.
+
+Один новый inline test проверяет retry/exhaustion с расшифровкой REQ/RCL,
+существующий manager timeout test дополнен проверкой RCL. Без ожидания реальных
+таймаутов: last_activity заранее сдвинут назад. Команды
+`cargo test -p rns-runtime --lib response_resource_timer --quiet` и
+`cargo test -p rns-runtime --lib tick_removes_timed_out_inbound_resource --quiet`:
+по1 passed, 0.01s. Новых test-only файлов нет, длительные тесты не запускались.
+
+Аудит таймеров ещё открыт: sender advertisement retries, восстановление
+потерянного final proof, cleanup/signalling при общем deadline, rncp proof
+wait cap120s. Наличие констант MAX_ADV_RETRIES/PROOF_TIMEOUT_FACTOR не считается
+реализованным runtime-поведением. Этап6 открыт, версия1.0.1.
+Workspace all-targets check, fmt check и diff check успешны; прежние warnings
+database_path/tracing prelude сохраняются.
