@@ -87,7 +87,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 queue pressure/drop statistics | Отсутствует с новыми очередями | 4, 7 |
 | 1.5.0 detailed announce/PR flow, totals/frequencies/composition | Частично: `traffic.rs`, `ingress.rs`, RPC/CLI частоты есть; полная композиция отсутствует | 7 |
 | 1.5.0 active links / blocked IP listings | Частично: LinkCount есть; отдельную статистику active Links проверить; blocked IP отсутствуют | 7 |
-| 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | Отсутствуют: RPC имеет first_hop_timeout, что не является medium_path_timeout | 6 |
+| 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | RPC/helpers реализованы; финальная сверка подключила общий medium_path_timeout к запуску recursive discovery и созданию списка ожидающих PR. Учитываются только online-интерфейсы с ненулевой скоростью, floor 15s; 9 коротких проверок прошли | 6 / финальная сверка |
 | 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Отсутствует связь с medium helper | 6 |
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
 | 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Actor/inflight перенесены; финальная сверка дополнительно исправила sustained ingress, offline recursive PR, relay proof timeout и preemptive PR egress (порог 2). Остальные семантические изменения проверяются по upstream commits | 4, 6 |
@@ -4226,3 +4226,25 @@ blocked_interface исходной записи, порядка очереди �
 Существующие inline checks проверяют повторы с другим blocked_interface
 и без него, сохранение времени отправки, повторную постановку после drain
 и лимит 32. Результат: 3 passed (0.00s), без sleep. Новых test-only файлов нет.
+
+## Финальная сверка: slow-medium timeout во внутреннем discovery
+
+Выявлен незавершённый перенос Python `4b914fb9` / `9ae3db16` и последующего
+inflight batching: RPC MediumPathTimeout работал, но actor создавал discovery
+state с фиксированными 15 секундами. Расчёт вынесен в общий метод actor,
+который используют RPC и оба внутренних пути: запуск recursive discovery
+и создание unengaged списка ожидающих при уже существующем inflight gate.
+
+Deadline теперь равен now + max(15s, medium_path_timeout). Medium timeout —
+время полного обмена одним базовым MTU на самом медленном online-интерфейсе
+с ненулевым bitrate, с прежними MINIMUM_BITRATE и per-hop allowance. Если
+такого интерфейса нет, medium timeout равен 0 и остаётся минимум 15s.
+Уже существующий список ожидающих не получает новый deadline при каждом
+повторе; 45-секундный inflight gate остаётся отдельным механизмом.
+
+Существующие inline cases проверяют RPC и unengaged batching при медленном
+канале (1606s), неизменность deadline при добавлении ожидающего интерфейса,
+реальный запуск recursive PR с тем же allowance, offline/zero-bitrate
+и обычные inflight guards. Результаты: medium timeout — 1 passed,
+recursive PR — 5 passed, inflight gate — 3 passed (0.00s/0.00s/0.06s).
+Ожидания по реальному deadline нет, новых test-only файлов нет.

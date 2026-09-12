@@ -641,19 +641,20 @@ impl TransportActor {
                 dest = %hex::encode(requested_dest),
                 "forwarding path request on other interfaces"
             );
+            let discovery_timeout = PATH_REQUEST_TIMEOUT.max(self.medium_path_timeout());
             let request = self
                 .discovery_path_requests
                 .entry(requested_dest)
                 .or_insert_with(|| DiscoveryPathRequest {
                     requesting_interfaces: Vec::new(),
-                    timeout: now + PATH_REQUEST_TIMEOUT,
+                    timeout: now + discovery_timeout,
                     engaged: false,
                 });
             if !request.requesting_interfaces.contains(&interface_id) {
                 request.requesting_interfaces.push(interface_id);
             }
             request.engaged = true;
-            request.timeout = now + PATH_REQUEST_TIMEOUT;
+            request.timeout = now + discovery_timeout;
             self.forward_path_request(
                 requested_dest,
                 Some(interface_id),
@@ -705,10 +706,11 @@ impl TransportActor {
         }
         if self.inflight_path_requests.contains_key(&dest) {
             if !ingress_limited && self.interfaces.contains_key(&interface_id) {
+                let discovery_timeout = PATH_REQUEST_TIMEOUT.max(self.medium_path_timeout());
                 let request = self.discovery_path_requests.entry(dest).or_insert_with(|| {
                     DiscoveryPathRequest {
                         requesting_interfaces: Vec::new(),
-                        timeout: now + PATH_REQUEST_TIMEOUT,
+                        timeout: now + discovery_timeout,
                         engaged: false,
                     }
                 });

@@ -1695,6 +1695,22 @@ impl TransportActor {
         Some(raw)
     }
 
+    /// Round-trip allowance for one base MTU on the slowest online medium.
+    /// Shared by RPC and internal discovery so they use the same live bitrate.
+    fn medium_path_timeout(&self) -> f64 {
+        self.interfaces
+            .values()
+            .filter(|iface| iface.bitrate > 0 && !interface_marked_offline(iface))
+            .map(|iface| iface.bitrate)
+            .min()
+            .map(|rate| {
+                2.0 * rns_wire::constants::MTU as f64 * 8.0
+                    / rate.max(rns_wire::constants::MINIMUM_BITRATE) as f64
+                    + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+            })
+            .unwrap_or(0.0)
+    }
+
     pub fn has_path(&self, dest_hash: &[u8; 16]) -> bool {
         self.path_table.has_path(dest_hash)
     }
@@ -3990,6 +4006,13 @@ mod tests {
         actor.interfaces.get_mut(&1).unwrap().bitrate = 1;
         online.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(query(&mut actor), 1606.0);
+        let dest = [0xD1; 16];
+        assert!(actor.admit_inflight_path_request(dest, 2, false, 100.0));
+        assert!(!actor.admit_inflight_path_request(dest, 2, false, 101.0));
+        assert_eq!(actor.discovery_path_requests[&dest].timeout, 1707.0);
+        assert!(!actor.discovery_path_requests[&dest].engaged);
+        assert!(!actor.admit_inflight_path_request(dest, 1, false, 102.0));
+        assert_eq!(actor.discovery_path_requests[&dest].timeout, 1707.0);
         actor.interfaces.get_mut(&1).unwrap().bitrate = 0;
         assert_eq!(query(&mut actor), 7.0);
         actor.interfaces.remove(&2);
@@ -11399,8 +11422,14 @@ mod tests {
         assert!(!actor.path_requests.contains_key(&[0xE7; 16]));
 
         online.store(true, std::sync::atomic::Ordering::SeqCst);
-        actor.interfaces.get_mut(&2).unwrap().bitrate = 115200;
+        actor.interfaces.get_mut(&2).unwrap().bitrate = 1;
+        let before_discovery = now_f64();
         actor.handle_inbound_path_request(&make_path_request_payload([0xE7; 16], None), 1);
+
+        let discovery = &actor.discovery_path_requests[&[0xE7; 16]];
+        assert!(discovery.engaged);
+        assert!(discovery.timeout >= before_discovery + 1606.0);
+        assert!(discovery.timeout <= now_f64() + 1606.0);
 
         outbound_rx
             .try_recv()
