@@ -4095,3 +4095,26 @@ lock или повторного учёта отправок не требует
 минимум отсчётов и decay. Actor case ограниченного интерфейса теперь также
 использует только два исходящих отсчёта. Результаты: ingress — 22 passed,
 recursive PR — 5 passed (обе группы 0.00s). Отдельных test-only файлов нет.
+
+## Финальная сверка: online admission для attached и broadcast outbound
+
+При сверке Python `3fdfe93e` найден отсутствующий online guard у кандидатов
+на исходящую отправку. Attached path в Rust уже выбирал интерфейс напрямую,
+без обхода всех интерфейсов; теперь он требует существующий OUT-интерфейс,
+не отмеченный offline, до обновления traffic, dedup и announce accounting.
+Отсутствующий target не вызывает broadcast fallback. Общий broadcast helper
+также исключает offline-интерфейсы из кандидатов.
+
+Это проверка admission, а не удаление интерфейсов и не изменение общего
+`send_to_interface`: регистрация reconnecting интерфейса сохраняется.
+Низкоуровневая буферизация shared-instance peer остаётся прежней, как и
+направленная отправка по существующему path/link. Отсутствующий optional
+online flag по-прежнему означает «не отмечен offline». Гонка с изменением
+driver flag после admission здесь не объявляется устранённой.
+
+Расширены существующие inline cases: отсутствующий/offline/inbound-only
+attached target не получает пакет и не меняет local traffic/dedup; после
+online пакет отправляется только выбранному интерфейсу. Broadcast пропускает
+offline target без удаления регистрации. Результаты: `outbound_` — 12 passed
+(0.01s), существующий offline shared-peer buffering case — 1 passed (0.00s).
+Отдельных test-only файлов нет.

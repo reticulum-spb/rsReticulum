@@ -213,6 +213,16 @@ impl TransportActor {
         request: crate::messages::OutboundRequest,
         interface_id: InterfaceId,
     ) {
+        // Python's attached-interface candidate must be OUT and online.
+        // Reject before traffic/hash/announce accounting, not just at enqueue.
+        // Keep send_to_interface's shared-peer reconnect buffering unchanged.
+        if !self
+            .interfaces
+            .get(&interface_id)
+            .is_some_and(|entry| entry.direction.outbound && !interface_marked_offline(entry))
+        {
+            return;
+        }
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
             if parsed.hops >= PATHFINDER_M {
                 return;

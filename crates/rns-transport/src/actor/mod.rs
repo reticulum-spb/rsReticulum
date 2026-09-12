@@ -1438,7 +1438,10 @@ impl TransportActor {
             .interfaces
             .iter()
             .filter_map(|(&id, entry)| {
-                if except == Some(id) || !entry.direction.outbound {
+                if except == Some(id)
+                    || !entry.direction.outbound
+                    || interface_marked_offline(entry)
+                {
                     None
                 } else {
                     Some(id)
@@ -4826,6 +4829,9 @@ mod tests {
         let (mut actor, _tx) = TransportActor::new();
         let (entry1, mut rx1) = make_test_interface("iface1");
         let (entry2, mut rx2) = make_test_interface("iface2");
+        let (mut offline, mut offline_rx) = make_test_interface("offline");
+        offline.online = Some(Arc::new(AtomicBool::new(false)));
+        actor.interfaces.insert(3, offline);
         actor.interfaces.insert(1, entry1);
         actor.interfaces.insert(2, entry2);
 
@@ -4855,6 +4861,8 @@ mod tests {
         // Both interfaces should receive the broadcast
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_ok());
+        assert!(offline_rx.try_recv().is_err());
+        assert!(actor.interfaces.contains_key(&3));
     }
 
     #[test]
@@ -11439,6 +11447,36 @@ mod tests {
         actor.interfaces.insert(2, iface_b);
 
         let (raw, dest) = make_valid_announce("test.path_response.attached", 0);
+        let hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        let online = Arc::new(AtomicBool::new(false));
+        actor.interfaces.get_mut(&2).unwrap().online = Some(online.clone());
+        for target in [2, 99] {
+            actor.on_outbound_attached(
+                OutboundRequest {
+                    raw: raw.clone(),
+                    destination_hash: dest,
+                },
+                target,
+            );
+            assert!(rx_a.try_recv().is_err());
+            assert!(rx_b.try_recv().is_err());
+            assert!(actor.traffic.get(&0).is_none());
+            assert!(!actor.packet_hashlist.contains(&hash));
+        }
+        assert!(actor.interfaces.contains_key(&2));
+        online.store(true, std::sync::atomic::Ordering::SeqCst);
+        actor.interfaces.get_mut(&2).unwrap().direction.outbound = false;
+        actor.on_outbound_attached(
+            OutboundRequest {
+                raw: raw.clone(),
+                destination_hash: dest,
+            },
+            2,
+        );
+        assert!(rx_b.try_recv().is_err());
+        assert!(actor.traffic.get(&0).is_none());
+        assert!(!actor.packet_hashlist.contains(&hash));
+        actor.interfaces.get_mut(&2).unwrap().direction.outbound = true;
         actor.handle_message(TransportMessage::OutboundAttached {
             request: OutboundRequest {
                 raw: raw.clone(),
