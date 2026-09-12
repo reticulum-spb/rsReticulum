@@ -2152,16 +2152,20 @@ impl LinkManager {
         active.link.untrack_resource(resource_hash);
         active.inbound_resources.remove(resource_hash);
 
-        let Some(route) = active.segment_routing.remove(resource_hash) else {
+        let original_hash = if let Some(route) = active.segment_routing.remove(resource_hash) {
+            route.original_hash
+        } else if active.inbound_split_resources.contains_key(resource_hash) {
+            // A streaming source may fail between segments, after the first
+            // segment has completed but before the next one is advertised.
+            *resource_hash
+        } else {
             return;
         };
-        active.inbound_split_resources.remove(&route.original_hash);
+        active.inbound_split_resources.remove(&original_hash);
         let sibling_hashes: Vec<_> = active
             .segment_routing
             .iter()
-            .filter_map(|(hash, sibling)| {
-                (sibling.original_hash == route.original_hash).then_some(*hash)
-            })
+            .filter_map(|(hash, sibling)| (sibling.original_hash == original_hash).then_some(*hash))
             .collect();
         for sibling_hash in sibling_hashes {
             active.segment_routing.remove(&sibling_hash);

@@ -3128,3 +3128,30 @@ test_set_retained_ratchets —1 passed0.00s; inbound_only_traffic —1 passed0.0
 в частности отсутствующего streaming Resource API. Версия1.0.1.
 Workspace all-targets check, fmt check и diff check успешны; прежние warnings
 database_path/tracing prelude сохраняются. Python reference чист.
+
+### Этап 6: Resource из AsyncRead известной длины
+
+Добавлен LinkSession::send_resource_reader: AsyncRead+Unpin, объявленная длина,
+metadata/compression/deadline. Поток не требует seek и не загружается целиком:
+готовится один сегмент, следующий читается после proof предыдущего. Рабочие
+копии compression/encryption ограничены сегментом, а не всем файлом. До чтения
+проверяются overflow, metadata budget, MAX_RESOURCE_SIZE/MAX_SEGMENTS.
+read_exact не объявляет неполный сегмент при EOF; лишние байты не потребляются.
+Общий timeout охватывает чтение и все отправки. Metadata идёт только в первом
+сегменте и уменьшает его data budget; d повторяет общий размер во всех ADV.
+original_hash равен hash первого сегмента, как Python Resource.py.
+
+При ошибке/timeout после подготовки выполняется best-effort ICL. LinkManager
+умеет очистить coordinator/siblings по original hash между сегментами, когда
+первый segment transfer уже завершён. Старые Vec API не изменены.
+
+Один inline source/admission test проверяет два сегмента, d/index/original hash,
+точное потребление reader и ранний EOF. Fixture знает исходные bytes и выдаёт
+валидные proofs без передачи частей — это не полный transfer/interop test.
+`cargo test -p rns-runtime --lib reader_resource_preserves --quiet`:
+1 passed, 0.14s. Workspace all-targets check успешен, прежние warnings
+database_path/tracing prelude сохраняются. Новых test-only файлов нет.
+
+Границы: неизвестная длина пока требует caller-side подготовки, автоматический
+spool отсутствует; CLI rncp ещё читает весь файл и не переключён на reader API.
+Этап6 остаётся открыт, версия1.0.1; длительные тесты не запускались.

@@ -1258,6 +1258,92 @@ impl LinkSession {
             .await
     }
 
+    /// Send exactly `data_size` bytes from a reader, retaining only one segment
+    /// at a time. No seek is required. Extra bytes remain unread; premature EOF
+    /// is an error. The deadline includes source reads and all segment proofs.
+    pub async fn send_resource_reader<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        data_size: usize,
+        mut metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+        deadline: Duration,
+    ) -> Result<[u8; 32], LinkClientError> {
+        use tokio::io::AsyncReadExt;
+        let metadata_size = metadata
+            .as_ref()
+            .map_or(Some(0), |m| m.len().checked_add(3))
+            .ok_or_else(|| LinkClientError::Resource("metadata size overflow".into()))?;
+        let total_size = data_size
+            .checked_add(metadata_size)
+            .ok_or_else(|| LinkClientError::Resource("resource size overflow".into()))?;
+        let segments = total_size.div_ceil(MAX_EFFICIENT_SIZE).max(1);
+        if metadata_size > MAX_EFFICIENT_SIZE
+            || data_size > rns_protocol::resource::MAX_RESOURCE_SIZE
+            || segments > rns_protocol::resource::MAX_SEGMENTS
+        {
+            return Err(LinkClientError::Resource(
+                "reader resource exceeds size limits".into(),
+            ));
+        }
+        let expires = Instant::now() + deadline;
+        let keys = self
+            .link
+            .session_keys()
+            .ok_or_else(|| LinkClientError::LinkCrypto("missing resource keys".into()))?;
+        let encrypt = |plaintext: &[u8]| {
+            rns_link::encryption::link_encrypt(&keys, plaintext)
+                .expect("validated Link session keys")
+        };
+        let mut remaining = data_size;
+        let mut original_hash = None;
+        let transfer = async {
+            for index in 1..=segments {
+                let budget = MAX_EFFICIENT_SIZE - if index == 1 { metadata_size } else { 0 };
+                let mut chunk = vec![0; remaining.min(budget)];
+                reader.read_exact(&mut chunk).await.map_err(|error| {
+                    LinkClientError::Resource(format!("resource source: {error}"))
+                })?;
+                remaining -= chunk.len();
+                let mut resource = OutboundResource::with_options(
+                    chunk,
+                    auto_compress,
+                    metadata.take(),
+                    None,
+                    Some(&encrypt),
+                )
+                .map_err(|error| LinkClientError::Resource(format!("reader segment: {error:?}")))?;
+                // Python's original hash is the FIRST segment hash, not a hash
+                // of the entire source; later segments repeat it for routing.
+                let original = *original_hash.get_or_insert(resource.resource_hash);
+                resource.flags.split = segments > 1;
+                resource.segment_index = index;
+                resource.total_segments = segments;
+                resource.advertisement_data_size = total_size;
+                resource.original_hash = (segments > 1).then_some(original);
+                let outbound = OutboundTransfer::from_prebuilt(resource, self.rtt());
+                self.send_resource_transfer(outbound, expires).await?;
+            }
+            Ok(original_hash.expect("at least one segment"))
+        };
+        let result = timeout(deadline, transfer)
+            .await
+            .unwrap_or(Err(LinkClientError::Timeout("resource reader")));
+        if result.is_err()
+            && let Some(hash) = original_hash
+        {
+            let _ = send_link_data(
+                &self.transport_tx,
+                &self.link,
+                self.id(),
+                rns_wire::context::PacketContext::ResourceIcl,
+                &hash,
+                true,
+            );
+        }
+        result
+    }
+
     async fn send_resource_inner(
         &mut self,
         data: Vec<u8>,
@@ -2444,6 +2530,83 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reader_resource_preserves_segment_size_and_source_position() {
+        use rns_wire::context::PacketContext;
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([7; 16], 1);
+        let (peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        link.validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        let link_id = link.link_id;
+        let (tx, mut output) = mpsc::channel(8);
+        let (events, rx) = mpsc::channel(8);
+        let mut session = LinkSession {
+            transport_tx: tx,
+            identity: Arc::new(Identity::new()),
+            link,
+            event_rx: rx,
+            channel: None,
+            channel_packets: Vec::new(),
+            pending_packets: VecDeque::new(),
+            pending_resource_packets: VecDeque::new(),
+        };
+        let size = MAX_EFFICIENT_SIZE + 7;
+        let data = vec![42; size + 1];
+        let mut reader = data.as_slice();
+        let sending =
+            session.send_resource_reader(&mut reader, size, None, true, Duration::from_secs(2));
+        let receiving = async {
+            let mut original = None;
+            for (index, bytes) in [(1, MAX_EFFICIENT_SIZE), (2, 7)] {
+                let TransportMessage::Outbound(packet) = output.recv().await.unwrap() else {
+                    panic!("ADV")
+                };
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                assert_eq!(header.context, PacketContext::ResourceAdv);
+                let adv =
+                    ResourceAdvertisement::unpack(&peer.decrypt(&packet.raw[offset..]).unwrap())
+                        .unwrap();
+                let first = *original.get_or_insert(adv.resource_hash);
+                assert_eq!(adv.original_hash, first);
+                assert_eq!(adv.data_size, size);
+                assert_eq!((adv.segment_index, adv.total_segments), (index, 2));
+                assert!(adv.flags.split);
+                // Admission/source test: the fixture already knows the source
+                // bytes and provides a valid proof without transferring parts.
+                let expected = rns_protocol::resource::compute_expected_proof(
+                    &vec![42; bytes],
+                    &adv.resource_hash,
+                );
+                let mut proof = adv.resource_hash.to_vec();
+                proof.extend_from_slice(&expected);
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_proof_packet(link_id, PacketContext::ResourcePrf, &proof),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
+            original.unwrap()
+        };
+        let (result, original) = tokio::join!(sending, receiving);
+        assert_eq!(result.unwrap(), original);
+        assert_eq!(reader.len(), 1, "read exactly the declared length");
+        let mut short = b"abc".as_slice();
+        assert!(matches!(
+            session
+                .send_resource_reader(&mut short, 4, None, false, Duration::from_secs(1))
+                .await,
+            Err(LinkClientError::Resource(_))
+        ));
+        assert!(
+            output.try_recv().is_err(),
+            "early EOF must not advertise a partial segment"
+        );
+    }
 
     #[test]
     fn response_resource_timer_retries_then_cancels() {

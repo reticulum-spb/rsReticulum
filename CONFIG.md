@@ -451,10 +451,23 @@ a cancelling hashmap update emits `RESOURCE_RCL` and ends response reception.
 LinkManager releases the corresponding transfer and split state in both cases.
 Resource requests naming a different full hash do not advance a sender's state.
 
-Resource send APIs currently accept in-memory `Vec<u8>` data; `rncp-rs` reads
-the file before sending. The Python 1.5.2 stream-proxy `flush`/`seek` fix has no
-equivalent temporary-file path here. This is not a claim of streaming parity:
-bounded-memory reader/file-source Resource sending remains unimplemented.
+`LinkSession::send_resource_reader(reader, data_size, metadata, auto_compress,
+deadline)` accepts a Tokio `AsyncRead + Unpin` source with a known length.
+It reads exactly that many bytes from the current position without seeking,
+leaves extra bytes unread, and reports premature EOF as an error. Metadata
+reduces the first segment's data budget. Only one logical Resource segment is
+prepared at a time (compression/encryption may make bounded working copies);
+the next is read after the previous proof. Size/segment limits are checked
+before reading. All reads and segment transfers share one deadline.
+
+Each advertisement repeats the total original size; the original hash is the
+first segment's hash, as in Python. Errors after preparation attempt ICL, and
+the Rust receiver can release split state by original hash between segments.
+Existing Vec APIs remain available. Unknown-length sources still require the
+caller to determine/spool the length: automatic temporary-file proxying is not
+implemented. `rncp-rs` still reads its file into memory; it has not yet switched
+to this reader API. No equivalent Python temporary-file `flush`/`seek` path is
+introduced by this implementation.
 
 ### Resource receive watchdog
 
