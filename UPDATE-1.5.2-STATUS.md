@@ -98,7 +98,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
-| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py и interface guards сверены. RequestReceipt: адресное завершение, отказ после ACK и cleanup при выходе из response wait исправлены; размер проверяется до принятия ответа. Остальные Link receive/error paths и ранний отказ отправки запроса ещё требуют сверки | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py и interface guards сверены. RequestReceipt: адресное завершение, отказ после ACK, cleanup response wait и отмены/ранних ошибок LinkSession исправлены; размер проверяется до принятия ответа. Остальные Link receive/error paths ещё требуют сверки | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -3858,3 +3858,32 @@ paths также остаются в финальной сверке; полна
 13 passed (0.04s), включая новую проверку ACK-only failure при timeout/close
 и сохранения чужого pending receipt. Inline проверки в production-модулях;
 новых test-only файлов нет, длительные тесты не запускались.
+
+## Финальная сверка: ранний отказ и отмена LinkSession request
+
+`LinkSession::request_with_response_mode` теперь владеет PendingSessionRequest
+на всём промежутке от prepare_request до выхода из response wait. Drop guard
+удаляет оставшийся receipt своего запроса и вызывает fail при ранней ошибке
+или отмене future вызывающим кодом. После штатного завершения response wait
+receipt уже удалён, поэтому повторного завершения нет.
+
+Guard обновляет свой ID одновременно с переходом на packet-hash request ID,
+до await отправки. Для Resource request сохраняется исходный request ID.
+Очистка не закрывает Link, не стирает остальные pending receipts и не запускает
+фоновую задачу. Ошибки до создания receipt не требуют удаления.
+
+Это локальная cancellation safety: уже поставленный transport packet невозможно
+отозвать, а при внешней отмене Resource future не гарантируется отправка remote
+RCL из синхронного Drop. Удалённая сторона использует штатные протокольные timeout;
+гарантия данного блока — отсутствие локального зависшего receipt и возможность
+следующего запроса на живом Link, а не отзыв уже доставленной удалённой операции.
+
+Короткая inline проверка охватывает закрытый transport, отмену при заполненном
+transport channel, отмену ожидания ответа, отмену Resource request и отказ для
+неустановленного Link. После отмены packet send/response wait следующий настоящий
+запрос на том же Link получает зашифрованный ответ; чужой receipt сохраняется.
+Новых test-only файлов нет. Остальные Link receive/error paths остаются в сверке.
+
+`session_request_cleans_receipt_on_send_error_and_cancellation`: 1 passed (0.08s);
+существующие runtime `response_`: 13 passed (0.04s). Default runtime и client-only
+cargo checks, fmt/diff checks прошли. Длительные тесты не запускались.

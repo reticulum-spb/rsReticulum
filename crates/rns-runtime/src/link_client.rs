@@ -76,6 +76,29 @@ pub struct LinkSession {
     pending_resource_packets: VecDeque<Bytes>,
 }
 
+/// Keep receipt ownership across every await, including cancellation by Drop.
+/// The response path normally removes it first; early errors/cancellation fail
+/// only this request and leave the reusable Link and other receipts intact.
+struct PendingSessionRequest<'a> {
+    session: &'a mut LinkSession,
+    request_id: [u8; 16],
+}
+
+impl Drop for PendingSessionRequest<'_> {
+    fn drop(&mut self) {
+        if let Some(index) = self
+            .session
+            .link
+            .pending_requests
+            .iter()
+            .position(|receipt| receipt.request_id[..16] == self.request_id[..])
+        {
+            let mut receipt = self.session.link.pending_requests.remove(index);
+            receipt.fail();
+        }
+    }
+}
+
 /// An outbound Link whose identifier and handshake packet have been prepared,
 /// but not yet sent to the transport.
 ///
@@ -950,14 +973,19 @@ impl LinkSession {
             .link
             .prepare_request(path, data, deadline)
             .map_err(|error| LinkClientError::LinkCrypto(format!("request: {error:?}")))?;
-        let response_id = match self.link.classify_request(packed) {
+        let mut pending = PendingSessionRequest {
+            session: self,
+            request_id,
+        };
+        let session = &mut *pending.session;
+        let response_id = match session.link.classify_request(packed) {
             rns_link::link::RequestSendMode::Packet(packed) => {
-                let encrypted = self
+                let encrypted = session
                     .link
                     .encrypt(&packed)
                     .map_err(|error| LinkClientError::LinkCrypto(format!("request: {error:?}")))?;
                 let packet = build_data_packet(
-                    self.id(),
+                    session.id(),
                     rns_wire::context::PacketContext::Request,
                     &encrypted,
                 );
@@ -965,34 +993,36 @@ impl LinkSession {
                     &packet,
                     rns_wire::flags::HeaderType::Header1,
                 );
-                self.link.update_pending_request_id(&request_id, id);
+                session.link.update_pending_request_id(&request_id, id);
+                pending.request_id = id;
                 send_transport(
-                    &self.transport_tx,
+                    &session.transport_tx,
                     TransportMessage::Outbound(OutboundRequest {
                         raw: packet,
-                        destination_hash: self.id(),
+                        destination_hash: session.id(),
                     }),
                 )
                 .await?;
                 id
             }
             rns_link::link::RequestSendMode::Resource(packed) => {
-                self.send_resource_inner(
-                    packed,
-                    None,
-                    true,
-                    time_remaining(expires)?,
-                    Some(request_id),
-                )
-                .await?;
+                session
+                    .send_resource_inner(
+                        packed,
+                        None,
+                        true,
+                        time_remaining(expires)?,
+                        Some(request_id),
+                    )
+                    .await?;
                 request_id
             }
         };
-        let link_id = self.link.link_id;
+        let link_id = session.link.link_id;
         wait_for_response(
-            &self.transport_tx,
-            &mut self.event_rx,
-            &mut self.link,
+            &session.transport_tx,
+            &mut session.event_rx,
+            &mut session.link,
             link_id,
             response_id,
             time_remaining(expires)?,
@@ -2934,6 +2964,105 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_request_cleans_receipt_on_send_error_and_cancellation() {
+        for mode in 0..5 {
+            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+            let public = key.public_key();
+            let (mut link, request) = Link::new_initiator([7; 16], 1);
+            let (mut peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+            let rtt = link
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            peer.receive_rtt_packet(&rtt).unwrap();
+            let (tx, mut out) = mpsc::channel(1);
+            let (events, rx) = mpsc::channel(4);
+            if mode == 0 {
+                out.close();
+            }
+            if mode == 1 {
+                tx.try_send(TransportMessage::Outbound(OutboundRequest {
+                    raw: Bytes::new(),
+                    destination_hash: [0; 16],
+                }))
+                .unwrap();
+            }
+            let mut session = LinkSession {
+                transport_tx: tx,
+                identity: Arc::new(Identity::new()),
+                link,
+                event_rx: rx,
+                channel: None,
+                channel_packets: Vec::new(),
+                pending_packets: VecDeque::new(),
+                pending_resource_packets: VecDeque::new(),
+            };
+            if mode == 4 {
+                session.link = Link::new_initiator([7; 16], 1).0;
+            }
+            let other = rns_link::request::RequestReceipt::new(
+                [9; 32],
+                session.id(),
+                Duration::from_secs(1),
+            );
+            session.link.pending_requests.push(other);
+            let data = vec![42; if mode == 3 { 4096 } else { 1 }];
+            let result = timeout(
+                Duration::from_millis(10),
+                session.request("cancel.test", Some(&data), Duration::from_secs(30)),
+            )
+            .await;
+            if mode == 0 || mode == 4 {
+                assert!(result.unwrap().is_err());
+            } else {
+                assert!(result.is_err(), "outer timeout must cancel the operation");
+            }
+            assert_eq!(session.link.pending_requests.len(), 1);
+            assert_eq!(session.link.pending_requests[0].request_id, [9; 32]);
+            assert_eq!(
+                session.link.state,
+                if mode == 4 {
+                    LinkState::Pending
+                } else {
+                    LinkState::Active
+                }
+            );
+            if mode == 1 || mode == 2 {
+                // A real subsequent request on the same Link still completes.
+                while out.try_recv().is_ok() {}
+                let link_id = session.id();
+                let response = async {
+                    let TransportMessage::Outbound(request) = out.recv().await.unwrap() else {
+                        panic!("request")
+                    };
+                    let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+                    peer.handle_request(&request.raw[offset..]).unwrap();
+                    let id = rns_wire::hash::truncated_packet_hash(
+                        &request.raw,
+                        rns_wire::flags::HeaderType::Header1,
+                    );
+                    events
+                        .send(DestinationEvent::InboundPacket {
+                            raw: build_data_packet(
+                                link_id,
+                                rns_wire::context::PacketContext::Response,
+                                &peer.create_response(&id, b"next works").unwrap(),
+                            ),
+                            interface_id: 0,
+                        })
+                        .await
+                        .unwrap();
+                };
+                let (result, ()) = tokio::join!(
+                    session.request("next", None, Duration::from_secs(1)),
+                    response
+                );
+                assert_eq!(result.unwrap(), b"next works");
+                assert_eq!(session.link.pending_requests.len(), 1);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn response_wait_failure_retires_only_its_receipt() {
