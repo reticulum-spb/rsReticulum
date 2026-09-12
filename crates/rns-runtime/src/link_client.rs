@@ -719,28 +719,44 @@ impl LinkSession {
                 .ok_or_else(|| {
                     LinkClientError::HandshakeFailed("destination channel closed".into())
                 })?;
-            let DestinationEvent::InboundPacket { raw, .. } = event else {
-                continue;
+            let raw = match event {
+                DestinationEvent::InboundPacket { raw, .. } => raw,
+                DestinationEvent::LinkClosed { link_id: closed_id } if closed_id == link_id => {
+                    return Err(LinkClientError::HandshakeFailed("link closed".into()));
+                }
+                _ => continue,
             };
             let (header, offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            if header.destination_hash == link_id
-                && header.flags.packet_type == rns_wire::flags::PacketType::Data
+            if header.destination_hash != link_id {
+                continue;
+            }
+            if header.flags.packet_type == rns_wire::flags::PacketType::Data
+                && header.context == rns_wire::context::PacketContext::LinkClose
+                && self.link.receive_teardown(&raw[offset..])
+            {
+                return Err(LinkClientError::HandshakeFailed(
+                    "link closed by remote".into(),
+                ));
+            }
+            if header.flags.packet_type == rns_wire::flags::PacketType::Data
                 && header.context == rns_wire::context::PacketContext::None
             {
                 let packet = self
                     .link
                     .decrypt(&raw[offset..])
                     .map_err(|error| LinkClientError::LinkCrypto(format!("packet: {error:?}")))?;
+                self.link.record_inbound();
+                self.link.record_rx(raw.len() - offset);
+                self.link.keepalive.record_data();
                 self.prove_application_packet(&raw, header.flags.header_type)
                     .await?;
                 self.pending_packets.push_back(packet);
                 continue;
             }
-            if header.destination_hash != link_id
-                || header.flags.packet_type != rns_wire::flags::PacketType::Proof
+            if header.flags.packet_type != rns_wire::flags::PacketType::Proof
                 || !matches!(
                     header.context,
                     rns_wire::context::PacketContext::LinkProof
@@ -754,6 +770,8 @@ impl LinkSession {
                 continue;
             };
             if self.link.validate_packet_proof(&packet_hash, proof) {
+                self.link.record_inbound();
+                self.link.record_rx(proof.len());
                 return Ok(packet_hash);
             }
         }
@@ -2898,6 +2916,84 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delivery_proof_recovers_stale_link_and_observes_close() {
+        use rns_wire::context::PacketContext;
+        for remote_close in [false, true] {
+            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+            let public = key.public_key();
+            let (mut link, request) = Link::new_initiator([7; 16], 1);
+            let (mut peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+            let rtt = link
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            peer.receive_rtt_packet(&rtt).unwrap();
+            let link_id = link.link_id;
+            link.state = LinkState::Stale;
+            let (tx, _output) = mpsc::channel(8);
+            let (events, rx) = mpsc::channel(8);
+            let mut session = LinkSession {
+                transport_tx: tx,
+                identity: Arc::new(Identity::new()),
+                link,
+                event_rx: rx,
+                channel: None,
+                channel_packets: Vec::new(),
+                pending_packets: VecDeque::new(),
+                pending_resource_packets: VecDeque::new(),
+            };
+            // Unrelated close events and unauthenticated teardown must not end the wait.
+            events
+                .send(DestinationEvent::LinkClosed { link_id: [0; 16] })
+                .await
+                .unwrap();
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_data_packet(link_id, PacketContext::LinkClose, &[0; 32]),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+            let hash = [42; 32];
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_proof_packet(
+                        link_id,
+                        PacketContext::LinkProof,
+                        &peer.prove_packet_with_link_key(&hash).unwrap(),
+                    ),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                session
+                    .recv_delivery_proof(Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                hash
+            );
+            assert_eq!(session.link.state, LinkState::Active);
+            let closed = if remote_close {
+                DestinationEvent::InboundPacket {
+                    raw: build_data_packet(
+                        link_id,
+                        PacketContext::LinkClose,
+                        &peer.teardown(CloseReason::DestinationClosed).unwrap(),
+                    ),
+                    interface_id: 0,
+                }
+            } else {
+                DestinationEvent::LinkClosed { link_id }
+            };
+            events.send(closed).await.unwrap();
+            assert!(
+                matches!(session.recv_delivery_proof(Duration::from_secs(1)).await,
+                Err(LinkClientError::HandshakeFailed(message)) if message.contains("link closed"))
+            );
+        }
+    }
 
     #[tokio::test]
     async fn resource_file_handle_receives_segments_and_rejects_oversize() {

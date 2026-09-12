@@ -101,7 +101,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 miscellaneous packet/link/interface fixes | Не конкретизированы changelog: требуется сопоставление Python diff и регрессионных тестов; не считать выполненными | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
-| 1.5.0 speedtest stale link | Проверить эквивалентные примеры и transfer status, не объявлять все примеры совместимыми заранее | 6 |
+| 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
 | 1.5.0 documentation queue/discovery | Отсутствуют новые YAML настройки в CONFIG/Web; обновить с реализацией | 1, 4 |
 | 1.5.1 adaptive dataplane ingress/egress | Отсутствует: `backbone_read_loop` ожидает общий mpsc; write path пишет отдельный HDLC frame | 5 |
 | 1.5.1 coalescing TX buffers | Отсутствует в Backbone backend | 5 |
@@ -119,7 +119,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 inbound defaults / announce queuing tuning | Новые очереди отсутствуют; использовать окончательные Python constants | 4 |
 | 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | Воспроизвести потоковые источники и граничные размеры Rust | 6 |
 | 1.5.1 rngit prefix/page init/large downloads | Самостоятельная утилита вне этого репозитория; общая Resource регрессия остаётся в этапе 6 | граница покрытия |
-| 1.5.1 RSSI/SNR reporting | Воспроизвести interface metadata→transport→RPC | 7 |
+| 1.5.1 RSSI/SNR reporting | Цепочка RNode/RNodeMulti → owned InboundPacket → record_packet_metrics → GetPacketRssi/Snr и RPC существует. Метрики копируются до очереди; Python исправление потери через mutable interface fields неприменимо к этой архитектуре. Аппаратная проверка не заявляется | 7 |
 | 1.5.1 non-epoll keepalive | Проверить служебные кадры всех Backbone-совместимых драйверов | 5 |
 | 1.5.1 blocked IP list includes unblocked | Новый механизм обязан отдавать только реально заблокированные IP | 3 |
 | 1.5.1 shared instance inter-app totals | `rnstatus.rs` суммирует interface stats; фильтрацию local/shared проверить | 7 |
@@ -3687,3 +3687,30 @@ eeprom_summary_reports_identity_and_radio_config --offline --quiet`:
 
 Далее: оставшиеся неклассифицированные minor/performance fixes в финальной
 матрице. Общая готовность релиза 1.5.2 пока не заявляется, версия не изменена.
+
+## Финальная сверка: speedtest и delivery-proof lifecycle
+
+Upstream `Examples/Speedtest.py` меняет условие Active на «не Closed».
+Rust `examples/src/bin/speedtest.rs` уже не останавливает отправку на Stale,
+но использует окно tracked packets вместо Python untracked flood. В общем
+`LinkSession::recv_delivery_proof` обнаружены и исправлены два пробела:
+
+- Событие закрытия своего Link и аутентифицированный remote teardown теперь
+  немедленно возвращают ошибку закрытия, а не игнорируются до deadline.
+  Чужие Link IDs и неподтверждённые teardown не завершают ожидание.
+- Валидные proofs и успешно расшифрованные встречные application packets
+  обновляют inbound activity и RX bytes. Proof восстанавливает Stale → Active;
+  application packet также обновляет data activity и сохраняется для recv.
+  Невалидный proof не обновляет эти счётчики. Общий deadline не продлевается.
+
+RSSI/SNR сверены отдельно: Rust сохраняет значения прямо в owned InboundPacket
+до enqueue, actor кеширует их по packet hash, RPC отдаёт GetPacketRssi/Snr.
+Удаление Python сброса interface fields решает потерю при отложенном чтении
+mutable interface; Rust повторно интерфейс для этих метрик не читает.
+Сброс per-frame RSSI/SNR сохранён, аппаратная валидация не заявляется.
+
+Короткий inline test `delivery_proof_recovers_stale_link_and_observes_close`:
+1 passed (0.03s), с настоящими Link ключами и authenticated teardown.
+Проверки сборки speedtest и client-only runtime, fmt/diff checks прошли.
+Новых test-only файлов и длительных тестов нет. Receipt callbacks, остальные
+minor/performance строки и итоговое объявление версии остаются отдельной работой.
