@@ -179,12 +179,145 @@ pub enum RequestOutcome {
         metadata: Option<Vec<u8>>,
         auto_compress: bool,
     },
+    /// ACK followed by a file Resource, prepared one segment at a time.
+    /// Reads the whole regular file from offset zero; the cloned handle shares
+    /// its cursor, so callers must not read/seek it concurrently. Admission
+    /// failure replies with MessagePack false. Later read errors close the Link.
+    ReplyWithFile {
+        ack: Vec<u8>,
+        file: Arc<std::fs::File>,
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+    },
     /// Silently drop; caller sees a timeout. Useful for ACL denies.
     Drop,
 }
 
 type RequestHandler = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> Option<Vec<u8>> + Send>;
 type RequestHandlerEx = Box<dyn Fn([u8; 16], [u8; 16], Vec<u8>) -> RequestOutcome + Send>;
+
+struct FileResourceSource {
+    file: std::fs::File,
+    metadata: Option<Vec<u8>>,
+    metadata_size: usize,
+    data_size: usize,
+    consumed: usize,
+    index: usize,
+    segments: usize,
+    original: Option<[u8; 32]>,
+    auto_compress: bool,
+    keys: rns_link::key_derivation::LinkKeys,
+    rtt: std::time::Duration,
+}
+
+impl FileResourceSource {
+    fn new(
+        file: &std::fs::File,
+        metadata: Option<Vec<u8>>,
+        auto_compress: bool,
+        keys: rns_link::key_derivation::LinkKeys,
+        rtt: std::time::Duration,
+    ) -> Result<Self, String> {
+        let stat = file.metadata().map_err(|e| e.to_string())?;
+        if !stat.is_file() {
+            return Err("file source must be a regular file".into());
+        }
+        let data_size = usize::try_from(stat.len()).map_err(|e| e.to_string())?;
+        let metadata_size = metadata
+            .as_ref()
+            .map_or(Some(0), |m| m.len().checked_add(3))
+            .ok_or("metadata overflow")?;
+        let total = data_size
+            .checked_add(metadata_size)
+            .ok_or("size overflow")?;
+        let segments = total.div_ceil(MAX_EFFICIENT_SIZE).max(1);
+        if metadata_size > MAX_EFFICIENT_SIZE
+            || data_size > rns_protocol::resource::MAX_RESOURCE_SIZE
+            || segments > MAX_SEGMENTS
+        {
+            return Err("file Resource exceeds limits".into());
+        }
+        Ok(Self {
+            file: file.try_clone().map_err(|e| e.to_string())?,
+            metadata,
+            metadata_size,
+            data_size,
+            consumed: 0,
+            index: 1,
+            segments,
+            original: None,
+            auto_compress,
+            keys,
+            rtt,
+        })
+    }
+
+    fn next(mut self) -> Result<(OutboundTransfer, Option<Self>), String> {
+        use std::io::{Read, Seek};
+        if self.index == 1 {
+            self.file.rewind().map_err(|e| e.to_string())?;
+        }
+        let capacity = MAX_EFFICIENT_SIZE
+            - if self.index == 1 {
+                self.metadata_size
+            } else {
+                0
+            };
+        let mut data = vec![0; (self.data_size - self.consumed).min(capacity)];
+        self.file.read_exact(&mut data).map_err(|e| e.to_string())?;
+        self.consumed += data.len();
+        let encrypt = |data: &[u8]| {
+            rns_link::encryption::link_encrypt(&self.keys, data).expect("valid session keys")
+        };
+        let mut resource = rns_protocol::resource::OutboundResource::with_options(
+            data,
+            self.auto_compress,
+            self.metadata.take(),
+            None,
+            Some(&encrypt),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let original = *self.original.get_or_insert(resource.resource_hash);
+        resource.flags.split = self.segments > 1;
+        resource.segment_index = self.index;
+        resource.total_segments = self.segments;
+        resource.original_hash = (self.segments > 1).then_some(original);
+        resource.advertisement_data_size = self.data_size + self.metadata_size;
+        self.index += 1;
+        let transfer = OutboundTransfer::from_prebuilt(resource, self.rtt);
+        let more = self.index <= self.segments;
+        Ok((transfer, more.then_some(self)))
+    }
+}
+
+struct FileResourceJob {
+    link_id: [u8; 16],
+    result: oneshot::Receiver<Result<(OutboundTransfer, Option<FileResourceSource>), String>>,
+}
+
+impl FileResourceJob {
+    fn spawn(link_id: [u8; 16], source: FileResourceSource) -> Self {
+        let (mut tx, result) = oneshot::channel();
+        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        let slots = SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+            .clone();
+        tokio::spawn(async move {
+            let permit = tokio::select! {
+                permit = slots.acquire_owned() => permit.expect("file slots remain open"),
+                _ = tx.closed() => return,
+            };
+            let prepared = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                source.next()
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()));
+            let _ = tx.send(prepared);
+        });
+        Self { link_id, result }
+    }
+}
 type LinkIdentityGate = Box<dyn Fn([u8; 16], [u8; 16]) -> bool + Send>;
 
 struct ResourceTransferStart {
@@ -211,6 +344,8 @@ pub struct LinkManager {
     request_handler: Option<RequestHandler>,
     /// Wins over `request_handler` when set; can schedule a resource transfer.
     request_handler_ex: Option<RequestHandlerEx>,
+    file_sources: HashMap<([u8; 16], [u8; 32]), FileResourceSource>,
+    file_jobs: Vec<FileResourceJob>,
     /// Called when the transport actor asks this destination to re-announce.
     announce_handler: Option<Box<dyn FnMut() + Send>>,
     response_tx: Option<mpsc::Sender<LinkResponse>>,
@@ -261,6 +396,8 @@ impl LinkManager {
             identity: None,
             request_handler: None,
             request_handler_ex: None,
+            file_sources: HashMap::new(),
+            file_jobs: Vec::new(),
             announce_handler: None,
             response_tx: None,
             resource_completed_tx: None,
@@ -312,6 +449,8 @@ impl LinkManager {
             identity: manager_identity,
             request_handler: None,
             request_handler_ex: None,
+            file_sources: HashMap::new(),
+            file_jobs: Vec::new(),
             announce_handler: None,
             response_tx: None,
             resource_completed_tx: None,
@@ -1660,6 +1799,10 @@ impl LinkManager {
                         if complete {
                             active.outbound_resources.remove(&rh);
                             let mut started_next_segment = false;
+                            if let Some(source) = self.file_sources.remove(&(link_id, rh)) {
+                                self.file_jobs.push(FileResourceJob::spawn(link_id, source));
+                                started_next_segment = true;
+                            }
                             let completed_resource_hash = queue_key.unwrap_or(rh);
                             if let Some(key) = queue_key {
                                 let (next, empty) = if let Some(queue) =
@@ -1838,17 +1981,49 @@ impl LinkManager {
             RequestOutcome::Drop
         };
 
-        let (resp_bytes_opt, fetch_spec) = match outcome {
-            RequestOutcome::Reply(r) => (Some(r), None),
+        let (resp_bytes_opt, fetch_spec, file_spec) = match outcome {
+            RequestOutcome::Reply(r) => (Some(r), None, None),
             RequestOutcome::ReplyWithResource {
                 ack,
                 data,
                 metadata,
                 auto_compress,
-            } => (Some(ack), Some((data, metadata, auto_compress))),
-            RequestOutcome::Drop => (None, None),
+            } => (Some(ack), Some((data, metadata, auto_compress)), None),
+            RequestOutcome::ReplyWithFile {
+                ack,
+                file,
+                metadata,
+                auto_compress,
+            } => {
+                let source = if self.file_sources.len() + self.file_jobs.len() < 32 {
+                    active.link.session_keys().and_then(|keys| {
+                        FileResourceSource::new(
+                            &file,
+                            metadata,
+                            auto_compress,
+                            keys,
+                            active
+                                .link
+                                .rtt
+                                .unwrap_or(std::time::Duration::from_millis(500)),
+                        )
+                        .ok()
+                    })
+                } else {
+                    None
+                };
+                if let Some(source) = source {
+                    (Some(ack), None, Some(source))
+                } else {
+                    (Some(vec![0xC2]), None, None)
+                }
+            }
+            RequestOutcome::Drop => (None, None, None),
         };
 
+        if let Some(source) = file_spec {
+            self.file_jobs.push(FileResourceJob::spawn(link_id, source));
+        }
         let mut response_resource = None;
         if let Some(resp_bytes) = resp_bytes_opt {
             if let Ok(packed_response) =
@@ -1931,6 +2106,7 @@ impl LinkManager {
     }
 
     fn on_tick(&mut self) {
+        self.poll_file_resources();
         let mut to_remove = Vec::new();
 
         for (link_id, active) in &mut self.active_links {
@@ -2148,6 +2324,47 @@ impl LinkManager {
         }));
     }
 
+    fn poll_file_resources(&mut self) {
+        self.file_sources.retain(|(link_id, hash), _| {
+            self.active_links
+                .get(link_id)
+                .is_some_and(|active| active.outbound_resources.contains_key(hash))
+        });
+        let mut pending = Vec::new();
+        for mut job in std::mem::take(&mut self.file_jobs) {
+            if !self.active_links.contains_key(&job.link_id) {
+                continue;
+            }
+            match job.result.try_recv() {
+                Ok(Ok((transfer, source))) => {
+                    let active = self
+                        .active_links
+                        .get_mut(&job.link_id)
+                        .expect("active Link");
+                    if let Some(hash) = Self::start_outbound_transfer(
+                        &self.transport_tx,
+                        active,
+                        &job.link_id,
+                        transfer,
+                    ) {
+                        if let Some(source) = source {
+                            self.file_sources.insert((job.link_id, hash), source);
+                        }
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => pending.push(job),
+                _ => {
+                    tracing::warn!(
+                        link_id = hex::encode(job.link_id),
+                        "file Resource preparation failed"
+                    );
+                    self.close_active_link(job.link_id, CloseReason::InitiatorClosed, true);
+                }
+            }
+        }
+        self.file_jobs = pending;
+    }
+
     fn remove_inbound_resource(active: &mut ActiveLink, resource_hash: &[u8; 32]) {
         active.link.untrack_resource(resource_hash);
         active.inbound_resources.remove(resource_hash);
@@ -2195,6 +2412,8 @@ impl LinkManager {
         let Some(mut active) = self.active_links.remove(&link_id) else {
             return false;
         };
+        self.file_sources.retain(|(id, _), _| *id != link_id);
+        self.file_jobs.retain(|job| job.link_id != link_id);
 
         if send_teardown {
             if let Some(teardown_data) = active.link.teardown(reason) {
@@ -3654,6 +3873,64 @@ mod tests {
     fn handshaken_link_pair() -> (Link, Link) {
         let (initiator, responder, _identity_key) = handshaken_link_pair_with_identity();
         (initiator, responder)
+    }
+
+    #[tokio::test]
+    async fn file_resource_prepares_only_one_segment() {
+        use std::io::{Seek, Write};
+        let (link, _) = handshaken_link_pair();
+        let path = std::env::temp_dir().join(format!(
+            "rns-fetch-source-{}-{}",
+            std::process::id(),
+            hex::encode(link.link_id)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let size = MAX_EFFICIENT_SIZE + 7;
+        file.write_all(&vec![42; size]).unwrap();
+        let metadata = vec![0x80];
+        let source = FileResourceSource::new(
+            &file,
+            Some(metadata),
+            false,
+            link.session_keys().unwrap(),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        // Starts at offset zero even though the original handle is at EOF.
+        let (first, source) = FileResourceJob::spawn(link.link_id, source)
+            .result
+            .await
+            .unwrap()
+            .unwrap();
+        let source = source.expect("unread tail");
+        assert_eq!(source.consumed, MAX_EFFICIENT_SIZE - 4);
+        assert_eq!(file.stream_position().unwrap() as usize, source.consumed);
+        assert_eq!(first.resource.segment_index, 1);
+        assert_eq!(first.resource.total_segments, 2);
+        assert_eq!(first.resource.advertisement_data_size, size + 4);
+        assert!(first.resource.flags.has_metadata);
+        let original = first.resource.resource_hash;
+        assert_eq!(first.resource.original_hash, Some(original));
+        let (second, source) = FileResourceJob::spawn(link.link_id, source)
+            .result
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source.is_none());
+        assert_eq!(second.resource.segment_index, 2);
+        assert_eq!(second.resource.total_segments, 2);
+        assert_eq!(second.resource.advertisement_data_size, size + 4);
+        assert_eq!(second.resource.original_hash, Some(original));
+        assert!(!second.resource.flags.has_metadata);
+        assert_eq!(second.resource.data, vec![42; 11]);
+        assert_eq!(file.stream_position().unwrap() as usize, size);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

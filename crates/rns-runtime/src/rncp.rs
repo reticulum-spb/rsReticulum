@@ -299,8 +299,17 @@ pub async fn spawn_rncp_listener(
                 }
             }
             match resolve_fetch_path(jail.as_deref(), &data) {
-                Ok(file_path) => match std::fs::read(&file_path) {
-                    Ok(bytes) => {
+                Ok(file_path) => match std::fs::File::open(&file_path) {
+                    Ok(file) => {
+                        let size = match file
+                            .metadata()
+                            .ok()
+                            .filter(|m| m.is_file())
+                            .and_then(|m| usize::try_from(m.len()).ok())
+                        {
+                            Some(size) if size <= rns_protocol::resource::MAX_RESOURCE_SIZE => size,
+                            _ => return RequestOutcome::Reply(vec![0xC2]),
+                        };
                         let basename = file_path
                             .file_name()
                             .map(|s| s.to_string_lossy().into_owned())
@@ -309,11 +318,11 @@ pub async fn spawn_rncp_listener(
                         let _ = fetch_events.try_send(RncpEvent::FetchServing {
                             link_id,
                             file_name: basename,
-                            bytes: bytes.len(),
+                            bytes: size,
                         });
-                        RequestOutcome::ReplyWithResource {
+                        RequestOutcome::ReplyWithFile {
                             ack: vec![0xC3], // msgpack `true`
-                            data: bytes,
+                            file: Arc::new(file),
                             metadata: Some(metadata),
                             auto_compress,
                         }

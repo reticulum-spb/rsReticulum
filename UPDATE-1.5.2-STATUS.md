@@ -3185,3 +3185,29 @@ reader source/admission проверки. Полный CLI/Python interop не �
 по1 passed, соответственно0.00/0.01/0.14s. Workspace all-targets check,
 fmt check и diff check успешны. Прежние warnings database_path/tracing prelude
 сохраняются, Python reference чист.
+
+### Этап 6: rncp fetch отправляет файловый источник по сегментам
+
+Fetch handler открывает File вместо std::fs::read всего файла. Новый
+RequestOutcome::ReplyWithFile сохраняет ACK/Resource flow: LinkManager готовит
+один сегмент в spawn_blocking, запускает его через обычный REQ/proof watchdog,
+после валидного proof готовит следующий. d включает metadata, original hash
+берётся из первого сегмента; metadata присутствует только в первом.
+ACL/jail и admission по размеру выполняются до положительного ACK.
+Отказ admission возвращает MessagePack false; поздняя ошибка чтения/подготовки
+закрывает Link. Существующий ReplyWithResource с Vec остаётся доступен.
+
+На manager ограничены 32 подготовки/непрочитанных хвоста; общая semaphore
+допускает 32 blocking подготовки одновременно. Закрытие Link освобождает
+источники и отменяет ожидающие задачи; уже начатое blocking чтение завершает
+текущий сегмент. Отмена активного Resource освобождает хвост на ближайшем tick.
+File handle читается с нуля; snapshot/locking не добавлены. Это перенос
+отправки fetch, а не изменение приёмной буферизации или spool неизвестной длины.
+
+Один inline test file_resource_prepares_only_one_segment проверяет непрочитанный
+хвост после первого сегмента, d/index/original hash, metadata и итоговый offset.
+`cargo test -p rns-runtime --lib file_resource_prepares_only_one_segment --quiet`:
+1 passed, 0.20s. Workspace all-targets check успешен, прежние warnings
+database_path/tracing prelude сохраняются. Python reference чист.
+Новых test-only файлов нет; длительные тесты и Python interop не запускались.
+Этап 6 открыт, версия 1.0.1 сохранена.

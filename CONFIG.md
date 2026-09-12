@@ -479,8 +479,19 @@ the initial size check is not sent. File changes are not snapshotted or locked.
 The old `rncp_send_file(RncpSendRequest { data: Vec<u8>, ... })` remains an API
 wrapper over the reader path. Progress weights each segment by original source
 bytes and tracks unique sent parts within it; future compressed sizes are not
-precomputed. An empty file still sends metadata and waits for proof. This change
-covers CLI send, not the fetch server's source handling or receiver buffering.
+precomputed. An empty file still sends metadata and waits for proof.
+
+The rncp fetch server also opens a file source instead of reading the whole file
+into memory. `RequestOutcome::ReplyWithFile` prepares one segment on a blocking
+worker and starts the next only after a valid proof. ACL/jail and size checks
+precede the positive ACK. Failed admission returns MessagePack false; a later
+read/preparation error closes the Link. Each manager admits at most 32 pending
+preparations/unread tails; a process-wide semaphore caps blocking preparations
+at 32. Link closure drops sources and queued work; an already-running blocking
+read finishes its current segment. Handles are read from offset zero and must
+not be concurrently read/seeked by their caller. Files are not snapshotted or
+locked. Receiver buffering and automatic spooling of unknown-length sources
+remain unchanged.
 
 ### Resource receive watchdog
 
