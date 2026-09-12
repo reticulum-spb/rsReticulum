@@ -98,7 +98,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
-| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py/interface guards и RequestReceipt сверены. LinkClosed теперь закрывает локальный Link в receive/wait путях; Resource teardown проверяется криптографически. Остальные Link receive/error paths, включая keepalive admission, ещё требуют сверки | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py/interface guards и RequestReceipt сверены. LinkClosed/Resource teardown исправлены. Keepalive admission централизован; initiator игнорирует request без изменения активности, ответы ограничены last_outbound. Оставшиеся Link receive/error paths ещё требуют сверки | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -3913,3 +3913,35 @@ proof wait, handshake proof wait, response wait, Resource receive и Resource se
 
 Повторный targeted test: 1 passed (0.11s); runtime `response_`: 13 passed
 (0.04s). Fmt/diff checks прошли; длительные тесты не запускались.
+
+## Финальная сверка: keepalive admission и last_outbound
+
+Python Link.receive игнорирует keepalive request на initiator до обновления
+activity; responder отвечает только на точный FF и после keepalive interval
+с последней отправки. В Rust это исправлено через общий Link::receive_keepalive:
+FF/FE должны быть ровно одним байтом, Link — Active/Stale; FF на initiator
+не меняет state, last_inbound и RX totals. Принятый keepalive восстанавливает
+Stale и учитывается в RX, но не обновляет application last_data. Closed не оживает.
+Строгий отказ malformed keepalive до activity — Rust validation boundary:
+Python также не отвечает на FF с хвостом, но общий receive может учитывать
+неизвестное тело как inbound. Поддержка валидных wire frames сохранена.
+
+Общая проверка подключена к LinkManager и LinkSession packet/proof/Channel/
+Resource receive/send/response wait. Keepalive должен быть DATA packet.
+Responder учитывает исходящий ответ только после успешного enqueue transport.
+
+Короткая проверка выявила старое расхождение record_tx_keepalive: оно не
+обновляло last_outbound, из-за чего повторные FF вызывали ответы без паузы.
+Теперь last_outbound обновляется как Python had_outbound(is_keepalive=True),
+без изменения inbound/last_data. Stale detection уже inbound-based и от
+собственных исходящих probes не продлевается. Старое inline ожидание
+«last_outbound не меняется» заменено проверкой правильных activity timestamps.
+
+Новых test-only файлов нет; использованы короткие inline проверки точного
+кадра, ролей, Closed/Stale, reply interval и существующие keepalive/response tests.
+Остальные Link receive/error paths и итоговая классификация релиза остаются
+отдельной работой; версия этим блоком не повышается.
+
+Итог: rns-link `keepalive` — 11 passed (0.07s), runtime `keepalive` —
+3 passed (0.01s), runtime `response_` — 13 passed (0.04s).
+Default runtime check, fmt/diff checks прошли; длительных тестов нет.

@@ -1074,11 +1074,14 @@ impl LinkManager {
             }
             rns_wire::context::PacketContext::Keepalive => {
                 if let Some(active) = self.active_links.get_mut(&link_id) {
-                    active.link.record_inbound();
-                    active.link.record_rx(data.len());
+                    if header.flags.packet_type != rns_wire::flags::PacketType::Data
+                        || !active.link.receive_keepalive(data)
+                    {
+                        return;
+                    }
 
                     // Keepalives are NOT encrypted (Packet.py:205-208).
-                    if data.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) {
+                    if data == [rns_link::constants::KEEPALIVE_REQUEST] {
                         // Only the responder replies.
                         if active.link.is_initiator {
                             tracing::trace!(
@@ -1104,13 +1107,16 @@ impl LinkManager {
                             let mut resp_raw =
                                 resp_header.pack().expect("locally constructed header");
                             resp_raw.push(rns_link::constants::KEEPALIVE_RESPONSE);
-                            active.link.record_tx_keepalive(1);
-                            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                                OutboundRequest {
+                            if self
+                                .transport_tx
+                                .try_send(TransportMessage::Outbound(OutboundRequest {
                                     raw: Bytes::from(resp_raw),
                                     destination_hash: link_id,
-                                },
-                            ));
+                                }))
+                                .is_ok()
+                            {
+                                active.link.record_tx_keepalive(1);
+                            }
                         }
                     }
                 }
@@ -5042,6 +5048,65 @@ mod tests {
             active.inbound_resources.is_empty(),
             "timed-out resource buffer must be released"
         );
+    }
+
+    #[test]
+    fn keepalive_requires_exact_frame_and_respects_reply_interval() {
+        let (_, receiver_link) = handshaken_link_pair();
+        let link_id = receiver_link.link_id;
+        let (tx, mut out) = mpsc::channel(16);
+        let (_events, rx) = mpsc::channel(4);
+        let mut lm = LinkManager::new(tx, rx, [0xCC; 16], None);
+        lm.active_links.insert(
+            link_id,
+            ActiveLink {
+                link: receiver_link,
+                _interface_id: 1,
+                channel: None,
+                inbound_resources: HashMap::new(),
+                outbound_resources: HashMap::new(),
+                outbound_split_queues: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                segment_routing: HashMap::new(),
+            },
+        );
+        lm.active_links
+            .get_mut(&link_id)
+            .unwrap()
+            .link
+            .keepalive
+            .last_outbound = None;
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::Keepalive,
+        };
+        for (payload, reply) in [
+            (&[0xff, 0][..], false),
+            (&[0xff][..], true),
+            (&[0xff][..], false),
+        ] {
+            let mut raw = header.pack().unwrap();
+            raw.extend_from_slice(payload);
+            lm.handle_inbound_packet(&raw, 1);
+            if reply {
+                let TransportMessage::Outbound(packet) = out.try_recv().unwrap() else {
+                    panic!("reply")
+                };
+                let (_, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                assert_eq!(&packet.raw[offset..], &[0xfe]);
+            } else {
+                assert!(out.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

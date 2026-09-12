@@ -1217,11 +1217,12 @@ impl Link {
         self.keepalive.record_outbound();
     }
 
-    /// Count an outbound keepalive beat (Python counts them too, Packet.py:291)
-    /// without touching the application-data `last_outbound` baseline.
+    /// Count an outbound keepalive and update last_outbound (Python had_outbound),
+    /// without touching the application-data last_data timestamp.
     pub fn record_tx_keepalive(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;
+        self.keepalive.record_outbound();
     }
 
     /// `bytes` is the link payload after the context byte (Link.py:929).
@@ -1313,6 +1314,23 @@ impl Link {
             }
             LinkState::Closed => LinkAction::None,
         }
+    }
+
+    /// Accept a one-byte keepalive without treating it as application data.
+    /// Initiators ignore requests, including for inactivity accounting.
+    pub fn receive_keepalive(&mut self, data: &[u8]) -> bool {
+        if !matches!(self.state, LinkState::Active | LinkState::Stale)
+            || !matches!(
+                data,
+                [crate::constants::KEEPALIVE_REQUEST] | [crate::constants::KEEPALIVE_RESPONSE]
+            )
+            || (self.is_initiator && data == [crate::constants::KEEPALIVE_REQUEST])
+        {
+            return false;
+        }
+        self.record_inbound();
+        self.record_rx(data.len());
+        true
     }
 
     /// Record that an inbound packet was received; recovers the link from STALE.
@@ -2132,6 +2150,34 @@ mod tests {
     /// `validate_proof` on an already-Closed link must not resurrect it.
     /// Models a late proof arriving after the initiator timed out.
     #[test]
+    fn keepalive_admission_preserves_activity_on_rejected_frames() {
+        let (initiator, responder, _) = make_active_link();
+        for mut link in [initiator, responder] {
+            for payload in [&[][..], &[0xff, 0], &[0xfe, 0], &[0], &[0xff], &[0xfe]] {
+                link.state = LinkState::Stale;
+                let before = (
+                    link.keepalive.last_inbound,
+                    link.keepalive.last_data,
+                    link.rx_bytes,
+                );
+                let accepted = payload == [0xfe] || (!link.is_initiator && payload == [0xff]);
+                assert_eq!(link.receive_keepalive(payload), accepted);
+                assert_eq!(link.keepalive.last_data, before.1);
+                assert_eq!(link.rx_bytes, before.2 + u64::from(accepted));
+                if accepted {
+                    assert_eq!(link.state, LinkState::Active);
+                } else {
+                    assert_eq!(link.state, LinkState::Stale);
+                    assert_eq!(link.keepalive.last_inbound, before.0);
+                }
+            }
+            link.mark_closed(CloseReason::DestinationClosed);
+            assert!(!link.receive_keepalive(&[0xfe]));
+            assert_eq!(link.state, LinkState::Closed);
+        }
+    }
+
+    #[test]
     fn test_validate_proof_on_closed_link_rejected() {
         let dest_hash = [0xAA; 16];
         let identity_key = Ed25519PrivateKey::generate();
@@ -2656,20 +2702,24 @@ mod tests {
         assert_eq!(rx_c, 1);
     }
 
-    /// Keepalive beats count into traffic stats (Packet.py:291) but must not
-    /// refresh `last_outbound`, or an initiator pinging a dead peer would
-    /// never go stale.
+    /// Keepalive beats count into traffic stats (Packet.py:291) and
+    /// refresh last_outbound but not inbound/data activity: sending probes
+    /// must not hide a dead peer from inbound-based stale detection.
     #[test]
-    fn test_record_tx_keepalive_counts_without_outbound_refresh() {
+    fn test_record_tx_keepalive_counts_without_inbound_refresh() {
         let (mut link, _, _) = make_active_link();
         assert!(link.keepalive.last_outbound.is_none());
 
+        let inbound = link.keepalive.last_inbound;
+        let data = link.keepalive.last_data;
         link.record_tx_keepalive(1);
 
         let (tx_b, _, tx_c, _) = link.traffic_stats();
         assert_eq!(tx_b, 1);
         assert_eq!(tx_c, 1);
-        assert!(link.keepalive.last_outbound.is_none());
+        assert!(link.keepalive.last_outbound.is_some());
+        assert_eq!(link.keepalive.last_inbound, inbound);
+        assert_eq!(link.keepalive.last_data, data);
     }
 
     /// Initiator knows expected_hops at creation (Link.py:282); the responder

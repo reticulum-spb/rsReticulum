@@ -757,6 +757,12 @@ impl LinkSession {
             if header.destination_hash != link_id {
                 continue;
             }
+            if header.context == rns_wire::context::PacketContext::Keepalive {
+                if header.flags.packet_type == rns_wire::flags::PacketType::Data {
+                    self.link.receive_keepalive(&raw[offset..]);
+                }
+                continue;
+            }
             if header.flags.packet_type == rns_wire::flags::PacketType::Data
                 && header.context == rns_wire::context::PacketContext::LinkClose
                 && self.link.receive_teardown(&raw[offset..])
@@ -832,6 +838,12 @@ impl LinkSession {
                     if header.destination_hash != self.id() {
                         continue;
                     }
+                    if header.context == rns_wire::context::PacketContext::Keepalive {
+                        if header.flags.packet_type == rns_wire::flags::PacketType::Data {
+                            self.link.receive_keepalive(&raw[offset..]);
+                        }
+                        continue;
+                    }
                     self.link.record_inbound();
                     self.link.record_rx(raw.len().saturating_sub(offset));
                     if header.context == rns_wire::context::PacketContext::LinkClose
@@ -840,9 +852,6 @@ impl LinkSession {
                         return Err(LinkClientError::HandshakeFailed(
                             "link closed by remote".into(),
                         ));
-                    }
-                    if header.context == rns_wire::context::PacketContext::Keepalive {
-                        continue;
                     }
                     if matches!(
                         header.context,
@@ -1096,6 +1105,12 @@ impl LinkSession {
                 continue;
             }
             let body = &raw[offset..];
+            if header.context == rns_wire::context::PacketContext::Keepalive {
+                if header.flags.packet_type == rns_wire::flags::PacketType::Data {
+                    self.link.receive_keepalive(body);
+                }
+                continue;
+            }
             if header.flags.packet_type == rns_wire::flags::PacketType::Proof {
                 if let Some(index) = self
                     .channel_packets
@@ -1244,6 +1259,11 @@ impl LinkSession {
                 }
                 let body = &raw[offset..];
                 match header.context {
+                    rns_wire::context::PacketContext::Keepalive => {
+                        if header.flags.packet_type == rns_wire::flags::PacketType::Data {
+                            self.link.receive_keepalive(body);
+                        }
+                    }
                     rns_wire::context::PacketContext::None
                         if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
                     {
@@ -1829,6 +1849,11 @@ impl LinkSession {
                 }
                 let body = &raw[offset..];
                 match header.context {
+                    rns_wire::context::PacketContext::Keepalive => {
+                        if header.flags.packet_type == rns_wire::flags::PacketType::Data {
+                            self.link.receive_keepalive(body);
+                        }
+                    }
                     rns_wire::context::PacketContext::ResourceReq => {
                         let plaintext = self.link.decrypt(body).map_err(|error| {
                             LinkClientError::LinkCrypto(format!("resource request: {error:?}"))
@@ -2418,6 +2443,11 @@ async fn wait_for_response(
                     }
                     let body = &raw[data_offset..];
                     match header.context {
+                        rns_wire::context::PacketContext::Keepalive => {
+                            if header.flags.packet_type == rns_wire::flags::PacketType::Data {
+                                link.receive_keepalive(body);
+                            }
+                        }
                         rns_wire::context::PacketContext::Response => {
                             match link
                                 .decrypt(body)
