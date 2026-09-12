@@ -92,7 +92,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
 | 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Частично: actor и ingress существуют; каждую семантическую регрессию сверить с Python тестами/изменениями | 4, 6 |
 | 1.5.0 Backbone EPOLL starvation | EPOLL Python implementation неприменима; справедливость Tokio read/write проверить нагрузкой | 5 |
-| 1.5.0 receipt callback deadlock | Python receipt lock не переносится; проверить повторную отправку из callback в actor архитектуре | 6 |
+| 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
 | 1.5.0 Link watchdog exception reset | Воспроизвести runtime malformed receive/error path | 6 |
 | 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Частично: сегменты/RCL реализованы; проверить индексы и повторное связывание Python↔Rust | 6 |
 | 1.5.0 stale BLE device reference | Воспроизвести программную lifecycle модель `rns-interface/src/ble_*`; аппаратный тест отдельно | 6 |
@@ -3714,3 +3714,27 @@ mutable interface; Rust повторно интерфейс для этих ме
 Проверки сборки speedtest и client-only runtime, fmt/diff checks прошли.
 Новых test-only файлов и длительных тестов нет. Receipt callbacks, остальные
 minor/performance строки и итоговое объявление версии остаются отдельной работой.
+
+## Финальная сверка: receipt notifications и очистка корреляций
+
+Python `Transport.py` в 1.5.2 собирает candidate receipts под receipts_lock,
+а proof validation с delivery callback выполняет после освобождения lock.
+Штатный Rust `RegisterReceipt` принимает только hashes, msg_id и timeout;
+actor создаёт receipt без callbacks, а `process_proof` отправляет DeliveryProof
+через `try_send` в destination channels. Application/probe ждут уведомление
+в собственной async-задаче. Это не требует переноса Python mutex или потоков.
+Контракт пояснён у RegisterReceipt. Низкоуровневые callbacks PacketReceipt
+остаются синхронными: вручную установленные через публичное состояние actor
+блокирующие callbacks не входят в заявленную гарантию штатного runtime API.
+
+При проверке обнаружена утечка `receipt_msg_ids`: maintenance удалял expired,
+concluded и вытесненные по MAX_RECEIPTS receipts, но сохранял их correlation IDs.
+Теперь после очистки и ограничения receipt table связанные msg_ids удаляются
+в том же проходе обслуживания. IDs действующих receipts сохраняются; успешная
+доставка, как прежде, удаляет обе записи в inbound path.
+
+Короткий inline test `receipt_maintenance_removes_expired_and_evicted_correlations`:
+1 passed (0.01s). Он регистрирует MAX_RECEIPTS+2 записей через настоящий handler,
+проверяет timeout первой, вытеснение второй и сохранение корреляций остальных.
+Новых test-only файлов нет, длительные тесты не запускались. Общая готовность
+1.5.2 не объявляется; остальные minor/performance пункты ещё требуют сверки.

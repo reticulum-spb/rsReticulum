@@ -217,6 +217,10 @@ impl TransportActor {
                     }
                 }
             }
+            // Correlation IDs must share the receipt lifetime, including timeout
+            // and capacity eviction (successful delivery removes both inline).
+            self.receipt_msg_ids
+                .retain(|hash, _| self.receipt_table.contains_key(hash));
             self.last_receipts_check = now;
         }
 

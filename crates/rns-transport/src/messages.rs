@@ -391,6 +391,8 @@ pub enum TransportMessage {
     },
     /// Register an outbound-packet receipt so the inbound path can match
     /// arriving proofs back to `msg_id`.
+    /// Delivery is reported through destination channels, not a user callback
+    /// running inside the actor. Consumers can enqueue subsequent sends there.
     RegisterReceipt {
         truncated_hash: [u8; 16],
         full_hash: [u8; 32],

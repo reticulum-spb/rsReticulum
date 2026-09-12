@@ -1792,6 +1792,46 @@ mod tests {
     use crate::path_table::PathEntry;
 
     #[test]
+    fn receipt_maintenance_removes_expired_and_evicted_correlations() {
+        let (mut actor, _) = TransportActor::new();
+        let now = std::time::Instant::now();
+        for index in 0..MAX_RECEIPTS + 2 {
+            let mut hash = [0; 16];
+            hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            actor.handle_message(TransportMessage::RegisterReceipt {
+                truncated_hash: hash,
+                full_hash: [0; 32],
+                msg_id: index.to_string(),
+                timeout: Some(Duration::from_secs(180)),
+            });
+            // First receipt expires; second is the oldest remaining and is culled.
+            actor.receipt_table.get_mut(&hash).unwrap().sent_at = if index == 0 {
+                now - Duration::from_secs(181)
+            } else if index == 1 {
+                now - Duration::from_secs(10)
+            } else {
+                now
+            };
+        }
+        actor.last_receipts_check = 0.0;
+        actor.on_tick();
+        assert_eq!(actor.receipt_table.len(), MAX_RECEIPTS);
+        assert_eq!(actor.receipt_msg_ids.len(), MAX_RECEIPTS);
+        for index in [0u64, 1] {
+            let mut hash = [0; 16];
+            hash[..8].copy_from_slice(&index.to_be_bytes());
+            assert!(!actor.receipt_table.contains_key(&hash));
+            assert!(!actor.receipt_msg_ids.contains_key(&hash));
+        }
+        assert!(
+            actor
+                .receipt_msg_ids
+                .keys()
+                .all(|hash| actor.receipt_table.contains_key(hash))
+        );
+    }
+
+    #[test]
     fn requested_client_filters_before_dedup_but_preserves_subscriptions_and_requests() {
         let (mut actor, _tx) = TransportActor::new();
         actor.shared_instance_client_mode = true;
