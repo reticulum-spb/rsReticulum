@@ -95,10 +95,10 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
 | 1.5.0 Link watchdog exception reset | Воспроизвести runtime malformed receive/error path | 6 |
 | 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Частично: сегменты/RCL реализованы; проверить индексы и повторное связывание Python↔Rust | 6 |
-| 1.5.0 stale BLE device reference | Воспроизвести программную lifecycle модель `rns-interface/src/ble_*`; аппаратный тест отдельно | 6 |
+| 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
-| 1.5.0 miscellaneous packet/link/interface fixes | Не конкретизированы changelog: требуется сопоставление Python diff и регрессионных тестов; не считать выполненными | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Частично классифицировано: empty input guards в UDP/Serial/Pipe/KISS/RNode/RNodeMulti уже есть; TCP HDLC min/max+IFAC ограничения перенесены. BLE и RSSI/SNR закрыты отдельными строками. Остальные packet/link изменения не считать автоматически выполненными | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -128,7 +128,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.2 dataplane tuning | Требует этапа 5 с конечными параметрами 1.5.2 | 5 |
 | 1.5.2 rngit block unidentified config example | Утилита вне покрытия; аналогичные rnsh authorization проверки остаются | граница покрытия |
 | 1.5.2 Resource regression | Воспроизвести Python↔Rust, включая большой/многосегментный download | 6 |
-| 1.5.2 I2P keepalive→transport | Воспроизвести текущий I2P/Backbone read path | 5 |
+| 1.5.2 I2P keepalive→transport | Закрыто: i2p_read_loop фильтрует empty HDLC frames и в initial_data, и при чтении; probes обновляют last_read, но не попадают в transport. Scoped watchdog/reader/writer уже перенесены; живой SAM/I2P не проверялся | 5 |
 
 ## Цепочка конфигурации
 
@@ -3738,3 +3738,36 @@ concluded и вытесненные по MAX_RECEIPTS receipts, но сохра�
 проверяет timeout первой, вытеснение второй и сохранение корреляций остальных.
 Новых test-only файлов нет, длительные тесты не запускались. Общая готовность
 1.5.2 не объявляется; остальные minor/performance пункты ещё требуют сверки.
+
+## Финальная сверка: BLE lifecycle и minor interface fixes
+
+Эталон по-прежнему Python `ea98db4f`, рабочее дерево эталона чистое.
+В этом блоке новых функциональных расхождений не найдено: исправления уже
+покрыты существующим Rust-кодом. Матрица уточнена без повторной реализации.
+
+- Android Python исправляет `self.ble_device == None` на присваивание при
+  отсутствии найденных устройств. Rust `resolve_ble_target` возвращает Err,
+  если список не содержит подходящего кандидата; `connect_rnode` каждый раз
+  вызывает resolver. Reconnect loop получает новый локальный conn, а после
+  разрыва отменяет и дожидается writer/forwarder перед следующей попыткой.
+  Rust native Android branch использует новое TCP bridge connection;
+  выбор BLE device принадлежит платформенному коду. Это не доказательство
+  свежести кеша btleplug/ОС или работоспособности конкретного BLE оборудования.
+- Python guards `if not data: return` уже имеют аналоги: UDP отбрасывает n=0;
+  Serial/Pipe/KISS/RNodeMulti проверяют frame.is_empty; общий RNode response
+  parser не выпускает пустой CMD_DATA. Эти ветки не требуют новых изменений.
+- TCP HDLC reader уже применяет fixed MTU с IFAC allowance и минимальную длину;
+  изменение Python check_frame_len покрыто существующим reader и его проверкой.
+- I2P empty probes FLAG FLAG не передаются transport ни из начального SAM
+  буфера, ни из последующих чтений. Они обновляют receive liveness. Reader,
+  writer и watchdog живут в одном scoped connection; это покрывает отдельное
+  исправление 1.5.2, уже реализованное на этапе 5.
+
+Остальные packet/link minor fixes, persistence/known destinations cleanup и
+окончательная классификация performance остаются открытыми. Общая версия и
+заявленная совместимость не повышаются этим документальным уточнением.
+
+Переиспользованы существующие короткие проверки: `i2p::liveness_tests` —
+6 passed (0.00s, in-memory/virtual time),
+`tcp_readers_use_fixed_mtu_with_escape_and_ifac_allowance` — 1 passed (0.86s,
+локальный loopback). Новые test-only файлы не создавались и старые не менялись.
