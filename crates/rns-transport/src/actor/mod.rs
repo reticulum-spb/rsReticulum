@@ -1396,6 +1396,7 @@ impl TransportActor {
                         && header.destination_hash == Self::path_request_dest_hash()
                     {
                         ingress.traffic.sent_path_request(raw.len());
+                        ingress.sent_path_request();
                     }
                 }
             }
@@ -2963,6 +2964,8 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().len(), announce.len() + 4);
         let pr = make_data_packet(TransportActor::path_request_dest_hash(), 0);
         actor.send_to_interface(1, &pr);
+        actor.send_path_request([0xE1; 16], 1, None, false); // full
+        assert_eq!(actor.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
         assert_eq!(rx.try_recv().unwrap().len(), pr.len() + 4);
         actor.send_to_interface(1, &make_data_packet([7; 16], 0));
         rx.try_recv().unwrap();
@@ -2978,6 +2981,7 @@ mod tests {
         assert_eq!(traffic.atxb, announce.len() as u64);
         assert_eq!(traffic.ptxc, 1);
         assert_eq!(traffic.ptxb, pr.len() as u64);
+        assert_eq!(actor.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
         let TransportQueryResponse::InterfaceStats(stats) =
             actor.handle_query(TransportQuery::GetInterfaceStats)
         else {
@@ -2987,6 +2991,15 @@ mod tests {
         actor.interfaces.get_mut(&1).unwrap().direction = InterfaceDirection::bidirectional();
         actor.send_to_interface(1, &announce);
         assert!(actor.interfaces[&1].ingress.outgoing_announce_frequency() > 0.0);
+        rx.try_recv().unwrap();
+        actor.on_outbound_attached(
+            OutboundRequest {
+                raw: pr,
+                destination_hash: TransportActor::path_request_dest_hash(),
+            },
+            1,
+        );
+        assert!(actor.interfaces[&1].ingress.outgoing_pr_frequency() > 0.0);
         actor.deregister_interface(1);
         let (replacement, _rx) = make_test_interface("replacement");
         actor.interfaces.insert(1, replacement);
@@ -11404,6 +11417,7 @@ mod tests {
         let (direct_iface, mut direct_rx) = make_test_interface("direct");
         direct.interfaces.insert(1, direct_iface);
         direct.on_path_request([0x10; 16]);
+        assert_eq!(direct.interfaces[&1].ingress.outgoing_pr_frequency(), 0.0);
         direct.on_path_request([0x11; 16]);
         direct_rx.try_recv().expect("first direct PR");
         direct_rx.try_recv().expect("second direct PR");

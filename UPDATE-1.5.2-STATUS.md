@@ -4187,3 +4187,23 @@ IFAC. Семантика PR frequency и удаления отложенного
 Два последовательных выпуска из announce queue также видны в частоте, без
 ожидания по таймеру. Control TX, queue drain и attached outbound — 3 passed
 (0.01s/0.00s/0.00s). Новых test-only файлов нет.
+
+## Финальная сверка: частота исходящих PR после TX admission
+
+Учёт PR frequency приведён к общей точке успешного принятия пакета в driver
+TX queue рядом с control traffic counters. Прежний вызов после попытки
+`send_path_request` удалён: он учитывал и отказ полной очереди, создавая
+ложную нагрузку для preemptive egress limiter. Общий путь также учитывает
+PR, отправленные через attached outbound без этого helper.
+
+Классификация остаётся той же, что для существующих PR counters: DATA на
+destination `rnstransport.path.request`. Full/closed queue и запрет outbound
+не дают отсчёта. Успех означает TX admission, не подтверждение физической
+доставки. Регистрация попытки в path_requests и резервирование announce cap
+не изменены: это отдельная политика повторных запросов, не счётчик отправок.
+
+Существующие inline cases расширены проверками отказа helper при полной
+очереди, attached PR, отсутствия двойного отсчёта при первой helper-отправке
+и сохранения прямого/пересылаемого/recursive поведения. Control TX — 1 passed,
+PR frequency — 1 passed, recursive PR — 5 passed (0.01s/0.00s/0.00s).
+Новых test-only файлов нет.

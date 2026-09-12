@@ -828,9 +828,6 @@ impl TransportActor {
         }
 
         self.send_to_interface(interface_id, &raw);
-        if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-            entry.ingress.sent_path_request();
-        }
         self.path_requests.insert(destination_hash, now);
     }
 
