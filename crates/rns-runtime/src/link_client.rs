@@ -831,8 +831,9 @@ impl LinkSession {
             .await
     }
 
-    /// Send a request while rejecting a response before Resource assembly
-    /// exceeds the application-provided payload limit.
+    /// Limit packet response data bytes, or the full advertised uncompressed
+    /// Resource size (including envelope and metadata). For split Resources,
+    /// each advertisement repeats the total size; it is not summed per segment.
     pub async fn request_with_metadata_limit(
         &mut self,
         path: &str,
@@ -1810,7 +1811,9 @@ async fn wait_for_response(
         let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
         let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
         let mut multi: Option<MultiSegmentInbound> = None;
-        let mut advertised_bytes = 0usize;
+        let mut response_shape = None;
+        let mut seen_segments = HashMap::new();
+        let mut assembled_bytes = 0usize;
 
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -1866,14 +1869,45 @@ async fn wait_for_response(
                             {
                                 continue;
                             }
-                            if !inbound_resources.contains_key(&adv.resource_hash) {
-                                advertised_bytes = advertised_bytes.saturating_add(adv.data_size);
-                                if advertised_bytes > max_response_bytes {
-                                    return Err(LinkClientError::UnexpectedResponse(
-                                        "resource response exceeds application size limit".into(),
-                                    ));
-                                }
+                            // `d` is the complete uncompressed size, repeated on
+                            // every segment, including metadata and the envelope.
+                            let shape = (adv.original_hash, adv.total_segments, adv.data_size);
+                            let invalid = adv.total_segments == 0
+                                || adv.total_segments > rns_protocol::resource::MAX_SEGMENTS
+                                || adv.segment_index == 0
+                                || adv.segment_index > adv.total_segments
+                                || response_shape.is_some_and(|previous| previous != shape)
+                                || seen_segments
+                                    .get(&adv.segment_index)
+                                    .is_some_and(|hash| *hash != adv.resource_hash)
+                                || seen_segments.iter().any(|(index, hash)| {
+                                    *index != adv.segment_index && *hash == adv.resource_hash
+                                });
+                            if adv.data_size > max_response_bytes || invalid {
+                                send_link_data(
+                                    transport_tx,
+                                    link,
+                                    link_id,
+                                    rns_wire::context::PacketContext::ResourceRcl,
+                                    &adv.resource_hash,
+                                    true,
+                                )?;
+                                return Err(LinkClientError::UnexpectedResponse(
+                                    if invalid {
+                                        "inconsistent resource response segments"
+                                    } else {
+                                        "resource response exceeds application size limit"
+                                    }
+                                    .into(),
+                                ));
                             }
+                            // Retransmitted advertisements must not reset an
+                            // active transfer or count a completed segment twice.
+                            if seen_segments.contains_key(&adv.segment_index) {
+                                continue;
+                            }
+                            response_shape = Some(shape);
+                            seen_segments.insert(adv.segment_index, adv.resource_hash);
 
                             let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
                             let copy_len = adv.random_hash.len().min(random_hash.len());
@@ -1997,6 +2031,24 @@ async fn wait_for_response(
                                     (assembled, proof, transfer.resource.metadata.clone())
                                 };
 
+                                assembled_bytes = assembled_bytes
+                                    .saturating_add(assembled.len())
+                                    .saturating_add(
+                                        metadata.as_ref().map_or(0, |m| m.len().saturating_add(3)),
+                                    );
+                                if assembled_bytes > max_response_bytes {
+                                    send_link_data(
+                                        transport_tx,
+                                        link,
+                                        link_id,
+                                        rns_wire::context::PacketContext::ResourceRcl,
+                                        &rh,
+                                        true,
+                                    )?;
+                                    return Err(LinkClientError::UnexpectedResponse(
+                                        "assembled response exceeds application size limit".into(),
+                                    ));
+                                }
                                 send_link_proof(transport_tx, link_id, &proof)?;
                                 inbound_resources.remove(&rh);
                                 let (_, segment_index, total_segments) =
@@ -2227,6 +2279,102 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn response_size_limit_uses_total_advertised_size() {
+        use rns_wire::context::PacketContext;
+        for limit in [31, 32, 33] {
+            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+            let public = key.public_key();
+            let (mut client, request) = Link::new_initiator([7; 16], 1);
+            let (mut server, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+            let rtt = client
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            server.receive_rtt_packet(&rtt).unwrap();
+            let link_id = client.link_id;
+            let request_id = [8; 16];
+            let (tx, mut outbound) = mpsc::channel(8);
+            let (events, mut rx) = mpsc::channel(8);
+            // Each segment advertises the SAME total d=32. Include a duplicate
+            // ADV to verify that it neither resets nor double-counts a transfer.
+            for index in [1, 1, 2] {
+                let mut adv = ResourceAdvertisement::new(
+                    16,
+                    32,
+                    1,
+                    [index as u8; 32],
+                    vec![0; 4],
+                    rns_protocol::resource::ResourceFlags {
+                        is_response: true,
+                        split: true,
+                        ..Default::default()
+                    },
+                    &[[index as u8; 4]],
+                    rns_wire::constants::ENCRYPTED_MDU,
+                );
+                adv.original_hash = [1; 32];
+                adv.segment_index = index;
+                adv.total_segments = 2;
+                adv.request_id = Some(request_id.to_vec());
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(
+                            link_id,
+                            PacketContext::ResourceAdv,
+                            &server.encrypt(&adv.pack()).unwrap(),
+                        ),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
+            events
+                .send(DestinationEvent::LinkClosed { link_id })
+                .await
+                .unwrap();
+            let result = wait_for_response(
+                &tx,
+                &mut rx,
+                &mut client,
+                link_id,
+                request_id,
+                Duration::from_secs(1),
+                limit,
+            )
+            .await;
+            if limit < 32 {
+                assert!(matches!(
+                    result,
+                    Err(LinkClientError::UnexpectedResponse(_))
+                ));
+                let TransportMessage::Outbound(packet) = outbound.try_recv().unwrap() else {
+                    panic!("outbound")
+                };
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                assert_eq!(header.context, PacketContext::ResourceRcl);
+                assert_eq!(server.decrypt(&packet.raw[offset..]).unwrap(), [1; 32]);
+            } else {
+                assert!(
+                    matches!(result, Err(LinkClientError::HandshakeFailed(_))),
+                    "{result:?}"
+                );
+                for _ in 0..2 {
+                    let TransportMessage::Outbound(packet) = outbound.try_recv().unwrap() else {
+                        panic!("outbound")
+                    };
+                    assert_eq!(
+                        rns_wire::header::PacketHeader::unpack(&packet.raw)
+                            .unwrap()
+                            .0
+                            .context,
+                        PacketContext::ResourceReq
+                    );
+                }
+            }
+            assert!(outbound.try_recv().is_err());
+        }
+    }
 
     #[tokio::test]
     async fn discovered_mtu_reaches_prepared_request_with_safe_fallbacks() {

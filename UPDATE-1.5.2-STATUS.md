@@ -2865,3 +2865,32 @@ database_path/tracing prelude. Новых test-only файлов нет, дли�
 Третий функциональный пункт этапа6 выполнен. Далее — существующий
 request_with_metadata_limit/max_response_size, затем Channel/Buffer и
 Resource-исправления. Этап6 ещё открыт, версия1.0.1.
+
+### Этап 6: аудит существующего ограничения ответа
+
+request_with_metadata_limit не реализован заново, сигнатура сохранена.
+Исправлена ошибка суммирования d: каждый сегмент содержит полный размер
+ответа, включая envelope и metadata, а не размер отдельного сегмента.
+Превышение теперь отправляет encrypted RESOURCE_RCL до приёма вместо одного
+локального error. Повторы ADV не сбрасывают transfer и не учитываются дважды.
+Проверяются согласованность original_hash/числа сегментов/d, диапазон индексов
+и MAX_SEGMENTS до создания coordinator; конфликтующие hash/index отклоняются.
+Реальный собранный размер с metadata prefixes проверяется перед proof/delivery,
+до объединения сегментов. Это не ограничение памяти самой декомпрессии.
+
+Семантика packet response сопоставлена: Python использует
+len(packb(response_data))-2, Rust ограничивает возвращаемые байты. Для binary
+с двухбайтовым префиксом совпадает, для других типов/длин может отличаться.
+Существующий Rust-контракт оставлен для совместимости приложений; различие
+описано в CONFIG.md. Raw file response Python, не содержащий packed envelope,
+не добавлен этим исправлением; текущий decoder ожидает [request_id, data].
+
+Точечный inline test проверяет d=32 для двух сегментов и повторного ADV при
+лимитах31/32/33, ResourceReq для допуска и decrypt RESOURCE_RCL при отказе.
+`cargo test -p rns-runtime --lib response_size_limit_uses_total --quiet`:
+1 passed, 0.03s. Это проверка admission, не полный многосегментный interop.
+`cargo check --workspace --all-targets --quiet` и `git diff --check` успешны;
+сохраняются прежние warnings database_path/tracing prelude.
+Новых test-only файлов нет, длительные тесты не запускались. Python reference
+ea98db4f чист. Пункт аудита ограничения ответа выполнен с описанными границами;
+далее — полный Link MDU в Channel/Buffer и оставшийся Resource-аудит.

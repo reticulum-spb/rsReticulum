@@ -385,6 +385,28 @@ checks trust the declared size and are not a general decompression memory cap.
 Responses and non-request Resources are unaffected; this is an API policy,
 not a new YAML configuration key.
 
+### Response size limits
+
+`LinkSession::request_with_metadata_limit` keeps its existing signature and
+unlimited wrappers. For response Resources the limit applies to advertisement
+`d`: the total uncompressed size, including the packed response envelope and
+metadata prefix. Every segment repeats that total; sizes are not added across
+advertisements. An oversized response gets encrypted `RESOURCE_RCL` before
+allocation, and the request returns an error without closing the link.
+Segment identity/count/size must remain consistent, indices are bounded, and
+duplicate advertisements do not restart accepted transfers. Actual assembled
+bytes (including metadata prefixes) are also bounded before delivery; this
+post-decompression check is not a decompressor memory cap.
+
+Packet responses preserve the established Rust API contract: the limit counts
+returned data bytes (binary/string contents, or MessagePack for structured
+values). Python 1.5.2 instead computes `len(packb(response_data)) - 2` for packet
+responses, which differs for structured values and some string/binary lengths.
+Resource limits follow Python's `d` semantics; the packet API is deliberately
+not changed incompatibly. The existing response decoder expects a packed
+`[request_id, response_data]` Resource; Python raw file-response handling is
+not added by this size-limit correction.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept
