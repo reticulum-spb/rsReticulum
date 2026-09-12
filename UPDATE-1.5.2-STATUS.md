@@ -72,7 +72,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.1 rnstatus gravity display/sort | Gravity есть в runtime/local RPC/remote schema; вывод и сортировка CLI ещё не перенесены | 7 |
 | 1.4.1 boundary→boundary/gateway PR | Реализовано; mode-матрицы с recursive/internal flags проходят в transport tests | 2 |
 | 1.4.1 I2P tasks garbage collection | Python GC причина неприменима к Tokio; прочие minor I2P fixes требуют локального воспроизведения | 5 |
-| 1.4.1 ingress burst active deadlock | Воспроизвести тайминги `ingress.rs` и maintenance без новых announces | 4 |
+| 1.4.1 ingress burst active deadlock | Перенесён порог снятия burst: IC_DEQUE_MIN_SAMPLE вместо IC_BURST_MIN_SAMPLES. Также перенесены sustained hold и PR cooldown из 1.5.2; 22 коротких ingress tests прошли. Maintenance выпускает held announces независимо от burst-флага | 4 / закрыто |
 | 1.4.1 memory efficiency / LOG_EXTREME | Воспроизвести нагрузку и числовые уровни, не переносить Python allocation детали без измерений | 5, 7 |
 | 1.4.1 historical discovery blackhole cleanup | Закрыто: list_with_blackholes удаляет записи по network_id/transport_id; runtime и autoconnect используют актуальный control snapshot, expired TTL исключены | 1 / финальная сверка |
 | 1.4.2 zero-bitrate recursive PR | Воспроизвести незапущенный RNode и bitrate=0 без аппаратуры | 2 |
@@ -4029,3 +4029,25 @@ watchdog_lock, который мог остаться установленным
 receive paths продолжают обработку там, где Python ловит ошибку и продолжает.
 Это не обещание изоляции произвольного panic в пользовательском callback.
 Далее — итоговая сверка ещё открытых строк матрицы; версия пока не повышается.
+
+## Финальная сверка: ingress burst recovery и sustained hold
+
+В `ingress.rs` оставалось поведение до Python commit `48388756`: для снятия
+announce burst требовалось шесть отсчётов, хотя decay оставляет минимум два.
+Теперь используется `IC_DEQUE_MIN_SAMPLE`, как в 1.5.2. Снятие состояния при
+повторной проверке больше не требует новых announces для пополнения deque.
+Это не новый фоновый сброс флага: как и в Python, состояние меняется при вызове
+limiter; maintenance независимо выпускает held announces по частоте и deadline.
+
+В том же блоке перенесены недостающие `burst_sustained` для announces и PR:
+выход возможен только после hold как от активации, так и от последнего
+наблюдаемого превышения порога. Для PR добавлен cooldown из трёх успешных
+проверок снижения частоты; следующая проверка снимает burst, ещё следующая
+разрешает PR. Повторное превышение обновляет sustained time и сбрасывает
+cooldown, а проверка до истечения hold также сбрасывает cooldown, как upstream.
+
+Проверки без sleep: decay до двух отсчётов без новых announces, продолженный
+burst после старой активации, PR cooldown и его сброс, выпуск held announce
+при ещё активном burst. `cargo test -p rns-transport --lib ingress::tests
+--offline --quiet`: 22 passed (0.00s). Изменены только production module с
+inline tests и этот журнал; отдельных test-only файлов нет.

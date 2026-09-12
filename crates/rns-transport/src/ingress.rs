@@ -82,8 +82,11 @@ pub struct IngressController {
     op_freq_deque: VecDeque<Instant>,
     burst_active: bool,
     burst_activated: Instant,
+    burst_sustained: Instant,
     pr_burst_active: bool,
     pr_burst_activated: Instant,
+    pr_burst_sustained: Instant,
+    pr_burst_cooldown: u8,
     /// Earliest instant at which the next held announce may be released.
     held_release: Instant,
     held_announces: HashMap<[u8; 16], HeldAnnounce>,
@@ -115,8 +118,11 @@ impl IngressController {
             op_freq_deque: VecDeque::with_capacity(OP_FREQ_SAMPLES),
             burst_active: false,
             burst_activated: now,
+            burst_sustained: now,
             pr_burst_active: false,
             pr_burst_activated: now,
+            pr_burst_sustained: now,
+            pr_burst_cooldown: 0,
             held_release: now,
             held_announces: HashMap::new(),
             burst_freq_new: IC_BURST_FREQ_NEW,
@@ -280,7 +286,7 @@ impl IngressController {
     /// Whether inbound announces should currently be held. Also updates the
     /// internal burst state — an exit from burst only happens once the
     /// frequency has dropped *and* `burst_hold` seconds have passed since
-    /// activation, preventing flapping on a noisy interface.
+    /// activation and the last observed high rate, preventing flapping.
     pub fn should_ingress_limit(&mut self) -> bool {
         if !self.enabled {
             return false;
@@ -303,14 +309,19 @@ impl IngressController {
             if ia_freq < freq_threshold
                 && now.duration_since(self.burst_activated)
                     > Duration::from_secs_f64(self.burst_hold)
-                && self.ia_freq_deque.len() >= IC_BURST_MIN_SAMPLES
+                && now.duration_since(self.burst_sustained)
+                    > Duration::from_secs_f64(self.burst_hold)
+                && self.ia_freq_deque.len() >= IC_DEQUE_MIN_SAMPLE
             {
                 self.burst_active = false;
+            } else if ia_freq >= freq_threshold {
+                self.burst_sustained = now;
             }
             true
         } else if ia_freq > freq_threshold {
             self.burst_active = true;
             self.burst_activated = now;
+            self.burst_sustained = now;
             self.held_release = now + Duration::from_secs_f64(self.burst_penalty);
             true
         } else {
@@ -342,13 +353,26 @@ impl IngressController {
             if ip_freq < freq_threshold
                 && now.duration_since(self.pr_burst_activated)
                     > Duration::from_secs_f64(self.burst_hold)
+                && now.duration_since(self.pr_burst_sustained)
+                    > Duration::from_secs_f64(self.burst_hold)
             {
-                self.pr_burst_active = false;
+                if self.pr_burst_cooldown == 0 {
+                    self.pr_burst_active = false;
+                } else {
+                    self.pr_burst_cooldown -= 1;
+                }
+            } else {
+                self.pr_burst_cooldown = 3;
+                if ip_freq >= freq_threshold {
+                    self.pr_burst_sustained = now;
+                }
             }
             true
         } else if ip_freq > freq_threshold {
             self.pr_burst_active = true;
             self.pr_burst_activated = now;
+            self.pr_burst_sustained = now;
+            self.pr_burst_cooldown = 3;
             true
         } else {
             false
@@ -616,18 +640,19 @@ mod tests {
     }
 
     #[test]
-    fn announce_burst_clears_only_with_minimum_remaining_samples() {
+    fn announce_burst_clears_with_decayed_minimum_samples_without_new_announces() {
         let mut ctrl = IngressController::new();
         push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 4, 1.0, 0.1);
         assert!(ctrl.should_ingress_limit());
         assert!(ctrl.is_burst_active());
 
         ctrl.burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.burst_sustained = ctrl.burst_activated;
         ctrl.ia_freq_deque.clear();
         push_samples(
             &mut ctrl.ia_freq_deque,
             IA_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES,
+            IC_DEQUE_MIN_SAMPLE - 1,
             AR_FREQ_DECAY + 1.0,
             0.1,
         );
@@ -639,10 +664,32 @@ mod tests {
         push_samples(
             &mut ctrl.ia_freq_deque,
             IA_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES + 1,
+            IC_DEQUE_MIN_SAMPLE + 1,
             AR_FREQ_DECAY + 1.0,
             0.1,
         );
+        assert!(ctrl.should_ingress_limit());
+        assert!(!ctrl.is_burst_active());
+        assert_eq!(ctrl.ia_freq_deque.len(), IC_DEQUE_MIN_SAMPLE);
+        assert!(!ctrl.should_ingress_limit());
+    }
+
+    #[test]
+    fn sustained_announce_burst_restarts_hold_after_activation() {
+        let mut ctrl = IngressController::new();
+        push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 4, 1.0, 0.1);
+        assert!(ctrl.should_ingress_limit());
+        let expired = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.burst_activated = expired;
+        ctrl.burst_sustained = expired;
+        assert!(ctrl.should_ingress_limit());
+        assert!(ctrl.burst_sustained > expired);
+
+        ctrl.ia_freq_deque.clear();
+        push_samples(&mut ctrl.ia_freq_deque, IA_FREQ_SAMPLES, 2, 10.0, 1.0);
+        assert!(ctrl.should_ingress_limit());
+        assert!(ctrl.is_burst_active());
+        ctrl.burst_sustained = expired;
         assert!(ctrl.should_ingress_limit());
         assert!(!ctrl.is_burst_active());
     }
@@ -664,11 +711,12 @@ mod tests {
         assert!(ctrl.is_burst_active());
 
         ctrl.burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.burst_sustained = ctrl.burst_activated;
         ctrl.ia_freq_deque.clear();
         push_samples(
             &mut ctrl.ia_freq_deque,
             IA_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES,
+            IC_DEQUE_MIN_SAMPLE - 1,
             AR_FREQ_DECAY + 1.0,
             0.1,
         );
@@ -697,6 +745,7 @@ mod tests {
         assert!(ctrl.is_pr_burst_active());
 
         ctrl.pr_burst_activated = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.pr_burst_sustained = ctrl.pr_burst_activated;
         ctrl.ip_freq_deque.clear();
         push_samples(
             &mut ctrl.ip_freq_deque,
@@ -706,6 +755,39 @@ mod tests {
             0.1,
         );
 
+        for remaining in (0..3).rev() {
+            assert!(ctrl.should_ingress_limit_pr());
+            assert!(ctrl.is_pr_burst_active());
+            assert_eq!(ctrl.pr_burst_cooldown, remaining);
+        }
+        assert!(ctrl.should_ingress_limit_pr());
+        assert!(!ctrl.is_pr_burst_active());
+        assert!(!ctrl.should_ingress_limit_pr());
+    }
+
+    #[test]
+    fn sustained_pr_burst_resets_hold_and_cooldown() {
+        let mut ctrl = IngressController::new();
+        push_samples(&mut ctrl.ip_freq_deque, IP_FREQ_SAMPLES, 4, 1.0, 0.1);
+        assert!(ctrl.should_ingress_limit_pr());
+        let expired = Instant::now() - Duration::from_secs_f64(IC_BURST_HOLD + 1.0);
+        ctrl.pr_burst_activated = expired;
+        ctrl.pr_burst_sustained = expired;
+        ctrl.pr_burst_cooldown = 1;
+        assert!(ctrl.should_ingress_limit_pr());
+        assert!(ctrl.pr_burst_sustained > expired);
+        assert_eq!(ctrl.pr_burst_cooldown, 3);
+
+        ctrl.ip_freq_deque.clear();
+        ctrl.pr_burst_cooldown = 1;
+        assert!(ctrl.should_ingress_limit_pr());
+        assert!(ctrl.is_pr_burst_active());
+        assert_eq!(ctrl.pr_burst_cooldown, 3);
+        ctrl.pr_burst_sustained = expired;
+        for _ in 0..3 {
+            assert!(ctrl.should_ingress_limit_pr());
+            assert!(ctrl.is_pr_burst_active());
+        }
         assert!(ctrl.should_ingress_limit_pr());
         assert!(!ctrl.is_pr_burst_active());
         assert!(!ctrl.should_ingress_limit_pr());
