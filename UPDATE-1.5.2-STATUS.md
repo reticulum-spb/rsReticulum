@@ -100,7 +100,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
 | 1.5.0 miscellaneous packet/link/interface fixes | Не конкретизированы changelog: требуется сопоставление Python diff и регрессионных тестов; не считать выполненными | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
-| 1.5.0 rnodeconf WiFi summary | Воспроизвести существующий summary Rust, отдельно от flashing backlog | 7 |
+| 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Проверить эквивалентные примеры и transfer status, не объявлять все примеры совместимыми заранее | 6 |
 | 1.5.0 documentation queue/discovery | Отсутствуют новые YAML настройки в CONFIG/Web; обновить с реализацией | 1, 4 |
 | 1.5.1 adaptive dataplane ingress/egress | Отсутствует: `backbone_read_loop` ожидает общий mpsc; write path пишет отдельный HDLC frame | 5 |
@@ -114,7 +114,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 HDLC/IFAC/HKDF parity tests | Rust crypto/wire тесты существуют; сравнить Python fixtures при изменениях | 5 |
 | 1.5.1 shared medium hints / auto MTU | Частично: `traits.rs:optimise_mtu` есть; финальные hints/пороги Python сверить | 5 |
 | 1.5.1 memory/CPU, traffic classes, HKDF/IFAC, locks, hashmap Links, hash reuse | Архитектурно частично: Rust HashMaps и crypto primitives; новые классы отсутствуют, оптимизации обосновывать benchmark | 4, 5 |
-| 1.5.1 announce signature cache | В `actor/inbound.rs` validate вызывается для принятого announce; кеширование результатов требует анализа/измерения | 5 |
+| 1.5.1 announce signature cache | Реализовано в actor: `PreparedInbound` переносит `VerifiedAnnounce` от admission к dispatch без повторной криптографической проверки. Python кеширует флаг в одном Packet, не между пакетами; глобальный кеш не требуется | 5 |
 | 1.5.1 optimized HDLC deframer | Rust deframer существует; побайтовая совместимость и производительность проверяются отдельно | 5 |
 | 1.5.1 inbound defaults / announce queuing tuning | Новые очереди отсутствуют; использовать окончательные Python constants | 4 |
 | 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | Воспроизвести потоковые источники и граничные размеры Rust | 6 |
@@ -3655,6 +3655,35 @@ Default workspace all-targets, runtime api/serial/rnode-tcp/sqlite-bundled
 all-targets и client-only checks прошли; fmt/diff checks чистые.
 
 Матрица дополнена результатами, но общий релиз ещё не объявлен завершённым.
-Далее остаются отдельные строки performance/signature cache, rnodeconf WiFi
-summary и прочие не классифицированные minor fixes; длительная валидация
-по-прежнему отложена. Версия остаётся 1.0.1.
+На момент этого блока оставались строки performance/signature cache, rnodeconf
+WiFi summary и прочие не классифицированные minor fixes. Продолжение ниже;
+длительная валидация по-прежнему отложена. Версия остаётся 1.0.1.
+
+## Финальная сверка: announce signature reuse и rnodeconf WiFi summary
+
+Сверено с неизменённым Python HEAD `ea98db4f` (1.5.2).
+
+- `Identity.validate_announce` сохраняет `packet.announce_signature_validated`:
+  оптимизация действует внутри одного Packet, а не между разными announces.
+  Rust уже передаёт `VerifiedAnnounce` в owned `PreparedInbound` от admission
+  к dispatch. Подпись там повторно не проверяется, но актуальная blackhole
+  policy и destination binding проверяются. Глобальный кеш не добавлен;
+  существующая граница описана комментарием в `actor/inbound.rs`.
+- Upstream WiFi fix в `rnodeconf.py` заменяет второй `if` на `elif`, исключая
+  одновременный вывод Station и Disabled. Rust EEPROM summary раньше вообще
+  не показывал WiFi. Теперь `rnodeconf-rs --info` показывает ровно одно состояние
+  Station/AP/Disabled, канал для включённого WiFi и состояние Bluetooth.
+  Значение канала вне 1–14 нормализуется в 1, как в Python. Отсутствующие поля
+  короткого EEPROM не индексируются: WiFi/канал обозначаются Unknown.
+- Это перенос исправленной семантики режима в существующий Rust summary,
+  не полная совместимость Python `--config`: SSID/PSK/IP из отдельного config
+  sector в этот summary не добавлены. Flashing backlog не затрагивался.
+
+Короткая проверка `cargo test -p rns-tools --bin rnodeconf-rs
+eeprom_summary_reports_identity_and_radio_config --offline --quiet`:
+1 passed (0.00s), включая четыре режима, границы канала и короткие образы.
+Проверка расширена в существующем production-модуле; новых test-only файлов нет.
+`cargo fmt --all` и `git diff --check` прошли.
+
+Далее: оставшиеся неклассифицированные minor/performance fixes в финальной
+матрице. Общая готовность релиза 1.5.2 пока не заявляется, версия не изменена.

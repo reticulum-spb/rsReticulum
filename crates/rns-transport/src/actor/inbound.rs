@@ -1,6 +1,9 @@
 use super::*;
 use crate::now_f64;
 
+// Per-packet signature reuse (Python's announce_signature_validated): admission
+// verifies once and transfers the result to dispatch. Policy and destination
+// binding are still checked at dispatch; this is not a cross-packet cache.
 type VerifiedAnnounce = (
     rns_identity::announce::AnnounceData,
     rns_identity::identity::Identity,

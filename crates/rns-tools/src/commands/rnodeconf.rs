@@ -574,6 +574,40 @@ fn eeprom_summary_lines(image: &eeprom::EepromImage) -> Vec<String> {
         lines.push("  Startup mode: Normal (host-controlled)".to_string());
     }
 
+    // Older EEPROM images can end before the optional connectivity settings.
+    if let Some(bluetooth) = image.bytes().get(eeprom::ADDR_CONF_BT) {
+        lines.push(format!(
+            "  Bluetooth: {}",
+            if *bluetooth == 0x73 {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        ));
+    }
+    match image.bytes().get(eeprom::ADDR_CONF_WIFI) {
+        Some(mode @ (0x01 | 0x02)) => {
+            let mode = if *mode == 0x01 { "Station" } else { "AP" };
+            lines.push(format!("  WiFi: Enabled ({mode})"));
+            let channel = image.bytes().get(eeprom::ADDR_CONF_WCHN).map(|channel| {
+                // Match rnodeconf's normalization of unset/invalid channels.
+                if (1..=14).contains(channel) {
+                    *channel
+                } else {
+                    1
+                }
+            });
+            lines.push(format!(
+                "    Channel: {}",
+                channel
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            ));
+        }
+        Some(_) => lines.push("  WiFi: Disabled".to_string()),
+        None => lines.push("  WiFi: Unknown (not present in EEPROM)".to_string()),
+    }
+
     lines
 }
 
@@ -1035,6 +1069,38 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("Frequency: 868000000 Hz"))
+        );
+        for (mode, expected) in [
+            (0, "Disabled"),
+            (1, "Enabled (Station)"),
+            (2, "Enabled (AP)"),
+            (0xff, "Disabled"),
+        ] {
+            for (channel, expected_channel) in [(0, 1), (6, 6), (14, 14), (255, 1)] {
+                let mut bytes = image.bytes().to_vec();
+                bytes[eeprom::ADDR_CONF_BT] = 0x73;
+                bytes[eeprom::ADDR_CONF_WIFI] = mode;
+                bytes[eeprom::ADDR_CONF_WCHN] = channel;
+                let lines = eeprom_summary_lines(&eeprom::EepromImage::new(bytes).unwrap());
+                let wifi: Vec<_> = lines.iter().filter(|line| line.contains("WiFi:")).collect();
+                assert_eq!(wifi, vec![&format!("  WiFi: {expected}")]);
+                assert!(lines.iter().any(|line| line == "  Bluetooth: Enabled"));
+                assert_eq!(
+                    lines.iter().find(|line| line.contains("Channel:")).cloned(),
+                    matches!(mode, 1 | 2).then(|| format!("    Channel: {expected_channel}"))
+                );
+            }
+        }
+        let mut short = image.bytes()[..=eeprom::ADDR_CONF_WIFI].to_vec();
+        short[eeprom::ADDR_CONF_WIFI] = 1;
+        let lines = eeprom_summary_lines(&eeprom::EepromImage::new(short.clone()).unwrap());
+        assert!(lines.iter().any(|line| line == "    Channel: Unknown"));
+        short.truncate(eeprom::ADDR_CONF_OK + 1);
+        let lines = eeprom_summary_lines(&eeprom::EepromImage::new(short).unwrap());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  WiFi: Unknown (not present in EEPROM)")
         );
     }
 
