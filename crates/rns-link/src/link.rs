@@ -12,7 +12,7 @@ use crate::handshake::{
 use crate::keepalive::KeepaliveState;
 use crate::key_derivation::LinkKeys;
 use crate::mtu_discovery::SignallingData;
-use crate::request::{RequestReceipt, RequestState};
+use crate::request::RequestReceipt;
 
 /// Link lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,6 +1013,23 @@ impl Link {
         &mut self,
         plaintext: &[u8],
     ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
+        let (request_id, response_data) = Self::decode_response_plaintext(plaintext)?;
+        if let Some(index) = self
+            .pending_requests
+            .iter()
+            .position(|r| r.request_id[..16] == request_id[..])
+        {
+            let mut receipt = self.pending_requests.remove(index);
+            receipt.receive_response(response_data.clone());
+        }
+        Ok((request_id, response_data))
+    }
+
+    /// Decode without concluding a receipt, so callers can check response ID
+    /// and application size limits before accepting the response.
+    pub fn decode_response_plaintext(
+        plaintext: &[u8],
+    ) -> Result<([u8; 16], Vec<u8>), LinkCryptoError> {
         let value = rmpv::decode::read_value(&mut &plaintext[..])
             .map_err(|_| LinkCryptoError::DecryptionFailed)?;
 
@@ -1031,17 +1048,6 @@ impl Link {
         request_id.copy_from_slice(id_bytes);
 
         let response_data = msgpack_value_to_bytes(&array[1])?;
-
-        if let Some(receipt) = self
-            .pending_requests
-            .iter_mut()
-            .find(|r| r.request_id[..16] == request_id[..])
-        {
-            receipt.receive_response(response_data.clone());
-        }
-
-        self.pending_requests
-            .retain(|r| r.state == RequestState::Sent);
 
         Ok((request_id, response_data))
     }
@@ -2498,6 +2504,18 @@ mod tests {
 
         // handle_response() must drain the receipt on success.
         assert!(initiator.pending_requests.is_empty());
+        for state in [
+            crate::request::RequestState::Delivered,
+            crate::request::RequestState::Receiving,
+        ] {
+            let mut receipt =
+                RequestReceipt::new([0xFA; 32], initiator.link_id, Duration::from_secs(1));
+            receipt.state = state;
+            initiator.pending_requests.push(receipt);
+        }
+        // A duplicate/unrelated response must not erase ACKed or streaming requests.
+        initiator.handle_response(&response_data).unwrap();
+        assert_eq!(initiator.pending_requests.len(), 2);
     }
 
     #[test]

@@ -72,7 +72,12 @@ impl RequestReceipt {
 
     /// Transition to `Failed` and fire the failure callback.
     pub fn fail(&mut self) {
-        if self.state == RequestState::Sent || self.state == RequestState::Receiving {
+        // Delivered is also used for an ACK without a response. Such a request
+        // can still fail (Python response_rejected); a completed response cannot.
+        if self.state == RequestState::Sent
+            || self.state == RequestState::Receiving
+            || (self.state == RequestState::Delivered && self.response.is_none())
+        {
             self.state = RequestState::Failed;
             if let Some(cb) = self.callbacks.failed.take() {
                 cb(self);
@@ -93,7 +98,10 @@ impl RequestReceipt {
     /// Distinct from `deliver()`: `receive_response` can fire after `mark_delivered()`
     /// for protocols that ack then stream the payload.
     pub fn receive_response(&mut self, data: Vec<u8>) {
-        if self.state == RequestState::Sent || self.state == RequestState::Delivered {
+        if matches!(
+            self.state,
+            RequestState::Sent | RequestState::Delivered | RequestState::Receiving
+        ) {
             self.rtt = Some(self.sent_at.elapsed());
             self.response = Some(data);
             self.state = RequestState::ResponseReceived;
@@ -189,6 +197,15 @@ mod tests {
         receipt.fail();
         assert_eq!(receipt.state, RequestState::Failed);
         assert!(!receipt.is_pending());
+        let mut ack = RequestReceipt::new([0; 32], [0; 16], Duration::from_secs(1));
+        ack.mark_delivered();
+        ack.fail();
+        ack.receive_response(b"too late".to_vec());
+        assert_eq!(ack.state, RequestState::Failed);
+        let mut completed = RequestReceipt::new([0; 32], [0; 16], Duration::from_secs(1));
+        completed.deliver(b"done".to_vec());
+        completed.fail();
+        assert_eq!(completed.state, RequestState::Delivered);
     }
 
     #[test]

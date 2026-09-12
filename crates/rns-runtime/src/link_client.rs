@@ -2373,7 +2373,10 @@ async fn wait_for_response(
                     let body = &raw[data_offset..];
                     match header.context {
                         rns_wire::context::PacketContext::Response => {
-                            match link.handle_response(body) {
+                            match link
+                                .decrypt(body)
+                                .and_then(|plain| Link::decode_response_plaintext(&plain))
+                            {
                                 Ok((id, response_data)) => {
                                     if id == request_id {
                                         if response_data.len() > max_response_bytes {
@@ -2638,7 +2641,7 @@ async fn wait_for_response(
                                         metadata,
                                     });
                                 }
-                                match link.handle_response_plaintext(&response_payload) {
+                                match Link::decode_response_plaintext(&response_payload) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
                                             return Ok(LinkResponse {
@@ -2760,7 +2763,22 @@ async fn wait_for_response(
             );
         }
     }
-    result.map_err(|_| LinkClientError::Timeout("response"))?
+    let result = result.unwrap_or_else(|_| Err(LinkClientError::Timeout("response")));
+    // Packet/packed responses can already have retired their own receipt in
+    // Link. Retire any remaining entry on every exit (including PythonFile,
+    // rejection and timeout), without disturbing other concurrent requests.
+    if let Some(index) = link
+        .pending_requests
+        .iter()
+        .position(|receipt| receipt.request_id[..16] == request_id[..])
+    {
+        let mut receipt = link.pending_requests.remove(index);
+        match &result {
+            Ok(response) => receipt.receive_response(response.data.clone()),
+            Err(_) => receipt.fail(),
+        }
+    }
+    result
 }
 
 /// Drive the existing receive watchdog without extending the request deadline.
@@ -2916,6 +2934,55 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn response_wait_failure_retires_only_its_receipt() {
+        use rns_link::request::{RequestReceipt, RequestState};
+        for closed in [false, true] {
+            let (mut link, _) = Link::new_initiator([7; 16], 1);
+            let link_id = link.link_id;
+            let (tx, _out) = mpsc::channel(4);
+            let (events, mut rx) = mpsc::channel(4);
+            let (failed, failure) = oneshot::channel();
+            let mut receipt = RequestReceipt::new([8; 32], link_id, Duration::from_secs(1));
+            receipt.mark_delivered();
+            receipt.set_failed_callback(move |receipt| {
+                assert_eq!(receipt.state, RequestState::Failed);
+                let _ = failed.send(());
+            });
+            link.pending_requests.push(receipt);
+            link.pending_requests.push(RequestReceipt::new(
+                [9; 32],
+                link_id,
+                Duration::from_secs(1),
+            ));
+            if closed {
+                events
+                    .send(DestinationEvent::LinkClosed { link_id })
+                    .await
+                    .unwrap();
+            }
+            let result = wait_for_response(
+                &tx,
+                &mut rx,
+                &mut link,
+                link_id,
+                [8; 16],
+                Duration::from_millis(5),
+                100,
+                ResourceResponseMode::Packed,
+            )
+            .await;
+            assert!(if closed {
+                matches!(result, Err(LinkClientError::HandshakeFailed(_)))
+            } else {
+                matches!(result, Err(LinkClientError::Timeout("response")))
+            });
+            failure.await.unwrap();
+            assert_eq!(link.pending_requests.len(), 1);
+            assert_eq!(link.pending_requests[0].request_id, [9; 32]);
+        }
+    }
 
     #[tokio::test]
     async fn delivery_proof_recovers_stale_link_and_observes_close() {

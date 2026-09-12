@@ -98,7 +98,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
-| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py сверено: добавлены outbound hops guard и отказ пустому payload при admission; bounds заголовка, hash helpers, traffic classes и signature reuse уже есть. Interface empty guards/TCP bounds, BLE и RSSI/SNR сверены отдельно. Остальные Link/RequestReceipt изменения не считать автоматически выполненными | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py и interface guards сверены. RequestReceipt: адресное завершение, отказ после ACK и cleanup при выходе из response wait исправлены; размер проверяется до принятия ответа. Остальные Link receive/error paths и ранний отказ отправки запроса ещё требуют сверки | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -3829,3 +3829,32 @@ background sleep не добавлялся, latency на большом ката
 обновления и повышение версии этим блоком не заявляются.
 
 Существующие `outbound` checks: 13 passed (0.01s). Fmt/diff checks чистые.
+
+## Финальная сверка: RequestReceipt и завершение response wait
+
+Python 1.5.2 добавляет response_rejected для уже доставленного запроса,
+ответ на который превышает max_response_size. При сопоставлении обнаружены
+и исправлены связанные расхождения Rust:
+
+- `Link::handle_response_plaintext` удалял все pending entries кроме Sent,
+  включая другие ACKed/Receiving requests. Теперь удаляется только receipt
+  с совпадающим request_id; неизвестный/дублированный ответ не чистит остальные.
+- `RequestReceipt::fail` допускает отказ после ACK-only Delivered, но не после
+  Delivered с готовым ответом. Повторный отказ не вызывает callback повторно;
+  ответ после Failed не меняет итог. Receiving может принять завершённый ответ.
+- Добавлен additive `Link::decode_response_plaintext` без изменения receipts.
+  Runtime проверяет ID и ограничения ответа до принятия, а не после вызова
+  handle_response, уже завершившего receipt. Старые handle_response API сохранены.
+- На всех обычных выходах из `wait_for_response` оставшийся receipt именно этого
+  запроса удаляется и завершается успехом/отказом: timeout, link close, rejection,
+  malformed response, cancellation Resource и PythonFile success. Остальные
+  запросы не затрагиваются; ошибка вызывает failure callback при наличии.
+
+Граница блока: отмена самой async future извне и ошибки отправки до входа в
+wait_for_response не проверялись этим изменением. Остальные Link receive/error
+paths также остаются в финальной сверке; полная готовность релиза не заявляется.
+
+Короткие проверки: rns-link `request` — 19 passed; runtime `response_` —
+13 passed (0.04s), включая новую проверку ACK-only failure при timeout/close
+и сохранения чужого pending receipt. Inline проверки в production-модулях;
+новых test-only файлов нет, длительные тесты не запускались.
