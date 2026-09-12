@@ -903,6 +903,19 @@ impl LinkSession {
             .is_none_or(LinkChannel::is_ready_to_send)
     }
 
+    pub fn channel_mdu(&self) -> usize {
+        rns_protocol::channel::Channel::channel_mdu(self.link.mdu)
+    }
+
+    /// Create a Buffer sized for this link. Send returned frames through
+    /// `send_channel`, respecting channel readiness and EOF drain ordering.
+    pub fn channel_buffer(
+        &self,
+        stream_id: u16,
+    ) -> Result<rns_protocol::buffer::ChannelBuffer, rns_protocol::stream_data::StreamIdError> {
+        rns_protocol::buffer::ChannelBuffer::new(stream_id, self.channel_mdu().saturating_sub(2))
+    }
+
     /// Send a typed message over the Link Channel.
     pub async fn send_channel(&mut self, message: &dyn MessageBase) -> Result<(), LinkClientError> {
         self.ensure_channel()?;
@@ -1452,6 +1465,10 @@ impl LinkSession {
             ));
             self.link.mark_channel_created();
         }
+        self.channel
+            .as_mut()
+            .expect("channel initialized")
+            .set_link_mdu(self.link.mdu);
         Ok(())
     }
 }

@@ -103,7 +103,7 @@ impl StreamWriter {
         validate_stream_id(stream_id)?;
         Ok(Self {
             stream_id,
-            max_data_len,
+            max_data_len: max_data_len.min(u16::MAX as usize - 2),
             closed: false,
         })
     }
@@ -118,6 +118,9 @@ impl StreamWriter {
 
         if data.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.max_data_len == 0 {
+            return Err(BufferError::ZeroCapacity);
         }
 
         let mut messages = Vec::new();
@@ -199,6 +202,8 @@ pub struct DrainClose {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BufferError {
+    #[error("channel has no capacity for stream data")]
+    ZeroCapacity,
     #[error("writer is closed")]
     WriterClosed,
 }

@@ -227,6 +227,7 @@ pub struct Channel {
     /// Called in registration order on each delivered message; the first
     /// handler that returns `true` stops the chain.
     message_handlers: Vec<MessageCallback>,
+    link_mdu: usize,
 }
 
 impl Channel {
@@ -241,6 +242,7 @@ impl Channel {
             initial_rtt: rtt,
             registered_types: Vec::new(),
             message_handlers: Vec::new(),
+            link_mdu: usize::MAX,
         }
     }
 
@@ -320,9 +322,13 @@ impl Channel {
         }
 
         let seq = self.next_tx_sequence;
-        self.next_tx_sequence = ((self.next_tx_sequence as u32 + 1) % SEQ_MODULUS) as u16;
-
         let mut envelope = Envelope::pack(msg, seq);
+        if envelope.raw.len() > self.link_mdu
+            || envelope.raw.len() - ENVELOPE_HEADER_SIZE > u16::MAX as usize
+        {
+            return Err(ChannelError::MessageTooBig);
+        }
+        self.next_tx_sequence = ((self.next_tx_sequence as u32 + 1) % SEQ_MODULUS) as u16;
         envelope.state = MessageState::Sent;
         envelope.tries = 1;
         envelope.last_sent = Some(Instant::now());
@@ -506,10 +512,22 @@ impl Channel {
         let mdu = link_mdu.saturating_sub(ENVELOPE_HEADER_SIZE);
         mdu.min(0xFFFF)
     }
+
+    /// Bind the envelope budget to the negotiated Link MDU. Standalone
+    /// channels default to the wire length-field limit until explicitly bound.
+    pub fn set_link_mdu(&mut self, link_mdu: usize) {
+        self.link_mdu = link_mdu;
+    }
+
+    pub fn mdu(&self) -> usize {
+        Self::channel_mdu(self.link_mdu)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
+    #[error("message exceeds channel MDU")]
+    MessageTooBig,
     #[error("channel is closed")]
     ChannelClosed,
     #[error("channel not ready to send")]
@@ -541,6 +559,21 @@ pub struct PreparedChannelData {
 }
 
 impl LinkChannel {
+    pub fn set_link_mdu(&mut self, link_mdu: usize) {
+        self.channel.set_link_mdu(link_mdu);
+    }
+
+    /// Application payload budget, excluding the six-byte envelope header.
+    pub fn mdu(&self) -> usize {
+        self.channel.mdu()
+    }
+
+    pub fn buffer(
+        &self,
+        stream_id: u16,
+    ) -> Result<crate::buffer::ChannelBuffer, crate::stream_data::StreamIdError> {
+        crate::buffer::ChannelBuffer::new(stream_id, self.mdu().saturating_sub(2))
+    }
     /// Plain-text channel (no transport-side encryption).
     pub fn new(link_id: [u8; 16], rtt: f64) -> Self {
         Self {
@@ -917,6 +950,67 @@ mod tests {
         assert_eq!(Channel::channel_mdu(3), 0);
         // Length field is u16, so values past 0xFFFF must saturate.
         assert_eq!(Channel::channel_mdu(0x20000), 0xFFFF);
+    }
+
+    #[test]
+    fn negotiated_mdu_bounds_send_and_buffer_frames() {
+        use crate::stream_data::StreamDataMessage;
+        for link_mdu in [415, 1100, 70000] {
+            let mut channel = LinkChannel::new([0; 16], 0.1);
+            channel.set_link_mdu(link_mdu);
+            let capacity = Channel::channel_mdu(link_mdu);
+            assert_eq!(channel.mdu(), capacity);
+            assert!(matches!(
+                channel.prepare_send(&TestMessage::new(&vec![0; capacity + 1])),
+                Err(ChannelError::MessageTooBig)
+            ));
+            let prepared = channel
+                .prepare_send_tracked(&TestMessage::new(&vec![0; capacity]))
+                .unwrap();
+            assert_eq!(
+                prepared.sequence, 0,
+                "rejection must not consume sequence or window"
+            );
+            assert_eq!(prepared.data.len(), capacity + ENVELOPE_HEADER_SIZE);
+            channel.delivered(prepared.sequence, 0.1);
+
+            let mut buffer = channel.buffer(42).unwrap();
+            let mut random = 0x12345678u32;
+            let data: Vec<u8> = (0..20000)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    random as u8
+                })
+                .collect();
+            let messages = buffer.write(&data).unwrap();
+            if link_mdu > 415 {
+                assert!(
+                    messages.iter().any(|msg| msg.data.len() > 407),
+                    "large MDU must reach stream splitting"
+                );
+            }
+            for message in messages {
+                let prepared = channel.prepare_send_tracked(&message).unwrap();
+                assert!(prepared.data.len() <= link_mdu);
+                let mut decoded = StreamDataMessage::new(0, Vec::new(), false).unwrap();
+                decoded
+                    .unpack(&prepared.data[ENVELOPE_HEADER_SIZE..])
+                    .unwrap();
+                buffer.feed_reader(&decoded);
+                channel.delivered(prepared.sequence, 0.1);
+            }
+            assert_eq!(buffer.read_all().unwrap(), data);
+            let eof = buffer.close_writer();
+            assert!(channel.prepare_send(&eof).is_ok());
+        }
+        let mut channel = LinkChannel::new([0; 16], 0.1);
+        channel.set_link_mdu(8);
+        assert!(matches!(
+            channel.buffer(0).unwrap().write(b"x"),
+            Err(crate::buffer::BufferError::ZeroCapacity)
+        ));
     }
 
     #[test]

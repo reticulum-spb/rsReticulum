@@ -407,6 +407,29 @@ not changed incompatibly. The existing response decoder expects a packed
 `[request_id, response_data]` Resource; Python raw file-response handling is
 not added by this size-limit correction.
 
+### Channel and Buffer MDU
+
+Runtime Channel sends now bind their envelope budget to the negotiated Link
+MDU (LinkSession, LinkManager and the rnsh client). The application message
+budget is `min(link_mdu - 6, 65535)`, with saturating subtraction. Oversized
+messages return `ChannelError::MessageTooBig` before consuming sequence/window
+state or emitting a packet. The 16-bit envelope length cannot wrap on send.
+Standalone `Channel`/`LinkChannel` constructors preserve their signatures and
+default to the wire length limit; callers using them directly must bind their
+transport budget through `set_link_mdu`. `mdu()` reports the payload budget.
+
+`LinkSession::channel_buffer(stream_id)` and `LinkChannel::buffer(stream_id)`
+create a Buffer with two additional bytes reserved for the stream header.
+Send its output through the channel with the existing readiness/acknowledgement
+and EOF drain handling; these factories do not start a background stream task.
+Existing Buffer constructors accepting an explicit data budget remain available.
+Zero-capacity nonempty writes return `BufferError::ZeroCapacity` instead of
+looping; explicit budgets are capped at 65533 for the wire format.
+Python's 16 KiB source-chunk/decompression bound and compression selection are
+retained, so a very large Link MDU does not imply a single arbitrary-size Buffer
+frame. Buffer factories snapshot the budget at creation. The separate rnsh
+application stream chunking is unchanged.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

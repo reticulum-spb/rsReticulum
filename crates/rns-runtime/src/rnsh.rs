@@ -406,6 +406,7 @@ pub async fn rnsh_client_execute(
         .session_keys()
         .ok_or_else(|| RnshError::LinkCrypto("no session keys".into()))?;
     let mut channel = LinkChannel::new_encrypted(link_id, link.rtt_secs(), session_keys);
+    channel.set_link_mdu(link.mdu);
     link.mark_channel_created();
     let mut pending_messages = VecDeque::new();
     let mut stdout = Vec::new();

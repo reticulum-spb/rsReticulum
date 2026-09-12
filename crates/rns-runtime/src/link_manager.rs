@@ -2288,6 +2288,7 @@ impl LinkManager {
             active.channel = Some(LinkChannel::new_encrypted(link_id, rtt, keys));
             active.link.mark_channel_created();
         }
+        active.channel.as_mut()?.set_link_mdu(active.link.mdu);
         active.channel.as_mut()
     }
 

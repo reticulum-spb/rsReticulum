@@ -2894,3 +2894,32 @@ len(packb(response_data))-2, Rust ограничивает возвращаем�
 Новых test-only файлов нет, длительные тесты не запускались. Python reference
 ea98db4f чист. Пункт аудита ограничения ответа выполнен с описанными границами;
 далее — полный Link MDU в Channel/Buffer и оставшийся Resource-аудит.
+
+### Этап 6: Link MDU в Channel/Buffer
+
+Расчёт Channel::channel_mdu уже существовал, но send не применял его.
+Channel получил настраиваемый Link MDU и getter payload MDU; send проверяет
+envelope до расходования sequence/window. Превышение согласованного размера
+или u16 length возвращает MessageTooBig. Runtime LinkSession/LinkManager и
+rnsh client связывают канал с текущим согласованным Link.mdu.
+Standalone-конструкторы сохранены: до set_link_mdu применяется wire ceiling,
+а не предположение о конкретном размере транспорта.
+
+LinkSession::channel_buffer и LinkChannel::buffer создают существующий Buffer
+с бюджетом min(link_mdu-6,65535)-2. Старый явный max_data_len API сохранён,
+но ограничен wire ceiling65533; нулевая вместимость теперь возвращает ошибку
+для непустой записи вместо бесконечного цикла. Запись/ACK/EOF остаются под
+управлением вызывающего кода. Как Python, writer сохраняет MAX_CHUNK_LEN16KiB
+и прежние правила compression; это не ошибочный legacy MDU cap. Бюджет Buffer
+фиксируется при создании. Собственный rnsh stream chunking не менялся.
+
+Один inline test проводит send и Buffer round-trip при Link MDU415/1100/70000,
+проверяет точную границу/превышение, отсутствие расхода sequence при отказе,
+увеличенные stream frames, EOF и zero capacity. Команда
+`cargo test -p rns-protocol --lib negotiated_mdu_bounds --quiet`:
+1 passed, 1.62s. Это локальная проверка формата, не Python↔Rust live interop.
+Workspace all-targets check, fmt check и diff check успешны; прежние warnings
+database_path/tracing prelude сохраняются.
+Новых test-only файлов нет, длительные тесты не запускались. Python reference
+ea98db4f чист. Пункт Channel/Buffer перенесён; далее — оставшиеся Resource
+исправления и Link/watchdog/ratchet/blackholed API. Этап6 открыт, версия1.0.1.
