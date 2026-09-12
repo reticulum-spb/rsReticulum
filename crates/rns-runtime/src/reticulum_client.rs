@@ -244,10 +244,16 @@ impl ReticulumHandle {
     }
 
     pub async fn query_control(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
-        if matches!(query, TransportQuery::GetInterfaceStats)
-            && let Some(rpc_key) = self.config.rpc_key.as_deref()
+        if matches!(
+            query,
+            TransportQuery::GetInterfaceStats | TransportQuery::MediumPathTimeout
+        ) && let Some(rpc_key) = self.config.rpc_key.as_deref()
         {
-            let request = crate::rpc::RpcRequest::GetInterfaceStats;
+            let request = if matches!(query, TransportQuery::MediumPathTimeout) {
+                crate::rpc::RpcRequest::GetMediumPathTimeout
+            } else {
+                crate::rpc::RpcRequest::GetInterfaceStats
+            };
             let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
                 SharedInstanceRpcEndpoint::Tcp(port) => {
                     crate::rpc::connect_and_request(port, rpc_key, &request, Duration::from_secs(5))
@@ -264,22 +270,38 @@ impl ReticulumHandle {
                 }
             };
             match rpc_result {
+                Ok(crate::rpc::RpcResponse::FloatResult(value))
+                    if matches!(query, TransportQuery::MediumPathTimeout) =>
+                {
+                    return Some(TransportQueryResponse::FloatResult(value));
+                }
                 Ok(crate::rpc::RpcResponse::InterfaceStats(entries)) => {
                     return Some(interface_stats_to_transport_response(entries));
                 }
                 Ok(response) => {
-                    tracing::debug!(
-                        ?response,
-                        "unexpected shared instance interface stats response"
-                    );
+                    tracing::debug!(?response, "unexpected shared instance control response");
                 }
                 Err(error) => {
-                    tracing::debug!(%error, "shared instance interface stats RPC failed; falling back to local actor");
+                    tracing::debug!(%error, "shared instance control RPC failed; falling back to local actor");
                 }
             }
         }
 
         self.query_transport(query).await
+    }
+
+    /// Query the shared daemon's slowest-medium round trip, falling back to the
+    /// local actor when control RPC is unavailable. Zero means no active medium.
+    pub async fn medium_path_timeout(&self) -> Option<Duration> {
+        match self
+            .query_control(TransportQuery::MediumPathTimeout)
+            .await?
+        {
+            TransportQueryResponse::FloatResult(Some(seconds)) => {
+                Duration::try_from_secs_f64(seconds).ok()
+            }
+            _ => None,
+        }
     }
 
     /// Discovery is owned by the shared instance in a client-only build.

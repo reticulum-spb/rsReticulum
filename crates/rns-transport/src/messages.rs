@@ -508,6 +508,8 @@ pub enum TransportQuery {
     FirstHopTimeout {
         dest: [u8; 16],
     },
+    /// MTU round trip on the slowest online nonzero-bitrate interface.
+    MediumPathTimeout,
     /// Extra link-proof timeout for a slow interface: `MTU * per_byte_latency`.
     ExtraLinkProofTimeout {
         interface_id: InterfaceId,

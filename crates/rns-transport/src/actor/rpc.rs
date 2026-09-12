@@ -536,6 +536,27 @@ impl TransportActor {
                     .map(|id| id as i64);
                 TransportQueryResponse::IntResult(id.unwrap_or(-1))
             }
+            TransportQuery::MediumPathTimeout => {
+                let slowest = self
+                    .interfaces
+                    .values()
+                    .filter(|iface| {
+                        iface.bitrate > 0
+                            && iface.online.as_ref().is_none_or(|online| {
+                                online.load(std::sync::atomic::Ordering::Relaxed)
+                            })
+                    })
+                    .map(|iface| iface.bitrate)
+                    .min();
+                let seconds = slowest
+                    .map(|rate| {
+                        2.0 * rns_wire::constants::MTU as f64 * 8.0
+                            / rate.max(rns_wire::constants::MINIMUM_BITRATE) as f64
+                            + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+                    })
+                    .unwrap_or(0.0);
+                TransportQueryResponse::FloatResult(Some(seconds))
+            }
             TransportQuery::FirstHopTimeout { dest } => {
                 let timeout = self
                     .path_table

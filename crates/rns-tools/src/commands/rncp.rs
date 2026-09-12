@@ -117,9 +117,9 @@ struct Args {
     #[arg(short = 'i', value_name = "identity")]
     identity_path: Option<String>,
 
-    /// Timeout before giving up (seconds)
-    #[arg(short = 'w', value_name = "seconds", default_value_t = DEFAULT_TIMEOUT_SECS)]
-    timeout: f64,
+    /// Timeout before giving up (seconds); automatic default adapts to slow media
+    #[arg(short = 'w', value_name = "seconds")]
+    timeout: Option<f64>,
 
     /// Display physical layer transfer rates.
     #[arg(short = 'P', long = "phy-rates")]
@@ -285,7 +285,7 @@ async fn run_fetch(args: Args) -> ! {
         println!("Fetching \"{path_arg}\" from <{}>", hex::encode(dest_hash));
     }
 
-    let timeout = Duration::from_secs_f64(args.timeout.max(1.0));
+    let timeout = transfer_timeout(&args, &handle).await;
     let path_wait = timeout;
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
@@ -432,7 +432,7 @@ async fn run_send(args: Args) -> ! {
         println!("Sending \"{file_name}\" to <{}>", hex::encode(dest_hash));
     }
 
-    let timeout = Duration::from_secs_f64(args.timeout.max(1.0));
+    let timeout = transfer_timeout(&args, &handle).await;
     let path_wait = timeout;
     let auto_compress = !args.no_compress;
     let bytes_total = data.len();
@@ -816,6 +816,17 @@ fn rncp_allowed_identity_file_candidates() -> Vec<PathBuf> {
         paths.push(home.join(".rncp/allowed_identities"));
     }
     paths
+}
+
+async fn transfer_timeout(
+    args: &Args,
+    handle: &rns_runtime::reticulum::ReticulumHandle,
+) -> Duration {
+    if let Some(seconds) = args.timeout {
+        return Duration::from_secs_f64(seconds.max(1.0));
+    }
+    Duration::from_secs_f64(DEFAULT_TIMEOUT_SECS)
+        .max(handle.medium_path_timeout().await.unwrap_or_default())
 }
 
 async fn start_reticulum(

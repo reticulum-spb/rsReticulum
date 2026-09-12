@@ -8,7 +8,8 @@ use std::time::Duration;
 use clap::Parser;
 
 use rns_runtime::probe::{
-    ProbeError, ProbeOutcome, default_probe_app_name, parse_dest_hash, probe_once,
+    ProbeError, ProbeOutcome, default_probe_app_name, parse_dest_hash,
+    probe_once_with_medium_timeout,
 };
 
 const DEFAULT_PROBE_SIZE: usize = 16;
@@ -105,7 +106,7 @@ pub(crate) async fn main() {
     };
 
     let size = args.size.unwrap_or(DEFAULT_PROBE_SIZE);
-    // None = Python default: 12 s + first-hop timeout, resolved per wait.
+    // None = max(12 s + first-hop timeout, slowest-medium round trip).
     let timeout = args.timeout.map(Duration::from_secs_f64);
     let wait = Duration::from_secs_f64(args.wait.max(0.0));
 
@@ -139,7 +140,12 @@ pub(crate) async fn main() {
         first = false;
 
         sent += 1;
-        let result = probe_once(
+        let medium_timeout = if timeout.is_none() {
+            handle.medium_path_timeout().await.unwrap_or_default()
+        } else {
+            Duration::ZERO
+        };
+        let result = probe_once_with_medium_timeout(
             handle.transport_tx.clone(),
             dest_hash,
             &full_name,
@@ -147,6 +153,7 @@ pub(crate) async fn main() {
             timeout,
             timeout,
             handle.should_use_implicit_proof(),
+            medium_timeout,
         )
         .await;
 

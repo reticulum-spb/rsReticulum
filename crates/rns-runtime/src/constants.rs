@@ -19,7 +19,7 @@ pub const QUEUED_ANNOUNCE_LIFE: u64 = 86400;
 /// fraction, because queue spacing is calculated as `tx_time / announce_cap`.
 pub const ANNOUNCE_CAP: f64 = 0.02;
 
-pub const MINIMUM_BITRATE: u64 = 5;
+pub const MINIMUM_BITRATE: u64 = rns_wire::constants::MINIMUM_BITRATE;
 pub const IFAC_MIN_SIZE: usize = 1;
 pub const LOG_MAXSIZE: u64 = 5_242_880;
 pub const DEFAULT_INSTANCE_NAME: &str = "default";

@@ -45,6 +45,8 @@ pub const PLAIN_MDU: usize = MDU;
 
 /// Default per-hop timeout in seconds.
 pub const DEFAULT_PER_HOP_TIMEOUT: f64 = 6.0;
+/// Lower bitrate bound for medium timeout estimation, in bit/s.
+pub const MINIMUM_BITRATE: u64 = 5;
 
 /// Name hash length in bytes (80 bits = 10 bytes).
 pub const NAME_HASH_LENGTH: usize = 10;

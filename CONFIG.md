@@ -335,6 +335,33 @@ or oldest-first trimming is performed. Shared-state reset and path-table clear
 do not erase tag history. The independent 45-second inflight request gate and
 15-second discovery waiters keep their existing timeouts.
 
+### Adaptive medium timeout
+
+`ReticulumHandle::medium_path_timeout()` returns an optional duration; the
+corresponding actor query is `MediumPathTimeout`, and control RPC accepts the
+Python-compatible MessagePack request `{"get": "medium_path_timeout"}` and
+returns seconds. It computes `2 * 500 * 8 / max(slowest_online_bitrate, 5) + 6`.
+Zero-bitrate/offline interfaces are excluded; no eligible interface yields zero.
+Legacy Rust entries without an online flag are treated as online. The estimate
+is computed from current registrations on each query, not a cached minimum.
+It is separate from the existing destination-specific first-hop timeout.
+Client-mode API calls query the shared daemon through authenticated control RPC;
+if RPC is unavailable they can fall back to the local actor, which cannot see
+the daemon's external media. API `None` denotes an unavailable/invalid response.
+
+Automatic CLI waits now use this estimate: `rncp-rs` takes the greater of its
+15-second default and the medium timeout for its operation/path wait budget;
+`rnpath-rs` extends default path discovery and remote management waits;
+`rnprobe-rs` takes `max(12 + first_hop_timeout, medium_path_timeout)` for automatic
+path/proof waits. Its CLI supplies the shared daemon's medium estimate and the
+runtime also checks the local estimate at each automatic wait. Existing
+`probe_once` callers retain their signature; `probe_once_with_medium_timeout`
+additionally accepts a shared-medium floor. Explicit `-w`/`--remote-timeout`
+remain authoritative (with existing CLI bounds), unlike Python rncp/rnpath's
+unconditional `max` even for explicit waits. Older daemons that do not support
+the new query retain the existing CLI defaults/fallback behavior. Resource
+transfer timers are separate and are not comprehensively changed by this setting.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept

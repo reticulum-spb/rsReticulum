@@ -3787,6 +3787,37 @@ mod tests {
     }
 
     #[test]
+    fn medium_path_timeout_tracks_active_bitrate() {
+        let (mut actor, _) = TransportActor::new();
+        let query = |actor: &mut TransportActor| match actor
+            .handle_query(TransportQuery::MediumPathTimeout)
+        {
+            TransportQueryResponse::FloatResult(Some(value)) => value,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(query(&mut actor), 0.0);
+        let (mut entry, _) = make_test_interface("slow");
+        let online = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        entry.online = Some(online.clone());
+        entry.bitrate = 1000;
+        actor.interfaces.insert(1, entry);
+        assert_eq!(query(&mut actor), 14.0);
+        let (mut fast, _) = make_test_interface("fast");
+        fast.bitrate = 8000;
+        actor.interfaces.insert(2, fast);
+        assert_eq!(query(&mut actor), 14.0);
+        online.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(query(&mut actor), 7.0);
+        actor.interfaces.get_mut(&1).unwrap().bitrate = 1;
+        online.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(query(&mut actor), 1606.0);
+        actor.interfaces.get_mut(&1).unwrap().bitrate = 0;
+        assert_eq!(query(&mut actor), 7.0);
+        actor.interfaces.remove(&2);
+        assert_eq!(query(&mut actor), 0.0);
+    }
+
+    #[test]
     fn next_hop_mtu_uses_capability_and_shared_destination_fallback() {
         use crate::messages::{TransportQuery, TransportQueryResponse};
         let (mut actor, _) = TransportActor::new();

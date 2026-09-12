@@ -242,8 +242,7 @@ impl Drop for DeliveryProofWaiter {
     }
 }
 
-/// `None` waits mirror Python rnprobe: `DEFAULT_TIMEOUT +
-/// get_first_hop_timeout(dest)`, resolved fresh at each wait.
+/// `None` waits use max(DEFAULT_TIMEOUT + first-hop timeout, medium timeout).
 pub async fn probe_once(
     transport_tx: mpsc::Sender<TransportMessage>,
     dest_hash: [u8; 16],
@@ -252,6 +251,31 @@ pub async fn probe_once(
     proof_wait: Option<Duration>,
     path_wait: Option<Duration>,
     use_implicit_proof: bool,
+) -> Result<ProbeOutcome, ProbeError> {
+    probe_once_with_medium_timeout(
+        transport_tx,
+        dest_hash,
+        app_name,
+        size,
+        proof_wait,
+        path_wait,
+        use_implicit_proof,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Supply the shared daemon's medium timeout when the local actor is only a client.
+/// Explicit waits remain authoritative; the floor only affects automatic waits.
+pub async fn probe_once_with_medium_timeout(
+    transport_tx: mpsc::Sender<TransportMessage>,
+    dest_hash: [u8; 16],
+    app_name: &str,
+    size: usize,
+    proof_wait: Option<Duration>,
+    path_wait: Option<Duration>,
+    use_implicit_proof: bool,
+    medium_timeout: Duration,
 ) -> Result<ProbeOutcome, ProbeError> {
     if size > MTU {
         return Err(ProbeError::MtuExceeded(size, MTU));
@@ -284,7 +308,9 @@ pub async fn probe_once(
 
         let path_wait = match path_wait {
             Some(d) => d,
-            None => default_probe_wait(&transport_tx, dest_hash).await?,
+            None => default_probe_wait(&transport_tx, dest_hash)
+                .await?
+                .max(medium_timeout),
         };
 
         let (await_tx, await_rx) = oneshot::channel();
@@ -353,7 +379,9 @@ pub async fn probe_once(
     // Per probe, like Python's per-packet `timeout or DEFAULT_TIMEOUT + fht`.
     let proof_wait = match proof_wait {
         Some(d) => d,
-        None => default_probe_wait(&transport_tx, dest_hash).await?,
+        None => default_probe_wait(&transport_tx, dest_hash)
+            .await?
+            .max(medium_timeout),
     };
 
     // trunc_hash keys `receipt_table`; unique msg_id filters fan-out.
@@ -425,10 +453,20 @@ async fn default_probe_wait(
     dest: [u8; 16],
 ) -> Result<Duration, ProbeError> {
     let first_hop = match query(tx, TransportQuery::FirstHopTimeout { dest }).await? {
-        TransportQueryResponse::FloatResult(Some(t)) => t,
+        TransportQueryResponse::FloatResult(Some(t)) if t.is_finite() && t >= 0.0 => t,
         _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
     };
-    Ok(Duration::from_secs_f64(DEFAULT_TIMEOUT_SECS + first_hop))
+    let medium = match query(tx, TransportQuery::MediumPathTimeout).await? {
+        TransportQueryResponse::FloatResult(Some(t)) if t.is_finite() && t >= 0.0 => t,
+        _ => 0.0,
+    };
+    Ok(
+        Duration::try_from_secs_f64((DEFAULT_TIMEOUT_SECS + first_hop).max(medium)).unwrap_or(
+            Duration::from_secs_f64(
+                DEFAULT_TIMEOUT_SECS + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+            ),
+        ),
+    )
 }
 
 pub fn parse_dest_hash(hex_str: &str) -> Result<[u8; 16], ProbeError> {

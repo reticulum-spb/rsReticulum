@@ -532,6 +532,12 @@ async fn process_rpc_request(
             }
             RpcResponse::Ok
         }
+        RpcRequest::GetMediumPathTimeout => {
+            match query_transport(transport_tx, TransportQuery::MediumPathTimeout).await {
+                Some(TransportQueryResponse::FloatResult(value)) => RpcResponse::FloatResult(value),
+                _ => RpcResponse::FloatResult(None),
+            }
+        }
         RpcRequest::GetFirstHopTimeout { destination_hash } => {
             let dest = hash_to_array(&destination_hash);
             match dest {

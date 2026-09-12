@@ -2797,3 +2797,42 @@ bitrate1M на всех. Workspace all-targets и client-only checks успеш�
 отложенной валидацией, а не блокируют переход к функционалу этапа 6.
 Это не завершение всего обновления: этапы6/7 и итоговая интеграционная
 проверка впереди; версия остаётся1.0.1.
+
+### Этап 6: medium_path_timeout и автоматические таймауты CLI
+
+Перенесён расчёт Python Transport.medium_path_timeout из ea98db4f:
+2*(MTU500*8/max(lowest_online_nonzero_bitrate,5))+DEFAULT_PER_HOP_TIMEOUT6.
+Нет подходящей среды —0. Actor вычисляет минимум по актуальным интерфейсам
+на запросе, учитывает online/изменение bitrate/удаление; отсутствующий legacy
+online flag означает online. Python cached minimum/stale-state не копируется.
+MINIMUM_BITRATE вынесен в общий wire constant, runtime сохраняет прежний alias.
+
+Добавлены TransportQuery::MediumPathTimeout, RpcRequest::GetMediumPathTimeout,
+dispatch и MessagePack get=medium_path_timeout с FloatResult(seconds/None).
+ReticulumHandle::medium_path_timeout доступен в full/client-only builds.
+Client control plane проксирует запрос daemon; без доступного авторизованного
+RPC действует существующий local fallback с его ограниченным обзором сети.
+Первый hop timeout не заменён и по-прежнему зависит от destination.
+
+rncp различает отсутствие -w и explicit value: default operation/path budgets
+max(15s,medium). rnpath адаптирует default discovery и remote management waits.
+rnprobe default path/proof waits=max(12s+first_hop,medium), CLI получает shared
+medium floor, local estimate обновляется для каждого automatic wait. Старый
+probe_once API сохранён, новый вариант принимает дополнительный floor.
+Explicit -w/remote-timeout не увеличиваются — приоритет пользовательского
+значения из плана; это документированное отличие от Python rncp/rnpath max.
+Старые daemon/недоступный query оставляют defaults/fallback. Полный аудит
+Resource timers, включая отдельный transfer proof deadline, ещё впереди.
+
+Доказательство переноса без расширения тестовой инфраструктуры: один inline
+actor test для0/online/offline/смены bitrate/минимума5/removal и один inline
+RPC test request/response shape и round-trip, оба успешны. Существующий
+перечень codec variants дополнен новым запросом. Новых test-only файлов нет.
+Команды: `cargo test -p rns-transport --lib medium_path_timeout --quiet` и
+`cargo test -p rns-runtime --lib medium_path_timeout --quiet` — по1 passed.
+Workspace all-targets и client-only tests checks успешны; прежние warnings
+database_path/tracing prelude сохраняются. Python reference чист, ea98db4f.
+
+Первые два функциональных пункта этапа6 выполнены. Далее — Destination
+max_request_size и отказ от слишком большого Resource до его приёма,
+затем аудит Channel/Buffer/Resource. Этап6 открыт, версия1.0.1.

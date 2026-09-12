@@ -215,9 +215,22 @@ impl ReticulumHandle {
         result
     }
 
-    /// Query this runtime's next-hop Link MTU capability, not a negotiated MTU.
-    /// Unknown paths and interfaces without upgrades return None. This uses
-    /// the local actor even when attached to a shared daemon.
+    /// Round-trip timeout on the slowest active medium. Uses the shared daemon
+    /// in client mode; zero means no active medium, None means unavailable.
+    pub async fn medium_path_timeout(&self) -> Option<Duration> {
+        match self
+            .query_control(TransportQuery::MediumPathTimeout)
+            .await?
+        {
+            TransportQueryResponse::FloatResult(Some(seconds)) => {
+                Duration::try_from_secs_f64(seconds).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Query the local actor's next-hop Link MTU capability, not a negotiated MTU.
+    /// Unknown paths and interfaces without upgrades return None.
     pub async fn next_hop_mtu(&self, destination: [u8; 16]) -> Option<u32> {
         match self
             .query_transport(TransportQuery::GetNextHopMtu { dest: destination })
@@ -342,6 +355,7 @@ fn transport_query_to_rpc_request(query: &TransportQuery) -> Option<crate::rpc::
         TransportQuery::GetNextHop { dest } => RpcRequest::GetNextHop {
             destination_hash: dest.to_vec(),
         },
+        TransportQuery::MediumPathTimeout => RpcRequest::GetMediumPathTimeout,
         TransportQuery::FirstHopTimeout { dest } => RpcRequest::GetFirstHopTimeout {
             destination_hash: dest.to_vec(),
         },

@@ -70,6 +70,7 @@ pub enum RpcRequest {
     GetFirstHopTimeout {
         destination_hash: Vec<u8>,
     },
+    GetMediumPathTimeout,
     GetLinkCount,
     GetPacketRssi {
         packet_hash: Vec<u8>,
@@ -314,6 +315,7 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
             ("get", PyValue::String("first_hop_timeout".to_string())),
             ("destination_hash", PyValue::Bytes(destination_hash.clone())),
         ]),
+        RpcRequest::GetMediumPathTimeout => py_get("medium_path_timeout"),
         RpcRequest::GetLinkCount => py_get("link_count"),
         RpcRequest::GetPacketRssi { packet_hash } => py_dict(vec![
             ("get", PyValue::String("packet_rssi".to_string())),
@@ -414,6 +416,7 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
             "next_hop" => Ok(RpcRequest::GetNextHop {
                 destination_hash: dict_bytes(entries, "destination_hash")?,
             }),
+            "medium_path_timeout" => Ok(RpcRequest::GetMediumPathTimeout),
             "first_hop_timeout" => Ok(RpcRequest::GetFirstHopTimeout {
                 destination_hash: dict_bytes(entries, "destination_hash")?,
             }),
@@ -784,6 +787,7 @@ fn py_value_to_response_for_request(
             _ => py_required_int(value)? != 0,
         })),
         RpcRequest::GetFirstHopTimeout { .. }
+        | RpcRequest::GetMediumPathTimeout
         | RpcRequest::GetPacketRssi { .. }
         | RpcRequest::GetPacketSnr { .. }
         | RpcRequest::GetPacketQ { .. } => Ok(RpcResponse::FloatResult(py_optional_float(value)?)),
@@ -2197,6 +2201,7 @@ mod tests {
     #[test]
     fn test_all_request_variants() {
         let requests = vec![
+            RpcRequest::GetMediumPathTimeout,
             RpcRequest::GetPathTable { max_hops: None },
             RpcRequest::GetInterfaceStats,
             RpcRequest::GetRateTable,
@@ -2242,6 +2247,27 @@ mod tests {
         for req in &requests {
             let encoded = encode_request(req).unwrap();
             let _ = decode_request(&encoded).unwrap();
+        }
+    }
+
+    #[test]
+    fn medium_path_timeout_rpc_contract() {
+        let request = RpcRequest::GetMediumPathTimeout;
+        let encoded = encode_request(&request).unwrap();
+        assert_eq!(
+            decode_umsgpack(&encoded).unwrap(),
+            py_get("medium_path_timeout")
+        );
+        assert!(matches!(
+            decode_request(&encoded).unwrap(),
+            RpcRequest::GetMediumPathTimeout
+        ));
+        for value in [None, Some(0.0), Some(1606.0)] {
+            let response = encode_response(&RpcResponse::FloatResult(value)).unwrap();
+            assert!(
+                matches!(decode_response_for_request(&response, &request).unwrap(),
+                RpcResponse::FloatResult(actual) if actual == value)
+            );
         }
     }
 

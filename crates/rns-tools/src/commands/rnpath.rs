@@ -783,11 +783,20 @@ async fn query_path(ctx: &ClientCtx, dest_hex: &str) -> ExitCode {
     let mut iface = iface;
     if next_hop.is_none() && path_entry.is_none() {
         // Python rnpath defaults -w to Transport.PATH_REQUEST_TIMEOUT.
-        let timeout_secs = ctx
+        let mut timeout_secs = ctx
             .explicit_timeout
             .map(|d| d.as_secs_f64())
             .unwrap_or(rns_transport::constants::PATH_REQUEST_TIMEOUT)
             .max(0.1);
+        if ctx.explicit_timeout.is_none() {
+            if let Ok(RpcResponse::FloatResult(Some(seconds))) =
+                request(ctx, &RpcRequest::GetMediumPathTimeout).await
+            {
+                if std::time::Duration::try_from_secs_f64(seconds).is_ok() {
+                    timeout_secs = timeout_secs.max(seconds);
+                }
+            }
+        }
         let req = RpcRequest::RequestPath {
             destination_hash: dest.to_vec(),
             timeout_secs: Some(timeout_secs),
@@ -935,11 +944,14 @@ async fn run_remote_blackhole_list(args: Args) -> ExitCode {
         }
     };
 
-    let timeout = Duration::from_secs(
+    let mut timeout = Duration::from_secs(
         args.remote_timeout
             .or(args.timeout)
             .unwrap_or(REMOTE_TIMEOUT_SECS),
     );
+    if args.remote_timeout.or(args.timeout).is_none() {
+        timeout = timeout.max(handle.medium_path_timeout().await.unwrap_or_default());
+    }
     let client = LinkClient::new(handle.transport_tx.clone(), identity);
     let response_bytes = match client
         .query(
@@ -1135,11 +1147,14 @@ async fn run_remote(args: Args) -> ExitCode {
         }
     };
 
-    let timeout = Duration::from_secs(
+    let mut timeout = Duration::from_secs(
         args.remote_timeout
             .or(args.timeout)
             .unwrap_or(REMOTE_TIMEOUT_SECS),
     );
+    if args.remote_timeout.or(args.timeout).is_none() {
+        timeout = timeout.max(handle.medium_path_timeout().await.unwrap_or_default());
+    }
 
     // Wire payload: [command, destination, max_hops]. Destination filter not
     // exposed by all older peers; max_hops is table-only.
