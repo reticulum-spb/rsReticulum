@@ -1346,6 +1346,37 @@ interfaces:
     target_port: 4242
 ```
 
+## rnpath remote queries and rncp transfer rates
+
+`rnpath-rs -R TRANSPORT_IDENTITY_HASH -i IDENTITY_FILE --table [DESTINATION]`
+and `--rates [DESTINATION]` use authenticated `/path` queries. `--max HOPS`
+applies to the path table. `-p TRANSPORT_IDENTITY_HASH [FILTER]` queries the
+separate published blackhole-list endpoint; it does not expose a private
+blackhole table or permit remote changes. Remote drop/path-request/blackhole
+mutations have no endpoint in Python Reticulum 1.5.2 either and are rejected
+before starting an RNS instance. Run those commands locally on the target.
+
+`rncp-rs -P` / `--phy-rates` enables an additional rate estimate in send/fetch
+progress. `--silent` suppresses it with the rest of the progress output. The
+listener is unaffected by this display flag, as in Python.
+
+The estimate uses `segment progress × encoded segment size`, equivalent to
+Python's `get_segment_progress() × get_transfer_size()`. It includes Resource
+metadata and the effects of compression/encryption, but not RNS packet headers,
+IFAC, framing, retries, channel contention or radio airtime. Units are bits/s
+with decimal k/M/G prefixes. This is deliberately labelled
+`physical/resource estimate`, not a measured PHY bitrate. Completed segment
+bytes accumulate without resetting the counter at the next segment; repeated
+parts/progress do not increase it. The display uses up to 32 recent samples,
+with elapsed time measured from the first Resource advertisement/transfer.
+Small transfers may only show an average over their available samples.
+
+Runtime callers can opt into `rncp_send_reader_with_stats` or
+`rncp_fetch_file_with_stats` with a latest-value `watch` sender carrying
+`RncpTransferProgress` (fraction, estimated encoded bytes, elapsed duration).
+Slow observers cannot block a transfer. Existing request structures and
+`rncp_send_reader`/`rncp_send_file`/`rncp_fetch_file` remain available unchanged.
+
 ## rnsh configuration and migration
 
 `rnsh-rs` uses the Reticulum 1.5.2 directory semantics:

@@ -167,10 +167,10 @@ rnprobe-rs  [-s SIZE] [-n COUNT] [-t TIMEOUT] [-w WAIT] [--json] <full_name> <de
 rnid-rs     [-i IDENTITY|-g FILE|-m PUB|-M PRV] [-p|-P] [-x|-X] [-H ASPECT]
             [-a [ASPECT]] [-e FILE|-d FILE|-s FILE|-V FILE] [-w FILE] [-f]
             [-R|-N] [-t SECONDS] [-b|-B] [--raw] [--version]
-rncp-rs     <file> <destination_hash>
+rncp-rs     [-P|--phy-rates] <file> <destination_hash>
 rncp-rs     -l [-b SECONDS] [-s DEST_DIR] [-a <allowed_hash>]...
 rncp-rs     -l -F [-j <jail_dir>] [-a <allowed_hash>|-n]...
-rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR]
+rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR] [-P|--phy-rates]
 rnodeconf-rs [-i] [-N|-T] [-b|-B|-p] [-w MODE] [-D N] [-t N] [-R N] [--freq HZ]
             [--bw HZ] [--txp DBM] [--sf SF] [--cr CR] [-x|-X]
             [--eeprom-backup|--eeprom-dump] [--trust-key HASH] [--version] [PORT]
@@ -406,10 +406,13 @@ Known gaps and intentional limits:
 - `rnstatus-rs` covers the practical operator surface, but does not implement
   every display/API behavior from upstream.
 - `rnpath-rs` remote mode is read-only for table/rates, including destination
-  filters, apart from the remote blackhole-list query path. Remote mutations
-  and remote active path requests are full gaps.
+  filters, apart from the remote blackhole-list query path. Reticulum 1.5.2
+  also has no management endpoint for remote mutations or active path requests;
+  those operations must be run locally.
 - `rncp-rs` implements the listener `-b` announce interval. `-P/--phy-rates`
-  is not supported for the time being.
+  displays an encoded Resource transfer-rate estimate for send/fetch, following
+  Python's Resource-progress meaning of “physical”. This is not radio airtime
+  or interface wire accounting; headers and retransmissions are excluded.
 - `rns-ratkey` hardware identity support is feature-gated and still has known
   hardware-verification gaps before it should be described as release-ready.
 

@@ -37,8 +37,9 @@ use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::StoragePaths;
 use rns_runtime::rncp::{
     DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchOutcome, RncpFetchRequest,
-    RncpListenerConfig, RncpOutcome, RncpSendReaderRequest, default_rncp_app_name, rncp_fetch_file,
-    rncp_send_reader, spawn_rncp_listener,
+    RncpListenerConfig, RncpOutcome, RncpSendReaderRequest, RncpTransferProgress,
+    default_rncp_app_name, rncp_fetch_file_with_stats, rncp_send_reader_with_stats,
+    spawn_rncp_listener,
 };
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
@@ -121,7 +122,7 @@ struct Args {
     #[arg(short = 'w', value_name = "seconds")]
     timeout: Option<f64>,
 
-    /// Display physical layer transfer rates.
+    /// Display encoded Resource transfer rates (not radio/interface wire rates).
     #[arg(short = 'P', long = "phy-rates")]
     phy_rates: bool,
 
@@ -199,12 +200,6 @@ pub(crate) async fn main() {
     if args.version {
         println!("rncp-rs {RS_RETICULUM_VERSION}");
         return;
-    }
-    if args.phy_rates {
-        eprintln!(
-            "rncp-rs: -P/--phy-rates is not implemented yet; the Rust resource layer currently exposes logical transfer progress only."
-        );
-        process::exit(2);
     }
 
     let level = match (args.verbose as i32) - (args.quiet as i32) {
@@ -289,10 +284,15 @@ async fn run_fetch(args: Args) -> ! {
     let path_wait = timeout;
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
+    let (stats_tx, stats_rx) = tokio::sync::watch::channel(RncpTransferProgress::default());
+    let stats_tx = args.phy_rates.then_some(stats_tx);
+    let phy_rates = args.phy_rates;
     let silent = args.silent;
     let progress_task = tokio::spawn(async move {
         let mut last = -1.0_f32;
+        let mut rates = PhysicalRateWindow::default();
         while let Some(p) = progress_rx.recv().await {
+            let physical = rates.display(*stats_rx.borrow(), phy_rates);
             if silent {
                 continue;
             }
@@ -303,7 +303,7 @@ async fn run_fetch(args: Args) -> ! {
             let pct = (p * 100.0).clamp(0.0, 100.0);
             let mut stderr = tokio::io::stderr();
             let _ = stderr
-                .write_all(format!("\rfetch: {pct:5.1}%   ").as_bytes())
+                .write_all(format!("\rfetch: {pct:5.1}%{physical}   ").as_bytes())
                 .await;
             let _ = stderr.flush().await;
         }
@@ -312,17 +312,20 @@ async fn run_fetch(args: Args) -> ! {
         }
     });
 
-    let result = rncp_fetch_file(RncpFetchRequest {
-        transport_tx: handle.transport_tx.clone(),
-        identity,
-        dest_hash,
-        remote_path: path_arg,
-        save_dir: &save_dir,
-        overwrite: args.overwrite,
-        overall_timeout: timeout,
-        path_wait,
-        progress_tx: Some(progress_tx),
-    })
+    let result = rncp_fetch_file_with_stats(
+        RncpFetchRequest {
+            transport_tx: handle.transport_tx.clone(),
+            identity,
+            dest_hash,
+            remote_path: path_arg,
+            save_dir: &save_dir,
+            overwrite: args.overwrite,
+            overall_timeout: timeout,
+            path_wait,
+            progress_tx: Some(progress_tx),
+        },
+        stats_tx,
+    )
     .await;
 
     let _ = progress_task.await;
@@ -450,10 +453,15 @@ async fn run_send(args: Args) -> ! {
     let auto_compress = !args.no_compress;
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
+    let (stats_tx, stats_rx) = tokio::sync::watch::channel(RncpTransferProgress::default());
+    let stats_tx = args.phy_rates.then_some(stats_tx);
+    let phy_rates = args.phy_rates;
     let silent = args.silent;
     let progress_task = tokio::spawn(async move {
         let mut last = -1.0_f32;
+        let mut rates = PhysicalRateWindow::default();
         while let Some(p) = progress_rx.recv().await {
+            let physical = rates.display(*stats_rx.borrow(), phy_rates);
             if silent {
                 continue;
             }
@@ -464,7 +472,7 @@ async fn run_send(args: Args) -> ! {
             let pct = (p * 100.0).clamp(0.0, 100.0);
             let mut stderr = tokio::io::stderr();
             let _ = stderr
-                .write_all(format!("\rtransfer: {pct:5.1}%   ").as_bytes())
+                .write_all(format!("\rtransfer: {pct:5.1}%{physical}   ").as_bytes())
                 .await;
             let _ = stderr.flush().await;
         }
@@ -473,18 +481,21 @@ async fn run_send(args: Args) -> ! {
         }
     });
 
-    let result = rncp_send_reader(RncpSendReaderRequest {
-        transport_tx: handle.transport_tx.clone(),
-        identity,
-        dest_hash,
-        file_name: &file_name,
-        reader: file,
-        data_size: bytes_total,
-        auto_compress,
-        overall_timeout: timeout,
-        path_wait,
-        progress_tx: Some(progress_tx),
-    })
+    let result = rncp_send_reader_with_stats(
+        RncpSendReaderRequest {
+            transport_tx: handle.transport_tx.clone(),
+            identity,
+            dest_hash,
+            file_name: &file_name,
+            reader: file,
+            data_size: bytes_total,
+            auto_compress,
+            overall_timeout: timeout,
+            path_wait,
+            progress_tx: Some(progress_tx),
+        },
+        stats_tx,
+    )
     .await;
 
     let _ = progress_task.await;
@@ -532,6 +543,75 @@ fn print_send_summary(outcome: &RncpOutcome, bytes: usize) {
         "Transferred {} bytes in {:.2}s ({:.2} {})",
         bytes, elapsed, t_value, t_unit
     );
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn physical_rates_are_opt_in_and_convert_bytes_to_bits() {
+        let mut window = PhysicalRateWindow::default();
+        let sample = RncpTransferProgress {
+            progress: 0.5,
+            encoded_bytes: 1000.0,
+            elapsed: Duration::from_secs(2),
+        };
+        assert_eq!(window.display(sample, false), "");
+        assert!(window.display(sample, true).contains("4.00 kbps"));
+        for second in 3..50 {
+            window.display(
+                RncpTransferProgress {
+                    elapsed: Duration::from_secs(second),
+                    encoded_bytes: second as f64 * 500.0,
+                    progress: 0.5,
+                },
+                true,
+            );
+        }
+        assert_eq!(window.samples.len(), 32);
+        assert!(
+            Args::try_parse_from(["rncp-rs", "-P", "file", "00112233445566778899aabbccddeeff"])
+                .unwrap()
+                .phy_rates
+        );
+    }
+}
+
+#[derive(Default)]
+struct PhysicalRateWindow {
+    samples: std::collections::VecDeque<RncpTransferProgress>,
+}
+
+impl PhysicalRateWindow {
+    fn display(&mut self, sample: RncpTransferProgress, enabled: bool) -> String {
+        if !enabled {
+            return String::new();
+        }
+        if self.samples.is_empty() {
+            self.samples.push_back(RncpTransferProgress::default());
+        }
+        if self
+            .samples
+            .back()
+            .is_some_and(|last| sample.elapsed > last.elapsed)
+        {
+            self.samples.push_back(sample);
+        }
+        while self.samples.len() > 32 {
+            self.samples.pop_front();
+        }
+        let first = self.samples.front().unwrap();
+        let last = self.samples.back().unwrap();
+        let span = last.elapsed.saturating_sub(first.elapsed).as_secs_f64();
+        let bps = if span > 0.0 {
+            (last.encoded_bytes - first.encoded_bytes).max(0.0) * 8.0 / span
+        } else {
+            0.0
+        };
+        let (value, unit) = human_rate(bps);
+        format!(" ({value:.2} {unit} physical/resource estimate)")
+    }
 }
 
 fn human_rate(bps: f64) -> (f64, &'static str) {

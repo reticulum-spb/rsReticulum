@@ -1111,7 +1111,7 @@ async fn run_remote(args: Args) -> ExitCode {
     if !args.table && !args.rates {
         if args.destination.is_some() {
             eprintln!(
-                "rnpath-rs: remote destination path requests are not implemented; use --table or --rates with the destination as a filter, or run the path request locally."
+                "rnpath-rs: Reticulum 1.5.2 provides no remote path-request endpoint; use --table or --rates with the destination as a filter, or run the path request locally."
             );
         } else {
             eprintln!("rnpath-rs: remote mode requires --table or --rates.");
@@ -1368,6 +1368,24 @@ fn map_bin(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_mutations_are_rejected_before_starting_runtime() {
+        for flag in ["--drop-announces", "--blackholed"] {
+            let args =
+                Args::try_parse_from(["rnpath-rs", "-R", "00112233445566778899aabbccddeeff", flag])
+                    .unwrap();
+            assert_eq!(run_remote(args).await, ExitCode::from(2));
+        }
+        let args = Args::try_parse_from([
+            "rnpath-rs",
+            "-R",
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+        ])
+        .unwrap();
+        assert_eq!(run_remote(args).await, ExitCode::from(2));
+    }
 
     #[test]
     fn local_rpc_auth_failure_explains_config_mismatch_and_port_owner() {

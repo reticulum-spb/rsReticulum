@@ -3495,3 +3495,45 @@ imports и загрузка compiled modules неприменимы. Полны�
 интерактивного UX Python, длительные сессии и живая Python↔Rust матрица здесь
 не заявляются. Блок обновления rnsh закрыт; далее по этапу 7 остаются
 `rnpath` remote mode и `rncp --phy-rates`. Версия остаётся 1.0.1.
+
+### Этап 7: rnpath remote/rncp --phy-rates; функциональный этап закрыт
+
+Эталон Python `ea98db4f` проверен, рабочее дерево не изменено. Проверены
+`rnpath.py` и `Transport.remote_path_handler`: `/path` поддерживает только
+`table`/`rates`, фильтр destination и max_hops для таблицы. Rust это уже
+реализует. Private blackhole table, mutations и active remote path request
+не поддерживаются и в Python 1.5.2; новые wire endpoints не изобретались.
+`-p` использует отдельный существующий published `/list` endpoint. CLI/README
+теперь явно отличают эту границу протокола от недоделанного Rust endpoint.
+
+`rncp -P/--phy-rates` реализован для send/fetch вместо прежнего отказа CLI:
+
+- Эталон расчёта — `rncp.sender_progress`, а не счётчики интерфейсов:
+  segment progress × Resource transfer size после metadata/compression/encryption.
+  Это оценка закодированных Resource bytes, без packet/IFAC/HDLC overhead,
+  повторных передач или airtime. В выводе явно указано `physical/resource estimate`.
+- Runtime выдаёт optional latest-value `RncpTransferProgress` через новые
+  `rncp_send_reader_with_stats`/`rncp_fetch_file_with_stats`. Существующие API
+  и request structs сохранены; observer не блокирует передачу.
+- Байты суммируются между сегментами, повторный прогресс не даёт двойного
+  учёта и не сбрасывает счётчик. CLI использует окно до 32 отсчётов и перевод
+  bytes/s → bits/s. При fetch доля текущего сегмента учитывает его индекс,
+  вместо повторения локальных 0–100% для каждого сегмента.
+- `--silent` сохраняет отсутствие progress output; listener не меняется.
+  README/CONFIG описывают расчёт и границы, аппаратные PHY измерения не заявлены.
+
+Короткие проверки: `cargo test -p rns-runtime --lib rncp::tests --offline
+--quiet` — 8 passed (0.01s), включая существующий ADV→REQ→parts→proof сценарий
+с проверкой итоговой статистики и compressed-size/multisegment/repeat учёт.
+`cargo test -p rns-tools --bin rncp-rs --bin rnpath-rs --offline --quiet` —
+1 + 2 passed (0.00s): rate units/window/CLI и локальный отказ неподдерживаемых
+remote операций без запуска runtime. Новых test-only файлов нет; длительная
+или аппаратная/внешняя проверка не запускалась.
+`cargo check --workspace --all-targets --offline --quiet`, fmt check и
+`git diff --check` успешны. Старые предупреждения database_path и tracing
+prelude остались без изменений.
+
+Этап 7 функционально закрыт с документированными границами rnstatus profiling,
+rnsh и remote management. Дальше — итоговая интеграционная проверка и сверка
+общей документации по плану, а не новые функции этапа 7. Версия 1.0.1
+не менялась: полный переход/заявление совместимости 1.5.2 ещё не завершён.

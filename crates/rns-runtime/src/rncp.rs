@@ -73,6 +73,45 @@ pub struct RncpOutcome {
     pub duration: Duration,
 }
 
+/// Resource-level transfer estimate, not radio/interface wire accounting.
+/// Encoded bytes include compression/encryption/metadata, exclude packet
+/// headers and retransmissions, and accumulate across resource segments.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RncpTransferProgress {
+    pub progress: f32,
+    pub encoded_bytes: f64,
+    pub elapsed: Duration,
+}
+
+struct TransferReporter {
+    tx: Option<tokio::sync::watch::Sender<RncpTransferProgress>>,
+    started: Option<Instant>,
+    segments: std::collections::HashMap<[u8; 32], f64>,
+}
+
+impl TransferReporter {
+    fn new(tx: Option<tokio::sync::watch::Sender<RncpTransferProgress>>) -> Self {
+        Self {
+            tx,
+            started: None,
+            segments: Default::default(),
+        }
+    }
+
+    fn update(&mut self, hash: [u8; 32], size: usize, fraction: f64, progress: f32) {
+        let Some(tx) = self.tx.as_ref() else { return };
+        let started = *self.started.get_or_insert_with(Instant::now);
+        let bytes = size as f64 * fraction.clamp(0.0, 1.0);
+        let previous = self.segments.entry(hash).or_default();
+        *previous = previous.max(bytes);
+        tx.send_replace(RncpTransferProgress {
+            progress: progress.clamp(0.0, 1.0),
+            encoded_bytes: self.segments.values().sum(),
+            elapsed: started.elapsed(),
+        });
+    }
+}
+
 pub struct RncpSendRequest<'a> {
     pub transport_tx: mpsc::Sender<TransportMessage>,
     pub identity: Identity,
@@ -524,6 +563,16 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
 pub async fn rncp_send_reader<R: tokio::io::AsyncRead + Unpin>(
     request: RncpSendReaderRequest<'_, R>,
 ) -> Result<RncpOutcome, RncpError> {
+    rncp_send_reader_with_stats(request, None).await
+}
+
+/// Reader send with optional latest-value Resource transfer statistics.
+/// The original request type and fractional progress API are unchanged.
+pub async fn rncp_send_reader_with_stats<R: tokio::io::AsyncRead + Unpin>(
+    request: RncpSendReaderRequest<'_, R>,
+    stats_tx: Option<tokio::sync::watch::Sender<RncpTransferProgress>>,
+) -> Result<RncpOutcome, RncpError> {
+    let mut stats = TransferReporter::new(stats_tx);
     use tokio::io::AsyncReadExt;
     let RncpSendReaderRequest {
         transport_tx,
@@ -680,6 +729,7 @@ pub async fn rncp_send_reader<R: tokio::io::AsyncRead + Unpin>(
                 resource,
                 lpkt_rx: &mut lpkt_rx,
                 progress_tx: progress_tx.clone(),
+                stats: &mut stats,
                 progress_base: consumed as f32 / byte_count.max(1) as f32,
                 progress_span: if byte_count == 0 {
                     1.0
@@ -735,6 +785,7 @@ fn pack_metadata(file_name: &str) -> Vec<u8> {
 }
 
 struct OutboundDrive<'a> {
+    stats: &'a mut TransferReporter,
     transport_tx: &'a mpsc::Sender<TransportMessage>,
     link: &'a mut Link,
     link_id: [u8; 16],
@@ -748,6 +799,7 @@ struct OutboundDrive<'a> {
 
 async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
     let OutboundDrive {
+        stats,
         transport_tx,
         link,
         link_id,
@@ -764,6 +816,8 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
         let mut transfer = OutboundTransfer::from_prebuilt(resource, rtt);
         let total = transfer.resource.parts.len();
+        let encoded_size = transfer.resource.total_size;
+        stats.update(resource_hash, encoded_size, 0.0, progress_base);
         if let Some(ref tx) = progress_tx {
             let _ = tx.try_send(if total == 0 {
                 progress_base + progress_span
@@ -831,14 +885,11 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                             ));
                         }
                     }
+                    let frac = transfer.progress();
+                    let progress = progress_base + progress_span * frac as f32;
+                    stats.update(resource_hash, encoded_size, frac, progress);
                     if let Some(ref tx) = progress_tx {
-                        let confirmed_count = transfer.sent_parts;
-                        let frac = if total == 0 {
-                            1.0
-                        } else {
-                            confirmed_count as f32 / total as f32
-                        };
-                        let _ = tx.try_send(progress_base + (progress_span * frac));
+                        let _ = tx.try_send(progress);
                     }
                 }
                 rns_wire::context::PacketContext::ResourcePrf => {
@@ -849,6 +900,12 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
                     if !transfer.handle_proof(body) {
                         return Err(RncpError::ResourceFailed("proof mismatch".into()));
                     }
+                    stats.update(
+                        resource_hash,
+                        encoded_size,
+                        1.0,
+                        progress_base + progress_span,
+                    );
                     if let Some(ref tx) = progress_tx {
                         let _ = tx.try_send(progress_base + progress_span);
                     }
@@ -1157,6 +1214,15 @@ pub struct RncpFetchRequest<'a> {
 /// link + identify → REQUEST `fetch_file` → ack byte (`0xC3` ok, `0xC2` not
 /// found, [`REQ_FETCH_NOT_ALLOWED`] denied) → resource → write to `save_dir`.
 pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchOutcome, RncpError> {
+    rncp_fetch_file_with_stats(request, None).await
+}
+
+/// Fetch with optional Resource-level statistics, preserving the legacy API.
+pub async fn rncp_fetch_file_with_stats(
+    request: RncpFetchRequest<'_>,
+    stats_tx: Option<tokio::sync::watch::Sender<RncpTransferProgress>>,
+) -> Result<RncpFetchOutcome, RncpError> {
+    let mut stats = TransferReporter::new(stats_tx);
     use rns_protocol::resource::{
         InboundTransfer, MAX_SEGMENTS, MultiSegmentInbound, TransferAction,
     };
@@ -1397,14 +1463,30 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
                     }
                 }
                 transfers.insert(adv.resource_hash, t);
+                stats.update(
+                    adv.resource_hash,
+                    adv.transfer_size,
+                    0.0,
+                    (adv.segment_index.saturating_sub(1)) as f32 / adv.total_segments.max(1) as f32,
+                );
             }
             rns_wire::context::PacketContext::Resource => {
                 let mut resource_action_to_send = None;
                 let mut completed_rh = None;
                 for (rh, t) in &mut transfers {
                     let action = t.receive_part(body.to_vec());
+                    let fraction = t.resource.progress();
+                    let progress = segment_routes
+                        .get(rh)
+                        .and_then(|(original, index)| {
+                            split_resources.get(original).map(|coord| {
+                                ((*index - 1) as f64 + fraction) / coord.total_segments as f64
+                            })
+                        })
+                        .unwrap_or(fraction) as f32;
+                    stats.update(*rh, t.resource.total_size, fraction, progress);
                     if let Some(ref tx) = progress_tx {
-                        let _ = tx.try_send(t.resource.progress() as f32);
+                        let _ = tx.try_send(progress);
                     }
                     match action {
                         TransferAction::SendHmu(_) | TransferAction::SendRequest(_) => {
@@ -1633,6 +1715,8 @@ mod tests {
             .unwrap();
         let link_id = link.link_id;
         let resource = OutboundResource::new(vec![42; 2000], false, None).unwrap();
+        let encoded_size = resource.total_size;
+        let (stats_tx, stats_rx) = tokio::sync::watch::channel(RncpTransferProgress::default());
         let parts = resource.parts.clone();
         let mut request = vec![rns_protocol::resource::HASHMAP_IS_NOT_EXHAUSTED];
         request.extend_from_slice(&resource.resource_hash);
@@ -1645,6 +1729,7 @@ mod tests {
         let (events, mut rx) = mpsc::channel(8);
         let task = async move {
             drive_outbound(OutboundDrive {
+                stats: &mut TransferReporter::new(Some(stats_tx)),
                 transport_tx: &tx,
                 link: &mut link,
                 link_id,
@@ -1704,6 +1789,25 @@ mod tests {
         };
         let (result, ()) = tokio::join!(task, peer_task);
         result.unwrap();
+        assert_eq!(stats_rx.borrow().encoded_bytes, encoded_size as f64);
+        assert_eq!(stats_rx.borrow().progress, 1.0);
+    }
+
+    #[test]
+    fn physical_progress_uses_encoded_size_and_accumulates_segments_once() {
+        let resource = OutboundResource::new(vec![42; 8000], true, None).unwrap();
+        assert!(resource.total_size < resource.data.len());
+        let size = resource.total_size;
+        let (tx, rx) = tokio::sync::watch::channel(RncpTransferProgress::default());
+        let mut reporter = TransferReporter::new(Some(tx));
+        reporter.update([1; 32], size, 0.5, 0.25);
+        assert_eq!(rx.borrow().encoded_bytes, size as f64 / 2.0);
+        reporter.update([1; 32], size, 0.5, 0.25); // duplicate part/progress
+        reporter.update([1; 32], size, 1.0, 0.5);
+        reporter.update([2; 32], 200, 0.5, 0.75);
+        assert_eq!(rx.borrow().encoded_bytes, size as f64 + 100.0);
+        reporter.update([1; 32], size, 0.0, 0.75); // repeated ADV cannot reset bytes
+        assert_eq!(rx.borrow().encoded_bytes, size as f64 + 100.0);
     }
 
     #[test]
