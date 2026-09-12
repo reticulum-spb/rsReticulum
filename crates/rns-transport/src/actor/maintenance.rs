@@ -598,13 +598,14 @@ impl TransportActor {
                 }
                 let stale = match a.last_used {
                     None => now - a.timestamp > UNUSED_DESTINATION_LINGER,
-                    Some(last_used) => now - last_used.max(a.timestamp) > used_threshold,
+                    Some(last_used) => now - last_used > used_threshold,
                 };
                 if stale { Some(a.dest_hash) } else { None }
             })
             .collect();
 
         if !to_drop.is_empty() {
+            self.state_dirty = true;
             for hash in &to_drop {
                 self.recent_announces.remove(hash);
             }
@@ -797,6 +798,82 @@ mod cleanup_tests {
 
         actor.cleanup_known_destinations(now);
         assert!(actor.recent_announces.is_empty());
+    }
+
+    #[test]
+    fn fresh_announce_does_not_renew_pathless_used_destination() {
+        let (mut actor, _tx) = TransportActor::new();
+        let now = 10_000_000.0;
+        let threshold = DESTINATION_TIMEOUT as f64 * 1.25;
+        insert_used_entry(&mut actor, 0x10, now, now - threshold - 1.0);
+        insert_used_entry(&mut actor, 0x11, now, now - threshold);
+        actor.state_dirty = false;
+        actor.cleanup_known_destinations(now);
+        assert!(!actor.recent_announces.contains_key(&[0x10; 16]));
+        assert!(actor.recent_announces.contains_key(&[0x11; 16]));
+        assert!(actor.state_dirty);
+        actor.state_dirty = false;
+        actor.cleanup_known_destinations(now);
+        assert!(!actor.state_dirty, "no change does not schedule a save");
+    }
+
+    #[test]
+    fn storage_cleanup_uses_last_use_not_latest_announce() {
+        use crate::storage::{MemoryTransportStorage, Mutation, Reply, Request, TransportStorage};
+        fn check(store: &mut dyn TransportStorage) {
+            let (mut actor, _) = TransportActor::new();
+            insert_used_entry(&mut actor, 1, 1000.0, 99.0);
+            insert_used_entry(&mut actor, 2, 1000.0, 100.0);
+            insert_entry_with_last_used(&mut actor, 3, 1000.0, true, Some(99.0));
+            let entries = actor
+                .recent_announces
+                .into_values()
+                .map(|announce| Mutation::PutAnnounce {
+                    announce,
+                    raw: None,
+                })
+                .collect();
+            store.execute(Request::Apply(entries)).unwrap();
+            assert!(matches!(
+                store
+                    .execute(Request::CleanKnown {
+                        unused_before: 500.0,
+                        used_before: 100.0,
+                        limit: 10,
+                    })
+                    .unwrap(),
+                Reply::Removed(1)
+            ));
+            for (id, present) in [(1, false), (2, true), (3, true)] {
+                assert!(
+                    matches!(store.execute(Request::Announce([id; 16])).unwrap(),
+                    Reply::Announce(entry) if entry.is_some() == present)
+                );
+            }
+        }
+        check(&mut MemoryTransportStorage::default());
+        #[cfg(feature = "sqlite")]
+        {
+            use crate::storage::{SqliteOptions, SqliteTransportStorage, StorageRole};
+            let dir = std::env::temp_dir().join(format!(
+                "rns-clean-known-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let mut store = SqliteTransportStorage::open(
+                &dir.join("transport.db"),
+                StorageRole::Standalone,
+                SqliteOptions::default(),
+            )
+            .unwrap();
+            check(&mut store);
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

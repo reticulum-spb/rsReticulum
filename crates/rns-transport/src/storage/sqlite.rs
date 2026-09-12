@@ -423,7 +423,7 @@ impl TransportStorage for SqliteTransportStorage {
             Request::ClearAnnounces => Reply::Removed(self.connection.execute("DELETE FROM announces",[])?),
             Request::CleanKnown { unused_before,used_before,limit } => Reply::Removed(self.connection.execute(
                 "DELETE FROM announces WHERE destination_hash IN (SELECT a.destination_hash FROM announces a WHERE retained=0
-                AND ((last_used IS NULL AND timestamp<?1) OR (last_used IS NOT NULL AND max(last_used,timestamp)<?2))
+                AND ((last_used IS NULL AND timestamp<?1) OR (last_used IS NOT NULL AND last_used<?2))
                 AND NOT EXISTS(SELECT 1 FROM packet_refs r WHERE r.destination_hash=a.destination_hash)
                 AND NOT EXISTS(SELECT 1 FROM packet_keep k JOIN packet_blobs p ON p.packet_hash=k.packet_hash WHERE p.destination_hash=a.destination_hash)
                 ORDER BY destination_hash LIMIT ?3)",params![unused_before,used_before,limit as i64])?),

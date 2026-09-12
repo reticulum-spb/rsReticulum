@@ -57,7 +57,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.3.9 internal discovery | Расхождение: `apply_discovery_mode_autocorrect` разрешает только gateway/AP | 1 |
 | 1.3.9 location script | Отсутствует в YAML и scheduler; Python `Discovery.py:get_interface_announce_data` запускает executable | 1 |
 | 1.3.9 RESOURCE_RCL, reliability | Реализована отмена в protocol/runtime, есть regression tests; межъязыковое поведение воспроизвести | 6 |
-| 1.4.0 transport persistence / interface hash / known destinations background cleaning и отказ от recombination | Частично: actor maintenance, storage worker и сохранённые interface hashes; профилирование и семантику очистки сверить. Python lock/thread оптимизации буквально неприменимы | 0, 7 |
+| 1.4.0 transport persistence / interface hash / known destinations background cleaning и отказ от recombination | Snapshot writes вынесены с actor, SQLite работает на worker; shared client не пишет сетевой cache, disk recombination при save нет. Исправлен timeout used entries по last_used во всех backend и dirty после очистки. Legacy sweep остаётся целиком на actor; latency большого каталога не измерена | 0, 7 / граница производительности |
 | 1.4.0 invalid discovery stamp cache | Закрыто при итоговой сверке: task-local FIFO до 2048 invalid digest entries | 1 / финальная сверка |
 | 1.4.0 valid discovery cache / sequential validation | Task-local FIFO до 2048 valid digest/value entries; source policy и обновление store остаются на каждом событии | 1 / финальная сверка |
 | 1.4.0 Link stale teardown / watchdog race | Частично: `rns-link/src/keepalive.rs:is_stale` учитывает outbound; проверить вызовы в runtime и ошибки приёма | 6 |
@@ -3771,3 +3771,34 @@ concluded и вытесненные по MAX_RECEIPTS receipts, но сохра�
 6 passed (0.00s, in-memory/virtual time),
 `tcp_readers_use_fixed_mtu_with_escape_and_ifac_allowance` — 1 passed (0.86s,
 локальный loopback). Новые test-only файлы не создавались и старые не менялись.
+
+## Финальная сверка: persistence и last-use cleanup
+
+`Identity.clean_known_destinations` Python 1.5.2 сохраняет retained и pathed
+записи. Для never-used действует UNUSED_DESTINATION_LINGER от announce;
+для used — DESTINATION_TIMEOUT × 1.25 от последнего использования. Rust ошибочно
+использовал max(last_used, timestamp), позволяя свежему announce продлить срок
+хранения уже давно не используемой pathless записи.
+
+Исправлены три реализации: legacy actor maintenance, MemoryTransportStorage
+и SQLite CleanKnown. Строгое сравнение порога сохранено: ровно на границе запись
+остаётся. Pins и path/reference guards не изменены. Opt-in requested-client
+пятиминутная политика — отдельное Rust поведение и не затрагивалась.
+После удаления записей legacy actor теперь выставляет state_dirty, чтобы
+очистка попала в следующий сохраняемый snapshot, даже если нет нового трафика.
+
+Сохранение сверено отдельно: routing_snapshot собирается из текущего состояния,
+save не подмешивает старые known destinations с диска. Periodic fsync/write
+вынесены на blocking pool; повторный save не запускается поверх незавершённого.
+Shared-instance client не сохраняет сетевой cache. SQLite выполняет запросы
+на выделенном storage worker и ограничивает CleanKnown порцией 128 записей.
+Legacy cleanup всё ещё проходит in-memory map на actor: эквивалент Python
+background sleep не добавлялся, latency на большом каталоге не измерена.
+
+Добавлены короткие inline проверки свежего announce при устаревшем last_used,
+строгой границы, retained и dirty/no-op поведения; backend-проверка выполняется
+для memory и, при sqlite feature, настоящего SQLite во временном каталоге.
+Новых test-only файлов нет. Общая готовность обновления пока не объявляется.
+
+`cargo test -p rns-transport --lib cleanup_tests --features sqlite-bundled
+--offline --quiet`: 9 passed (0.04s). Fmt и diff checks прошли.

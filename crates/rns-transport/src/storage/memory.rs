@@ -116,9 +116,8 @@ impl TransportStorage for MemoryTransportStorage {
                     .values()
                     .filter(|a| {
                         !a.retained
-                            && a.last_used.map_or(a.timestamp < unused_before, |t| {
-                                t.max(a.timestamp) < used_before
-                            })
+                            && a.last_used
+                                .map_or(a.timestamp < unused_before, |t| t < used_before)
                             && !self
                                 .references
                                 .keys()
