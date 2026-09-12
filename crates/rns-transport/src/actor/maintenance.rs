@@ -268,6 +268,15 @@ impl TransportActor {
         blocked_interface: Option<InterfaceId>,
         now: f64,
     ) -> bool {
+        // Python jobs deduplicates by destination, not by the full queue
+        // entry. Keep the original blocked interface and throttle schedule.
+        if self
+            .pending_discovery_prs
+            .iter()
+            .any(|request| request.destination_hash == destination_hash)
+        {
+            return false;
+        }
         if self.pending_discovery_prs.len() >= MAX_QUEUED_DISCOVERY_PRS {
             trace!(
                 dest = hex::encode(destination_hash),

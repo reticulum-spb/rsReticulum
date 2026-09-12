@@ -12038,6 +12038,10 @@ mod tests {
         let now = now_f64();
 
         actor.queue_discovery_path_request([0xA1; 16], None, now);
+        assert!(!actor.queue_discovery_path_request([0xA1; 16], Some(1), now + 0.2));
+        assert_eq!(actor.pending_discovery_prs.len(), 1);
+        assert_eq!(actor.pending_discovery_prs[0].blocked_interface, None);
+        assert_eq!(actor.last_discovery_pr_tx, now);
         actor.queue_discovery_path_request([0xA2; 16], None, now);
 
         actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE - 0.01);
@@ -12057,6 +12061,8 @@ mod tests {
         rx.try_recv()
             .expect("second queued discovery PR should wait for the next throttle window");
         assert!(actor.pending_discovery_prs.is_empty());
+        // Dedup lasts only while queued, not permanently after transmission.
+        assert!(actor.queue_discovery_path_request([0xA1; 16], None, now + 2.0));
     }
 
     #[test]
@@ -12071,6 +12077,8 @@ mod tests {
         let now = now_f64();
 
         actor.queue_discovery_path_request([0xB1; 16], Some(2), now);
+        assert!(!actor.queue_discovery_path_request([0xB1; 16], Some(1), now + 0.1));
+        assert!(!actor.queue_discovery_path_request([0xB1; 16], None, now + 0.2));
         actor.process_pending_discovery_path_requests(now + DISCOVERY_PR_TX_THROTTLE);
 
         rx_a.try_recv()

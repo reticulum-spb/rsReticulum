@@ -4207,3 +4207,22 @@ destination `rnstransport.path.request`. Full/closed queue и запрет outbo
 и сохранения прямого/пересылаемого/recursive поведения. Control TX — 1 passed,
 PR frequency — 1 passed, recursive PR — 5 passed (0.01s/0.00s/0.00s).
 Новых test-only файлов нет.
+
+## Финальная сверка: dedup ожидающих discovery PR по destination
+
+Перенесено исправление Python `33817380`: перед постановкой discovery PR
+проверяется наличие destination среди уже ожидающих записей. Ранее Rust
+безусловно добавлял запись до capacity, что позволяло повторам занимать
+32-элементную очередь и задерживать запросы других destinations.
+
+Проверка общая для всех вызовов `queue_discovery_path_request`, включая
+rediscovery после истечения Link. Повтор возвращает false без изменения
+blocked_interface исходной записи, порядка очереди и last_discovery_pr_tx.
+После извлечения записи из очереди этот destination снова можно поставить;
+это не новый долгоживущий кеш и не изменение inflight/tag dedup.
+Окончательные параметры 1.5.2 здесь уже совпадали: capacity 32, интервал
+отправки 0.5s, предел поколения PR tags 16000 и gate timeout 45s.
+
+Существующие inline checks проверяют повторы с другим blocked_interface
+и без него, сохранение времени отправки, повторную постановку после drain
+и лимит 32. Результат: 3 passed (0.00s), без sleep. Новых test-only файлов нет.
