@@ -203,6 +203,13 @@ impl TransportActor {
             }
         };
 
+        // Packet.unpack() in Python 1.5.2 rejects header-only packets. Keep
+        // this at admission: the header codec also serves header-only tooling.
+        if data_offset == raw.len() {
+            self.protocol_violation(packet.interface_id);
+            return None;
+        }
+
         // Python 1.3.8 Packet.py:247-248: unpack() rejects on-wire hop counts
         // >= PATHFINDER_M for every packet type. Checked on the RAW hops byte,
         // before the inbound hop adjustment; kept at the inbound boundary so

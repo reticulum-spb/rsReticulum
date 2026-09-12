@@ -1792,6 +1792,75 @@ mod tests {
     use crate::path_table::PathEntry;
 
     #[test]
+    fn packet_boundaries_reject_empty_payload_and_exhausted_outbound_hops() {
+        use rns_wire::flags::{HeaderType, PacketType};
+        for attached in [false, true] {
+            for hops in [PATHFINDER_M, u8::MAX, PATHFINDER_M - 1] {
+                let (mut actor, _) = TransportActor::new();
+                let (iface, mut rx) = make_test_interface("packet-boundary");
+                actor.interfaces.insert(1, iface);
+                let raw = make_data_packet([7; 16], hops);
+                let request = OutboundRequest {
+                    raw: raw.clone(),
+                    destination_hash: [7; 16],
+                };
+                if attached {
+                    actor.on_outbound_attached(request, 1);
+                } else {
+                    actor.on_outbound(request);
+                }
+                if hops >= PATHFINDER_M {
+                    assert!(rx.try_recv().is_err());
+                    assert!(actor.receipt_table.is_empty());
+                    assert!(actor.traffic.get(&0).is_none());
+                    assert!(
+                        !actor
+                            .packet_hashlist
+                            .contains(&rns_wire::hash::packet_hash(&raw, HeaderType::Header1))
+                    );
+                } else {
+                    assert!(rx.try_recv().is_ok());
+                }
+            }
+        }
+        for header_type in [HeaderType::Header1, HeaderType::Header2] {
+            for packet_type in [
+                PacketType::Data,
+                PacketType::Announce,
+                PacketType::Proof,
+                PacketType::LinkRequest,
+            ] {
+                let (mut actor, _) = TransportActor::new();
+                let (iface, _) = make_test_interface("empty-payload");
+                actor.interfaces.insert(1, iface);
+                let (mut header, _) =
+                    rns_wire::header::PacketHeader::unpack(&make_data_packet([7; 16], 0)).unwrap();
+                header.flags.header_type = header_type;
+                header.flags.packet_type = packet_type;
+                header.transport_id = (header_type == HeaderType::Header2).then_some([8; 16]);
+                let raw = Bytes::from(header.pack().unwrap());
+                let hash = rns_wire::hash::packet_hash(&raw, header_type);
+                assert!(
+                    actor
+                        .prepare_inbound(InboundPacket {
+                            raw,
+                            interface_id: 1,
+                            rssi: None,
+                            snr: None,
+                            q: None,
+                        })
+                        .is_none()
+                );
+                assert!(!actor.packet_hashlist.contains(&hash));
+                assert_eq!(
+                    actor.interfaces[&1].inbound_diagnostics.protocol_violations,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn receipt_maintenance_removes_expired_and_evicted_correlations() {
         let (mut actor, _) = TransportActor::new();
         let now = std::time::Instant::now();

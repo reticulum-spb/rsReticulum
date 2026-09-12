@@ -98,7 +98,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
-| 1.5.0 miscellaneous packet/link/interface fixes | Частично классифицировано: empty input guards в UDP/Serial/Pipe/KISS/RNode/RNodeMulti уже есть; TCP HDLC min/max+IFAC ограничения перенесены. BLE и RSSI/SNR закрыты отдельными строками. Остальные packet/link изменения не считать автоматически выполненными | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py сверено: добавлены outbound hops guard и отказ пустому payload при admission; bounds заголовка, hash helpers, traffic classes и signature reuse уже есть. Interface empty guards/TCP bounds, BLE и RSSI/SNR сверены отдельно. Остальные Link/RequestReceipt изменения не считать автоматически выполненными | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -3802,3 +3802,30 @@ background sleep не добавлялся, latency на большом ката
 
 `cargo test -p rns-transport --lib cleanup_tests --features sqlite-bundled
 --offline --quiet`: 9 passed (0.04s). Fmt и diff checks прошли.
+
+## Финальная сверка: Packet.py и границы admission/send
+
+В diff Python `Packet.py` 1.3.8 → 1.5.2 найдены два ещё не перенесённых условия:
+
+- `Packet.send` отказывается от hops >= PATHFINDER_M (128). Rust теперь делает
+  это в обоих пользовательских outbound путях: обычном и OutboundAttached.
+  Отказ происходит до TX accounting, dedup, receipts и отправки интерфейсу.
+  Значение 127 разрешено; ingress hop adjustment и transit forwarding не менялись.
+- `Packet.unpack` отказывается от нулевого payload. Rust проверяет это после
+  разбора заголовка на inbound admission, до очереди/dedup и обработки типа.
+  Отказ учитывается как protocol violation, в том числе для Header2. Низкоуровневый
+  PacketHeader::unpack продолжает поддерживать отдельные заголовки для tooling.
+
+Прочие изменения Packet.py классифицированы: fixed-size поля transport/destination
+уже защищены bounds в header codec; traffic class и validated announce передаются
+через PreparedInbound; hash/truncated hash helpers существуют; физические метрики
+идут через packet metrics/RPC вместо Python singleton lookup. Python log formatting
+и оптимизация доступа к атрибутам отдельной Rust реализации не требуют.
+
+Короткая inline проверка `packet_boundaries_reject_empty_payload_and_exhausted_outbound_hops`
+прошла (1 test, 0.00s): ordinary/attached sends, hops 127/128/255, Header1/Header2
+и четыре packet types с пустым payload. Новых test-only файлов нет.
+Оставшиеся Link/RequestReceipt minor fixes ещё требуют сверки; готовность всего
+обновления и повышение версии этим блоком не заявляются.
+
+Существующие `outbound` checks: 13 passed (0.01s). Fmt/diff checks чистые.

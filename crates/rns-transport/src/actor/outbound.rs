@@ -24,12 +24,16 @@ macro_rules! pr_log {
 
 impl TransportActor {
     pub(super) fn on_outbound(&mut self, request: crate::messages::OutboundRequest) {
-        self.traffic.record_tx(0, request.raw.len() as u64); // interface 0 = local
-
         let parsed = match rns_wire::header::PacketHeader::unpack(&request.raw) {
             Ok((header, _)) => header,
             Err(_) => return,
         };
+        // Packet.send() in Python 1.5.2 rejects exhausted hops before routing
+        // or creating receipt/dedup state, including explicitly attached sends.
+        if parsed.hops >= PATHFINDER_M {
+            return;
+        }
+        self.traffic.record_tx(0, request.raw.len() as u64); // interface 0 = local
 
         // Seed the dedup set with our own packet hash so echoes looped back
         // from the fabric aren't re-processed.
@@ -209,9 +213,11 @@ impl TransportActor {
         request: crate::messages::OutboundRequest,
         interface_id: InterfaceId,
     ) {
-        self.traffic.record_tx(0, request.raw.len() as u64);
-
         if let Ok((parsed, _)) = rns_wire::header::PacketHeader::unpack(&request.raw) {
+            if parsed.hops >= PATHFINDER_M {
+                return;
+            }
+            self.traffic.record_tx(0, request.raw.len() as u64);
             let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
             self.packet_hashlist.insert(pkt_hash);
             // Python's outbound applies should_apply_delta on attached-
