@@ -1388,13 +1388,14 @@ impl TransportActor {
                 // Count the actual frame after hop/header mangling, but before
                 // IFAC. Queue rejection is not a transmitted control packet.
                 if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(raw) {
-                    let traffic = &mut self.interfaces.get_mut(&id).unwrap().ingress.traffic;
+                    let ingress = &mut self.interfaces.get_mut(&id).unwrap().ingress;
                     if header.flags.packet_type == rns_wire::flags::PacketType::Announce {
-                        traffic.sent_announce(raw.len());
+                        ingress.traffic.sent_announce(raw.len());
+                        ingress.sent_announce();
                     } else if header.flags.packet_type == rns_wire::flags::PacketType::Data
                         && header.destination_hash == Self::path_request_dest_hash()
                     {
-                        traffic.sent_path_request(raw.len());
+                        ingress.traffic.sent_path_request(raw.len());
                     }
                 }
             }
@@ -1582,9 +1583,6 @@ impl TransportActor {
                     self.send_to_interface(id, &mangled);
                 }
                 _ => self.send_to_interface(id, raw),
-            }
-            if let Some(entry) = self.interfaces.get_mut(&id) {
-                entry.ingress.sent_announce();
             }
         }
     }
@@ -2958,6 +2956,10 @@ mod tests {
         let (announce, _) = make_valid_announce("test.flow.tx", 0);
         actor.send_to_interface(1, &announce);
         actor.send_to_interface(1, &announce); // full
+        assert_eq!(
+            actor.interfaces[&1].ingress.outgoing_announce_frequency(),
+            0.0
+        );
         assert_eq!(rx.try_recv().unwrap().len(), announce.len() + 4);
         let pr = make_data_packet(TransportActor::path_request_dest_hash(), 0);
         actor.send_to_interface(1, &pr);
@@ -2968,6 +2970,10 @@ mod tests {
         actor.send_to_interface(1, &announce);
         actor.send_to_interface(1, &pr);
         let traffic = actor.interfaces[&1].ingress.traffic;
+        assert_eq!(
+            actor.interfaces[&1].ingress.outgoing_announce_frequency(),
+            0.0
+        );
         assert_eq!(traffic.atxc, 1);
         assert_eq!(traffic.atxb, announce.len() as u64);
         assert_eq!(traffic.ptxc, 1);
@@ -2978,6 +2984,9 @@ mod tests {
             panic!()
         };
         assert_eq!(stats[0].control_traffic, traffic);
+        actor.interfaces.get_mut(&1).unwrap().direction = InterfaceDirection::bidirectional();
+        actor.send_to_interface(1, &announce);
+        assert!(actor.interfaces[&1].ingress.outgoing_announce_frequency() > 0.0);
         actor.deregister_interface(1);
         let (replacement, _rx) = make_test_interface("replacement");
         actor.interfaces.insert(1, replacement);
@@ -8669,6 +8678,10 @@ mod tests {
             rx.try_recv().is_ok(),
             "process_announce_queues must release one announce on the wire"
         );
+        assert_eq!(
+            actor.interfaces[&1].ingress.outgoing_announce_frequency(),
+            0.0
+        );
 
         let entry = actor.interfaces.get(&1).expect("interface still present");
         let expected_delay =
@@ -8690,6 +8703,10 @@ mod tests {
             rx.try_recv().is_err(),
             "second drain before announce_allowed_at must not release the next entry"
         );
+        let next = actor.interfaces[&1].announce_allowed_at;
+        actor.process_announce_queues(next);
+        assert!(rx.try_recv().is_ok());
+        assert!(actor.interfaces[&1].ingress.outgoing_announce_frequency() > 0.0);
     }
 
     #[test]

@@ -241,11 +241,6 @@ impl TransportActor {
             } else {
                 self.send_to_interface(interface_id, &request.raw);
             }
-            if parsed.flags.packet_type == rns_wire::flags::PacketType::Announce {
-                if let Some(entry) = self.interfaces.get_mut(&interface_id) {
-                    entry.ingress.sent_announce();
-                }
-            }
         }
     }
 
