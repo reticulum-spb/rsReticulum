@@ -103,7 +103,14 @@ impl KeepaliveState {
             .map(|t| t.elapsed())
             .unwrap_or(Duration::MAX);
 
-        self.is_initiator && inbound_elapsed >= jittered && keepalive_elapsed >= jittered
+        let outbound_elapsed = self
+            .last_outbound
+            .or(self.activated_at)
+            .map(|t| t.elapsed())
+            .unwrap_or(inbound_elapsed);
+        self.is_initiator
+            && (inbound_elapsed >= jittered || outbound_elapsed >= jittered)
+            && keepalive_elapsed >= jittered
     }
 
     /// Whether the link should transition to STALE.
@@ -115,11 +122,6 @@ impl KeepaliveState {
         if let Some(proof) = self.last_proof {
             if proof > latest {
                 latest = proof;
-            }
-        }
-        if let Some(outbound) = self.last_outbound {
-            if outbound > latest {
-                latest = outbound;
             }
         }
         if let Some(activated) = self.activated_at {
@@ -148,6 +150,24 @@ impl KeepaliveState {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn inbound_only_traffic_still_sends_keepalive() {
+        let mut state = KeepaliveState::new(true);
+        state.last_outbound = Some(Instant::now() - Duration::from_secs(1000));
+        state.record_inbound();
+        assert!(state.should_send_keepalive());
+        state.mark_keepalive_sent();
+        assert!(!state.should_send_keepalive());
+        state.stale_time = Duration::from_secs(1);
+        state.last_inbound = Instant::now() - Duration::from_secs(2);
+        assert!(state.is_stale());
+        state.record_outbound();
+        assert!(
+            state.is_stale(),
+            "local sending does not establish peer liveness"
+        );
+    }
 
     fn instant_before_now(elapsed: Duration) -> Instant {
         if let Some(instant) = Instant::now().checked_sub(elapsed) {

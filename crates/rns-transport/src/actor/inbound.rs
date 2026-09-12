@@ -463,17 +463,17 @@ impl TransportActor {
                         has_ratchet_key = announce_data.ratchet.is_some(),
                         "announce unpacked"
                     );
-                    match announce_data.verify_signature(&header.destination_hash) {
-                        Ok(validated_identity) => {
-                            if self.blackhole_table.is_blackholed(&validated_identity.hash) {
-                                trace!(
-                                    identity = hex::encode(validated_identity.hash),
-                                    dest = hex::encode(header.destination_hash),
-                                    "announce from blackholed identity, dropping"
-                                );
-                                return None;
-                            }
-                            (announce_data, validated_identity)
+                    match announce_data
+                        .verify_signature_with_blackhole(&header.destination_hash, |hash| {
+                            self.blackhole_table.is_blackholed(hash)
+                        }) {
+                        Ok(validated_identity) => (announce_data, validated_identity),
+                        Err(rns_identity::announce::AnnounceError::Blackholed(hash)) => {
+                            trace!(
+                                identity = hex::encode(hash),
+                                "announce from blackholed identity, dropping"
+                            );
+                            return None;
                         }
                         Err(e) => {
                             tracing::warn!(

@@ -3094,3 +3094,37 @@ blackholed announce API ещё требуют аудита. Этап6 откры
 `cargo test -p rns-runtime --lib resource_sender_waits_for_requests --quiet`:
 1 passed, 0.01s. Workspace all-targets check успешен; прежние warnings
 database_path/tracing prelude сохраняются. Python reference чист.
+
+### Этап 6: Link liveness, ratchet retention и blackhole API
+
+Сопоставлены e64d8150/fb7479a6/39e3854d Python Link fixes. Найдено и исправлено
+условие initiator keepalive: тишина по inbound ИЛИ outbound, а не только inbound.
+Непрерывный поток от responder больше не подавляет keepalive молчащего initiator.
+Stale baseline теперь inbound/proof/activation, без local outbound как ложного
+доказательства живого peer. Responder в LinkManager подавляет echo при свежем
+исходящем application traffic. Rust jitter сохранён как локальная особенность.
+Watchdog-lock/finally и отрицательный sleep из Python неприменимы к текущему
+monotonic tick с эксклюзивным &mut Link; эти Python механизмы не копировались.
+
+9b4947ef ratchet retention уже реализован: RatchetRing::clean обрезает до
+retained_count, set_retained_ratchets вызывает clean, удаляемые ключи zeroize.
+Повторной реализации не сделано.
+
+Для API signal_blackholed добавлены AnnounceError::Blackholed(hash), методы
+validate_with_blackhole и verify_signature_with_blackhole с caller predicate.
+Transport использует второй метод до ingress admission и сохраняет повторную
+проверку перед learning. Как Python, blocked identity отклоняется до signature
+verification; это policy result, а не доказательство подлинности пакета.
+Старые validate/validate_with_known_key и их сигнатуры сохранены.
+
+Короткие проверки: blackhole_validation —1 passed0.02s; существующий
+test_set_retained_ratchets —1 passed0.00s; inbound_only_traffic —1 passed0.00s;
+`cargo test -p rns-link --lib keepalive --quiet` —10 passed0.07s.
+Команды первых проверок: `cargo test -p rns-identity --lib blackhole_validation --quiet`,
+`cargo test -p rns-identity --lib test_set_retained_ratchets --quiet`,
+`cargo test -p rns-link --lib inbound_only_traffic --quiet`.
+Новых test-only файлов нет, длительные тесты не запускались. Этап6 ещё не
+объявлен закрытым: нужна итоговая сверка оставшихся функциональных границ,
+в частности отсутствующего streaming Resource API. Версия1.0.1.
+Workspace all-targets check, fmt check и diff check успешны; прежние warnings
+database_path/tracing prelude сохраняются. Python reference чист.

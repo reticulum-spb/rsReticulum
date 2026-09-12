@@ -860,7 +860,9 @@ impl LinkManager {
                                 link_id = hex::encode(link_id),
                                 "ignoring keepalive request on initiator side"
                             );
-                        } else {
+                        } else if active.link.keepalive.last_outbound.is_none_or(|sent| {
+                            sent.elapsed() >= active.link.keepalive.keepalive_interval
+                        }) {
                             let resp_header = rns_wire::header::PacketHeader {
                                 flags: rns_wire::flags::PacketFlags {
                                     header_type: rns_wire::flags::HeaderType::Header1,

@@ -19,6 +19,9 @@ const MIN_ANNOUNCE_SIZE: usize = PUBKEY_SIZE + NAME_HASH_SIZE + RANDOM_HASH_SIZE
 
 #[derive(Debug, Error)]
 pub enum AnnounceError {
+    /// Policy rejection, distinct from a malformed or invalid signature.
+    #[error("announced identity is blackholed")]
+    Blackholed([u8; 16]),
     #[error("announce data too short: {0} bytes (minimum {MIN_ANNOUNCE_SIZE})")]
     TooShort(usize),
     #[error("signature verification failed")]
@@ -209,6 +212,35 @@ impl AnnounceData {
         self.validate_with_known_key(packet_dest_hash, None)
     }
 
+    /// Validate with caller-owned blackhole policy and optional known-key binding.
+    /// Unlike `validate`, this can report `AnnounceError::Blackholed`.
+    pub fn validate_with_blackhole(
+        &self,
+        packet_dest_hash: &[u8; 16],
+        known_public_key: Option<&[u8; 64]>,
+        is_blackholed: impl FnOnce(&[u8; 16]) -> bool,
+    ) -> Result<Identity, AnnounceError> {
+        let identity = self.verify_signature_with_blackhole(packet_dest_hash, is_blackholed)?;
+        self.validate_destination_binding(packet_dest_hash, &identity, known_public_key)?;
+        Ok(identity)
+    }
+
+    /// Signature-only policy check for early transport admission. Like Python,
+    /// blackhole rejection precedes signature validation: it does not certify
+    /// the authenticity of an announce carrying a blocked public key.
+    pub fn verify_signature_with_blackhole(
+        &self,
+        packet_dest_hash: &[u8; 16],
+        is_blackholed: impl FnOnce(&[u8; 16]) -> bool,
+    ) -> Result<Identity, AnnounceError> {
+        let identity = Identity::from_public_key(&self.public_key)
+            .map_err(|_| AnnounceError::InvalidPublicKey)?;
+        if is_blackholed(&identity.hash) {
+            return Err(AnnounceError::Blackholed(identity.hash));
+        }
+        self.verify_signature(packet_dest_hash)
+    }
+
     /// Validate and optionally enforce first-seen key binding.
     ///
     /// If `known_public_key` is supplied and differs from the announced key,
@@ -334,6 +366,37 @@ mod tests {
         assert!(matches!(
             AnnounceData::create_at(&id, "test.time", None, None, ANNOUNCE_TIME_MAX + 1,),
             Err(AnnounceError::InvalidWireTime(_))
+        ));
+    }
+
+    #[test]
+    fn blackhole_validation_is_distinct_from_invalid_signature() {
+        let identity = Identity::new();
+        let mut announce = AnnounceData::create(&identity, "test.policy", None, None).unwrap();
+        let destination = crate::destination::Destination::hash_from_name_and_identity(
+            "test.policy",
+            Some(&identity.hash),
+        );
+        assert!(
+            announce
+                .validate_with_blackhole(&destination, None, |_| false)
+                .is_ok()
+        );
+        assert!(
+            matches!(announce.validate_with_blackhole(&destination, None, |hash| *hash == identity.hash), Err(AnnounceError::Blackholed(hash)) if hash == identity.hash)
+        );
+        announce.signature[0] ^= 1;
+        assert!(matches!(
+            announce.verify_signature_with_blackhole(&destination, |_| true),
+            Err(AnnounceError::Blackholed(_))
+        ));
+        assert!(matches!(
+            announce.validate_with_blackhole(&destination, None, |_| false),
+            Err(AnnounceError::SignatureInvalid)
+        ));
+        assert!(matches!(
+            announce.validate(&destination),
+            Err(AnnounceError::SignatureInvalid)
         ));
     }
 

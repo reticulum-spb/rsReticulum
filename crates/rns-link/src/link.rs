@@ -1212,7 +1212,7 @@ impl Link {
     }
 
     /// Count an outbound keepalive beat (Python counts them too, Packet.py:291)
-    /// without touching `last_outbound` — that would defer `is_stale` forever.
+    /// without touching the application-data `last_outbound` baseline.
     pub fn record_tx_keepalive(&mut self, bytes: usize) {
         self.tx_bytes += bytes as u64;
         self.tx_count += 1;

@@ -508,6 +508,26 @@ prevent delivery, but does not extend the deadline. Local transfer state is
 released regardless. Dropping an application future is not a new cancellation
 API and does not guarantee an on-wire cancel.
 
+### Announce validation policy and Link liveness
+
+`AnnounceData::validate_with_blackhole(destination, known_key, predicate)`
+returns `AnnounceError::Blackholed(identity_hash)` for caller-blocked identities;
+`verify_signature_with_blackhole` provides the signature-only variant used by
+transport admission. Existing validation methods retain their signatures and
+do not implicitly consult a global blocklist. Like Python, the policy check
+precedes signature verification: a blackholed result is not authentication of
+the packet. Transport retains its later blackhole recheck before learning paths.
+
+An initiator sends keepalive when either inbound or outbound activity has been
+quiet for an interval, even during continuous reception. Staleness uses inbound
+traffic, proofs and activation, not local outbound traffic alone. A responder
+does not echo keepalive while its recent outgoing application traffic already
+demonstrates activity. Existing Rust scheduling jitter is retained. Monotonic
+timing and exclusive mutable Link access avoid Python's watchdog-lock cleanup
+and negative sleep-time failure paths; no Python watchdog thread is added.
+Ratchet retention cleanup already uses the configured retained count and
+zeroises discarded keys.
+
 ### Ingress mappings
 
 The `reticulum.ingress` mapping and every interface's `ingress` mapping accept
