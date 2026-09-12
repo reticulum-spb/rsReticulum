@@ -154,6 +154,17 @@ impl DiscoveryStore {
         &self,
         discovery_sources: Option<&[[u8; 16]]>,
     ) -> Result<Vec<DiscoveredInterface>, StorageError> {
+        self.list_with_blackholes(discovery_sources, &std::collections::HashSet::new())
+    }
+
+    /// Like `list`, additionally purge historical discoveries whose announcing
+    /// network identity or advertised transport identity is currently blackholed.
+    /// The caller supplies an authoritative snapshot; storage owns no policy.
+    pub fn list_with_blackholes(
+        &self,
+        discovery_sources: Option<&[[u8; 16]]>,
+        blackholed: &std::collections::HashSet<[u8; 16]>,
+    ) -> Result<Vec<DiscoveredInterface>, StorageError> {
         let now = unix_now();
         let mut out: Vec<DiscoveredInterface> = Vec::new();
 
@@ -183,7 +194,9 @@ impl DiscoveryStore {
             };
 
             let heard_delta = now.saturating_sub(rec.last_heard);
-            let mut should_remove = heard_delta > THRESHOLD_REMOVE_SECS;
+            let mut should_remove = heard_delta > THRESHOLD_REMOVE_SECS
+                || blackholed.contains(&rec.network_id)
+                || blackholed.contains(&rec.info.transport_id);
             if let Some(sources) = discovery_sources {
                 if !sources.iter().any(|s| s == &rec.network_id) {
                     should_remove = true;
@@ -467,6 +480,30 @@ mod tests {
         let c = discovery_hash(&[0x11; 16], "beta");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn blackhole_snapshot_purges_network_and_transport_identities_from_disk() {
+        let dir = tmpdir("blackhole");
+        let store = DiscoveryStore::open(&dir).unwrap();
+        for (name, transport, network) in [
+            ("network-block", 1, 9),
+            ("transport-block", 9, 2),
+            ("keep", 3, 4),
+        ] {
+            let mut rec = record(name, [transport; 16]);
+            rec.network_id = [network; 16];
+            rec.last_heard = unix_now();
+            store.upsert(rec).unwrap();
+        }
+        let listed = store
+            .list_with_blackholes(None, &std::collections::HashSet::from([[9; 16]]))
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].info.name, "keep");
+        // A later empty snapshot cannot resurrect purged historical records.
+        assert_eq!(store.list(None).unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

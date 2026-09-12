@@ -687,8 +687,13 @@ next outer level”.
 
 | Field | Type | Default | Valid values and meaning |
 | --- | --- | --- | --- |
-| `level` | integer | `4` | Log level `0..=7`. |
+| `level` | integer | `4` | Log level `0..=8`; `7` = Pathing, `8` = Extreme. |
 | `timestamps` | boolean | `true` | Include timestamps in formatted logs. |
+
+`rnsd-rs` maps levels 0–1 to ERROR, 2 to WARN, 3–4 to INFO, 5–6 to DEBUG,
+and 7–8 to TRACE. Pathing and Extreme are distinct stored configuration values,
+not separate tracing levels or exact copies of Python log messages. The existing
+Rust 0–8 configuration does not expose Python's `LOG_NONE = -1` sentinel.
 
 ## `api`
 
@@ -759,6 +764,23 @@ notification still run on valid hits. Caches reset when the receiver restarts;
 they do not cache policy decisions or bypass transport signature/blackhole checks.
 Direct `ReceiverConfig::process_event` calls remain uncached; `spawn` owns the
 cache without changing the public config structure.
+
+Historical discovery listing also applies the current blackhole snapshot to
+both the authenticated `network_id` and advertised `transport_id`. Matching
+records are removed from the discovery store, alongside expired/source-disallowed
+records, as in Python 1.5.2. Unblocking does not restore deleted history; a new
+permitted announcement can repopulate it. Autoconnect uses the filtered startup
+list and checks queued observer records again before connecting. Already-open
+interfaces are not disconnected by this historical cleanup.
+
+The full runtime obtains the authoritative blackhole list through its control
+query path (shared-daemon RPC when attached), with a five-second bound and no
+Python-style 60-second snapshot cache. Expired TTL entries are excluded. If
+the snapshot is unavailable, listing/autoconnect returns no candidates without
+deleting records, so an RPC failure is not treated as an empty allow-all policy.
+Low-level `DiscoveryStore::list` retains its policy-free API; callers with a
+blackhole snapshot can use `list_with_blackholes`. Client-only discovery remains
+owned by the shared instance.
 
 These flat fields use the Python interface parameter names. The daemon installs
 a native discovery stamper automatically; applications can override it through

@@ -12,7 +12,7 @@
 | Этап | Текущее состояние |
 |---|---|
 | 0 | Исходная матрица составлена; окончательная классификация всех её строк продолжается. |
-| 1 | Discovery YAML/runtime/API/UI перенесены; при финальной сверке дополнен кеш stamp validation. |
+| 1 | Discovery YAML/runtime/API/UI перенесены; при финальной сверке дополнены stamp caches и очистка historical blackholes. |
 | 2 | Gravity, выбор маршрута, Link rebalance и internal policy реализованы; есть packet interop, полная многодемонная матрица отложена. |
 | 3 | Backbone fast-flapping и диагностика блокировок реализованы. |
 | 4 | Приоритетные очереди, inflight path requests, фильтры и счётчики реализованы. |
@@ -53,7 +53,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.3.9 rnsh security | Сверено с исходниками: identity gate и authorized state сохранены; fatal errors терминальны, ошибочный peer не завершает listener. Короткие allowed/denied проверки пройдены | 7 |
 | 1.3.9 rnsh config/identity paths | Перенесено: раздельные --config/--rnsconfig, identity[.SERVICE] и allowed_identities в выбранном rnsh каталоге; миграция описана в CONFIG.md | 7 |
 | 1.3.9 Backbone fast flapping | Отсутствует: listener/config в `rns-interface/src/backbone.rs` не ведут историю блокировок IP | 3 |
-| 1.3.9 LOG_PATHING / logging | Частично: tracing и числовые уровни в runtime; прямое соответствие новых уровней проверить | 7 |
+| 1.3.9 LOG_PATHING / logging | YAML/runtime/UI принимают 7 Pathing и 8 Extreme; оба соответствуют Rust TRACE. Граница шкалы и LOG_NONE описана в CONFIG | 7 / финальная сверка |
 | 1.3.9 internal discovery | Расхождение: `apply_discovery_mode_autocorrect` разрешает только gateway/AP | 1 |
 | 1.3.9 location script | Отсутствует в YAML и scheduler; Python `Discovery.py:get_interface_announce_data` запускает executable | 1 |
 | 1.3.9 RESOURCE_RCL, reliability | Реализована отмена в protocol/runtime, есть regression tests; межъязыковое поведение воспроизвести | 6 |
@@ -74,9 +74,9 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.1 I2P tasks garbage collection | Python GC причина неприменима к Tokio; прочие minor I2P fixes требуют локального воспроизведения | 5 |
 | 1.4.1 ingress burst active deadlock | Воспроизвести тайминги `ingress.rs` и maintenance без новых announces | 4 |
 | 1.4.1 memory efficiency / LOG_EXTREME | Воспроизвести нагрузку и числовые уровни, не переносить Python allocation детали без измерений | 5, 7 |
-| 1.4.1 historical discovery blackhole cleanup | Воспроизвести: `DiscoveryStore` хранит историю; проверить runtime blackhole фильтр и очистку | 1 |
+| 1.4.1 historical discovery blackhole cleanup | Закрыто: list_with_blackholes удаляет записи по network_id/transport_id; runtime и autoconnect используют актуальный control snapshot, expired TTL исключены | 1 / финальная сверка |
 | 1.4.2 zero-bitrate recursive PR | Воспроизвести незапущенный RNode и bitrate=0 без аппаратуры | 2 |
-| 1.4.2 Android slow blackhole filtering | Python Android причина не доказана в Rust; проверить общую фильтрацию discoveries | 1 |
+| 1.4.2 Android slow blackhole filtering | Общее фильтрование discovery перенесено через HashSet snapshot; Python runtime-specific slowdown/60s cache не копируется. Android hardware/performance не проверялись | 1 / граница платформенной проверки |
 | 1.5.0 discovery operator LXMF | Wire/runtime реализованы; YAML отсутствует | 1 |
 | 1.5.0 prioritized inbound / configurable four queue lengths | Отсутствуют: `TransportActor::new` создаёт один mpsc для control и inbound | 4 |
 | 1.5.0 early filtering / excessive hops | Частично: проверки в `actor/inbound.rs`, нет новой классификации до общей очереди | 4 |
@@ -3617,3 +3617,44 @@ runtime-поведение включённых возможностей.
 проверок. Полный workspace test, многодемонные Python↔Rust сценарии, длительный
 soak и аппаратные проверки в этом проходе не запускались. Новых test-only
 файлов нет; имеющиеся используются без изменения.
+
+### Итоговая сверка: historical discovery blackholes и logging 1.5.2
+
+Проверен `Discovery.list_discovered_interfaces` эталона: удаляются записи с
+blackholed network_id **или** transport_id, не только новые announces на входе.
+В Rust этого не было: исторический store проверял age/source-list, а startup
+autoconnect читал его напрямую. Пропуск исправлен:
+
+- Новый additive `DiscoveryStore::list_with_blackholes` удаляет соответствующие
+  записи с диска; старый policy-free `list` сохранён для standalone callers.
+- Runtime `discovered_interfaces` получает авторитетный GetBlackholedIdentities
+  через query_control (в full client mode — RPC общего демона), фильтрует
+  истёкшие TTL и передаёт HashSet в store. Весь запрос ограничен пятью секундами;
+  при недоступности snapshot возвращается пустой список, файлы не удаляются.
+- Startup autoconnect использует этот список; queued observer records проверяются
+  заново перед подключением, чтобы учитывать изменение blackhole после announce.
+  Не добавлено отключение уже работающих интерфейсов. Unblackhole не воскрешает
+  удалённую историю, но новое допустимое объявление сохраняется обычным путём.
+- Python 60s cache списка blackhole не перенесён: Rust получает свежий snapshot
+  и проверяет membership через HashSet. Специфичная производительность Android
+  не заявляется проверенной; client-only runtime, как прежде, не ведёт discovery.
+
+Дополнительно закрыта строка LOG_PATHING/LOG_EXTREME: YAML validator и runtime
+принимают уровень 8, Web UI различает 7 Pathing / 8 Extreme. Старое поведение
+0–7 не ломается; daemon отображает оба подробных уровня в TRACE. Отдельная
+Python-шкала сообщений и LOG_NONE=-1 не имитируются; граница описана в CONFIG.
+
+Короткие проверки: storage module — 10 passed (0.00s), включая оба blocked IDs
+и отсутствие восстановления удалённых записей при пустом следующем snapshot;
+`discovery_history_uses` runtime — 1 passed (0.00s), с реальным actor, TTL,
+повторной проверкой observer и сохранением файлов при недоступной политике;
+`logging_pathing` — 1 passed (0.00s), YAML roundtrip и нормализация 7/8, отказ 9.
+Web UI Node test passed (около 0.09s). Использованы inline проверки в существующих
+production-модулях; новых test-only файлов и внешних соединений нет.
+Default workspace all-targets, runtime api/serial/rnode-tcp/sqlite-bundled
+all-targets и client-only checks прошли; fmt/diff checks чистые.
+
+Матрица дополнена результатами, но общий релиз ещё не объявлен завершённым.
+Далее остаются отдельные строки performance/signature cache, rnodeconf WiFi
+summary и прочие не классифицированные minor fixes; длительная валидация
+по-прежнему отложена. Версия остаётся 1.0.1.

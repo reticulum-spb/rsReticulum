@@ -188,9 +188,9 @@ impl Config {
             &self.reticulum.interface_discovery_sources,
         )?;
         validate_hashes("blackhole_sources", &self.reticulum.blackhole_sources)?;
-        if !(0..=7).contains(&self.logging.level) {
+        if !(0..=8).contains(&self.logging.level) {
             return Err(YamlConfigError::Validation(
-                "logging.level must be in 0..=7".into(),
+                "logging.level must be in 0..=8".into(),
             ));
         }
         Ok(())
@@ -2398,6 +2398,29 @@ mod tests {
         let config = Config::default();
         let yaml = config.to_yaml().unwrap();
         assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+    }
+
+    #[test]
+    fn logging_pathing_and_extreme_survive_yaml_roundtrip() {
+        for level in [7, 8] {
+            let cfg =
+                Config::parse(&format!("logging:\n  level: {level}\n"), "config.yaml").unwrap();
+            assert_eq!(cfg.logging.level, level);
+            assert_eq!(
+                Config::parse(&cfg.to_yaml().unwrap(), "config.yaml").unwrap(),
+                cfg
+            );
+            #[cfg(feature = "full")]
+            assert_eq!(
+                crate::reticulum::ReticulumConfig::try_from_config(
+                    &cfg.to_runtime_config().unwrap()
+                )
+                .unwrap()
+                .loglevel,
+                level
+            );
+        }
+        assert!(Config::parse("logging:\n  level: 9\n", "config.yaml").is_err());
     }
 
     #[test]

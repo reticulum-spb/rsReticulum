@@ -311,7 +311,7 @@ impl ReticulumHandle {
             .is_some()
     }
 
-    /// Snapshot of currently-known interfaces. Stale + disallowed entries
+    /// Snapshot of currently-known interfaces. Expired, disallowed and blackholed entries
     /// are purged on read. Python: `discovered_interfaces()`.
     pub async fn discovered_interfaces(&self) -> Vec<DiscoveredInterface> {
         let store = self.discovery.store.lock().await.clone();
@@ -323,7 +323,14 @@ impl ReticulumHandle {
         } else {
             Some(self.config.interface_discovery_sources.as_slice())
         };
-        store.list(sources).unwrap_or_default()
+        // Do not expose/autoconnect stale policy data if the authoritative
+        // control plane is unavailable. Keep disk records for a later retry.
+        let Some(blackholed) = discovery_blackholes(self).await else {
+            return Vec::new();
+        };
+        store
+            .list_with_blackholes(sources, &blackholed)
+            .unwrap_or_default()
     }
 
     /// Identity hashes whose blackhole manifest this node subscribes to.
@@ -1087,7 +1094,7 @@ impl ReticulumConfig {
 
         if let Some(sec) = config.section("logging") {
             if let Some(level) = config_int("logging", sec, "loglevel")? {
-                rc.loglevel = (level as i32).clamp(0, 7);
+                rc.loglevel = level.clamp(0, 8) as i32;
             }
             if let Some(value) = config_bool("logging", sec, "logtimestamps")? {
                 rc.log_timestamps = value;
@@ -2978,19 +2985,35 @@ fn parse_discovery_location(output: &[u8]) -> Result<(f64, f64, f64), String> {
     Ok((latitude, longitude, height))
 }
 
+async fn discovery_blackholes(
+    handle: &ReticulumHandle,
+) -> Option<std::collections::HashSet<[u8; 16]>> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.query_control(TransportQuery::GetBlackholedIdentities),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    let TransportQueryResponse::BlackholeList(entries) = response else {
+        return None;
+    };
+    let now = rns_transport::now_f64();
+    Some(
+        entries
+            .into_iter()
+            .filter(|entry| entry.ttl.is_none_or(|ttl| now < entry.created + ttl))
+            .map(|entry| entry.identity_hash)
+            .collect(),
+    )
+}
+
 async fn run_discovery_autoconnect(
     handle: ReticulumHandle,
     mut rx: mpsc::Receiver<DiscoveredInterface>,
 ) {
-    if let Some(store) = handle.discovery.store.lock().await.clone() {
-        let sources = if handle.config.interface_discovery_sources.is_empty() {
-            None
-        } else {
-            Some(handle.config.interface_discovery_sources.as_slice())
-        };
-        for record in store.list(sources).unwrap_or_default() {
-            maybe_autoconnect_discovered(&handle, record).await;
-        }
+    for record in handle.discovered_interfaces().await {
+        maybe_autoconnect_discovered(&handle, record).await;
     }
 
     loop {
@@ -3006,6 +3029,17 @@ async fn run_discovery_autoconnect(
 async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: DiscoveredInterface) {
     let limit = handle.config.autoconnect_discovered_interfaces;
     if limit == 0 {
+        return;
+    }
+    // Also check observer events: they can be queued before a blackhole update,
+    // and their transport_id need not equal the authenticated network_id.
+    let Some(blackholed) = discovery_blackholes(handle).await else {
+        return;
+    };
+    if blackholed.contains(&record.network_id) || blackholed.contains(&record.info.transport_id) {
+        if let Some(store) = handle.discovery.store.lock().await.clone() {
+            let _ = store.remove(&record.info.transport_id, &record.info.name);
+        }
         return;
     }
     if !matches!(
@@ -5403,6 +5437,64 @@ mod tests {
         h.config.blackhole_sources = vec![[0xAA; 16], [0xBB; 16]];
         assert_eq!(h.blackhole_sources().len(), 2);
         assert_eq!(h.blackhole_sources()[0], [0xAA; 16]);
+    }
+
+    #[tokio::test]
+    async fn discovery_history_uses_live_blackholes_and_rechecks_observer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DiscoveryStore::open(dir.path()).unwrap());
+        let mut h = dummy_handle();
+        let (mut actor, input, control) =
+            rns_transport::actor::TransportActor::new_with_control_channel();
+        actor.blackhole_table.add([9; 16], None);
+        actor.blackhole_table.add([8; 16], Some(-1.0));
+        h.transport_tx = control;
+        h.interface_transport_tx = input;
+        h.config.autoconnect_discovered_interfaces = 1;
+        h.install_discovery_store_for_tests(store.clone()).await;
+        let task = tokio::spawn(actor.run());
+        let mut denied = None;
+        for (name, transport, network) in [("denied", 1, 9), ("expired-block", 8, 2)] {
+            let now = rns_transport::now_f64() as u64;
+            let rec = DiscoveredInterface {
+                info: rns_transport::discovery::app_data::DiscoveryInfo {
+                    name: name.into(),
+                    transport_id: [transport; 16],
+                    interface_type: "BackboneInterface".into(),
+                    ..Default::default()
+                },
+                network_id: [network; 16],
+                hops: 1,
+                stamp_value: 16,
+                stamp: vec![],
+                discovered: now,
+                last_heard: now,
+                heard_count: 0,
+                status: None,
+            };
+            store.upsert(rec.clone()).unwrap();
+            if name == "denied" {
+                denied = Some(rec);
+            }
+        }
+        let listed = h.discovered_interfaces().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].info.name, "expired-block");
+        let denied = denied.unwrap();
+        store.upsert(denied.clone()).unwrap(); // observer raced ahead of the new policy
+        maybe_autoconnect_discovered(&h, denied).await;
+        assert_eq!(store.list(None).unwrap().len(), 1);
+        assert!(h.discovery.autoconnected.lock().await.is_empty());
+        drop(h);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        // Unavailable control plane hides candidates but does not erase them.
+        let h = dummy_handle();
+        h.install_discovery_store_for_tests(store.clone()).await;
+        assert!(h.discovered_interfaces().await.is_empty());
+        assert_eq!(store.list(None).unwrap().len(), 1);
     }
 
     #[test]
