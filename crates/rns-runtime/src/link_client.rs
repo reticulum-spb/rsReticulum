@@ -1506,17 +1506,14 @@ impl LinkSession {
                         }
                     }
                     rns_wire::context::PacketContext::ResourceHmu => {
-                        let plaintext = self.link.decrypt(body).map_err(|error| {
-                            LinkClientError::LinkCrypto(format!("resource HMU: {error:?}"))
-                        })?;
-                        let (resource_hash, segment, hashmap) =
-                            rns_protocol::resource::parse_hashmap_update(&plaintext).map_err(
-                                |error| {
-                                    LinkClientError::UnexpectedResponse(format!(
-                                        "resource HMU: {error:?}"
-                                    ))
-                                },
-                            )?;
+                        let Ok(plaintext) = self.link.decrypt(body) else {
+                            continue;
+                        };
+                        let Ok((resource_hash, segment, hashmap)) =
+                            rns_protocol::resource::parse_hashmap_update(&plaintext)
+                        else {
+                            continue;
+                        };
                         if let Some(transfer) = transfers.get_mut(&resource_hash) {
                             match transfer.hashmap_update(segment, &hashmap) {
                                 TransferAction::SendRequest(request) => send_link_data(
@@ -1852,9 +1849,9 @@ impl LinkSession {
                         }
                     }
                     rns_wire::context::PacketContext::ResourceReq => {
-                        let plaintext = self.link.decrypt(body).map_err(|error| {
-                            LinkClientError::LinkCrypto(format!("resource request: {error:?}"))
-                        })?;
+                        let Ok(plaintext) = self.link.decrypt(body) else {
+                            continue;
+                        };
                         let packet_hash =
                             rns_wire::hash::packet_hash(&raw, header.flags.header_type);
                         for action in transfer.handle_request_packet(packet_hash, &plaintext) {
@@ -2718,27 +2715,21 @@ async fn wait_for_response(
                                         }
                                     }
                                     Err(e) => {
-                                        return Err(LinkClientError::LinkCrypto(format!(
-                                            "resource response decode: {e:?}"
-                                        )));
+                                        tracing::debug!(error = ?e, "ignoring malformed Resource response envelope");
+                                        continue;
                                     }
                                 }
                             }
                         }
                         rns_wire::context::PacketContext::ResourceHmu => {
-                            let plaintext = link.decrypt(body).map_err(|e| {
-                                LinkClientError::LinkCrypto(format!(
-                                    "resource hashmap update decrypt: {e:?}"
-                                ))
-                            })?;
-                            let (rh, segment, hashmap) =
-                                rns_protocol::resource::parse_hashmap_update(&plaintext).map_err(
-                                    |e| {
-                                        LinkClientError::UnexpectedResponse(format!(
-                                            "resource hashmap update: {e:?}"
-                                        ))
-                                    },
-                                )?;
+                            let Ok(plaintext) = link.decrypt(body) else {
+                                continue;
+                            };
+                            let Ok((rh, segment, hashmap)) =
+                                rns_protocol::resource::parse_hashmap_update(&plaintext)
+                            else {
+                                continue;
+                            };
                             let Some(transfer) = inbound_resources.get_mut(&rh) else {
                                 continue;
                             };
@@ -3054,6 +3045,15 @@ mod tests {
             } else {
                 PacketContext::Response
             };
+            for body in [vec![0; 32], peer.encrypt(&[0xc1]).unwrap()] {
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(link_id, PacketContext::ResourceHmu, &body),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
             let mut bodies = vec![vec![0; 32]];
             if mode >= 3 {
                 bodies.push(peer.encrypt(&[0xc1]).unwrap());
@@ -3810,6 +3810,13 @@ mod tests {
         let (events, rx) = mpsc::channel(8);
         events
             .send(DestinationEvent::InboundPacket {
+                raw: build_data_packet(link_id, PacketContext::ResourceReq, &[0; 32]),
+                interface_id: 0,
+            })
+            .await
+            .unwrap();
+        events
+            .send(DestinationEvent::InboundPacket {
                 raw: build_data_packet(
                     link_id,
                     PacketContext::ResourceReq,
@@ -3852,9 +3859,10 @@ mod tests {
     #[tokio::test]
     async fn response_split_metadata_flag_and_receive_segment_cap() {
         use rns_wire::context::PacketContext;
-        for response_mode in [
-            ResourceResponseMode::Packed,
-            ResourceResponseMode::PythonFile,
+        for (response_mode, malformed_envelope) in [
+            (ResourceResponseMode::Packed, false),
+            (ResourceResponseMode::PythonFile, false),
+            (ResourceResponseMode::Packed, true),
         ] {
             let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
             let public = key.public_key();
@@ -3865,7 +3873,10 @@ mod tests {
                 .unwrap();
             let link_id = client.link_id;
             let request_id = [8; 16];
-            let payload = Link::pack_response(&request_id, b"reply").unwrap();
+            let mut payload = Link::pack_response(&request_id, b"reply").unwrap();
+            if malformed_envelope {
+                payload[0] = 0xc1;
+            }
             let (tx, mut output) = mpsc::channel(8);
             let (events, mut rx) = mpsc::channel(8);
             let mut original = None;
@@ -3919,6 +3930,20 @@ mod tests {
                     .unwrap();
                 resources.push(transfer.resource);
             }
+            if malformed_envelope {
+                let valid = Link::pack_response(&request_id, b"reply").unwrap();
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(
+                            link_id,
+                            PacketContext::Response,
+                            &server.encrypt(&valid).unwrap(),
+                        ),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
             let response = wait_for_response(
                 &tx,
                 &mut rx,
@@ -3937,7 +3962,10 @@ mod tests {
                 // not guess and strip them in Python mode.
                 ResourceResponseMode::PythonFile => assert_eq!(response.data, payload),
             }
-            assert_eq!(response.metadata, Some(vec![0x80]));
+            assert_eq!(
+                response.metadata,
+                (!malformed_envelope).then_some(vec![0x80])
+            );
             for mut resource in resources {
                 let _request = output.try_recv().unwrap();
                 let TransportMessage::Outbound(proof) = output.try_recv().unwrap() else {

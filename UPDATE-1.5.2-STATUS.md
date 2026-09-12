@@ -93,7 +93,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Частично: actor и ingress существуют; каждую семантическую регрессию сверить с Python тестами/изменениями | 4, 6 |
 | 1.5.0 Backbone EPOLL starvation | EPOLL Python implementation неприменима; справедливость Tokio read/write проверить нагрузкой | 5 |
 | 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
-| 1.5.0 Link watchdog exception reset | Воспроизвести runtime malformed receive/error path | 6 |
+| 1.5.0 Link watchdog exception reset | Python watchdog_lock неприменим: Rust receive возвращает Result и не удерживает persistent receive lock. Пропуск malformed DATA/Response/ResourceReq/HMU, authenticated ADV teardown и продолжение после ошибок проверены короткими runtime cases. Произвольные panic пользовательских callbacks не входят в гарантию | 6 / архитектурная граница |
 | 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Частично: сегменты/RCL реализованы; проверить индексы и повторное связывание Python↔Rust | 6 |
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
@@ -3999,3 +3999,33 @@ receive/error ветки требуют отдельной сверки; обн�
 Итог: targeted test — 1 passed (0.06s), существующие runtime response_ —
 13 passed (0.04s). Client-only check и fmt/diff checks прошли.
 Длительные тесты не запускались.
+
+## Финальная сверка: ResourceReq/HMU и собранные response envelopes
+
+Клиентские Resource receive/send/response wait приведены к уже существующему
+LinkManager: ciphertext, не прошедший decrypt, игнорируется. Неразбираемый
+HMU также пропускается без отмены операции. После успешного разбора сохраняются
+проверки resource hash и действия state machine: пустое/недопустимое обновление
+hashmap, адресованное активной передаче, может вызвать штатную отмену. Ошибка
+локального шифрования или отправки собственного ответа по-прежнему возвращается.
+
+Для Packed Resource response успешное получение bytes ещё не означает успешный
+ответ запроса: ошибка decode response envelope теперь пропускается, receipt
+остаётся ожидающим до корректного ответа или исходного deadline. Валидный
+последующий packet Response принимается. PythonFile остаётся raw bytes и не
+проходит такой разбор. Resource proof подтверждает получение Resource, а не
+валидность вложенного response envelope — этот порядок сохранён.
+
+Существующие inline tests расширены: corrupted ResourceReq перед authenticated
+invalid request (проверяется сохранение ICL), corrupted/invalid HMU перед
+следующими DATA/Response и split Resource с invalid MessagePack envelope,
+за которым приходит корректный packet Response. Короткие результаты:
+`malformed_` — 3 passed (0.06s),
+`response_split_metadata_flag_and_receive_segment_cap` — 1 passed (0.03s).
+Новых test-only файлов нет.
+
+Строка Python watchdog exception reset классифицирована: Rust не имеет
+watchdog_lock, который мог остаться установленным после return Err; исправленные
+receive paths продолжают обработку там, где Python ловит ошибку и продолжает.
+Это не обещание изоляции произвольного panic в пользовательском callback.
+Далее — итоговая сверка ещё открытых строк матрицы; версия пока не повышается.
