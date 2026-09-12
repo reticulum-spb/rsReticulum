@@ -1594,10 +1594,13 @@ impl TransportActor {
     /// gates. Enqueueing lets `process_announce_queues` apply ANNOUNCE_CAP
     /// spacing and hop priority.
     fn broadcast_announce_on_interfaces(&mut self, raw: &[u8], except: Option<InterfaceId>) {
-        let destination_hash = rns_wire::header::PacketHeader::unpack(raw)
-            .ok()
-            .map(|(h, _)| h.destination_hash)
-            .unwrap_or([0u8; 16]);
+        let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(raw) else {
+            return;
+        };
+        let Some(emitted) = queued_announce_timebase(raw) else {
+            return;
+        };
+        let destination_hash = header.destination_hash;
         let hops = raw.get(1).copied().unwrap_or(0);
         let now = now_f64();
         // One copy at the boundary; per-interface queue entries clone the
@@ -1615,6 +1618,18 @@ impl TransportActor {
             let Some(entry) = self.interfaces.get_mut(&id) else {
                 continue;
             };
+            if let Some(existing) = entry
+                .announce_queue
+                .iter_mut()
+                .find(|queued| queued.destination_hash == destination_hash)
+            {
+                if queued_announce_timebase(&existing.raw).is_none_or(|old| emitted > old) {
+                    existing.time = now;
+                    existing.hops = hops;
+                    existing.raw = shared.clone();
+                }
+                continue;
+            }
             entry.announce_queue.push(crate::messages::QueuedAnnounce {
                 destination_hash,
                 time: now,
@@ -1752,6 +1767,14 @@ fn interface_marked_offline(entry: &InterfaceEntry) -> bool {
         .as_ref()
         .map(|online| !online.load(std::sync::atomic::Ordering::SeqCst))
         .unwrap_or(false)
+}
+
+fn queued_announce_timebase(raw: &[u8]) -> Option<u64> {
+    let (header, offset) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
+    let announce =
+        rns_identity::announce::AnnounceData::unpack(&raw[offset..], header.flags.context_flag)
+            .ok()?;
+    Some(announce_timebase(&announce.random_hash))
 }
 
 fn announce_timebase(random_blob: &[u8; 10]) -> u64 {
@@ -5887,7 +5910,9 @@ mod tests {
                 rns_wire::header::PacketHeader::unpack(&make_data_packet(link_id, 0)).unwrap();
             header.flags.packet_type = kind;
             header.context = context;
-            let raw: Bytes = header.pack().unwrap().into();
+            let mut raw = header.pack().unwrap();
+            raw.extend_from_slice(&[0x42; 96]);
+            let raw = Bytes::from(raw);
             let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
             let packet = || InboundPacket {
                 raw: raw.clone(),
@@ -5938,7 +5963,9 @@ mod tests {
             let mut header = header.clone();
             header.flags.packet_type = kind;
             header.context = PacketContext::Lrproof;
-            let raw: Bytes = header.pack().unwrap().into();
+            let mut raw = header.pack().unwrap();
+            raw.extend_from_slice(&[0x42; 96]);
+            let raw = Bytes::from(raw);
             let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
             let prepared = actor
                 .prepare_inbound(InboundPacket {
@@ -8563,7 +8590,9 @@ mod tests {
         let (entry, mut rx) = make_test_interface("spaced_iface");
         actor.interfaces.insert(1, entry);
 
-        let (raw, dest) = make_valid_announce("test.cap", 0);
+        let identity = rns_identity::identity::Identity::new();
+        let (raw, dest) =
+            make_announce_for_with_random_blob(&identity, "test.cap", 0, random_blob(1, 10));
         let raw_len = raw.len();
 
         // Two distinct announces back-to-back. The first call must just
@@ -8574,6 +8603,21 @@ mod tests {
         let (raw2, dest2) = make_valid_announce("test.cap.b", 0);
         actor.local_destinations.insert(dest2);
         actor.broadcast_announce_on_interfaces(&raw2, None);
+        actor.interfaces.get_mut(&1).unwrap().announce_queue[0].time = 1.0;
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        assert_eq!(actor.interfaces[&1].announce_queue[0].time, 1.0);
+        let (newer, _) =
+            make_announce_for_with_random_blob(&identity, "test.cap", 1, random_blob(2, 11));
+        actor.broadcast_announce_on_interfaces(&newer, None);
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        let queue = &actor.interfaces[&1].announce_queue;
+        assert_eq!(queue[0].raw, newer);
+        assert_eq!(queue[0].hops, 1);
+        assert!(queue[0].time > 1.0);
+        assert_eq!(
+            queue[1].raw, raw2,
+            "update must not overwrite another destination"
+        );
         assert!(
             rx.try_recv().is_err(),
             "broadcast_announce_on_interfaces must NOT send directly — it queues"
