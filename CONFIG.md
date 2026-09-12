@@ -451,6 +451,19 @@ a cancelling hashmap update emits `RESOURCE_RCL` and ends response reception.
 LinkManager releases the corresponding transfer and split state in both cases.
 Resource requests naming a different full hash do not advance a sender's state.
 
+`LinkSession::request_with_response_mode(path, data, deadline, max_response_bytes,
+ResourceResponseMode::PythonFile)` receives Python-style file responses. A
+Resource with metadata returns its raw payload bytes in `LinkResponse.data`,
+using the request id already matched in each encrypted advertisement. No attempt
+is made to interpret file contents as a response envelope, even if the bytes
+happen to be valid MessagePack. Responses without metadata and packet responses
+still decode `[request_id, data]`. Existing request methods default to
+`ResourceResponseMode::Packed` and preserve the Rust envelope contract even
+when metadata is present. Choose the mode explicitly for the peer/application;
+the formats cannot be inferred unambiguously from the payload. Size limits
+include wire metadata; returned file-response bytes remain in memory. This API
+does not return an open file or change server-side response generation.
+
 `LinkSession::send_resource_reader(reader, data_size, metadata, auto_compress,
 deadline)` accepts a Tokio `AsyncRead + Unpin` source with a known length.
 It reads exactly that many bytes from the current position without seeking,

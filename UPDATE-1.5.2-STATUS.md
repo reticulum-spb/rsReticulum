@@ -3354,3 +3354,29 @@ Rust wait_for_response всё ещё требует packed [request_id, data]. �
 responses; простое переключение всех metadata ответов на raw изменит их контракт.
 Полная Python↔Rust матрица/длительные проверки отложены по указанию пользователя,
 а не объявлены пройденными. Этап 6 пока открыт, версия 1.0.1.
+
+### Этап 6: приём raw file Resource-ответов Python
+
+Добавлены ResourceResponseMode::{Packed, PythonFile} и публичный
+LinkSession::request_with_response_mode(path, data, deadline, max_response_bytes,
+mode). PythonFile повторяет правило Python Link.response_resource_concluded:
+если Resource содержит metadata, payload возвращается как raw file bytes,
+request_id берётся из проверенного encrypted advertisement. Для Resource без
+metadata и обычных packet responses остаётся декодирование envelope.
+
+Старые request/request_with_metadata/request_with_metadata_limit сохраняют
+Packed по умолчанию, включая metadata-bearing packed responses. Эвристика
+«попробовать MessagePack, иначе файл» не применяется: файл сам может содержать
+корректную [request_id, data], и его нельзя незаметно преобразовывать.
+Сохранены проверки q, размеров, hash/proofs и многосегментная сборка.
+
+Существующая короткая response_split_metadata_flag fixture теперь проходит
+оба режима: одни и те же bytes с metadata дают decoded data в Packed и точные
+bytes файла в PythonFile, включая случай файла, похожего на envelope.
+1 passed, 0.02s. Workspace all-targets check успешен; прежние warnings
+database_path/tracing prelude сохраняются. Новых test-only файлов нет,
+длительные тесты/полная Python interop матрица не запускались.
+
+Пробел приёма raw file response закрыт opt-in API. Границы: LinkResponse.data
+остаётся Vec под лимитом, не открытым файлом; генерация файловых request replies
+на сервере этим изменением не добавлялась. Утилиты не менялись, версия 1.0.1.

@@ -173,6 +173,17 @@ pub struct ReceivedFileResource {
     pub resource_hash: [u8; 32],
 }
 
+/// Wire interpretation of metadata-bearing Resource responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResourceResponseMode {
+    /// Existing Rust contract: decode `[request_id, data]`, even with metadata.
+    #[default]
+    Packed,
+    /// Python contract: Resources with metadata contain raw file bytes.
+    /// Resources without metadata and packet responses still use the envelope.
+    PythonFile,
+}
+
 /// Response payload and optional Resource metadata returned by a Link request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkResponse {
@@ -894,6 +905,28 @@ impl LinkSession {
         deadline: Duration,
         max_response_bytes: usize,
     ) -> Result<LinkResponse, LinkClientError> {
+        self.request_with_response_mode(
+            path,
+            data,
+            deadline,
+            max_response_bytes,
+            ResourceResponseMode::Packed,
+        )
+        .await
+    }
+
+    /// Select the wire interpretation of Resource responses explicitly, without
+    /// guessing from file contents. PythonFile returns raw file bytes in
+    /// LinkResponse.data, not a file handle; max_response_bytes still bounds
+    /// the full Resource size including metadata, before reception.
+    pub async fn request_with_response_mode(
+        &mut self,
+        path: &str,
+        data: Option<&[u8]>,
+        deadline: Duration,
+        max_response_bytes: usize,
+        response_mode: ResourceResponseMode,
+    ) -> Result<LinkResponse, LinkClientError> {
         let expires = Instant::now() + deadline;
         let (packed, request_id) = self
             .link
@@ -946,6 +979,7 @@ impl LinkSession {
             response_id,
             time_remaining(expires)?,
             max_response_bytes,
+            response_mode,
         )
         .await
     }
@@ -2090,6 +2124,7 @@ impl LinkClient {
             packet_request_id,
             time_remaining(deadline)?,
             usize::MAX,
+            ResourceResponseMode::Packed,
         )
         .await
         .map(|response| response.data);
@@ -2282,6 +2317,7 @@ async fn wait_for_response(
     request_id: [u8; 16],
     deadline: Duration,
     max_response_bytes: usize,
+    response_mode: ResourceResponseMode,
 ) -> Result<LinkResponse, LinkClientError> {
     let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
     let fut = async {
@@ -2574,6 +2610,16 @@ async fn wait_for_response(
                                     .as_ref()
                                     .and_then(|coordinator| coordinator.metadata.clone())
                                     .or(metadata);
+                                if response_mode == ResourceResponseMode::PythonFile
+                                    && metadata.is_some()
+                                {
+                                    // The request id was already authenticated/matched
+                                    // in every encrypted Resource advertisement (`q`).
+                                    return Ok(LinkResponse {
+                                        data: response_payload,
+                                        metadata,
+                                    });
+                                }
                                 match link.handle_response_plaintext(&response_payload) {
                                     Ok((id, response_data)) => {
                                         if id == request_id {
@@ -3225,132 +3271,143 @@ mod tests {
     #[tokio::test]
     async fn response_split_metadata_flag_and_receive_segment_cap() {
         use rns_wire::context::PacketContext;
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let public = key.public_key();
-        let (mut client, request) = Link::new_initiator([7; 16], 1);
-        let (server, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
-        client
-            .validate_proof(&proof, &public, &public.to_bytes())
-            .unwrap();
-        let link_id = client.link_id;
-        let request_id = [8; 16];
-        let payload = Link::pack_response(&request_id, b"reply").unwrap();
-        let (tx, mut output) = mpsc::channel(8);
-        let (events, mut rx) = mpsc::channel(8);
-        let mut original = None;
-        let mut resources = Vec::new();
-        for (index, data) in [(1, &payload[..5]), (2, &payload[5..])] {
-            let encrypt = |data: &[u8]| server.encrypt(data).unwrap();
-            let mut resource = OutboundResource::with_options(
-                data.to_vec(),
-                false,
-                (index == 1).then_some(vec![0x80]),
-                None,
-                Some(&encrypt),
+        for response_mode in [
+            ResourceResponseMode::Packed,
+            ResourceResponseMode::PythonFile,
+        ] {
+            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+            let public = key.public_key();
+            let (mut client, request) = Link::new_initiator([7; 16], 1);
+            let (server, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+            client
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            let link_id = client.link_id;
+            let request_id = [8; 16];
+            let payload = Link::pack_response(&request_id, b"reply").unwrap();
+            let (tx, mut output) = mpsc::channel(8);
+            let (events, mut rx) = mpsc::channel(8);
+            let mut original = None;
+            let mut resources = Vec::new();
+            for (index, data) in [(1, &payload[..5]), (2, &payload[5..])] {
+                let encrypt = |data: &[u8]| server.encrypt(data).unwrap();
+                let mut resource = OutboundResource::with_options(
+                    data.to_vec(),
+                    false,
+                    (index == 1).then_some(vec![0x80]),
+                    None,
+                    Some(&encrypt),
+                )
+                .unwrap();
+                let root = *original.get_or_insert(resource.resource_hash);
+                resource.flags.split = true;
+                resource.flags.is_response = true;
+                resource.flags.has_metadata = true;
+                resource.request_id = Some(request_id.to_vec());
+                resource.original_hash = Some(root);
+                resource.segment_index = index;
+                resource.total_segments = 2;
+                resource.advertisement_data_size = payload.len() + 4;
+                let mut transfer =
+                    OutboundTransfer::from_prebuilt(resource, Duration::from_millis(500));
+                let TransferAction::SendAdvertisement(adv) = transfer.tick() else {
+                    panic!("ADV")
+                };
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(
+                            link_id,
+                            PacketContext::ResourceAdv,
+                            &server.encrypt(&adv).unwrap(),
+                        ),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(transfer.resource.parts.len(), 1);
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(
+                            link_id,
+                            PacketContext::Resource,
+                            &transfer.resource.parts[0],
+                        ),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+                resources.push(transfer.resource);
+            }
+            let response = wait_for_response(
+                &tx,
+                &mut rx,
+                &mut client,
+                link_id,
+                request_id,
+                Duration::from_secs(1),
+                payload.len() + 4,
+                response_mode,
             )
+            .await
             .unwrap();
-            let root = *original.get_or_insert(resource.resource_hash);
-            resource.flags.split = true;
-            resource.flags.is_response = true;
-            resource.flags.has_metadata = true;
-            resource.request_id = Some(request_id.to_vec());
-            resource.original_hash = Some(root);
-            resource.segment_index = index;
-            resource.total_segments = 2;
-            resource.advertisement_data_size = payload.len() + 4;
-            let mut transfer =
-                OutboundTransfer::from_prebuilt(resource, Duration::from_millis(500));
-            let TransferAction::SendAdvertisement(adv) = transfer.tick() else {
-                panic!("ADV")
+            match response_mode {
+                ResourceResponseMode::Packed => assert_eq!(response.data, b"reply"),
+                // File bytes deliberately resemble a valid response envelope: do
+                // not guess and strip them in Python mode.
+                ResourceResponseMode::PythonFile => assert_eq!(response.data, payload),
+            }
+            assert_eq!(response.metadata, Some(vec![0x80]));
+            for mut resource in resources {
+                let _request = output.try_recv().unwrap();
+                let TransportMessage::Outbound(proof) = output.try_recv().unwrap() else {
+                    panic!("proof")
+                };
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
+                assert_eq!(header.context, PacketContext::ResourcePrf);
+                assert!(resource.validate_proof(&proof.raw[offset..]));
+            }
+            let mut session = LinkSession {
+                transport_tx: tx,
+                identity: Arc::new(Identity::new()),
+                link: client,
+                event_rx: rx,
+                channel: None,
+                channel_packets: Vec::new(),
+                pending_packets: VecDeque::new(),
+                pending_resource_packets: VecDeque::new(),
             };
+            let mut adv = ResourceAdvertisement::new(
+                16,
+                32,
+                1,
+                [3; 32],
+                vec![0; 4],
+                rns_protocol::resource::ResourceFlags::default(),
+                &[[3; 4]],
+                rns_wire::constants::ENCRYPTED_MDU,
+            );
+            adv.total_segments = rns_protocol::resource::MAX_SEGMENTS + 1;
             events
                 .send(DestinationEvent::InboundPacket {
                     raw: build_data_packet(
                         link_id,
                         PacketContext::ResourceAdv,
-                        &server.encrypt(&adv).unwrap(),
+                        &server.encrypt(&adv.pack()).unwrap(),
                     ),
                     interface_id: 0,
                 })
                 .await
                 .unwrap();
-            assert_eq!(transfer.resource.parts.len(), 1);
-            events
-                .send(DestinationEvent::InboundPacket {
-                    raw: build_data_packet(
-                        link_id,
-                        PacketContext::Resource,
-                        &transfer.resource.parts[0],
-                    ),
-                    interface_id: 0,
-                })
-                .await
-                .unwrap();
-            resources.push(transfer.resource);
-        }
-        let response = wait_for_response(
-            &tx,
-            &mut rx,
-            &mut client,
-            link_id,
-            request_id,
-            Duration::from_secs(1),
-            payload.len() + 4,
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.data, b"reply");
-        assert_eq!(response.metadata, Some(vec![0x80]));
-        for mut resource in resources {
-            let _request = output.try_recv().unwrap();
-            let TransportMessage::Outbound(proof) = output.try_recv().unwrap() else {
-                panic!("proof")
+            assert!(matches!(
+                session.recv_resource(Duration::from_secs(1)).await,
+                Err(LinkClientError::Resource(_))
+            ));
+            let TransportMessage::Outbound(cancel) = output.try_recv().unwrap() else {
+                panic!("RCL")
             };
-            let (header, offset) = rns_wire::header::PacketHeader::unpack(&proof.raw).unwrap();
-            assert_eq!(header.context, PacketContext::ResourcePrf);
-            assert!(resource.validate_proof(&proof.raw[offset..]));
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&cancel.raw).unwrap();
+            assert_eq!(header.context, PacketContext::ResourceRcl);
         }
-        let mut session = LinkSession {
-            transport_tx: tx,
-            identity: Arc::new(Identity::new()),
-            link: client,
-            event_rx: rx,
-            channel: None,
-            channel_packets: Vec::new(),
-            pending_packets: VecDeque::new(),
-            pending_resource_packets: VecDeque::new(),
-        };
-        let mut adv = ResourceAdvertisement::new(
-            16,
-            32,
-            1,
-            [3; 32],
-            vec![0; 4],
-            rns_protocol::resource::ResourceFlags::default(),
-            &[[3; 4]],
-            rns_wire::constants::ENCRYPTED_MDU,
-        );
-        adv.total_segments = rns_protocol::resource::MAX_SEGMENTS + 1;
-        events
-            .send(DestinationEvent::InboundPacket {
-                raw: build_data_packet(
-                    link_id,
-                    PacketContext::ResourceAdv,
-                    &server.encrypt(&adv.pack()).unwrap(),
-                ),
-                interface_id: 0,
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            session.recv_resource(Duration::from_secs(1)).await,
-            Err(LinkClientError::Resource(_))
-        ));
-        let TransportMessage::Outbound(cancel) = output.try_recv().unwrap() else {
-            panic!("RCL")
-        };
-        let (header, _) = rns_wire::header::PacketHeader::unpack(&cancel.raw).unwrap();
-        assert_eq!(header.context, PacketContext::ResourceRcl);
     }
 
     #[tokio::test]
@@ -3434,6 +3491,7 @@ mod tests {
                 request_id,
                 Duration::from_secs(1),
                 limit,
+                ResourceResponseMode::Packed,
             )
             .await;
             if limit < 32 {
