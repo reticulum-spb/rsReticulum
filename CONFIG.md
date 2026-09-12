@@ -465,9 +465,22 @@ first segment's hash, as in Python. Errors after preparation attempt ICL, and
 the Rust receiver can release split state by original hash between segments.
 Existing Vec APIs remain available. Unknown-length sources still require the
 caller to determine/spool the length: automatic temporary-file proxying is not
-implemented. `rncp-rs` still reads its file into memory; it has not yet switched
-to this reader API. No equivalent Python temporary-file `flush`/`seek` path is
+implemented. No equivalent Python temporary-file `flush`/`seek` path is
 introduced by this implementation.
+
+CLI `rncp-rs` send now opens the file, takes its length from that open handle,
+and calls `rncp_send_reader(RncpSendReaderRequest)`. That runtime path also
+prepares one encrypted segment at a time and waits for its proof before reading
+the next. File-name metadata reduces the first segment budget; the total `d`
+includes metadata. Reads share the operation deadline, and premature EOF or a
+read error closes the rncp Link through its usual cleanup. Data appended after
+the initial size check is not sent. File changes are not snapshotted or locked.
+
+The old `rncp_send_file(RncpSendRequest { data: Vec<u8>, ... })` remains an API
+wrapper over the reader path. Progress weights each segment by original source
+bytes and tracks unique sent parts within it; future compressed sizes are not
+precomputed. An empty file still sends metadata and waits for proof. This change
+covers CLI send, not the fetch server's source handling or receiver buffering.
 
 ### Resource receive watchdog
 

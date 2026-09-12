@@ -3155,3 +3155,33 @@ database_path/tracing prelude сохраняются. Новых test-only фа�
 Границы: неизвестная длина пока требует caller-side подготовки, автоматический
 spool отсутствует; CLI rncp ещё читает весь файл и не переключён на reader API.
 Этап6 остаётся открыт, версия1.0.1; длительные тесты не запускались.
+
+### Этап 6: rncp send читает файл по сегментам
+
+CLI заменил tokio::fs::read на File::open и metadata открытого handle.
+Новый RncpSendReaderRequest/rncp_send_reader принимает AsyncRead+Unpin с длиной;
+старый RncpSendRequest/rncp_send_file сохранён как wrapper с Cursor<Vec<u8>>.
+Runtime не создаёт MultiSegmentOutbound со всеми частями в памяти: read_exact
+одного сегмента → metadata/encrypt → существующий drive_outbound/proof →
+следующий сегмент. До discovery проверяются общий размер/metadata/segment cap.
+Объявленный d включает metadata, original_hash — hash первого сегмента.
+Timeout чтения использует остаток общего deadline. Ошибка/EOF проходит обычный
+rncp Link close/cleanup; хвост файла сверх первоначальной длины не читается.
+Snapshot/locking файла не добавлен, изменение файла во время чтения возможно.
+
+Прогресс взвешен по исходным byte spans, внутри сегмента — unique sent_parts;
+не нужно заранее сжимать все сегменты для вычисления будущего числа частей.
+Пустой файл сохраняет metadata/proof flow. Изменение касается CLI send;
+fetch server source и receiver buffering этим коммитом не менялись.
+
+Один новый inline test проверяет отказ от чрезмерного источника до connecting.
+Повторно запускаются существующие короткие sender handshake/REQ/proof и
+reader source/admission проверки. Полный CLI/Python interop не запускался.
+Новых test-only файлов нет; неизвестная длина пока требует caller-side
+подготовки, автоматический spool ещё отсутствует. Этап6 открыт, версия1.0.1.
+Команды `cargo test -p rns-runtime --lib reader_size_is_validated --quiet`,
+`cargo test -p rns-runtime --lib resource_sender_waits_for_requests --quiet`,
+`cargo test -p rns-runtime --lib reader_resource_preserves --quiet`:
+по1 passed, соответственно0.00/0.01/0.14s. Workspace all-targets check,
+fmt check и diff check успешны. Прежние warnings database_path/tracing prelude
+сохраняются, Python reference чист.

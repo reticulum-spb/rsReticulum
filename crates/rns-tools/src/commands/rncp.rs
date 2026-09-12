@@ -37,8 +37,8 @@ use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
 use rns_runtime::platform::StoragePaths;
 use rns_runtime::rncp::{
     DEFAULT_RNCP_APP_NAME, RncpError, RncpEvent, RncpFetchOutcome, RncpFetchRequest,
-    RncpListenerConfig, RncpOutcome, RncpSendRequest, default_rncp_app_name, rncp_fetch_file,
-    rncp_send_file, spawn_rncp_listener,
+    RncpListenerConfig, RncpOutcome, RncpSendReaderRequest, default_rncp_app_name, rncp_fetch_file,
+    rncp_send_reader, spawn_rncp_listener,
 };
 
 const DEFAULT_TIMEOUT_SECS: f64 = 15.0;
@@ -408,10 +408,23 @@ async fn run_send(args: Args) -> ! {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "file".to_string());
 
-    let data = match tokio::fs::read(&file_path).await {
+    let file = match tokio::fs::File::open(&file_path).await {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Failed to read \"{}\": {e}", file_path.display());
+            process::exit(1);
+        }
+    };
+    let bytes_total = match file.metadata().await {
+        Ok(metadata) => match usize::try_from(metadata.len()) {
+            Ok(size) => size,
+            Err(_) => {
+                eprintln!("File is too large for this platform");
+                process::exit(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("Failed to inspect file: {error}");
             process::exit(1);
         }
     };
@@ -435,7 +448,6 @@ async fn run_send(args: Args) -> ! {
     let timeout = transfer_timeout(&args, &handle).await;
     let path_wait = timeout;
     let auto_compress = !args.no_compress;
-    let bytes_total = data.len();
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f32>(32);
     let silent = args.silent;
@@ -461,12 +473,13 @@ async fn run_send(args: Args) -> ! {
         }
     });
 
-    let result = rncp_send_file(RncpSendRequest {
+    let result = rncp_send_reader(RncpSendReaderRequest {
         transport_tx: handle.transport_tx.clone(),
         identity,
         dest_hash,
         file_name: &file_name,
-        data,
+        reader: file,
+        data_size: bytes_total,
         auto_compress,
         overall_timeout: timeout,
         path_wait,

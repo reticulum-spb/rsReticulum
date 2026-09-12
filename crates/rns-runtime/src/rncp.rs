@@ -16,7 +16,7 @@ use rns_identity::identity::Identity;
 use rns_link::encryption::link_encrypt;
 use rns_link::link::{CloseReason, Link};
 use rns_protocol::resource::{
-    MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundResource, OutboundTransfer, TransferAction,
+    MAX_EFFICIENT_SIZE, OutboundResource, OutboundTransfer, TransferAction,
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
@@ -79,6 +79,20 @@ pub struct RncpSendRequest<'a> {
     pub dest_hash: [u8; 16],
     pub file_name: &'a str,
     pub data: Vec<u8>,
+    pub auto_compress: bool,
+    pub overall_timeout: Duration,
+    pub path_wait: Duration,
+    pub progress_tx: Option<mpsc::Sender<f32>>,
+}
+
+/// Known-length reader source; read sequentially from its current position.
+pub struct RncpSendReaderRequest<'a, R> {
+    pub transport_tx: mpsc::Sender<TransportMessage>,
+    pub identity: Identity,
+    pub dest_hash: [u8; 16],
+    pub file_name: &'a str,
+    pub reader: R,
+    pub data_size: usize,
     pub auto_compress: bool,
     pub overall_timeout: Duration,
     pub path_wait: Duration,
@@ -482,12 +496,33 @@ fn build_link_close(link: &mut Link) -> Option<Bytes> {
 }
 
 pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome, RncpError> {
-    let RncpSendRequest {
+    let data_size = request.data.len();
+    rncp_send_reader(RncpSendReaderRequest {
+        transport_tx: request.transport_tx,
+        identity: request.identity,
+        dest_hash: request.dest_hash,
+        file_name: request.file_name,
+        reader: std::io::Cursor::new(request.data),
+        data_size,
+        auto_compress: request.auto_compress,
+        overall_timeout: request.overall_timeout,
+        path_wait: request.path_wait,
+        progress_tx: request.progress_tx,
+    })
+    .await
+}
+
+pub async fn rncp_send_reader<R: tokio::io::AsyncRead + Unpin>(
+    request: RncpSendReaderRequest<'_, R>,
+) -> Result<RncpOutcome, RncpError> {
+    use tokio::io::AsyncReadExt;
+    let RncpSendReaderRequest {
         transport_tx,
         identity,
         dest_hash,
         file_name,
-        data,
+        mut reader,
+        data_size: byte_count,
         auto_compress,
         overall_timeout,
         path_wait,
@@ -496,7 +531,25 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
 
     let started = Instant::now();
     let deadline = started + overall_timeout;
-    let byte_count = data.len();
+    let mut metadata_bytes = Some(pack_metadata(file_name));
+    let metadata_size = metadata_bytes
+        .as_ref()
+        .unwrap()
+        .len()
+        .checked_add(3)
+        .ok_or_else(|| RncpError::ResourceCreate("metadata size overflow".into()))?;
+    let total_size = byte_count
+        .checked_add(metadata_size)
+        .ok_or_else(|| RncpError::ResourceCreate("resource size overflow".into()))?;
+    let total_segments = total_size.div_ceil(MAX_EFFICIENT_SIZE).max(1);
+    if metadata_size > MAX_EFFICIENT_SIZE
+        || byte_count > rns_protocol::resource::MAX_RESOURCE_SIZE
+        || total_segments > rns_protocol::resource::MAX_SEGMENTS
+    {
+        return Err(RncpError::ResourceCreate(
+            "source exceeds Resource size limits".into(),
+        ));
+    }
 
     let pubkey =
         discover_pubkey(&transport_tx, dest_hash, path_wait.min(remaining(deadline))).await?;
@@ -583,60 +636,55 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
         link_encrypt(&session_keys_enc, plaintext).unwrap_or_default()
     };
 
-    let metadata_bytes = pack_metadata(file_name);
-
     let link_rtt = link.rtt.unwrap_or(Duration::from_millis(500));
-    let resources = if metadata_bytes.len() + 3 + data.len() <= MAX_EFFICIENT_SIZE {
-        vec![
-            OutboundResource::with_options(
-                data,
+    let mut resource_hash = None;
+    let mut total_parts = 0;
+    let transfer_result = async {
+        let mut consumed = 0;
+        for index in 1..=total_segments {
+            let capacity = MAX_EFFICIENT_SIZE - if index == 1 { metadata_size } else { 0 };
+            let mut chunk = vec![0; (byte_count - consumed).min(capacity)];
+            timeout(remaining(deadline), reader.read_exact(&mut chunk))
+                .await
+                .map_err(|_| RncpError::Timeout("resource source"))?
+                .map_err(|error| RncpError::Io(error.to_string()))?;
+            let chunk_size = chunk.len();
+            let mut resource = OutboundResource::with_options(
+                chunk,
                 auto_compress,
-                Some(metadata_bytes),
+                metadata_bytes.take(),
                 None,
                 Some(&encrypt_fn),
             )
-            .map_err(|e| RncpError::ResourceCreate(format!("{e:?}")))?,
-        ]
-    } else {
-        MultiSegmentOutbound::with_options(
-            data,
-            auto_compress,
-            Some(metadata_bytes),
-            None,
-            false,
-            Some(&encrypt_fn),
-        )
-        .map_err(|e| RncpError::ResourceCreate(format!("{e:?}")))?
-        .segments
-    };
-    let resource_hash = resources
-        .first()
-        .map(|r| r.original_hash.unwrap_or(r.resource_hash))
-        .unwrap_or([0u8; 32]);
-    let total_parts: usize = resources.iter().map(|r| r.parts.len()).sum();
-    let total_parts_nonzero = total_parts.max(1);
-
-    let mut transfer_result = Ok(());
-    let mut completed_parts = 0usize;
-    for resource in resources {
-        let segment_parts = resource.parts.len();
-        transfer_result = drive_outbound(OutboundDrive {
-            transport_tx: &transport_tx,
-            link: &mut link,
-            link_id,
-            resource,
-            lpkt_rx: &mut lpkt_rx,
-            progress_tx: progress_tx.clone(),
-            progress_base: completed_parts as f32 / total_parts_nonzero as f32,
-            progress_span: segment_parts as f32 / total_parts_nonzero as f32,
-            deadline,
-        })
-        .await;
-        if transfer_result.is_err() {
-            break;
+            .map_err(|error| RncpError::ResourceCreate(format!("{error:?}")))?;
+            let original = *resource_hash.get_or_insert(resource.resource_hash);
+            resource.flags.split = total_segments > 1;
+            resource.segment_index = index;
+            resource.total_segments = total_segments;
+            resource.advertisement_data_size = total_size;
+            resource.original_hash = (total_segments > 1).then_some(original);
+            total_parts += resource.parts.len();
+            drive_outbound(OutboundDrive {
+                transport_tx: &transport_tx,
+                link: &mut link,
+                link_id,
+                resource,
+                lpkt_rx: &mut lpkt_rx,
+                progress_tx: progress_tx.clone(),
+                progress_base: consumed as f32 / byte_count.max(1) as f32,
+                progress_span: if byte_count == 0 {
+                    1.0
+                } else {
+                    chunk_size as f32 / byte_count as f32
+                },
+                deadline,
+            })
+            .await?;
+            consumed += chunk_size;
         }
-        completed_parts += segment_parts;
+        Ok::<(), RncpError>(())
     }
+    .await;
 
     if let Some(close_pkt) = build_link_close(&mut link) {
         let _ = transport_tx
@@ -653,7 +701,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
     tracing::info!(
         dest = hex::encode(dest_hash),
         link_id = hex::encode(link_id),
-        resource = hex::encode(&resource_hash[..8]),
+        resource = hex::encode(&resource_hash.unwrap_or([0; 32])[..8]),
         bytes = byte_count,
         parts = total_parts,
         "rncp send complete"
@@ -1544,6 +1592,26 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reader_size_is_validated_before_connecting() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let result = rncp_send_reader(RncpSendReaderRequest {
+            transport_tx: tx,
+            identity: Identity::new(),
+            dest_hash: [7; 16],
+            file_name: "too-large.bin",
+            reader: tokio::io::empty(),
+            data_size: rns_protocol::resource::MAX_RESOURCE_SIZE + 1,
+            auto_compress: false,
+            overall_timeout: Duration::from_secs(1),
+            path_wait: Duration::from_secs(1),
+            progress_tx: None,
+        })
+        .await;
+        assert!(matches!(result, Err(RncpError::ResourceCreate(_))));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn resource_sender_waits_for_requests() {
