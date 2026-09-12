@@ -494,8 +494,24 @@ the session worker. Its deadline includes establishment, queue capacity and
 earlier commands; expired or cancelled queued calls do not start receiving.
 If the caller drops an already-started call, reception continues until completion
 or its original deadline and the undeliverable temporary-file result is dropped.
-The LinkManager completion channel is unchanged. Existing byte-returning APIs
-retain their in-memory result representation.
+Existing byte-returning APIs retain their in-memory result representation.
+
+Before accepting Links, applications can opt into file reception with
+`LinkManager::set_file_resource_completion_channel(sender, max_size)`. Ordinary
+Resources then produce `FileResourceCompletion { link_id, resource_hash, file,
+data_size, metadata }`, with a `std::fs::File` positioned at zero; the two byte
+completion channels are bypassed. Request/response Resources retain their old
+handling. Limits include metadata and are checked before receiving; decoded
+totals and segment order must agree with advertisements. Blocking file writes
+run outside the manager loop, and `on_tick` emits proofs after successful writes.
+The final result must fit the completion channel before its proof is sent; a
+closed/full channel triggers RCL and drops the temporary file. At most 32 file
+Resources per manager and 32 blocking writes process-wide are admitted. A missing
+next advertisement releases partial files after 120 seconds; existing segment
+watchdogs still apply during reception. Link closure releases file state, and
+Resource cancellation releases it on the next tick. Queued writes are cancelled;
+an already-running OS write finishes before its handle is closed. This adds no
+application file overwrite or whole-Resource memory reassembly.
 
 CLI `rncp-rs` send now opens the file, takes its length from that open handle,
 and calls `rncp_send_reader(RncpSendReaderRequest)`. That runtime path also

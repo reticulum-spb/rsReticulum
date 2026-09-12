@@ -2736,7 +2736,7 @@ pub(crate) fn send_link_data(
         .map_err(|_| LinkClientError::TransportUnavailable)
 }
 
-fn send_link_proof(
+pub(crate) fn send_link_proof(
     transport_tx: &mpsc::Sender<TransportMessage>,
     link_id: [u8; 16],
     proof: &[u8],

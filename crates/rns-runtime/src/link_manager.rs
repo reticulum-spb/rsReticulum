@@ -166,6 +166,86 @@ pub struct ResourceCompletion {
     pub metadata: Option<Vec<u8>>,
 }
 
+/// File-backed completion for an opted-in application Resource receiver.
+#[derive(Debug)]
+pub struct FileResourceCompletion {
+    pub link_id: [u8; 16],
+    pub resource_hash: [u8; 32],
+    pub file: std::fs::File,
+    pub data_size: usize,
+    pub metadata: Option<Vec<u8>>,
+}
+
+struct FileResourceReceiver {
+    total: usize,
+    advertised_size: usize,
+    next: usize,
+    current_hash: [u8; 32],
+    bytes: usize,
+    metadata: Option<Vec<u8>>,
+    file: Option<std::fs::File>,
+    pending: Option<oneshot::Receiver<Result<std::fs::File, String>>>,
+    proof: Vec<u8>,
+    updated_at: std::time::Instant,
+}
+
+impl FileResourceReceiver {
+    fn write_segment(
+        &mut self,
+        data: Vec<u8>,
+        metadata: Option<Vec<u8>>,
+        proof: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.next == 1 {
+            self.metadata = metadata;
+        }
+        self.bytes += data.len();
+        let wire_size = self.bytes + self.metadata.as_ref().map_or(0, |m| m.len() + 3);
+        if wire_size > self.advertised_size
+            || (self.next == self.total && wire_size != self.advertised_size)
+        {
+            return Err("decoded file Resource size mismatch".into());
+        }
+        let file = self.file.take();
+        let last = self.next == self.total;
+        let (mut tx, rx) = oneshot::channel();
+        self.proof = proof;
+        self.pending = Some(rx);
+        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        let slots = SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+            .clone();
+        tokio::spawn(async move {
+            let permit = tokio::select! {
+                permit = slots.acquire_owned() => permit.expect("file write slots remain open"),
+                _ = tx.closed() => return,
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                use std::io::{Seek, Write};
+                let result = (|| -> std::io::Result<std::fs::File> {
+                    let mut file = match file {
+                        Some(file) => file,
+                        None => tempfile::tempfile()?,
+                    };
+                    file.write_all(&data)?;
+                    file.flush()?;
+                    if last {
+                        file.rewind()?;
+                    }
+                    Ok(file)
+                })()
+                .map_err(|e| e.to_string());
+                result
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            let _ = tx.send(result);
+        });
+        Ok(())
+    }
+}
+
 /// Result of an extended request handler. `Reply` is the ordinary response;
 /// `ReplyWithResource` sends an inline ack followed by a resource transfer
 /// (rncp --fetch). Python: `RNS.Resource(..., target_link=link)`.
@@ -346,6 +426,8 @@ pub struct LinkManager {
     request_handler_ex: Option<RequestHandlerEx>,
     file_sources: HashMap<([u8; 16], [u8; 32]), FileResourceSource>,
     file_jobs: Vec<FileResourceJob>,
+    file_receivers: HashMap<([u8; 16], [u8; 32]), FileResourceReceiver>,
+    file_completion: Option<(mpsc::Sender<FileResourceCompletion>, usize)>,
     /// Called when the transport actor asks this destination to re-announce.
     announce_handler: Option<Box<dyn FnMut() + Send>>,
     response_tx: Option<mpsc::Sender<LinkResponse>>,
@@ -398,6 +480,8 @@ impl LinkManager {
             request_handler_ex: None,
             file_sources: HashMap::new(),
             file_jobs: Vec::new(),
+            file_receivers: HashMap::new(),
+            file_completion: None,
             announce_handler: None,
             response_tx: None,
             resource_completed_tx: None,
@@ -451,6 +535,8 @@ impl LinkManager {
             request_handler_ex: None,
             file_sources: HashMap::new(),
             file_jobs: Vec::new(),
+            file_receivers: HashMap::new(),
+            file_completion: None,
             announce_handler: None,
             response_tx: None,
             resource_completed_tx: None,
@@ -1162,6 +1248,104 @@ impl LinkManager {
                             }
 
                             // Split-resource routing set up before the per-segment
+                            // File receivers retain only an empty coordinator as a
+                            // cancellation anchor, never assembled segment bytes.
+                            let file_mode = self.file_completion.is_some()
+                                && !adv.flags.is_request
+                                && !adv.flags.is_response;
+                            if !file_mode
+                                && self.file_receivers.contains_key(&(
+                                    link_id,
+                                    if adv.total_segments > 1 {
+                                        adv.original_hash
+                                    } else {
+                                        adv.resource_hash
+                                    },
+                                ))
+                            {
+                                Self::send_resource_control_packet(
+                                    &self.transport_tx,
+                                    active,
+                                    &link_id,
+                                    rns_wire::context::PacketContext::ResourceRcl,
+                                    &adv.resource_hash,
+                                );
+                                break 'adv;
+                            }
+                            if file_mode {
+                                if active.inbound_resources.contains_key(&adv.resource_hash) {
+                                    break 'adv;
+                                }
+                                let root = if adv.total_segments > 1 {
+                                    adv.original_hash
+                                } else {
+                                    adv.resource_hash
+                                };
+                                let key = (link_id, root);
+                                let limit = self.file_completion.as_ref().unwrap().1;
+                                let valid = adv.total_segments >= 1
+                                    && adv.total_segments <= MAX_SEGMENTS
+                                    && adv.segment_index >= 1
+                                    && adv.segment_index <= adv.total_segments
+                                    && adv.data_size <= limit
+                                    && match self.file_receivers.get(&key) {
+                                        Some(state) => {
+                                            state.total == adv.total_segments
+                                                && state.advertised_size == adv.data_size
+                                                && state.next == adv.segment_index
+                                                && state.pending.is_none()
+                                        }
+                                        None => {
+                                            adv.segment_index == 1
+                                                && self.file_receivers.len() < 32
+                                                && !active
+                                                    .inbound_split_resources
+                                                    .contains_key(&root)
+                                        }
+                                    };
+                                if !valid {
+                                    Self::send_resource_control_packet(
+                                        &self.transport_tx,
+                                        active,
+                                        &link_id,
+                                        rns_wire::context::PacketContext::ResourceRcl,
+                                        &adv.resource_hash,
+                                    );
+                                    break 'adv;
+                                }
+                                let receiver =
+                                    self.file_receivers.entry(key).or_insert_with(|| {
+                                        FileResourceReceiver {
+                                            total: adv.total_segments,
+                                            advertised_size: adv.data_size,
+                                            next: 1,
+                                            current_hash: adv.resource_hash,
+                                            bytes: 0,
+                                            metadata: None,
+                                            file: None,
+                                            pending: None,
+                                            proof: Vec::new(),
+                                            updated_at: std::time::Instant::now(),
+                                        }
+                                    });
+                                receiver.current_hash = adv.resource_hash;
+                                receiver.updated_at = std::time::Instant::now();
+                                active
+                                    .inbound_split_resources
+                                    .entry(root)
+                                    .or_insert_with(|| {
+                                        MultiSegmentInbound::new(adv.total_segments, root)
+                                    });
+                                active.segment_routing.insert(
+                                    adv.resource_hash,
+                                    SegmentRoute {
+                                        original_hash: root,
+                                        segment_index: adv.segment_index,
+                                    },
+                                );
+                            }
+
+                            // Split-resource routing set up before the per-segment
                             // transfer. The MAX_SEGMENTS cap is load-bearing: a peer
                             // could otherwise advertise u32::MAX and OOM
                             // `MultiSegmentInbound::new`.
@@ -1357,6 +1541,16 @@ impl LinkManager {
                         }
 
                         if let Some(rh) = completed_rh {
+                            let file_key = active
+                                .segment_routing
+                                .get(&rh)
+                                .map(|route| (link_id, route.original_hash));
+                            if file_key
+                                .and_then(|key| self.file_receivers.get(&key))
+                                .is_some_and(|state| state.pending.is_some())
+                            {
+                                return;
+                            }
                             // Reverses pre-chunk encryption (Resource.py:424).
                             let decrypt_fn = |data: &[u8]| -> Result<
                                 Vec<u8>,
@@ -1375,6 +1569,28 @@ impl LinkManager {
                                 if let Ok((assembled_data, proof)) =
                                     transfer.complete(Some(&decrypt_fn))
                                 {
+                                    if let Some(state) =
+                                        file_key.and_then(|key| self.file_receivers.get_mut(&key))
+                                    {
+                                        if let Err(error) = state.write_segment(
+                                            assembled_data,
+                                            transfer.resource.metadata.clone(),
+                                            proof,
+                                        ) {
+                                            tracing::warn!(%error, "file Resource rejected");
+                                            Self::send_resource_control_packet(
+                                                &self.transport_tx,
+                                                active,
+                                                &link_id,
+                                                rns_wire::context::PacketContext::ResourceRcl,
+                                                &rh,
+                                            );
+                                            Self::remove_inbound_resource(active, &rh);
+                                        }
+                                        // Keep the active transfer as cancellation state until
+                                        // the write finishes. Proof is emitted from on_tick.
+                                        return;
+                                    }
                                     // PROOF+RESOURCE_PRF = plaintext, PacketType::Proof
                                     // (Packet.py:195-197). Each split segment still needs its
                                     // own proof or the sender retries.
@@ -2106,6 +2322,7 @@ impl LinkManager {
     }
 
     fn on_tick(&mut self) {
+        self.poll_file_receivers();
         self.poll_file_resources();
         let mut to_remove = Vec::new();
 
@@ -2324,6 +2541,82 @@ impl LinkManager {
         }));
     }
 
+    fn poll_file_receivers(&mut self) {
+        for ((link_id, root), mut state) in std::mem::take(&mut self.file_receivers) {
+            let Some(active) = self.active_links.get_mut(&link_id) else {
+                continue;
+            };
+            if !active.inbound_split_resources.contains_key(&root) {
+                continue;
+            }
+            let waiting_for_adv = state.pending.is_none()
+                && !active.inbound_resources.contains_key(&state.current_hash);
+            let expired =
+                waiting_for_adv && state.updated_at.elapsed() > std::time::Duration::from_secs(120);
+            let ready = if expired {
+                Some(Err("next file segment was not advertised".to_string()))
+            } else if let Some(rx) = state.pending.as_mut() {
+                match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(oneshot::error::TryRecvError::Empty) => None,
+                    Err(_) => Some(Err("file writer stopped".into())),
+                }
+            } else {
+                None
+            };
+            let Some(ready) = ready else {
+                self.file_receivers.insert((link_id, root), state);
+                continue;
+            };
+            let last = state.next == state.total;
+            let result = ready.and_then(|file| {
+                if last {
+                    let (tx, _) = self
+                        .file_completion
+                        .as_ref()
+                        .ok_or("file completion channel removed")?;
+                    tx.try_send(FileResourceCompletion {
+                        link_id,
+                        resource_hash: root,
+                        file,
+                        data_size: state.bytes,
+                        metadata: state.metadata.take(),
+                    })
+                    .map_err(|_| "file completion channel unavailable")?;
+                } else {
+                    state.file = Some(file);
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                tracing::warn!(%error, "file Resource reception failed");
+                Self::send_resource_control_packet(
+                    &self.transport_tx,
+                    active,
+                    &link_id,
+                    rns_wire::context::PacketContext::ResourceRcl,
+                    &state.current_hash,
+                );
+                Self::remove_inbound_resource(active, &root);
+                continue;
+            }
+            let _ = crate::link_client::send_link_proof(&self.transport_tx, link_id, &state.proof);
+            active.link.record_tx(state.proof.len());
+            active.inbound_resources.remove(&state.current_hash);
+            active.segment_routing.remove(&state.current_hash);
+            active.link.untrack_resource(&state.current_hash);
+            if last {
+                active.inbound_split_resources.remove(&root);
+            } else {
+                state.next += 1;
+                state.pending = None;
+                state.proof.clear();
+                state.updated_at = std::time::Instant::now();
+                self.file_receivers.insert((link_id, root), state);
+            }
+        }
+    }
+
     fn poll_file_resources(&mut self) {
         self.file_sources.retain(|(link_id, hash), _| {
             self.active_links
@@ -2413,6 +2706,7 @@ impl LinkManager {
             return false;
         };
         self.file_sources.retain(|(id, _), _| *id != link_id);
+        self.file_receivers.retain(|(id, _), _| *id != link_id);
         self.file_jobs.retain(|job| job.link_id != link_id);
 
         if send_teardown {
@@ -2666,6 +2960,19 @@ impl LinkManager {
 
     pub fn set_resource_completion_channel(&mut self, tx: mpsc::Sender<ResourceCompletion>) {
         self.resource_completion_tx = Some(tx);
+    }
+
+    /// Route ordinary inbound Resources to temporary files instead of byte
+    /// completion channels. Requests/responses keep their existing handling.
+    /// Configure before accepting Links. `max_size` includes wire metadata;
+    /// at most 32 file Resources can be pending per manager. A full/closed
+    /// completion channel rejects the final segment instead of proving it.
+    pub fn set_file_resource_completion_channel(
+        &mut self,
+        tx: mpsc::Sender<FileResourceCompletion>,
+        max_size: usize,
+    ) {
+        self.file_completion = Some((tx, max_size));
     }
 
     /// Fires when a link reaches the active state.
@@ -4806,6 +5113,15 @@ mod tests {
     /// rncp_interop covers realistic sizes via the full HMU loop.
     #[tokio::test(flavor = "current_thread")]
     async fn test_split_resource_inbound_reassembles_via_coordinator() {
+        split_resource_receive(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_split_resource_inbound_file_completion() {
+        split_resource_receive(true).await;
+    }
+
+    async fn split_resource_receive(file_mode: bool) {
         use rns_protocol::resource::{OutboundResource, OutboundTransfer, TransferAction};
 
         let (sender_link, receiver_link) = handshaken_link_pair();
@@ -4819,6 +5135,11 @@ mod tests {
         lm.set_resource_completion_channel(completion_tx);
         let (legacy_tx, mut legacy_rx) = mpsc::channel(8);
         lm.set_resource_completed_channel(legacy_tx);
+
+        let (file_tx, mut file_rx) = mpsc::channel(8);
+        if file_mode {
+            lm.set_file_resource_completion_channel(file_tx, 16 * 1024);
+        }
 
         lm.active_links.insert(
             link_id,
@@ -4860,6 +5181,8 @@ mod tests {
             segment.segment_index = i + 1;
             segment.total_segments = total_segments;
             segment.original_hash = Some(original_hash);
+
+            segment.advertisement_data_size = payload.len();
 
             let mut transfer = OutboundTransfer::from_prebuilt(segment, rtt);
             let action = transfer.tick();
@@ -4914,37 +5237,85 @@ mod tests {
                 part_raw.extend_from_slice(part);
                 lm.handle_inbound_packet(&part_raw, 1);
             }
+            if file_mode {
+                while let Ok(TransportMessage::Outbound(packet)) = transport_rx.try_recv() {
+                    let (header, _) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                    assert_ne!(
+                        header.context,
+                        rns_wire::context::PacketContext::ResourcePrf,
+                        "proof must wait for the file write"
+                    );
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        lm.on_tick();
+                        if !lm.active_links[&link_id]
+                            .inbound_resources
+                            .contains_key(&segment_rh)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let mut proved = false;
+                while let Ok(TransportMessage::Outbound(packet)) = transport_rx.try_recv() {
+                    let (header, offset) =
+                        rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                    if header.context == rns_wire::context::PacketContext::ResourcePrf {
+                        assert!(transfer.resource.validate_proof(&packet.raw[offset..]));
+                        proved = true;
+                    }
+                }
+                assert!(proved);
+            }
         }
 
         // Drain the queued ResourceReq / ResourcePrf so the channel isn't pinned.
         while transport_rx.try_recv().is_ok() {}
 
-        let completion = completion_rx
-            .try_recv()
-            .expect("expected exactly one ResourceCompletion");
-        assert_eq!(
-            completion.resource_hash, original_hash,
-            "completion must surface original_hash, not a per-segment hash"
-        );
-        assert_eq!(completion.link_id, link_id);
-        assert_eq!(completion.data, payload, "reassembled bytes match input");
-        assert!(
-            completion_rx.try_recv().is_err(),
-            "no per-segment completion events should fire for a split resource"
-        );
+        if file_mode {
+            use std::io::Read;
+            let mut completion = file_rx.try_recv().unwrap();
+            assert_eq!(completion.resource_hash, original_hash);
+            assert_eq!(completion.link_id, link_id);
+            assert_eq!(completion.data_size, payload.len());
+            let mut data = Vec::new();
+            completion.file.read_to_end(&mut data).unwrap();
+            assert_eq!(data, payload);
+            assert!(completion_rx.try_recv().is_err());
+            assert!(legacy_rx.try_recv().is_err());
+            assert!(lm.file_receivers.is_empty());
+        } else {
+            let completion = completion_rx
+                .try_recv()
+                .expect("expected exactly one ResourceCompletion");
+            assert_eq!(
+                completion.resource_hash, original_hash,
+                "completion must surface original_hash, not a per-segment hash"
+            );
+            assert_eq!(completion.link_id, link_id);
+            assert_eq!(completion.data, payload, "reassembled bytes match input");
+            assert!(
+                completion_rx.try_recv().is_err(),
+                "no per-segment completion events should fire for a split resource"
+            );
 
-        let (legacy_data, legacy_link) = legacy_rx
-            .try_recv()
-            .expect("legacy channel must also fire once");
-        assert_eq!(legacy_link, link_id);
-        assert_eq!(
-            legacy_data, payload,
-            "legacy callback receives reassembled blob, not per-segment chunks"
-        );
-        assert!(
-            legacy_rx.try_recv().is_err(),
-            "legacy channel must also collapse to one event per original"
-        );
+            let (legacy_data, legacy_link) = legacy_rx
+                .try_recv()
+                .expect("legacy channel must also fire once");
+            assert_eq!(legacy_link, link_id);
+            assert_eq!(
+                legacy_data, payload,
+                "legacy callback receives reassembled blob, not per-segment chunks"
+            );
+            assert!(
+                legacy_rx.try_recv().is_err(),
+                "legacy channel must also collapse to one event per original"
+            );
+        }
 
         // Coordinator + routing entries cleaned up after success.
         let active = lm.active_links.get(&link_id).unwrap();

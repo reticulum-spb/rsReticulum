@@ -3287,3 +3287,33 @@ worker завершает её или достигает исходного dead
 Workspace all-targets check успешен; прежние warnings database_path/tracing
 prelude сохраняются. Этап 6 открыт: файловый completion в LinkManager и
 итоговая сверка покрытия остаются. Утилиты не менялись, версия 1.0.1.
+
+### Этап 6: файловый completion в LinkManager
+
+Добавлен opt-in set_file_resource_completion_channel(sender, max_size) для
+обычных inbound Resources. FileResourceCompletion передаёт открытый std File
+с offset 0, link_id/original hash, payload size и metadata. Byte completion
+каналы на этом пути не вызываются; без opt-in работают как раньше. Request и
+response Resources сохраняют прежнюю обработку, а не перенаправляются в файл.
+
+Сегмент после проверки hash передаётся фоновой записи; proof отправляется из
+on_tick только после write/flush. Последний сегмент также требует успешной
+доставки результата в completion channel: full/closed → RCL, без proof.
+Coordinator остаётся пустым cancellation anchor, прежние сегменты в RAM не
+сохраняются. Проверяются размер advertisement/decoded bytes, общий d/count и
+порядок сегментов. Приёмов максимум 32 на manager, blocking записей максимум
+32 на процесс. Ожидающие записи отменяются при освобождении состояния;
+начатая OS запись завершается перед закрытием handle.
+
+Закрытие Link удаляет файловое состояние сразу, отмена Resource — на следующем
+tick. После proof ожидание следующего advertisement ограничено 120 секундами;
+во время приёма сегмента действует прежний watchdog. Утилиты не затрагивались.
+
+Существующая короткая split fixture используется для byte и file путей:
+реальные parts/proofs, точный файл, отсутствие byte callbacks в file mode,
+отсутствие преждевременного proof и очистка состояния после завершения.
+`cargo test -p rns-runtime --lib test_split_resource_inbound --offline --quiet`:
+2 passed, 0.02s. Workspace all-targets check успешен; прежние warnings
+database_path/tracing prelude сохраняются. Новых test-only файлов нет,
+длительные тесты не запускались. Этап 6 открыт до итоговой сверки покрытия;
+request/response APIs по-прежнему возвращают bytes. Версия 1.0.1 сохранена.
