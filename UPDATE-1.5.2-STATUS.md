@@ -116,7 +116,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 memory/CPU, traffic classes, HKDF/IFAC, locks, hashmap Links, hash reuse | Архитектурно частично: Rust HashMaps и crypto primitives; новые классы отсутствуют, оптимизации обосновывать benchmark | 4, 5 |
 | 1.5.1 announce signature cache | Реализовано в actor: `PreparedInbound` переносит `VerifiedAnnounce` от admission к dispatch без повторной криптографической проверки. Python кеширует флаг в одном Packet, не между пакетами; глобальный кеш не требуется | 5 |
 | 1.5.1 optimized HDLC deframer | Rust deframer существует; побайтовая совместимость и производительность проверяются отдельно | 5 |
-| 1.5.1 inbound defaults / announce queuing tuning | Новые очереди отсутствуют; использовать окончательные Python constants | 4 |
+| 1.5.1 inbound defaults / announce queuing tuning | Четыре inbound очереди реализованы ранее. Финальная сверка исправила отдельную outbound announce queue: 4096 записей, TTL 3 часа, отказ новым поступлениям при заполнении вместо вытеснения ожидающих; 3 короткие проверки прошли | 4 / финальная сверка |
 | 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | Воспроизвести потоковые источники и граничные размеры Rust | 6 |
 | 1.5.1 rngit prefix/page init/large downloads | Самостоятельная утилита вне этого репозитория; общая Resource регрессия остаётся в этапе 6 | граница покрытия |
 | 1.5.1 RSSI/SNR reporting | Цепочка RNode/RNodeMulti → owned InboundPacket → record_packet_metrics → GetPacketRssi/Snr и RPC существует. Метрики копируются до очереди; Python исправление потери через mutable interface fields неприменимо к этой архитектуре. Аппаратная проверка не заявляется | 7 |
@@ -4144,3 +4144,25 @@ drain с announce cap — 1 passed (0.00s).
 header-only fixtures, несовместимые с уже перенесённым запретом пустого payload;
 fixtures исправлены, проверка прошла (1 passed, 0.00s). Это не новая реализация
 hashlist и не изменение правил дедупликации. Новых test-only файлов нет.
+
+## Финальная сверка: окончательные лимиты outbound announce queue
+
+Перенесены конечные параметры Python 1.5.2: `MAX_QUEUED_ANNOUNCES = 4096`
+и `QUEUED_ANNOUNCE_LIFE = 10800` секунд вместо прежних 16384 и 86400.
+Это очередь исходящих announces на интерфейсе, не inbound class queue
+`qlen_in_announce` и не ingress-held buffer.
+
+При достижении capacity новый announce отклоняется до поиска существующего
+destination, как в Python Transport._outbound. Следовательно, при полной
+очереди не выполняется и замена более новым announce. Уже ожидающие записи
+не вытесняются новыми поступлениями. Защитная обрезка oversized очереди в
+maintenance сохраняет её начало. Обновление существующей записи ниже лимита
+остаётся из предыдущего блока.
+
+Оба пути очистки — periodic cull и отправка — используют строгое истечение:
+запись живёт на точной границе time + TTL и удаляется после неё. Порядок
+отправки по hops/time и announce cap не изменён.
+
+Короткая группа `announce_queue`: 3 passed (0.00s), включая заполненную
+очередь, границу TTL и замену/отправку записей. Проверка сборки transport
+и форматирование прошли. Новых test-only файлов нет.

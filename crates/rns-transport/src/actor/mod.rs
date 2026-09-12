@@ -1618,6 +1618,11 @@ impl TransportActor {
             let Some(entry) = self.interfaces.get_mut(&id) else {
                 continue;
             };
+            // Upstream applies capacity admission before replacement as well:
+            // a full queue preserves all waiting entries until it drains.
+            if entry.announce_queue.len() >= MAX_QUEUED_ANNOUNCES {
+                continue;
+            }
             if let Some(existing) = entry
                 .announce_queue
                 .iter_mut()
@@ -1636,10 +1641,6 @@ impl TransportActor {
                 hops,
                 raw: shared.clone(),
             });
-            if entry.announce_queue.len() > MAX_QUEUED_ANNOUNCES {
-                let excess = entry.announce_queue.len() - MAX_QUEUED_ANNOUNCES;
-                entry.announce_queue.drain(..excess);
-            }
         }
     }
 
@@ -8130,6 +8131,8 @@ mod tests {
 
     #[test]
     fn test_announce_queue_life_culling() {
+        assert_eq!(QUEUED_ANNOUNCE_LIFE, 10_800.0);
+        assert_eq!(MAX_QUEUED_ANNOUNCES, 4096);
         let (mut actor, _tx) = TransportActor::new();
         let (mut entry, _rx) = make_test_interface("iface1");
         // Add stale announce queue entries
@@ -8141,14 +8144,14 @@ mod tests {
         });
         entry.announce_queue.push(crate::messages::QueuedAnnounce {
             destination_hash: [0x02; 16],
-            time: now_f64(), // Fresh
+            time: 100.0,
             hops: 1,
             raw: Bytes::from_static(&[0u8; 32]),
         });
         actor.interfaces.insert(1, entry);
 
-        // Cull at current time
-        actor.cull_announce_queues(now_f64());
+        // Strict expiry: the exact three-hour boundary is still retained.
+        actor.cull_announce_queues(100.0 + QUEUED_ANNOUNCE_LIFE);
 
         // Only the fresh entry should remain
         assert_eq!(actor.interfaces.get(&1).unwrap().announce_queue.len(), 1);
@@ -8156,6 +8159,36 @@ mod tests {
             actor.interfaces.get(&1).unwrap().announce_queue[0].destination_hash,
             [0x02; 16]
         );
+        actor.cull_announce_queues(100.001 + QUEUED_ANNOUNCE_LIFE);
+        assert!(actor.interfaces[&1].announce_queue.is_empty());
+    }
+
+    #[test]
+    fn full_announce_queue_preserves_waiting_entries() {
+        let (mut actor, _) = TransportActor::new();
+        let (mut entry, _rx) = make_test_interface("full-announce-queue");
+        let (raw, dest) = make_valid_announce("test.queue.full", 0);
+        let now = now_f64();
+        for i in 0..MAX_QUEUED_ANNOUNCES {
+            entry.announce_queue.push(crate::messages::QueuedAnnounce {
+                destination_hash: (i as u128).to_be_bytes(),
+                time: now,
+                hops: 1,
+                raw: raw.clone(),
+            });
+        }
+        actor.interfaces.insert(1, entry);
+        actor.local_destinations.insert(dest);
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        let queue = &actor.interfaces[&1].announce_queue;
+        assert_eq!(queue.len(), MAX_QUEUED_ANNOUNCES);
+        assert_eq!(queue[0].destination_hash, [0; 16]);
+        assert!(!queue.iter().any(|a| a.destination_hash == dest));
+        // At capacity even a same-destination replacement is not admitted.
+        actor.interfaces.get_mut(&1).unwrap().announce_queue[0].destination_hash = dest;
+        actor.broadcast_announce_on_interfaces(&raw, None);
+        assert_eq!(actor.interfaces[&1].announce_queue[0].hops, 1);
+        assert_eq!(actor.interfaces[&1].announce_queue[0].time, now);
     }
 
     #[test]

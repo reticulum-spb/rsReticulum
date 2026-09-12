@@ -238,12 +238,12 @@ pub const ANNOUNCE_QUEUE_INTERVAL: f64 = 1.0;
 pub const LOCAL_CLIENT_CACHE_MAXSIZE: usize = 512;
 
 /// Maximum lifetime for queued announces (24 hours, in seconds).
-/// Matches Python `Reticulum.QUEUED_ANNOUNCE_LIFE = 60*60*24`.
-pub const QUEUED_ANNOUNCE_LIFE: f64 = 86_400.0;
+/// Matches Python 1.5.2 `Reticulum.QUEUED_ANNOUNCE_LIFE = 60*60*3`.
+pub const QUEUED_ANNOUNCE_LIFE: f64 = 10_800.0;
 
 /// Maximum number of queued announces per interface.
-/// Matches Python `Reticulum.MAX_QUEUED_ANNOUNCES = 16384`.
-pub const MAX_QUEUED_ANNOUNCES: usize = 16_384;
+/// Matches Python 1.5.2 `Reticulum.MAX_QUEUED_ANNOUNCES = 4096`.
+pub const MAX_QUEUED_ANNOUNCES: usize = 4096;
 
 /// Startup grace period (seconds) before cache cleaning runs.
 /// Allows interfaces to come online before pruning stale cache entries.

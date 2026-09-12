@@ -450,7 +450,7 @@ impl TransportActor {
             if let Some(entry) = self.interfaces.get_mut(&iface_id) {
                 entry
                     .announce_queue
-                    .retain(|a| now - a.time < QUEUED_ANNOUNCE_LIFE);
+                    .retain(|a| now <= a.time + QUEUED_ANNOUNCE_LIFE);
             }
 
             let selected = if let Some(entry) = self.interfaces.get(&iface_id) {
@@ -619,17 +619,14 @@ impl TransportActor {
     }
 
     /// Trim announce queues to age (QUEUED_ANNOUNCE_LIFE) and size
-    /// (MAX_QUEUED_ANNOUNCES). Oldest entries are dropped first so a burst
-    /// of fresh announces isn't starved by a backlog of stale ones.
+    /// (MAX_QUEUED_ANNOUNCES). Preserve the admitted prefix if an oversized
+    /// queue is encountered; new arrivals must not evict waiting entries.
     pub(super) fn cull_announce_queues(&mut self, now: f64) {
         for iface in self.interfaces.values_mut() {
             iface
                 .announce_queue
-                .retain(|entry| now - entry.time < QUEUED_ANNOUNCE_LIFE);
-            if iface.announce_queue.len() > MAX_QUEUED_ANNOUNCES {
-                let excess = iface.announce_queue.len() - MAX_QUEUED_ANNOUNCES;
-                iface.announce_queue.drain(..excess);
-            }
+                .retain(|entry| now <= entry.time + QUEUED_ANNOUNCE_LIFE);
+            iface.announce_queue.truncate(MAX_QUEUED_ANNOUNCES);
         }
     }
 
