@@ -13,6 +13,7 @@
 //! Runs as a dedicated Tokio task so slow stamp validation does not stall
 //! the transport actor loop.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -88,12 +89,72 @@ pub enum Reason {
     StorageFailed,
 }
 
+const STAMP_CACHE_SIZE: usize = 2048;
+
+/// Receiver-task-local FIFO caches. Store only digests and stamp values, not
+/// untrusted payloads; source policy and storage refresh are never cached.
+#[derive(Default)]
+struct StampCache {
+    valid: HashMap<[u8; 32], u8>,
+    valid_order: VecDeque<[u8; 32]>,
+    invalid: HashSet<[u8; 32]>,
+    invalid_order: VecDeque<[u8; 32]>,
+}
+
+impl StampCache {
+    fn get(&self, hash: &[u8; 32]) -> Option<(bool, u8)> {
+        if self.invalid.contains(hash) {
+            Some((false, 0))
+        } else {
+            self.valid.get(hash).map(|value| (true, *value))
+        }
+    }
+
+    fn insert(&mut self, hash: [u8; 32], valid: bool, value: u8) {
+        if self.get(&hash).is_some() {
+            return;
+        }
+        if valid {
+            if self.valid.len() == STAMP_CACHE_SIZE {
+                if let Some(old) = self.valid_order.pop_front() {
+                    self.valid.remove(&old);
+                }
+            }
+            self.valid.insert(hash, value);
+            self.valid_order.push_back(hash);
+        } else {
+            if self.invalid.len() == STAMP_CACHE_SIZE {
+                if let Some(old) = self.invalid_order.pop_front() {
+                    self.invalid.remove(&old);
+                }
+            }
+            self.invalid.insert(hash);
+            self.invalid_order.push_back(hash);
+        }
+    }
+}
+
 impl ReceiverConfig {
     /// Classify a single announce event, upsert on accept, emit on observer.
     ///
     /// Synchronous so unit tests can drive it without a task. Returns an
     /// [`Outcome`] describing the decision.
     pub fn process_event(&self, event: &AnnounceHandlerEvent) -> Outcome {
+        self.process_event_cached(event, None)
+    }
+
+    fn process_event_cached(
+        &self,
+        event: &AnnounceHandlerEvent,
+        cache: Option<&mut StampCache>,
+    ) -> Outcome {
+        // Identity is supplied by the authenticated announce path. Check before
+        // expensive validation; keep the decoded-info fallback for legacy callers.
+        if let (Some(sources), Some(identity)) = (&self.discovery_sources, event.identity_hash) {
+            if !sources.contains(&identity) {
+                return Outcome::Rejected(Reason::UnauthorizedSource);
+            }
+        }
         let Some(raw) = event.app_data.as_ref() else {
             return Outcome::Rejected(Reason::MissingAppData);
         };
@@ -126,8 +187,26 @@ impl ReceiverConfig {
             Err(_) => return Outcome::Rejected(Reason::Malformed),
         };
 
-        let infohash = rns_crypto::sha::full_hash(packed_info);
-        if !self.stamper.valid(&infohash, stamp, self.required_value) {
+        // Key the complete decrypted body (info + stamp), so another stamp is
+        // independently validated. Decryption still runs on every encrypted hit.
+        let cache_key = rns_crypto::sha::full_hash(working);
+        let (valid, stamp_value) = cache
+            .as_ref()
+            .and_then(|cache| cache.get(&cache_key))
+            .unwrap_or_else(|| {
+                let infohash = rns_crypto::sha::full_hash(packed_info);
+                let valid = self.stamper.valid(&infohash, stamp, self.required_value);
+                let value = if valid {
+                    self.stamper.value(&infohash, stamp)
+                } else {
+                    0
+                };
+                (valid, value)
+            });
+        if let Some(cache) = cache {
+            cache.insert(cache_key, valid, stamp_value);
+        }
+        if !valid {
             return Outcome::Rejected(Reason::StampInvalid);
         }
 
@@ -146,7 +225,6 @@ impl ReceiverConfig {
             }
         }
 
-        let stamp_value = self.stamper.value(&infohash, stamp);
         let now = now_unix();
         let record = DiscoveredInterface {
             info,
@@ -182,8 +260,9 @@ impl ReceiverConfig {
 pub fn spawn(config: ReceiverConfig) -> (JoinHandle<()>, mpsc::Sender<AnnounceHandlerEvent>) {
     let (tx, mut rx) = mpsc::channel::<AnnounceHandlerEvent>(128);
     let handle = tokio::spawn(async move {
+        let mut cache = StampCache::default();
         while let Some(event) = rx.recv().await {
-            let outcome = config.process_event(&event);
+            let outcome = config.process_event_cached(&event, Some(&mut cache));
             match outcome {
                 Outcome::Accepted => debug!(
                     dest = %hex::encode(event.destination_hash),
@@ -218,6 +297,7 @@ mod tests {
     struct MockStamper {
         ok_stamp: Vec<u8>,
         value: u8,
+        validations: std::sync::atomic::AtomicUsize,
     }
 
     impl MockStamper {
@@ -226,6 +306,7 @@ mod tests {
             Self {
                 ok_stamp: stamp,
                 value,
+                validations: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -238,6 +319,8 @@ mod tests {
             self.value
         }
         fn valid(&self, _ih: &[u8; 32], stamp: &[u8], required: u8) -> bool {
+            self.validations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.value >= required && stamp == self.ok_stamp.as_slice()
         }
     }
@@ -583,10 +666,19 @@ mod tests {
         let info = sample_info();
         let (blob, _) = stamped_blob(&info, &stamp);
 
-        let cfg = make_cfg(stamper, store.clone(), None, None);
+        let cfg = make_cfg(stamper.clone(), store.clone(), Some(vec![[0x11; 16]]), None);
         let (handle, tx) = spawn(cfg);
 
-        tx.send(event_with(blob)).await.unwrap();
+        tx.send(event_with(blob.clone())).await.unwrap();
+        let mut repeated = event_with(blob.clone());
+        repeated.hops = 1;
+        tx.send(repeated).await.unwrap();
+        let mut unauthorized = event_with(blob);
+        unauthorized.identity_hash = Some([0x77; 16]);
+        tx.send(unauthorized).await.unwrap();
+        let (bad, _) = stamped_blob(&info, &vec![0xCD; STAMP_SIZE]);
+        tx.send(event_with(bad.clone())).await.unwrap();
+        tx.send(event_with(bad)).await.unwrap();
         // Drop tx so the task exits cleanly.
         drop(tx);
         // Wait for the task to complete processing + exit.
@@ -594,5 +686,31 @@ mod tests {
 
         let listed = store.list(None).unwrap();
         assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hops, 1);
+        assert_eq!(
+            stamper
+                .validations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn stamp_caches_evict_oldest_and_bound_both_classes() {
+        let mut cache = StampCache::default();
+        for valid in [true, false] {
+            for index in 0..=STAMP_CACHE_SIZE {
+                let mut hash = [u8::from(valid); 32];
+                hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                cache.insert(hash, valid, 20);
+            }
+            let mut oldest = [u8::from(valid); 32];
+            oldest[..8].fill(0);
+            assert!(cache.get(&oldest).is_none());
+        }
+        assert_eq!(cache.valid.len(), STAMP_CACHE_SIZE);
+        assert_eq!(cache.invalid.len(), STAMP_CACHE_SIZE);
+        assert_eq!(cache.valid_order.len(), STAMP_CACHE_SIZE);
+        assert_eq!(cache.invalid_order.len(), STAMP_CACHE_SIZE);
     }
 }

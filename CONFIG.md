@@ -190,8 +190,9 @@ Full/closed TX channels and outbound-disabled interfaces do not increment it.
 This is not a physical-delivery acknowledgement: a driver can subsequently
 drop the packet. Python invokes its counters at separate outbound/announce-queue
 sites; Rust intentionally centralizes this accounting at channel admission.
-These counters are per registered endpoint; parent-interface aggregation,
-global external totals, traffic composition and PPS remain pending.
+These counters are per registered endpoint. Shared-instance RPC and rnstatus
+also expose external totals/composition and PPS, excluding shared/local roles;
+parent-interface aggregation is not implied by those sums.
 Existing frequency estimates and ingress/egress limits are unchanged.
 
 The interface entries also expose `arxs`, `atxs`, `prxs`, `ptxs`: sampled
@@ -204,8 +205,9 @@ the actual monotonic elapsed time and multiplying by eight. The first sample
 establishes a baseline and reports zero; an idle interval returns the rates
 to zero. Queries read the last sample without changing the measurement window.
 Re-registration resets both rates and baseline. Old RPC responses default to
-zero; inactive configured interfaces expose `null`. Parent/global aggregation
-and the legacy general-traffic sampler are not changed by this calculation.
+zero; inactive configured interfaces expose `null`. The general-traffic sampler
+now supplies RPC `rxs`/`txs` in bits/s; Web API `rx_rate`/`tx_rate` convert these
+to bytes/s to preserve the UI contract. Parent aggregation remains separate.
 
 ### Receive violation diagnostics (partial 1.5.2 coverage)
 
@@ -746,6 +748,17 @@ higher gravity changes the destination route. Losing that interface does not
 make the established Link broadcast its traffic on other interfaces.
 
 ## Discovery publication
+
+The discovery receiver validates announcements sequentially in its own bounded
+task queue. Task-local FIFO caches retain up to 2048 valid and 2048 invalid stamp
+results, avoiding repeated stamp work for the same information and stamp.
+Cache keys hash the complete decrypted body; encrypted announcements are still
+decrypted on every receive. Only digests/results are retained, not payloads.
+Source authorization, decoding, `last_heard`/hop updates, storage and observer
+notification still run on valid hits. Caches reset when the receiver restarts;
+they do not cache policy decisions or bypass transport signature/blackhole checks.
+Direct `ReceiverConfig::process_event` calls remain uncached; `spawn` owns the
+cache without changing the public config structure.
 
 These flat fields use the Python interface parameter names. The daemon installs
 a native discovery stamper automatically; applications can override it through

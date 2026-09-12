@@ -26,6 +26,20 @@ interoperable. It is not the source-of-truth implementation, do not treat it as 
 Commands are intentionally namespaced for Rust with `*-rs` command names, so
 rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 
+### Reticulum 1.5.2 update status
+
+The functional migration stages are implemented, including discovery publication,
+gravity/rebalancing, Backbone protection and flow control, priority queues,
+Resource/Channel APIs, and diagnostic tools. Final cross-component validation
+is still in progress; this is **not yet a completed 1.5.2 compatibility release**.
+Package version `1.0.1` and the currently advertised compatibility version remain
+unchanged until that review is complete.
+
+See the [current update status](UPDATE-1.5.2-STATUS.md#текущий-статус) for completed
+checks, documented differences and remaining validation. The historical entries
+in that journal are not the current backlog. [CONFIG.md](CONFIG.md) documents
+the migrated settings and the rnsh command-line/identity migration.
+
 ## Application ecosystem
 
 The workspace is also the transport foundation for adjacent Rust applications:

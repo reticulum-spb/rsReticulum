@@ -1820,8 +1820,9 @@ fn merge_iface_json(
         // ── traffic counters ──────────────────────────────────────────
         "rx_bytes":                     e.rx_bytes,
         "tx_bytes":                     e.tx_bytes,
-        "rx_rate":                      e.rx_rate,
-        "tx_rate":                      e.tx_rate,
+        // RPC/actor rates use bits/s; the existing Web API/UI contract is B/s.
+        "rx_rate":                      e.rx_rate as f64 / 8.0,
+        "tx_rate":                      e.tx_rate as f64 / 8.0,
         "tx_drops":                     e.tx_drops,
         "protocol_violations": e.inbound_diagnostics.protocol_violations,
         "ifac_violations": e.inbound_diagnostics.ifac_violations,
@@ -2346,7 +2347,11 @@ mod tests {
             prxs: 37.5,
             ptxs: 50.0,
         };
+        stats[0].rx_rate = 8000;
+        stats[0].tx_rate = 12;
         let value = merge_iface_json(&stats[0], None, None);
+        assert_eq!(value["rx_rate"], 1000.0);
+        assert_eq!(value["tx_rate"], 1.5);
         for (key, expected) in [
             ("arxb", 101),
             ("atxb", 202),

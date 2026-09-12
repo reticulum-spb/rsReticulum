@@ -1451,6 +1451,7 @@ pub async fn init_with_options(
         .section("reticulum")
         .and_then(|s| s.get_bool("sqlite_storage"))
         .unwrap_or(false);
+    #[cfg(feature = "sqlite")]
     let database_path = config
         .section("storage")
         .and_then(|s| s.get("database_path"))

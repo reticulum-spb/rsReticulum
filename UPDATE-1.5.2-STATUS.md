@@ -1,5 +1,31 @@
 # Обновление до Reticulum 1.5.2: матрица и журнал
 
+## Текущий статус
+
+Функциональные этапы 1–7 пройдены; сейчас выполняется итоговая сверка всей
+матрицы и стыков компонентов. Это не утверждение о завершённом релизе 1.5.2:
+финальная сверка продолжает выявлять пропуски, которые исправляются здесь.
+Версия пакетов остаётся 1.0.1, объявленная совместимость — 1.3.8 до завершения
+проверки. Исходная матрица и промежуточные записи ниже исторические; строки
+«отсутствует»/«этап открыт» следует читать вместе с последующими результатами.
+
+| Этап | Текущее состояние |
+|---|---|
+| 0 | Исходная матрица составлена; окончательная классификация всех её строк продолжается. |
+| 1 | Discovery YAML/runtime/API/UI перенесены; при финальной сверке дополнен кеш stamp validation. |
+| 2 | Gravity, выбор маршрута, Link rebalance и internal policy реализованы; есть packet interop, полная многодемонная матрица отложена. |
+| 3 | Backbone fast-flapping и диагностика блокировок реализованы. |
+| 4 | Приоритетные очереди, inflight path requests, фильтры и счётчики реализованы. |
+| 5 | Функциональная часть flow control/MTU/keepalive закрыта; длительный soak и before/after нагрузка отложены. |
+| 6 | API/timeouts/Channel/Resource перенесены; Python file responses доступны явно через PythonFile, а не сменой старого API. |
+| 7 | rnstatus, rnsh, rncp rates завершены; rnpath remote restrictions соответствуют отсутствующим Python endpoints. |
+| Финал | Короткие проверки API/UI/config/features и codec interop выполняются; полный workspace test, живая межъязыковая матрица и проверки других ОС не объявлены пройденными. |
+
+Новые test-only файлы не включаются в коммиты. Длительные тесты и аппаратные
+проверки не запускаются согласно текущему указанию пользователя. Существующий
+backlog rnodeconf/flashing и документированные границы API не выдаются за
+полный функциональный паритет Python.
+
 ## Основание проверки
 
 План: `updateTo-1.5.2.md`. Python: `ea98db4f53dcf0defc0e71a16e60d28b1229c4e6`.
@@ -32,8 +58,8 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.3.9 location script | Отсутствует в YAML и scheduler; Python `Discovery.py:get_interface_announce_data` запускает executable | 1 |
 | 1.3.9 RESOURCE_RCL, reliability | Реализована отмена в protocol/runtime, есть regression tests; межъязыковое поведение воспроизвести | 6 |
 | 1.4.0 transport persistence / interface hash / known destinations background cleaning и отказ от recombination | Частично: actor maintenance, storage worker и сохранённые interface hashes; профилирование и семантику очистки сверить. Python lock/thread оптимизации буквально неприменимы | 0, 7 |
-| 1.4.0 invalid discovery stamp cache | Отсутствует в `discovery/receiver.rs:process_event`: каждый stamp проверяется заново | 1 / контроль нагрузки |
-| 1.4.0 valid discovery cache / sequential validation | Частично: отдельная последовательная receiver task; повторное событие снова проходит decode/stamp/store | 1 / контроль нагрузки |
+| 1.4.0 invalid discovery stamp cache | Закрыто при итоговой сверке: task-local FIFO до 2048 invalid digest entries | 1 / финальная сверка |
+| 1.4.0 valid discovery cache / sequential validation | Task-local FIFO до 2048 valid digest/value entries; source policy и обновление store остаются на каждом событии | 1 / финальная сверка |
 | 1.4.0 Link stale teardown / watchdog race | Частично: `rns-link/src/keepalive.rs:is_stale` учитывает outbound; проверить вызовы в runtime и ошибки приёма | 6 |
 | 1.4.0 Backbone None-check / exception logging | Python-specific None/exception детали; Rust Result/Option; эквивалентные disconnect ошибки проверить с fast flapping | 3 |
 | 1.4.0 stamp default 16 | Реализовано в `discovery/constants.rs` и runtime | 1, сохранить |
@@ -126,7 +152,8 @@ Discovery publication отдельно строится в `discovery_config_for
 - [x] Этап 1: YAML/runtime publication, internal mode, location_cmd, API/UI.
 - [x] Этап 2: gravity/internal, transit/local Link rebalance, interface binding; границы interop ниже.
 - [x] Этап 3: Backbone fast-flapping, YAML/API/UI, RPC и локальный/удалённый статус.
-- [ ] Этапы 4–7 и финальная интеграция.
+- [x] Функциональные этапы 4–7 с границами, указанными в журнале.
+- [ ] Финальная сверка матрицы и интеграция; текущие результаты — в конце журнала.
 
 Уже выполненные команды:
 
@@ -3537,3 +3564,56 @@ prelude остались без изменений.
 rnsh и remote management. Дальше — итоговая интеграционная проверка и сверка
 общей документации по плану, а не новые функции этапа 7. Версия 1.0.1
 не менялась: полный переход/заявление совместимости 1.5.2 ещё не завершён.
+
+### Итоговая сверка: Web API units, discovery stamp cache, feature builds
+
+Сводка в начале журнала актуализирована отдельно от исторической матрицы.
+README теперь явно отличает реализованные этапы от незавершённого релиза;
+совместимость и package version не повышались.
+
+Найдены и исправлены два функциональных пропуска:
+
+- После включения общего traffic sampler actor/RPC отдаёт `rxs`/`txs` в
+  бит/с, тогда как Web API `rx_rate`/`tx_rate` и UI formatRate используют байт/с.
+  `merge_iface_json` теперь делит на 8, сохраняя дробную часть (12 bit/s →
+  1.5 B/s). В существующей actor→API проверке добавлены значения 8000 и 12.
+  Устаревшие CONFIG утверждения о pending PPS/global totals уточнены.
+- Исходные строки 1.4.0 про discovery caches не были закрыты реализацией
+  publication в этапе 1. Теперь `receiver::spawn` владеет двумя FIFO caches
+  по 2048 записей для valid/invalid stamps. Повторный body+stamp не запускает
+  stamper вновь; source allow-list проверяется до дорогой работы, а decode,
+  hops/last_heard/store/observer продолжают обновляться на cache hit.
+  Кеш не содержит исходных payloads, только digest/value, и живёт в одной
+  последовательной task. Config struct и прямой uncached process_event API
+  сохранены. Отличие от Python: digest считается после расшифровки, поэтому
+  decrypt не пропускается на encrypted hits; подпись announce и source policy
+  не обходятся. Новые stamps по прежнему info проверяются отдельно.
+
+Убраны два feature-зависимых предупреждения: database_path вычисляется только
+при sqlite, tracing prelude импортируется только при api. Это не меняет
+runtime-поведение включённых возможностей.
+
+Короткие результаты на Linux, без длительной нагрузки:
+
+- `cargo test -p rns-runtime --features api --lib config::tests --offline
+  --quiet`: 20 passed, включая YAML defaults/example/roundtrip (0.01s).
+- `cargo test -p rns-runtime --features api --lib api_server::tests --offline
+  --quiet`: 22 passed после unit conversion (0.01s).
+- `cargo test -p rns-transport --lib discovery::receiver::tests --offline
+  --quiet`: 14 passed (0.02s), включая реальную spawn task, повторные valid/
+  invalid stamps, source policy, обновление hops и FIFO eviction обоих caches.
+- `cargo test -p rns-runtime --test inbound_queue_rpc_python --offline --quiet
+  -- --ignored`: 1 passed (0.15s). Используется существующий read-only Python
+  codec из локального эталона, без запуска демона, сетевых портов и новых файлов.
+- `node --test crates/rns-runtime/web/app.test.js`: passed (около 0.13s).
+- Проверки default workspace all-targets, runtime `api,serial,rnode-tcp,
+  sqlite-bundled` all-targets и `--no-default-features --features client`
+  прошли отдельно после исправлений, без прежних warnings; fmt/diff checks
+  чистые. Это не утверждение о проверке BLE/всех ОС/all-features.
+
+Дальше остаётся завершить построчную классификацию исходной матрицы (включая
+историческую discovery/blackhole cleanup и применимость остальных performance
+изменений), затем собрать окончательный перечень отложенных интеграционных
+проверок. Полный workspace test, многодемонные Python↔Rust сценарии, длительный
+soak и аппаратные проверки в этом проходе не запускались. Новых test-only
+файлов нет; имеющиеся используются без изменения.
