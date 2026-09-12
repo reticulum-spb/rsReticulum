@@ -1445,9 +1445,18 @@ impl LinkSession {
                 "resource channel closed".into(),
             ))
         };
-        timeout(time_remaining(deadline)?, future)
-            .await
-            .map_err(|_| LinkClientError::Timeout("resource proof"))??;
+        let result = timeout(deadline.saturating_duration_since(Instant::now()), future).await;
+        if result.is_err() {
+            let _ = send_link_data(
+                &self.transport_tx,
+                &self.link,
+                link_id,
+                rns_wire::context::PacketContext::ResourceIcl,
+                &resource_hash,
+                true,
+            );
+        }
+        result.map_err(|_| LinkClientError::Timeout("resource proof"))??;
         Ok(())
     }
 
@@ -1874,8 +1883,8 @@ async fn wait_for_response(
     deadline: Duration,
     max_response_bytes: usize,
 ) -> Result<LinkResponse, LinkClientError> {
+    let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
     let fut = async {
-        let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
         let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
         let mut multi: Option<MultiSegmentInbound> = None;
         let mut response_shape = None;
@@ -2266,9 +2275,20 @@ async fn wait_for_response(
             "destination channel closed".into(),
         ))
     };
-    timeout(deadline, fut)
-        .await
-        .map_err(|_| LinkClientError::Timeout("response"))?
+    let result = timeout(deadline, fut).await;
+    if result.is_err() {
+        for hash in inbound_resources.keys() {
+            let _ = send_link_data(
+                transport_tx,
+                link,
+                link_id,
+                rns_wire::context::PacketContext::ResourceRcl,
+                hash,
+                true,
+            );
+        }
+    }
+    result.map_err(|_| LinkClientError::Timeout("response"))?
 }
 
 /// Drive the existing receive watchdog without extending the request deadline.
@@ -2315,7 +2335,7 @@ fn resource_cancel_hash(link: &Link, body: &[u8]) -> Option<[u8; 32]> {
     plaintext.get(..32)?.try_into().ok()
 }
 
-fn send_link_data(
+pub(crate) fn send_link_data(
     transport_tx: &mpsc::Sender<TransportMessage>,
     link: &Link,
     link_id: [u8; 16],

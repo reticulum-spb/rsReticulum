@@ -616,7 +616,6 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
     let total_parts: usize = resources.iter().map(|r| r.parts.len()).sum();
     let total_parts_nonzero = total_parts.max(1);
 
-    let proof_deadline = Instant::now() + overall_timeout.min(Duration::from_secs(120));
     let mut transfer_result = Ok(());
     let mut completed_parts = 0usize;
     for resource in resources {
@@ -630,7 +629,7 @@ pub async fn rncp_send_file(request: RncpSendRequest<'_>) -> Result<RncpOutcome,
             progress_tx: progress_tx.clone(),
             progress_base: completed_parts as f32 / total_parts_nonzero as f32,
             progress_span: segment_parts as f32 / total_parts_nonzero as f32,
-            deadline: proof_deadline.min(deadline),
+            deadline,
         })
         .await;
         if transfer_result.is_err() {
@@ -703,100 +702,127 @@ async fn drive_outbound(request: OutboundDrive<'_>) -> Result<(), RncpError> {
         deadline,
     } = request;
 
-    let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
-    let mut transfer = OutboundTransfer::from_prebuilt(resource, rtt);
-    let total = transfer.resource.parts.len();
-    if let Some(ref tx) = progress_tx {
-        let _ = tx.try_send(if total == 0 {
-            progress_base + progress_span
-        } else {
-            progress_base
-        });
-    }
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err(RncpError::Timeout("resource proof"));
+    let resource_hash = resource.resource_hash;
+    let future = async {
+        let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
+        let mut transfer = OutboundTransfer::from_prebuilt(resource, rtt);
+        let total = transfer.resource.parts.len();
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.try_send(if total == 0 {
+                progress_base + progress_span
+            } else {
+                progress_base
+            });
         }
 
+        send_transfer_action(transport_tx, link, link_id, transfer.tick()).await?;
         loop {
-            match transfer.tick() {
-                TransferAction::None => break,
-                TransferAction::Complete => return Ok(()),
-                TransferAction::Failed(reason) => return Err(RncpError::ResourceFailed(reason)),
-                action => send_transfer_action(transport_tx, link, link_id, action).await?,
+            if Instant::now() >= deadline {
+                let _ = crate::link_client::send_link_data(
+                    transport_tx,
+                    link,
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceIcl,
+                    &transfer.resource.resource_hash,
+                    true,
+                );
+                return Err(RncpError::Timeout("resource proof"));
             }
-        }
 
-        let recv_timeout = remaining(deadline).min(Duration::from_secs(5));
-        let ev = match tokio::time::timeout(recv_timeout, lpkt_rx.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => return Err(RncpError::ResourceFailed("link channel closed".into())),
-            Err(_) => continue,
-        };
-
-        let DestinationEvent::InboundPacket { raw, .. } = ev else {
-            continue;
-        };
-        let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        if header.destination_hash != link_id {
-            continue;
-        }
-        let body = &raw[off..];
-        match header.context {
-            rns_wire::context::PacketContext::Keepalive
-                if body.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) =>
-            {
-                send_keepalive_response(transport_tx, link_id).await?;
+            let action = transfer.check_sender_timeout(link_id);
+            let cancelled = matches!(action, TransferAction::SendCancel(_, _));
+            send_transfer_action(transport_tx, link, link_id, action).await?;
+            if cancelled {
+                return Err(RncpError::ResourceFailed("sender watchdog expired".into()));
             }
-            rns_wire::context::PacketContext::ResourceHmu
-            | rns_wire::context::PacketContext::ResourceReq => {
-                let Ok(plaintext) = link.decrypt(body) else {
-                    continue;
-                };
-                if header.context == rns_wire::context::PacketContext::ResourceReq {
+
+            let recv_timeout = remaining(deadline).min(Duration::from_secs(1));
+            let ev = match tokio::time::timeout(recv_timeout, lpkt_rx.recv()).await {
+                Ok(Some(ev)) => ev,
+                Ok(None) => return Err(RncpError::ResourceFailed("link channel closed".into())),
+                Err(_) => continue,
+            };
+
+            let DestinationEvent::InboundPacket { raw, .. } = ev else {
+                continue;
+            };
+            let (header, off) = match rns_wire::header::PacketHeader::unpack(&raw) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if header.destination_hash != link_id {
+                continue;
+            }
+            let body = &raw[off..];
+            match header.context {
+                rns_wire::context::PacketContext::Keepalive
+                    if body.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) =>
+                {
+                    send_keepalive_response(transport_tx, link_id).await?;
+                }
+                rns_wire::context::PacketContext::ResourceReq => {
+                    let Ok(plaintext) = link.decrypt(body) else {
+                        continue;
+                    };
                     let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
                     for action in transfer.handle_request_packet(packet_hash, &plaintext) {
+                        let cancelled = matches!(action, TransferAction::SendCancel(_, _));
                         send_transfer_action(transport_tx, link, link_id, action).await?;
+                        if cancelled {
+                            return Err(RncpError::ResourceFailed(
+                                "invalid resource request".into(),
+                            ));
+                        }
                     }
-                } else {
-                    transfer.handle_hmu(&plaintext);
+                    if let Some(ref tx) = progress_tx {
+                        let confirmed_count = transfer.sent_parts;
+                        let frac = if total == 0 {
+                            1.0
+                        } else {
+                            confirmed_count as f32 / total as f32
+                        };
+                        let _ = tx.try_send(progress_base + (progress_span * frac));
+                    }
                 }
-                if let Some(ref tx) = progress_tx {
-                    let confirmed_count = transfer.confirmed_parts.iter().filter(|c| **c).count();
-                    let frac = if total == 0 {
-                        1.0
-                    } else {
-                        confirmed_count as f32 / total as f32
-                    };
-                    let _ = tx.try_send(progress_base + (progress_span * frac));
+                rns_wire::context::PacketContext::ResourcePrf => {
+                    // PROOF+RESOURCE_PRF plaintext = resource_hash(32) || proof(32) (Packet.py:195-197).
+                    if body.len() < 64 {
+                        continue;
+                    }
+                    if !transfer.handle_proof(body) {
+                        return Err(RncpError::ResourceFailed("proof mismatch".into()));
+                    }
+                    if let Some(ref tx) = progress_tx {
+                        let _ = tx.try_send(progress_base + progress_span);
+                    }
+                    return Ok(());
                 }
+                rns_wire::context::PacketContext::ResourceRcl => {
+                    if link.decrypt(body).ok().is_some_and(|data| {
+                        data.get(..32) == Some(transfer.resource.resource_hash.as_slice())
+                    }) {
+                        return Err(RncpError::ResourceFailed("receiver cancelled".into()));
+                    }
+                }
+                rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {
+                    return Err(RncpError::ResourceFailed("link closed before proof".into()));
+                }
+                _ => {}
             }
-            rns_wire::context::PacketContext::ResourcePrf => {
-                // PROOF+RESOURCE_PRF plaintext = resource_hash(32) || proof(32) (Packet.py:195-197).
-                if body.len() < 64 {
-                    continue;
-                }
-                if !transfer.handle_proof(body) {
-                    return Err(RncpError::ResourceFailed("proof mismatch".into()));
-                }
-                if let Some(ref tx) = progress_tx {
-                    let _ = tx.try_send(progress_base + progress_span);
-                }
-                return Ok(());
-            }
-            rns_wire::context::PacketContext::ResourceRcl => {
-                return Err(RncpError::ResourceFailed("receiver cancelled".into()));
-            }
-            rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {
-                return Err(RncpError::ResourceFailed("link closed before proof".into()));
-            }
-            _ => {}
         }
+    };
+    let result = tokio::time::timeout(remaining(deadline), future).await;
+    if result.is_err() {
+        let _ = crate::link_client::send_link_data(
+            transport_tx,
+            link,
+            link_id,
+            rns_wire::context::PacketContext::ResourceIcl,
+            &resource_hash,
+            true,
+        );
     }
+    result.map_err(|_| RncpError::Timeout("resource proof"))?
 }
 
 async fn send_keepalive_response(
@@ -1518,6 +1544,90 @@ pub async fn rncp_fetch_file(request: RncpFetchRequest<'_>) -> Result<RncpFetchO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resource_sender_waits_for_requests() {
+        use rns_wire::context::PacketContext;
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([7; 16], 1);
+        let (peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        link.validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        let link_id = link.link_id;
+        let resource = OutboundResource::new(vec![42; 2000], false, None).unwrap();
+        let parts = resource.parts.clone();
+        let mut request = vec![rns_protocol::resource::HASHMAP_IS_NOT_EXHAUSTED];
+        request.extend_from_slice(&resource.resource_hash);
+        for hash in &resource.map_hashes {
+            request.extend_from_slice(hash);
+        }
+        let mut proof = resource.resource_hash.to_vec();
+        proof.extend_from_slice(&resource.expected_proof);
+        let (tx, mut output) = mpsc::channel(32);
+        let (events, mut rx) = mpsc::channel(8);
+        let task = async move {
+            drive_outbound(OutboundDrive {
+                transport_tx: &tx,
+                link: &mut link,
+                link_id,
+                resource,
+                lpkt_rx: &mut rx,
+                progress_tx: None,
+                progress_base: 0.0,
+                progress_span: 1.0,
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .await
+        };
+        let peer_task = async {
+            let TransportMessage::Outbound(adv) = output.recv().await.unwrap() else {
+                panic!("ADV")
+            };
+            assert_eq!(
+                rns_wire::header::PacketHeader::unpack(&adv.raw)
+                    .unwrap()
+                    .0
+                    .context,
+                PacketContext::ResourceAdv
+            );
+            tokio::task::yield_now().await;
+            assert!(output.try_recv().is_err(), "no unsolicited parts");
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: build_data_packet(
+                        link_id,
+                        PacketContext::ResourceReq,
+                        &peer.encrypt(&request).unwrap(),
+                    ),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+            for part in parts {
+                let TransportMessage::Outbound(packet) = output.recv().await.unwrap() else {
+                    panic!("part")
+                };
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+                assert_eq!(header.context, PacketContext::Resource);
+                assert_eq!(&packet.raw[offset..], part.as_slice());
+            }
+            let raw = build_data_packet(link_id, PacketContext::ResourcePrf, &proof);
+            let (mut header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            header.flags.packet_type = rns_wire::flags::PacketType::Proof;
+            let mut raw = header.pack().unwrap();
+            raw.extend_from_slice(&proof);
+            events
+                .send(DestinationEvent::InboundPacket {
+                    raw: Bytes::from(raw),
+                    interface_id: 0,
+                })
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(task, peer_task);
+        result.unwrap();
+    }
 
     #[test]
     fn metadata_roundtrip() {

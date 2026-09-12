@@ -488,9 +488,25 @@ leaf nodes. Entries are lost on restart or eviction; transit proofs are not
 cached by this implementation. Link-table routing carries queries to the
 receiver, whose cached proof remains available after transfer state is freed.
 
-Sender inactivity and signalling on the caller's overall deadline still need
-separate review. The separate rncp sender loop and its 120-second proof-wait
-cap have not yet been migrated to this watchdog.
+Sender inactivity during part transfer is bounded by
+`RTT * 6 * 16 + 10s + (1 + ... + 16) * 0.5s`, matching the receiver retry budget
+and Python sender grace. Expiry emits ICL and releases the transfer through
+the same runtime cancellation paths.
+
+The rncp sender now uses this watchdog too: one initial advertisement, then
+only receiver-requested parts, with advertisement/proof retries. It no longer
+uses the old push-window/HMU interpretation or the separate 120-second proof
+cap. All segments share the existing operation deadline. Progress counts
+unique sent parts; success still requires a valid proof. RCL must decrypt and
+name the current Resource.
+
+On expiration of the send/response wait, LinkSession attempts ICL/RCL for the
+active Resource(s). The rncp Resource loop is bounded by the operation deadline
+even while awaiting transport admission and attempts ICL on expiry. Deadline
+cancellation signals are best-effort, nonblocking: a full/closed transport can
+prevent delivery, but does not extend the deadline. Local transfer state is
+released regardless. Dropping an application future is not a new cancellation
+API and does not guarantee an on-wire cancel.
 
 ### Ingress mappings
 

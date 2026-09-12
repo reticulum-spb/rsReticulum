@@ -3064,3 +3064,33 @@ interop. Новых test-only файлов нет. Workspace all-targets check �
 прежние warnings database_path/tracing prelude сохраняются. Python reference
 ea98db4f чист. Sender inactivity, общий deadline cleanup и rncp loop ещё
 открыты; этап6 не завершён, версия1.0.1.
+
+### Этап 6: sender inactivity, deadline и цикл rncp
+
+Общий Resource watchdog дополнен sender inactivity в состоянии Transferring:
+RTT*6*MAX_RETRIES16 + SENDER_GRACE10 + sum(1..16)*PER_RETRY_DELAY0.5.
+Активность отсчитывается от последнего обработанного valid RESOURCE_REQ.
+Истечение возвращает ICL и использует уже подключённый cleanup runtime.
+
+LinkSession при истечении ожидания отправки пытается послать ICL, при истечении
+ожидания ответа — RCL для активных сегментов. Сигналы best-effort/try_send:
+полная очередь не продлевает deadline; локальное состояние освобождается.
+Это не гарантия отправки cancel при произвольном drop application future.
+
+rncp drive_outbound перенесён с legacy push tick на один начальный ADV и
+check_sender_timeout. Части отправляются только по RESOURCE_REQ, HMU больше
+не интерпретируется как receiver ACK. Прогресс — число уникальных sent_parts;
+окончание — валидный proof. RCL проверяется decrypt и текущим resource hash.
+Отдельный proof cap120s удалён, все сегменты ограничены общим operation deadline.
+Весь Resource loop дополнительно обёрнут timeout, включая ожидание admission;
+при expiry выполняется неблокирующая попытка ICL.
+
+Две короткие inline проверки: граница inactivity при RTT0.5 (125/127s без
+реального ожидания), rncp handshake → ADV без push → REQ → части → proof.
+Новых test-only файлов нет, длительные тесты не запускались. Полный streaming
+API по-прежнему отсутствует; оставшиеся Link keepalive/watchdog, ratchet и
+blackholed announce API ещё требуют аудита. Этап6 открыт, версия1.0.1.
+`cargo test -p rns-protocol --lib sender_inactivity --quiet`: 1 passed, 0.00s;
+`cargo test -p rns-runtime --lib resource_sender_waits_for_requests --quiet`:
+1 passed, 0.01s. Workspace all-targets check успешен; прежние warnings
+database_path/tracing prelude сохраняются. Python reference чист.

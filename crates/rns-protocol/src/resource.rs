@@ -1422,6 +1422,22 @@ impl OutboundTransfer {
     }
 
     pub fn check_sender_timeout(&mut self, link_id: [u8; 16]) -> TransferAction {
+        if self.resource.state == ResourceState::Transferring {
+            let extra = (MAX_RETRIES * (MAX_RETRIES + 1) / 2) as f64 * PER_RETRY_DELAY;
+            let wait = self.rtt.as_secs_f64()
+                * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR
+                * MAX_RETRIES as f64
+                + SENDER_GRACE_TIME
+                + extra;
+            if self
+                .last_part_sent
+                .is_some_and(|last| last.elapsed().as_secs_f64() >= wait)
+            {
+                self.resource.state = ResourceState::Failed;
+                return TransferAction::SendCancel(CancelType::Icl, self.resource.resource_hash);
+            }
+            return TransferAction::None;
+        }
         if self.resource.state != ResourceState::AwaitingProof {
             return self.check_advertisement_timeout();
         }
@@ -4125,6 +4141,29 @@ mod tests {
         assert!(matches!(
             sender.check_sender_timeout([7; 16]),
             TransferAction::None
+        ));
+    }
+
+    #[test]
+    fn sender_inactivity_cancels_after_receiver_retry_budget() {
+        let mut sender =
+            OutboundTransfer::new(vec![42; 2000], false, Duration::from_millis(500)).unwrap();
+        sender.tick();
+        let mut request = vec![HASHMAP_IS_NOT_EXHAUSTED];
+        request.extend_from_slice(&sender.resource.resource_hash);
+        request.extend_from_slice(&sender.resource.map_hashes[0]);
+        sender.handle_request(&request);
+        // 0.5*6*16 + 10 + (1+...+16)*0.5 = 126 seconds.
+        sender.rtt = Duration::from_millis(500);
+        sender.last_part_sent = Some(Instant::now() - Duration::from_secs(125));
+        assert!(matches!(
+            sender.check_sender_timeout([7; 16]),
+            TransferAction::None
+        ));
+        sender.last_part_sent = Some(Instant::now() - Duration::from_secs(127));
+        assert!(matches!(
+            sender.check_sender_timeout([7; 16]),
+            TransferAction::SendCancel(CancelType::Icl, _)
         ));
     }
 
