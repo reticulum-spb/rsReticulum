@@ -1345,3 +1345,50 @@ interfaces:
     target_host: example.org
     target_port: 4242
 ```
+
+## rnsh configuration and migration
+
+`rnsh-rs` uses the Reticulum 1.5.2 directory semantics:
+
+- `-c/--config DIR`: rnsh's own directory. Without it, an existing
+  `~/.config/rnsh` wins; otherwise `~/.rnsh` is used/created. Explicit `~/...`
+  is expanded. This does not select Reticulum YAML configuration.
+- `--rnsconfig DIR`: Reticulum configuration directory, passed to the normal
+  Rust runtime/configuration resolver. RNS defaults and YAML format are unchanged.
+- `-i/--identity FILE`: use this identity path, independently of either directory.
+  Otherwise the client uses `DIR/identity`; the listener uses
+  `DIR/identity.default`, or `DIR/identity.SERVICE` with `-s SERVICE`.
+  Service names retain Unicode letters/numbers and underscores and discard
+  punctuation/path separators. Empty listener service names mean `default`.
+- `DIR/allowed_identities`: one 32-character identity hash per line. Only the
+  selected rnsh directory is used; other home-directory allow-lists are not merged.
+  `-a HASH` adds an explicit grant. File additions/removals apply to new
+  identifications without restarting; an unreadable/deleted file grants nothing.
+  Existing authenticated sessions are not revoked by editing the file.
+- Authentication remains enabled by default. `-n/--no-auth` explicitly allows
+  unidentified clients too; `-N/--no-id` on a client does not bypass an authenticated
+  listener. `-C` rejects remote command lines; `-A` appends remote arguments to
+  a fresh copy of the listener command for each session. Separate commands with `--`.
+- `-w/--timeout` defaults to 15 seconds; finite positive fractional values are
+  accepted without rounding up to one second. It bounds connection/operation
+  waits, not the lifetime of the remote shell. Idle sessions use Link keepalive
+  and stale detection. SIGINT/SIGTERM still terminate the local client.
+- `-b 0` announces on startup only; positive values also announce periodically.
+  `-m` mirrors the remote exit code using the existing Rust 0–255 mapping.
+  `-p` prints/reuses the selected identity without starting an RNS instance.
+
+**Migration:** old Rust identities were under
+`RNS_DIR/storage/identities/rnsh[.SERVICE]`. They are not moved or silently reused.
+To retain your identity/destination, pass the old file with `-i`, or copy it to
+the new rnsh directory before first use. Change old invocations of
+`--config RNS_DIR` to `--rnsconfig RNS_DIR`. Identity files remain raw 64-byte
+private keys compatible with Python; an invalid existing file produces an error
+instead of being replaced by a new identity.
+
+Rust-specific boundaries: logging continues through tracing to stderr rather
+than Python's `logfile`/`logfile.initiator`; `-vvv` enables TRACE, with no literal
+mapping of every Python numerical log level. The existing shell fallback uses
+`SHELL` (or `COMSPEC` on Windows), and rnsh stream chunks remain conservatively
+bounded at 240 bytes rather than reproducing Python's adaptive compression
+heuristic. These differences do not alter the rnsh message format. Python-only
+module compilation/import cleanup requires no Rust equivalent.

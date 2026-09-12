@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use rns_crypto::ed25519::Ed25519PublicKey;
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkAction};
 use rns_protocol::channel::{ChannelError, LinkChannel};
 use rns_protocol::channel_message::MessageBase;
 use rns_protocol::rnsh::{
@@ -88,6 +88,7 @@ pub struct RnshClientConfig {
     pub destination_hash: [u8; 16],
     pub command: Vec<String>,
     pub no_id: bool,
+    /// Connection/operation timeout; does not limit remote process runtime.
     pub timeout: Duration,
     pub stdin_data: Vec<u8>,
     pub stdin_rx: Option<mpsc::Receiver<Vec<u8>>>,
@@ -196,9 +197,10 @@ async fn run_rnsh_listener_inner(
     // link down at identify time in addition to the handler-level allow-check
     // below. allow_all installs no gate.
     if !cfg.allow_all {
-        let allowed = listener_allowed_identities(&cfg);
+        let allowed = cfg.allowed.clone();
+        let allowed_files = cfg.allowed_identity_files.clone();
         link_mgr.set_link_identity_gate(move |_link_id, identity_hash| {
-            allowed.contains(&identity_hash)
+            load_listener_allowed_identities(&allowed, &allowed_files).contains(&identity_hash)
         });
     }
 
@@ -218,6 +220,16 @@ async fn run_rnsh_listener_inner(
 
     loop {
         tokio::select! {
+            // LinkManager publishes establishment and identification before channel
+            // data. Preserve that ordering across its separate event queues.
+            biased;
+            _ = async {
+                if let Some(shutdown) = shutdown.as_ref() {
+                    shutdown.wait().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => { break; }
             maybe_link = established_rx.recv() => {
                 let Some(link_id) = maybe_link else { break };
                 // or_insert (not insert) so a rare identification processed ahead
@@ -272,12 +284,21 @@ async fn run_rnsh_listener_inner(
             }
             maybe_msg = channel_rx.recv() => {
                 let Some(msg) = maybe_msg else { break };
-                handle_listener_channel_message(
+                let link_id = msg.link_id;
+                if let Err(error) = handle_listener_channel_message(
                     &command_tx,
                     &cfg,
                     &mut sessions,
                     msg,
-                ).await?;
+                ).await {
+                    // A peer's malformed message or failed process must not stop
+                    // the listener and unrelated sessions.
+                    if let Some(session) = sessions.get_mut(&link_id) {
+                        session.close();
+                    }
+                    tracing::warn!(?link_id, %error, "rnsh session failed");
+                    close_link_after_error(command_tx.clone(), link_id);
+                }
             }
             _ = async {
                 if let Some(interval) = announce_interval.as_mut() {
@@ -287,15 +308,6 @@ async fn run_rnsh_listener_inner(
                 }
             } => {
                 send_announce(&transport_tx, &cfg.identity, RNSH_APP_NAME).await?;
-            }
-            _ = async {
-                if let Some(shutdown) = shutdown.as_ref() {
-                    shutdown.wait().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                break;
             }
         }
     }
@@ -310,7 +322,10 @@ pub async fn rnsh_client_execute(
     mut cfg: RnshClientConfig,
 ) -> Result<RnshClientOutcome, RnshError> {
     let started = Instant::now();
-    let deadline = started + cfg.timeout;
+    let deadline = started
+        .checked_add(cfg.timeout)
+        .filter(|_| !cfg.timeout.is_zero())
+        .ok_or(RnshError::Timeout("invalid timeout"))?;
     let destination_hash = cfg.destination_hash;
 
     let pubkey = discover_pubkey(
@@ -488,7 +503,6 @@ pub async fn rnsh_client_execute(
             stderr: &mut stderr,
             cfg: &mut cfg,
         },
-        deadline,
     )
     .await
     {
@@ -538,7 +552,6 @@ async fn run_client_io_loop(
     channel: &mut LinkChannel,
     pending_messages: &mut VecDeque<RnshMessage>,
     io: ClientIoState<'_>,
-    deadline: Instant,
 ) -> Result<i64, RnshError> {
     let ClientIoState {
         stdout,
@@ -586,16 +599,11 @@ async fn run_client_io_loop(
         }
 
         resend_timed_out_client_channel_messages(transport_tx, link, channel).await?;
-        if Instant::now() >= deadline {
-            return Err(RnshError::Timeout("rnsh channel"));
-        }
-
+        drive_client_watchdog(transport_tx, link).await?;
         let retry_wait = channel
             .next_timeout_duration()
             .unwrap_or_else(|| Duration::from_secs(1))
-            .min(Duration::from_secs(1))
-            .min(remaining(deadline));
-        let deadline_wait = remaining(deadline);
+            .min(Duration::from_secs(1));
 
         tokio::select! {
             maybe_event = lpkt_rx.recv() => {
@@ -611,6 +619,9 @@ async fn run_client_io_loop(
                 ).await?;
             }
             maybe_chunk = recv_optional_stdin_chunk(&mut stdin_rx), if !stdin_eof_sent => {
+                // --timeout bounds an operation, not the lifetime of an
+                // interactive shell or a long-running remote command.
+                let deadline = Instant::now() + cfg.timeout;
                 match maybe_chunk {
                     Some(data) if !data.is_empty() => {
                         for chunk in data.chunks(CLIENT_CHUNK_LEN) {
@@ -656,6 +667,7 @@ async fn run_client_io_loop(
                 }
             }
             maybe_window = recv_optional_window_size(&mut window_rx) => {
+                let deadline = Instant::now() + cfg.timeout;
                 match maybe_window {
                     Some(window) => {
                         send_client_message_when_ready(
@@ -674,9 +686,6 @@ async fn run_client_io_loop(
                 }
             }
             _ = tokio::time::sleep(retry_wait) => {}
-            _ = tokio::time::sleep(deadline_wait) => {
-                return Err(RnshError::Timeout("rnsh channel"));
-            }
         }
     }
 }
@@ -776,6 +785,14 @@ struct ListenerSession {
 }
 
 impl ListenerSession {
+    fn close(&mut self) {
+        self.authorized = false;
+        self.state = ListenerState::Closed;
+        self.stdin.take();
+        self.window.take();
+        self.process_cleanup.take();
+    }
+
     fn new(allow_all: bool) -> Self {
         Self {
             authorized: allow_all,
@@ -1039,8 +1056,10 @@ async fn handle_listener_channel_message(
         return Ok(());
     }
 
-    let decoded = RnshMessage::decode(msg.msg_type, &msg.payload)
-        .map_err(|e| RnshError::Channel(e.to_string()))?;
+    let decoded = RnshMessage::decode(msg.msg_type, &msg.payload).map_err(|e| {
+        session.close();
+        RnshError::Channel(e.to_string())
+    })?;
 
     match session.state {
         ListenerState::Closed => Ok(()),
@@ -1048,6 +1067,7 @@ async fn handle_listener_channel_message(
         ListenerState::WaitVersion => match decoded {
             RnshMessage::VersionInfo(version) => {
                 if version.protocol_version != PROTOCOL_VERSION {
+                    session.close();
                     send_manager_message(
                         command_tx,
                         msg.link_id,
@@ -1066,6 +1086,8 @@ async fn handle_listener_channel_message(
                 Ok(())
             }
             _ => {
+                session.close();
+                close_link_after_error(command_tx.clone(), msg.link_id);
                 send_manager_message(
                     command_tx,
                     msg.link_id,
@@ -1088,6 +1110,7 @@ async fn handle_listener_channel_message(
                 ) {
                     Ok(command) => command,
                     Err(reason) => {
+                        session.close();
                         send_manager_message(
                             command_tx,
                             msg.link_id,
@@ -1118,6 +1141,7 @@ async fn handle_listener_channel_message(
                 {
                     Ok(stdin) => stdin,
                     Err(error) => {
+                        session.close();
                         send_manager_message(
                             command_tx,
                             msg.link_id,
@@ -1135,6 +1159,8 @@ async fn handle_listener_channel_message(
                 Ok(())
             }
             _ => {
+                session.close();
+                close_link_after_error(command_tx.clone(), msg.link_id);
                 send_manager_message(
                     command_tx,
                     msg.link_id,
@@ -1146,6 +1172,8 @@ async fn handle_listener_channel_message(
         ListenerState::Running => match decoded {
             RnshMessage::StreamData(stream) => {
                 if stream.stream_id != STREAM_ID_STDIN {
+                    session.close();
+                    close_link_after_error(command_tx.clone(), msg.link_id);
                     send_manager_message(
                         command_tx,
                         msg.link_id,
@@ -1681,9 +1709,15 @@ async fn process_client_destination_event(
         }
         rns_wire::flags::PacketType::Data => match header.context {
             rns_wire::context::PacketContext::Keepalive
-                if body.first() == Some(&rns_link::constants::KEEPALIVE_REQUEST) =>
+                if body == [rns_link::constants::KEEPALIVE_REQUEST] =>
             {
+                link.record_inbound();
                 send_keepalive_response(transport_tx, *channel.link_id()).await?;
+            }
+            rns_wire::context::PacketContext::Keepalive
+                if body == [rns_link::constants::KEEPALIVE_RESPONSE] =>
+            {
+                link.record_inbound();
             }
             rns_wire::context::PacketContext::LinkClose if link.receive_teardown(body) => {
                 return Err(RnshError::HandshakeFailed("link closed by remote".into()));
@@ -1795,6 +1829,38 @@ async fn wait_for_link_proof(
 
 async fn cleanup_destination(transport_tx: &mpsc::Sender<TransportMessage>, link_id: [u8; 16]) {
     let _ = transport_tx.try_send(TransportMessage::DeregisterDestination { hash: link_id });
+}
+
+async fn drive_client_watchdog(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link: &mut Link,
+) -> Result<(), RnshError> {
+    use rns_wire::context::PacketContext;
+    let (context, data, closing) = match link.tick() {
+        LinkAction::None => return Ok(()),
+        LinkAction::SendKeepalive | LinkAction::TransitionedToStale => (
+            PacketContext::Keepalive,
+            vec![rns_link::constants::KEEPALIVE_REQUEST],
+            false,
+        ),
+        LinkAction::SendTeardownAndClose(data) => (PacketContext::LinkClose, data, true),
+        LinkAction::Closed(_) => return Err(RnshError::Timeout("link watchdog")),
+    };
+    if !data.is_empty() {
+        transport_tx
+            .send(TransportMessage::Outbound(OutboundRequest {
+                raw: build_data_packet(link.link_id, context, &data),
+                destination_hash: link.link_id,
+            }))
+            .await
+            .map_err(|_| RnshError::TransportUnavailable)?;
+    }
+    if closing {
+        Err(RnshError::Timeout("link keepalive response"))
+    } else {
+        link.record_tx_keepalive(1);
+        Ok(())
+    }
 }
 
 async fn send_keepalive_response(
@@ -1969,8 +2035,12 @@ fn select_listener_command(
 }
 
 fn listener_allowed_identities(cfg: &RnshListenerConfig) -> HashSet<[u8; 16]> {
-    let mut allowed: HashSet<[u8; 16]> = cfg.allowed.iter().copied().collect();
-    for path in &cfg.allowed_identity_files {
+    load_listener_allowed_identities(&cfg.allowed, &cfg.allowed_identity_files)
+}
+
+fn load_listener_allowed_identities(explicit: &[[u8; 16]], files: &[PathBuf]) -> HashSet<[u8; 16]> {
+    let mut allowed: HashSet<[u8; 16]> = explicit.iter().copied().collect();
+    for path in files {
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
@@ -2259,6 +2329,128 @@ mod tests {
             msg_type: msg.msg_type(),
             payload: msg.pack(),
         }
+    }
+
+    #[test]
+    fn allowed_file_updates_are_not_frozen_into_explicit_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowed_identities");
+        let files = vec![path.clone()];
+        let explicit = [[1; 16]];
+        std::fs::write(&path, format!("{}\r\ninvalid\n", hex::encode([2; 16]))).unwrap();
+        assert!(load_listener_allowed_identities(&explicit, &files).contains(&[2; 16]));
+        std::fs::write(&path, hex::encode([3; 16])).unwrap();
+        let allowed = load_listener_allowed_identities(&explicit, &files);
+        assert!(!allowed.contains(&[2; 16]));
+        assert!(allowed.contains(&[3; 16]));
+        assert!(allowed.contains(&[1; 16]));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            load_listener_allowed_identities(&explicit, &files),
+            HashSet::from([[1; 16]])
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_protocol_error_cannot_be_followed_by_execute() {
+        let marker = unique_marker("fatal");
+        let cfg = marker_listener_config(&marker);
+        let (tx, rx) = mpsc::channel(64);
+        spawn_ack_manager(rx, Arc::new(Mutex::new(Vec::new())));
+        let id = [9; 16];
+        for bad_message in [
+            execute_command_channel_msg(id),
+            LinkChannelMessage {
+                link_id: id,
+                msg_type: 0xffff,
+                payload: vec![],
+            },
+        ] {
+            let mut sessions = HashMap::from([(id, ListenerSession::new(true))]);
+            let _ = handle_listener_channel_message(&tx, &cfg, &mut sessions, bad_message).await;
+            assert_eq!(sessions[&id].state, ListenerState::Closed);
+            handle_listener_channel_message(&tx, &cfg, &mut sessions, version_channel_msg(id))
+                .await
+                .unwrap();
+            handle_listener_channel_message(
+                &tx,
+                &cfg,
+                &mut sessions,
+                execute_command_channel_msg(id),
+            )
+            .await
+            .unwrap();
+            assert!(sessions[&id].process_cleanup.is_none());
+            assert!(!marker.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_client_outlives_operation_timeout_and_uses_link_watchdog() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let (mut link, request) = Link::new_initiator([7; 16], 1);
+        let (_, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+        link.validate_proof(&proof, &public, &public.to_bytes())
+            .unwrap();
+        let mut channel = LinkChannel::new(link.link_id, link.rtt_secs());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_event_tx, mut event_rx) = mpsc::channel(8);
+        let mut pending = VecDeque::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut cfg = RnshClientConfig {
+            identity: Identity::new(),
+            destination_hash: [7; 16],
+            command: vec![],
+            no_id: false,
+            timeout: Duration::from_millis(1),
+            stdin_data: vec![],
+            stdin_rx: None,
+            stdout_tx: None,
+            stderr_tx: None,
+            window_rx: None,
+            pipe_stdin: false,
+            pipe_stdout: true,
+            pipe_stderr: true,
+            term: None,
+            rows: None,
+            cols: None,
+            hpix: None,
+            vpix: None,
+        };
+        // Only 20ms: prove there is no total session deadline without a long test.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                run_client_io_loop(
+                    &tx,
+                    &mut event_rx,
+                    &mut link,
+                    &mut channel,
+                    &mut pending,
+                    ClientIoState {
+                        stdout: &mut stdout,
+                        stderr: &mut stderr,
+                        cfg: &mut cfg
+                    },
+                )
+            )
+            .await
+            .is_err()
+        );
+        link.keepalive.update_from_rtt(Duration::ZERO);
+        link.keepalive.last_inbound = Instant::now() - Duration::from_secs(6);
+        drive_client_watchdog(&tx, &mut link).await.unwrap();
+        let TransportMessage::Outbound(request) = rx.try_recv().unwrap() else {
+            panic!("keepalive expected")
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.context, rns_wire::context::PacketContext::Keepalive);
+        assert_eq!(
+            &request.raw[offset..],
+            &[rns_link::constants::KEEPALIVE_REQUEST]
+        );
     }
 
     // The 1.3.9 rnsh flaw: a rejected identity ignores the fatal error, then

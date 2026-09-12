@@ -24,8 +24,8 @@ tunnel synthesis и воспроизведение кешированных anno
 
 | Версия / изменение | Исходное состояние и доказательство | Дальнейший этап |
 |---|---|---|
-| 1.3.9 rnsh security | Реализована защита в `rns-runtime/src/rnsh.rs`: identity gate, authorized/session state, регрессии запрещённого Execute. Повторить сценарии | 7 |
-| 1.3.9 rnsh config/identity paths | Частично: `rns-tools/src/commands/rnsh.rs` использует `--config` для RNS; сверить новые Python defaults | 7 |
+| 1.3.9 rnsh security | Сверено с исходниками: identity gate и authorized state сохранены; fatal errors терминальны, ошибочный peer не завершает listener. Короткие allowed/denied проверки пройдены | 7 |
+| 1.3.9 rnsh config/identity paths | Перенесено: раздельные --config/--rnsconfig, identity[.SERVICE] и allowed_identities в выбранном rnsh каталоге; миграция описана в CONFIG.md | 7 |
 | 1.3.9 Backbone fast flapping | Отсутствует: listener/config в `rns-interface/src/backbone.rs` не ведут историю блокировок IP | 3 |
 | 1.3.9 LOG_PATHING / logging | Частично: tracing и числовые уровни в runtime; прямое соответствие новых уровней проверить | 7 |
 | 1.3.9 internal discovery | Расхождение: `apply_discovery_mode_autocorrect` разрешает только gateway/AP | 1 |
@@ -97,7 +97,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 non-epoll keepalive | Проверить служебные кадры всех Backbone-совместимых драйверов | 5 |
 | 1.5.1 blocked IP list includes unblocked | Новый механизм обязан отдавать только реально заблокированные IP | 3 |
 | 1.5.1 shared instance inter-app totals | `rnstatus.rs` суммирует interface stats; фильтрацию local/shared проверить | 7 |
-| 1.5.1 minor rnsh/rnir/identity fixes | rnsh/identity воспроизвести; отдельная rnir утилита не обнаружена | 6, 7 |
+| 1.5.1 minor rnsh/rnir/identity fixes | rnsh сверено по diff 1.3.8..ea98db4f; пути, auth, повторная идентификация, копирование argv, timeout проверены. Python import/logging границы описаны; отдельная rnir отсутствует | 6, 7 |
 | 1.5.1 AES exception description / Python2 umsgpack removal | Python-specific exception/dead-code изменения | неприменимо |
 | 1.5.2 dataplane tuning | Требует этапа 5 с конечными параметрами 1.5.2 | 5 |
 | 1.5.2 rngit block unidentified config example | Утилита вне покрытия; аналогичные rnsh authorization проверки остаются | граница покрытия |
@@ -3444,3 +3444,54 @@ Python↔Rust матрица не запускались; аппаратные �
 Блок rnstatus закрыт с описанными границами измерений/profiling. Этап 7 целиком
 не завершён: далее отдельная сверка rnsh и ограничений rnpath remote/rncp
 --phy-rates по плану. Версия 1.0.1 сохранена.
+
+### Этап 7: блок rnsh завершён целиком
+
+Эталон `ea98db4f` остаётся чистым. Сверены актуальные args/rnsh/listener/
+initiator/session/protocol и diff Python `1.3.8..ea98db4f`, включая 1.3.9
+authorization fix и последующие исправления. Вывод не основан только на
+формулировке changelog: Rust уже имел identity gate, authorized/Closed state,
+копирование default argv и защиту от повторного изменения состояния identity.
+
+Перенесено/исправлено одним блоком:
+
+- CLI: `--config` для rnsh, `--rnsconfig` для RNS; выбор существующего
+  `~/.config/rnsh` либо `~/.rnsh`; `identity`, `identity.default` и suffix
+  сервиса; явный `-i` сохранён, Unicode service name очищается от разделителей.
+  `-p` использует те же пути, не создаёт Reticulum storage/instance.
+- Allow-list берётся только из выбранного rnsh каталога. Файл больше не
+  копируется в постоянные `-a` grants, а LinkManager gate и listener используют
+  общий загрузчик. Добавления/удаления учитываются при новой идентификации,
+  недоступный файл не даёт разрешений; активные сессии не отзываются.
+- Fatal protocol/command errors закрывают состояние до отправки ответа;
+  последующие VersionInfo/Execute не могут его оживить. Malformed/unsupported
+  сообщения и ошибки процесса изолированы в одной сессии, не останавливают
+  весь listener. Порядок established → identified → channel сохранён между
+  раздельными очередями; shutdown имеет приоритет.
+- `--timeout` принимает конечные положительные дробные секунды без прежнего
+  clamp до 1s; некорректные/непредставимые значения отклоняются без panic.
+  Общий лимит жизни shell удалён: handshake/операции ограничены, а idle Link
+  обслуживает watchdog/keepalive/stale detection. Клиент явно реагирует на
+  shutdown. TRACE доступен через `-vvv`.
+- README/CONFIG описывают несовместимую смену смысла `--config`, перенос старых
+  identity вручную или через `-i`, неизменный raw-key формат и отсутствие
+  автоматической замены повреждённого identity.
+
+Короткие проверки: `cargo test -p rns-tools --bin rnsh-rs --offline --quiet`
+— 16 passed (0.01s); `cargo test -p rns-runtime --lib rnsh::tests --offline
+--quiet` — 9 passed (0.31s), включая denied/unidentified и разрешённое
+выполнение локальной команды, fatal→Execute, обновление файла разрешений,
+idle за пределами operation timeout, keepalive и PTY cleanup. Новые проверки
+встроены в production-модули, новых test-only файлов нет.
+`cargo check --workspace --all-targets --offline --quiet`, fmt check и
+`git diff --check` успешны; прежние warnings database_path/tracing prelude
+не менялись. Длительные тесты не запускались.
+
+Границы: Rust tracing/stderr вместо Python logfile и числовой шкалы;
+консервативные 240-byte stream chunks вместо адаптивного выбора compression
+chunk (новое Python HEADER_LEN не требует изменения совместимого Rust wire
+формата); Rust shell/exit-code defaults сохранены и описаны. Удаление Python
+imports и загрузка compiled modules неприменимы. Полный паритет старого
+интерактивного UX Python, длительные сессии и живая Python↔Rust матрица здесь
+не заявляются. Блок обновления rnsh закрыт; далее по этапу 7 остаются
+`rnpath` remote mode и `rncp --phy-rates`. Версия остаётся 1.0.1.

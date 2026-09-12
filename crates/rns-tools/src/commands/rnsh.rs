@@ -16,7 +16,7 @@ use clap::{ArgAction, CommandFactory, Parser};
 use rns_identity::destination::{DestType, Destination, Direction};
 use rns_identity::identity::Identity;
 use rns_runtime::lifecycle::{ShutdownSignal, install_signal_handlers};
-use rns_runtime::platform::{StoragePaths, resolve_config_dir};
+use rns_runtime::platform::resolve_config_dir;
 use rns_runtime::rnsh::{
     RnshClientConfig, RnshError, RnshListenerConfig, RnshWindowSize, rnsh_client_execute,
     run_rnsh_listener_with_shutdown,
@@ -38,8 +38,14 @@ const IDENTITY_HASH_HEX_LEN: usize = 32;
     after_help = "When specifying a command to execute, separate rnsh-rs options from the command and its arguments with --\n\nFor example:\n  rnsh-rs -l -- /bin/bash --login\n  rnsh-rs <destination> -- ls -la /tmp"
 )]
 struct Args {
-    #[arg(short = 'c', long = "config")]
+    #[arg(
+        short = 'c',
+        long = "config",
+        help = "Path to rnsh configuration directory"
+    )]
     config: Option<PathBuf>,
+    #[arg(long = "rnsconfig", help = "Path to Reticulum configuration directory")]
+    rnsconfig: Option<PathBuf>,
     #[arg(short = 'i', long = "identity")]
     identity: Option<PathBuf>,
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
@@ -70,7 +76,7 @@ struct Args {
     no_id: bool,
     #[arg(short = 'm', long = "mirror")]
     mirror: bool,
-    #[arg(short = 'w', long = "timeout", value_name = "SECONDS")]
+    #[arg(short = 'w', long = "timeout", value_name = "SECONDS", value_parser = parse_timeout)]
     timeout: Option<f64>,
 
     destination: Option<String>,
@@ -91,7 +97,7 @@ async fn run(mut args: Args) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if args.listen && args.service.is_none() {
+    if args.listen && args.service.as_deref().is_none_or(str::is_empty) {
         args.service = Some(DEFAULT_SERVICE_NAME.to_string());
     }
 
@@ -103,6 +109,16 @@ async fn run(mut args: Args) -> ExitCode {
                 ExitCode::from(1)
             }
         };
+    }
+
+    if args.listen || args.destination.is_some() {
+        match rnsh_config_dir(args.config.as_deref()) {
+            Ok(dir) => args.config = Some(dir),
+            Err(e) => {
+                eprintln!("rnsh-rs: {e}");
+                return ExitCode::from(1);
+            }
+        }
     }
 
     if args.listen {
@@ -124,17 +140,24 @@ async fn run_listener(args: Args) -> ExitCode {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
-    init_logging(args.verbose, args.quiet, args.config.as_deref());
+    init_logging(args.verbose, args.quiet, args.rnsconfig.as_deref());
 
-    let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
+    let handle = match start_reticulum(args.rnsconfig.as_deref(), shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("rnsh-rs: failed to start reticulum: {e}");
             return ExitCode::from(1);
         }
     };
-    let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity_path = identity_path(args.identity.as_deref(), &paths, args.service.as_deref());
+    let config_dir = args
+        .config
+        .as_deref()
+        .expect("resolved rnsh config directory");
+    let identity_path = identity_path(
+        args.identity.as_deref(),
+        config_dir,
+        args.service.as_deref(),
+    );
     let identity = match load_or_create_identity(&identity_path) {
         Ok(identity) => identity,
         Err(e) => {
@@ -143,15 +166,14 @@ async fn run_listener(args: Args) -> ExitCode {
         }
     };
 
-    let mut allowed = match parse_allowed_identities(&args.allowed) {
+    let allowed = match parse_allowed_identities(&args.allowed) {
         Ok(allowed) => allowed,
         Err(e) => {
             eprintln!("rnsh-rs: {e}");
             return ExitCode::from(1);
         }
     };
-    let allowed_identity_files = allowed_identity_file_candidates();
-    allowed.extend(load_allowed_identity_files(&allowed_identity_files));
+    let allowed_identity_files = vec![config_dir.join("allowed_identities")];
 
     let cfg = RnshListenerConfig {
         identity,
@@ -179,7 +201,7 @@ async fn run_initiator(args: Args) -> ExitCode {
     // Register before any slow init so an early SIGINT exits cleanly.
     let shutdown = ShutdownSignal::new();
     let _signal_rx = install_signal_handlers(shutdown.clone());
-    init_logging(args.verbose, args.quiet, args.config.as_deref());
+    init_logging(args.verbose, args.quiet, args.rnsconfig.as_deref());
 
     let destination = match args.destination.as_deref().and_then(parse_hash16) {
         Some(hash) => hash,
@@ -189,15 +211,18 @@ async fn run_initiator(args: Args) -> ExitCode {
         }
     };
 
-    let handle = match start_reticulum(args.config.as_deref(), shutdown.clone()).await {
+    let handle = match start_reticulum(args.rnsconfig.as_deref(), shutdown.clone()).await {
         Ok(handle) => handle,
         Err(e) => {
             eprintln!("rnsh-rs: failed to start reticulum: {e}");
             return ExitCode::from(1);
         }
     };
-    let paths = StoragePaths::from_config_dir(&handle.config_dir);
-    let identity_path = identity_path(args.identity.as_deref(), &paths, None);
+    let config_dir = args
+        .config
+        .as_deref()
+        .expect("resolved rnsh config directory");
+    let identity_path = identity_path(args.identity.as_deref(), config_dir, None);
     let identity = match load_or_create_identity(&identity_path) {
         Ok(identity) => identity,
         Err(e) => {
@@ -220,7 +245,7 @@ async fn run_initiator(args: Args) -> ExitCode {
     let (stderr_tx, stderr_writer) = spawn_output_writer(true);
     let window_rx = spawn_window_size_watcher();
 
-    let timeout = Duration::from_secs_f64(args.timeout.unwrap_or(15.0).max(1.0));
+    let timeout = Duration::from_secs_f64(args.timeout.unwrap_or(15.0));
     let cfg = RnshClientConfig {
         identity,
         destination_hash: destination,
@@ -242,7 +267,11 @@ async fn run_initiator(args: Args) -> ExitCode {
         vpix,
     };
 
-    match rnsh_client_execute(handle.transport_tx.clone(), cfg).await {
+    let result = tokio::select! {
+        result = rnsh_client_execute(handle.transport_tx.clone(), cfg) => result,
+        _ = shutdown.wait() => return ExitCode::from(130),
+    };
+    match result {
         Ok(outcome) => {
             if let Err(e) = finish_output_writers(stdout_writer, stderr_writer).await {
                 eprintln!("rnsh-rs: {e}");
@@ -269,6 +298,7 @@ async fn start_reticulum(
 
 fn init_logging(verbose: u8, quiet: u8, config_dir: Option<&Path>) {
     let level = match (verbose as i32) - (quiet as i32) {
+        n if n >= 3 => tracing::Level::TRACE,
         n if n >= 2 => tracing::Level::DEBUG,
         1 => tracing::Level::INFO,
         0 => tracing::Level::WARN,
@@ -471,13 +501,12 @@ fn error_exit_code(error: &RnshError) -> u8 {
 }
 
 fn print_identity(args: &Args) -> Result<(), String> {
-    let config_dir = resolve_config_dir(args.config.as_deref().and_then(Path::to_str));
-    let paths = StoragePaths::from_config_dir(&config_dir);
-    paths
-        .ensure_dirs()
-        .map_err(|e| format!("could not prepare Reticulum storage: {e}"))?;
-
-    let identity_path = identity_path(args.identity.as_deref(), &paths, args.service.as_deref());
+    let config_dir = rnsh_config_dir(args.config.as_deref())?;
+    let identity_path = identity_path(
+        args.identity.as_deref(),
+        &config_dir,
+        args.service.as_deref(),
+    );
     let identity = load_or_create_identity(&identity_path)?;
     let destination = Destination::new(Some(&identity), Direction::In, DestType::Single, APP_NAME)
         .map_err(|e| format!("could not create rnsh destination: {e}"))?;
@@ -517,23 +546,23 @@ fn load_or_create_identity(path: &Path) -> Result<Identity, String> {
     Ok(identity)
 }
 
-fn identity_path(explicit: Option<&Path>, paths: &StoragePaths, service: Option<&str>) -> PathBuf {
+fn identity_path(explicit: Option<&Path>, config_dir: &Path, service: Option<&str>) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    let mut name = APP_NAME.to_string();
+    let mut name = "identity".to_string();
     let service = sanitize_service_name(service.unwrap_or(""));
     if !service.is_empty() {
         name.push('.');
         name.push_str(&service);
     }
-    paths.identity_dir.join(name)
+    config_dir.join(name)
 }
 
 fn sanitize_service_name(service: &str) -> String {
     service
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect()
 }
 
@@ -666,28 +695,19 @@ fn parse_allowed_identities(values: &[String]) -> Result<Vec<[u8; 16]>, String> 
         .collect()
 }
 
-fn allowed_identity_file_candidates() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-    vec![
-        home.join(".config/rnsh/allowed_identities"),
-        home.join(".rnsh/allowed_identities"),
-    ]
-}
-
-fn load_allowed_identity_files(candidates: &[PathBuf]) -> Vec<[u8; 16]> {
-    let Some(path) = candidates.iter().find(|path| path.is_file()) else {
-        return Vec::new();
-    };
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    content
-        .replace('\r', "")
-        .lines()
-        .filter_map(|line| parse_hash16(line.trim()))
-        .collect()
+fn parse_timeout(value: &str) -> Result<f64, String> {
+    let seconds: f64 = value.parse().map_err(|_| "expected seconds".to_string())?;
+    if !seconds.is_finite()
+        || seconds <= 0.0
+        || Duration::try_from_secs_f64(seconds)
+            .ok()
+            .filter(|duration| !duration.is_zero())
+            .and_then(|duration| std::time::Instant::now().checked_add(duration))
+            .is_none()
+    {
+        return Err("timeout must be a finite, positive, representable duration".into());
+    }
+    Ok(seconds)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -758,8 +778,26 @@ fn remote_exit_code(return_code: i64, mirror: bool) -> u8 {
     }
 }
 
-fn _rnsh_config_dir(home: &Path, dot_config_exists: bool, _dot_rnsh_exists: bool) -> PathBuf {
-    if dot_config_exists {
+fn rnsh_config_dir(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let dir = match explicit {
+        Some(path) => match path.strip_prefix("~") {
+            Ok(suffix) => home
+                .ok_or("cannot expand ~ without a home directory")?
+                .join(suffix),
+            Err(_) => path.to_path_buf(),
+        },
+        None => default_rnsh_config_dir(&home.ok_or("cannot locate home directory; use --config")?),
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not prepare rnsh directory {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+fn default_rnsh_config_dir(home: &Path) -> PathBuf {
+    if home.join(".config/rnsh").is_dir() {
         home.join(".config/rnsh")
     } else {
         home.join(".rnsh")
@@ -794,6 +832,8 @@ mod tests {
     fn parser_accepts_upstream_flag_surface() {
         let args = parse(&[
             "--config",
+            "/tmp/rnsh",
+            "--rnsconfig",
             "/tmp/rns",
             "--identity",
             "/tmp/id",
@@ -822,7 +862,8 @@ mod tests {
             "echo hi",
         ]);
 
-        assert_eq!(args.config, Some(PathBuf::from("/tmp/rns")));
+        assert_eq!(args.config, Some(PathBuf::from("/tmp/rnsh")));
+        assert_eq!(args.rnsconfig, Some(PathBuf::from("/tmp/rns")));
         assert_eq!(args.identity, Some(PathBuf::from("/tmp/id")));
         assert_eq!(args.verbose, 2);
         assert_eq!(args.quiet, 1);
@@ -864,19 +905,56 @@ mod tests {
 
     #[test]
     fn identity_paths_match_upstream_service_suffix() {
-        let paths = StoragePaths::from_config_dir(Path::new("/tmp/reticulum"));
+        let paths = Path::new("/tmp/rnsh");
+        assert_eq!(identity_path(None, paths, None), paths.join("identity"));
+        assert_eq!(
+            identity_path(None, paths, Some("сервис-1")),
+            paths.join("identity.сервис1")
+        );
         assert_eq!(
             identity_path(None, &paths, Some("default")),
-            PathBuf::from("/tmp/reticulum/storage/identities/rnsh.default")
+            PathBuf::from("/tmp/rnsh/identity.default")
         );
         assert_eq!(
             identity_path(None, &paths, Some("svc/name!")),
-            PathBuf::from("/tmp/reticulum/storage/identities/rnsh.svcname")
+            PathBuf::from("/tmp/rnsh/identity.svcname")
         );
         assert_eq!(
             identity_path(Some(Path::new("/tmp/custom")), &paths, None),
             PathBuf::from("/tmp/custom")
         );
+    }
+
+    #[test]
+    fn config_directory_precedence_and_identity_reuse() {
+        let root = std::env::temp_dir().join(format!(
+            "rnsh-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(default_rnsh_config_dir(&root), root.join(".rnsh"));
+        std::fs::create_dir_all(root.join(".config/rnsh")).unwrap();
+        assert_eq!(default_rnsh_config_dir(&root), root.join(".config/rnsh"));
+        let selected = rnsh_config_dir(Some(&root.join("custom"))).unwrap();
+        let path = identity_path(None, &selected, Some("default"));
+        let first = load_or_create_identity(&path).unwrap();
+        assert_eq!(first.hash, load_or_create_identity(&path).unwrap().hash);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 64);
+        std::fs::write(&path, b"invalid identity").unwrap();
+        assert!(load_or_create_identity(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid identity");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn timeout_accepts_fractional_seconds_without_panicking_on_invalid_values() {
+        assert_eq!(parse_timeout("0.25").unwrap(), 0.25);
+        for value in ["NaN", "inf", "-1", "0", "1e100", "1e-100"] {
+            assert!(Args::try_parse_from(["rnsh", &format!("--timeout={value}")]).is_err());
+        }
     }
 
     #[test]

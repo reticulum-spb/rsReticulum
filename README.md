@@ -174,12 +174,21 @@ rncp-rs     -f <destination_hash> <remote_path> [-s DEST_DIR]
 rnodeconf-rs [-i] [-N|-T] [-b|-B|-p] [-w MODE] [-D N] [-t N] [-R N] [--freq HZ]
             [--bw HZ] [--txp DBM] [--sf SF] [--cr CR] [-x|-X]
             [--eeprom-backup|--eeprom-dump] [--trust-key HASH] [--version] [PORT]
-rnsh-rs     -l [-i FILE] [-s NAME] [-b PERIOD] [-a HASH]... [-n] [-A|-C] [-- CMD...]
-rnsh-rs     [-i FILE] [-s NAME] [-N] [-m] [-w SECONDS] <destination_hash> [-- CMD...]
+rnsh-rs     [--config RNSH_DIR] [--rnsconfig RNS_DIR] -l [-i FILE] [-s NAME]
+            [-b PERIOD] [-a HASH]... [-n] [-A|-C] [-- CMD...]
+rnsh-rs     [--config RNSH_DIR] [--rnsconfig RNS_DIR] [-i FILE] [-N] [-m]
+            [-w SECONDS] <destination_hash> [-- CMD...]
 ```
 
 Add the release `bin/` directory or `target/release` to `PATH` if
 you want to call them without a path prefix.
+
+`rnsh-rs --config` now selects the **rnsh** directory; use `--rnsconfig` for
+Reticulum YAML configuration. Default identities are `~/.rnsh/identity` (client)
+and `~/.rnsh/identity.default` (listener), with an existing `~/.config/rnsh`
+taking precedence. To keep an existing destination, explicitly reuse the old
+identity with `-i`, or copy it to the new location before starting rnsh.
+See [rnsh configuration and migration](CONFIG.md#rnsh-configuration-and-migration).
 
 `rncp-rs` follows the established listener authentication model: without `-n`,
 incoming senders must match `-a <hash>` or an `allowed_identities` file.
