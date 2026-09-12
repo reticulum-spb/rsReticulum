@@ -167,8 +167,22 @@ impl TransportActor {
 
         if now - self.last_links_check >= LINKS_CHECK_INTERVAL {
             self.traffic.update_speeds();
+            self.packet_rates.sample();
             let sampled_at = std::time::Instant::now();
-            for entry in self.interfaces.values_mut() {
+            self.interface_rates
+                .retain(|id, _| self.interfaces.contains_key(id));
+            for (id, entry) in &mut self.interfaces {
+                let rx = entry
+                    .rxb
+                    .as_ref()
+                    .map(|v| v.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                let tx = entry
+                    .txb
+                    .as_ref()
+                    .map(|v| v.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                self.interface_rates.entry(*id).or_default().sample(rx, tx);
                 entry
                     .ingress
                     .traffic_sampler

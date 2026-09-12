@@ -445,10 +445,15 @@ fn rpc_response_to_transport_response(
             TransportQueryResponse::PathTable(entries)
         }
         RpcResponse::InterfaceStats(entries)
-        | RpcResponse::InterfaceStatsWithQueues(entries, _) => {
+        | RpcResponse::InterfaceStatsWithQueues(entries, _)
+        | RpcResponse::InterfaceStatsSnapshot {
+            interfaces: entries,
+            ..
+        } => {
             let entries = entries
                 .into_iter()
                 .map(|entry| InterfaceStatRpcEntry {
+                    tx_diagnostics: entry.tx_diagnostics,
                     control_traffic: entry.control_traffic,
                     inbound_diagnostics: entry.inbound_diagnostics,
                     blocked_ips: entry.blocked_ips,

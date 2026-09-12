@@ -131,8 +131,45 @@ fn handle_status(tx: &mpsc::Sender<TransportMessage>, data: &[u8]) -> Option<Vec
         None
     };
 
-    let stats = build_transport_stats(iface_stats);
+    let mut stats: rmpv::Value =
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&build_transport_stats(iface_stats)).ok()?)
+            .ok()?;
+    if let Some(TransportQueryResponse::InboundQueueStats(Some(queues))) =
+        blocking_query(tx, TransportQuery::GetInboundQueueStats)
+    {
+        // Reuse the local RPC wire fields so local and remote queue pressure
+        // and drop accounting cannot silently diverge.
+        let raw = crate::rpc::encode_response(&crate::rpc::RpcResponse::InterfaceStatsWithQueues(
+            Vec::new(),
+            queues,
+        ))
+        .ok()?;
+        let extra: rmpv::Value = rmp_serde::from_slice(&raw).ok()?;
+        if let (rmpv::Value::Map(fields), rmpv::Value::Map(extra)) = (&mut stats, extra) {
+            fields.extend(extra.into_iter().filter(|(key, _)| {
+                key.as_str()
+                    .is_some_and(|key| key.starts_with("rxq") || key.ends_with("qpressure"))
+            }));
+        }
+    }
 
+    if let Some(TransportQueryResponse::PacketStats(packets)) =
+        blocking_query(tx, TransportQuery::GetPacketStats)
+    {
+        if let rmpv::Value::Map(fields) = &mut stats {
+            fields.push(("rxpps".into(), packets.rxpps.into()));
+            fields.push(("txpps".into(), packets.txpps.into()));
+        }
+    }
+    if include_link_count {
+        if let Some(TransportQueryResponse::IntResult(count)) =
+            blocking_query(tx, TransportQuery::GetActiveLinkCount)
+        {
+            if let rmpv::Value::Map(fields) = &mut stats {
+                fields.push(("active_link_count".into(), count.max(0).into()));
+            }
+        }
+    }
     let bytes = if let Some(lc) = link_count {
         rmp_serde::to_vec_named(&(&stats, lc)).ok()?
     } else {
@@ -215,14 +252,23 @@ fn blocking_query(
 fn build_transport_stats(entries: Vec<InterfaceStatRpcEntry>) -> schema::TransportStats {
     let (total_rxb, total_txb) = entries
         .iter()
+        .filter(|e| e.role == "normal")
         .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
     let (total_rxs, total_txs) = entries
         .iter()
+        .filter(|e| e.role == "normal")
         .fold((0u64, 0u64), |(r, t), e| (r + e.rx_rate, t + e.tx_rate));
 
+    let control_traffic = rns_transport::traffic::ControlTraffic::total(
+        entries
+            .iter()
+            .filter(|e| e.role == "normal")
+            .map(|e| e.control_traffic),
+    );
     let interfaces = entries.into_iter().map(interface_stats_from_rpc).collect();
 
     schema::TransportStats {
+        control_traffic,
         interfaces,
         rxb: total_rxb,
         txb: total_txb,
@@ -244,6 +290,12 @@ fn interface_stats_from_rpc(e: InterfaceStatRpcEntry) -> schema::InterfaceStats 
         None
     };
     schema::InterfaceStats {
+        tx_diagnostics: e.tx_diagnostics,
+        control_traffic: e.control_traffic,
+        inbound_diagnostics: e.inbound_diagnostics,
+        mtu: e.mtu,
+        role: e.role,
+        tx_drops: e.tx_drops,
         blocked_ips: e.blocked_ips,
         blocked_ip_list: e.blocked_ip_list,
         gravity: e.gravity,
@@ -331,7 +383,14 @@ mod tests {
     #[test]
     fn status_response_is_python_compatible_list() {
         let stats = schema::TransportStats {
+            control_traffic: Default::default(),
             interfaces: vec![schema::InterfaceStats {
+                tx_diagnostics: Default::default(),
+                control_traffic: Default::default(),
+                inbound_diagnostics: Default::default(),
+                mtu: 500,
+                role: "normal".into(),
+                tx_drops: 0,
                 blocked_ips: 0,
                 blocked_ip_list: Vec::new(),
                 gravity: 0,
@@ -470,6 +529,7 @@ mod tests {
                     let resp = match query {
                         TransportQuery::GetInterfaceStats => {
                             let stats = vec![InterfaceStatRpcEntry {
+                                tx_diagnostics: Default::default(),
                                 control_traffic: Default::default(),
                                 inbound_diagnostics: Default::default(),
                                 blocked_ips: 1,

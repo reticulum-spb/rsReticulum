@@ -129,6 +129,14 @@ impl TransportActor {
     ) -> Option<PreparedInbound> {
         self.traffic
             .record_rx(packet.interface_id, packet.raw.len() as u64);
+        if !released_from_ingress
+            && self
+                .interfaces
+                .get(&packet.interface_id)
+                .is_some_and(|e| e.role == crate::messages::InterfaceRole::Normal)
+        {
+            self.packet_rates.rx = self.packet_rates.rx.saturating_add(1);
+        }
 
         // Python checks minimum framing before attempting IFAC processing.
         if packet.raw.len() <= 2 {

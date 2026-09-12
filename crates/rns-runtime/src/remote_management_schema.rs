@@ -24,6 +24,15 @@ pub(crate) mod bytes_opt {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InterfaceStats {
+    #[serde(flatten)]
+    pub tx_diagnostics: rns_transport::tx_queue::TxDiagnostics,
+    #[serde(default, flatten)]
+    pub control_traffic: rns_transport::traffic::ControlTraffic,
+    #[serde(flatten)]
+    pub inbound_diagnostics: rns_transport::messages::InboundDiagnostics,
+    pub mtu: u32,
+    pub role: String,
+    pub tx_drops: u64,
     #[serde(default)]
     pub blocked_ips: u64,
     #[serde(default)]
@@ -71,6 +80,8 @@ pub struct InterfaceStats {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportStats {
+    #[serde(flatten)]
+    pub control_traffic: rns_transport::traffic::ControlTraffic,
     pub interfaces: Vec<InterfaceStats>,
     pub rxb: u64,
     pub txb: u64,

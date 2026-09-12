@@ -8,6 +8,9 @@ impl TransportActor {
     ) -> crate::messages::TransportQueryResponse {
         use crate::messages::*;
         match query {
+            TransportQuery::GetPacketStats => {
+                TransportQueryResponse::PacketStats(self.packet_rates.sample())
+            }
             TransportQuery::GetInboundQueueStats => TransportQueryResponse::InboundQueueStats(
                 self.control_rx
                     .as_ref()
@@ -73,6 +76,7 @@ impl TransportActor {
                             .and_then(|diagnostics| diagnostics.blocked_ip_list())
                             .unwrap_or_default();
                         InterfaceStatRpcEntry {
+                            tx_diagnostics: entry.tx.diagnostics(),
                             control_traffic: entry.ingress.traffic,
                             inbound_diagnostics: entry.inbound_diagnostics,
                             blocked_ips: blocked_ip_list.len() as u64,
@@ -83,8 +87,16 @@ impl TransportActor {
                             name: entry.name.clone(),
                             rx_bytes,
                             tx_bytes,
-                            rx_rate: 0,
-                            tx_rate: 0,
+                            rx_rate: self
+                                .interface_rates
+                                .get(&iface_id)
+                                .map(|s| s.rates.0)
+                                .unwrap_or(0),
+                            tx_rate: self
+                                .interface_rates
+                                .get(&iface_id)
+                                .map(|s| s.rates.1)
+                                .unwrap_or(0),
                             online,
                             bitrate: entry.bitrate,
                             mtu: entry.mtu,
@@ -142,6 +154,12 @@ impl TransportActor {
             TransportQuery::GetLinkCount => {
                 TransportQueryResponse::IntResult(self.link_table.len() as i64)
             }
+            TransportQuery::GetActiveLinkCount => TransportQueryResponse::IntResult(
+                self.link_table
+                    .iter()
+                    .filter(|(_, entry)| entry.validated)
+                    .count() as i64,
+            ),
             TransportQuery::GetRecentAnnounces => {
                 let mut entries: Vec<AnnounceRpcEntry> = self
                     .recent_announces

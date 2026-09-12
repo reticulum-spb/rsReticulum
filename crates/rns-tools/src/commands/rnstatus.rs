@@ -61,8 +61,18 @@ struct Args {
     /// Display traffic totals.
     #[arg(short, long)]
     totals: bool,
+    /// Show inbound queue heights, drops and pressure (--quiet keeps its old -q).
+    #[arg(long)]
+    queues: bool,
+    /// Show packet rates in the global diagnostics.
+    #[arg(short = 'p', long)]
+    pps: bool,
+    /// Show peer profiling results when available (Rust uses tracing spans).
+    #[arg(short = 'z', long)]
+    profiling: bool,
 
-    /// Sort interfaces by rate, traffic, rx, tx, rxs, txs, announces, arx, atx, prx, ptx or held.
+    /// Sort by rate, traffic, rx/tx/rxs/txs, announces/anns, arx/atx/prx/ptx,
+    /// arxc/atxc/prxc/ptxc, held, gravity/g, pvs/ivs/flt, txdrp/txdrb/txbuf.
     #[arg(short, long)]
     sort: Option<String>,
 
@@ -231,26 +241,48 @@ async fn run_local_once(args: &Args) -> ExitCode {
     let timeout = Duration::from_secs(args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
     let endpoint = rc.shared_rpc_endpoint(&std::env::temp_dir());
 
-    let stats =
-        match local_rpc_request(&endpoint, &rpc_key, &RpcRequest::GetInterfaceStats, timeout).await
-        {
-            Ok(RpcResponse::InterfaceStats(v)) => v,
-            Ok(RpcResponse::Error(e)) => {
-                eprintln!("rnstatus-rs: {e}");
-                return ExitCode::from(1);
-            }
-            Ok(other) => {
-                eprintln!("rnstatus-rs: unexpected response: {other:?}");
-                return ExitCode::from(1);
-            }
-            Err(e) => {
-                eprintln!(
-                    "rnstatus-rs: {}",
-                    local_rpc_failure_message(&endpoint, &config_dir, &e)
-                );
-                return ExitCode::from(1);
-            }
-        };
+    let raw_stats = match &endpoint {
+        SharedInstanceRpcEndpoint::Tcp(port) => {
+            rpc::connect_and_request_raw(*port, &rpc_key, &RpcRequest::GetInterfaceStats, timeout)
+                .await
+        }
+        SharedInstanceRpcEndpoint::Unix(path) => {
+            rpc::connect_unix_and_request_raw(
+                path,
+                &rpc_key,
+                &RpcRequest::GetInterfaceStats,
+                timeout,
+            )
+            .await
+        }
+    };
+    let mut diagnostics = raw_stats
+        .as_ref()
+        .ok()
+        .and_then(|raw| rmp_serde::from_slice::<rmpv::Value>(raw).ok())
+        .and_then(|v| v.as_map().map(|m| diagnostic_fields(m, true)))
+        .unwrap_or_default();
+    add_profiling(&mut diagnostics, args, None);
+    let stats = match raw_stats
+        .and_then(|raw| rpc::decode_response_for_request(&raw, &RpcRequest::GetInterfaceStats))
+    {
+        Ok(RpcResponse::InterfaceStats(v)) => v,
+        Ok(RpcResponse::Error(e)) => {
+            eprintln!("rnstatus-rs: {e}");
+            return ExitCode::from(1);
+        }
+        Ok(other) => {
+            eprintln!("rnstatus-rs: unexpected response: {other:?}");
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "rnstatus-rs: {}",
+                local_rpc_failure_message(&endpoint, &config_dir, &e)
+            );
+            return ExitCode::from(1);
+        }
+    };
 
     let link_count = if args.link_stats {
         match local_rpc_request(&endpoint, &rpc_key, &RpcRequest::GetLinkCount, timeout).await {
@@ -261,10 +293,22 @@ async fn run_local_once(args: &Args) -> ExitCode {
         None
     };
 
+    if args.link_stats {
+        if let Ok(RpcResponse::IntResult(count)) = local_rpc_request(
+            &endpoint,
+            &rpc_key,
+            &RpcRequest::GetActiveLinkCount,
+            timeout,
+        )
+        .await
+        {
+            diagnostics.insert("active_link_count".into(), count.into());
+        }
+    }
     if args.json {
-        print_local_json(&stats, link_count, args);
+        print_local_json(&stats, link_count, args, &diagnostics);
     } else {
-        print_local_human(&stats, link_count, args);
+        print_local_human(&stats, link_count, args, &diagnostics);
     }
 
     ExitCode::SUCCESS
@@ -353,6 +397,8 @@ fn local_rpc_failure_message(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortKey {
+    Diagnostic(&'static str),
+    Gravity,
     Rate,
     Rx,
     Tx,
@@ -385,13 +431,24 @@ fn parse_sort_key(value: Option<&str>) -> Result<Option<SortKey>, String> {
         return Ok(None);
     };
     let key = match value.to_ascii_lowercase().as_str() {
+        "gravity" | "g" => SortKey::Gravity,
         "rate" | "bitrate" => SortKey::Rate,
         "rx" => SortKey::Rx,
         "tx" => SortKey::Tx,
         "rxs" => SortKey::RxRate,
         "txs" => SortKey::TxRate,
         "traffic" => SortKey::Traffic,
-        "announces" | "announce" => SortKey::Announces,
+        "announces" | "announce" | "anns" => SortKey::Announces,
+        "arxc" => SortKey::Diagnostic("arxc"),
+        "atxc" => SortKey::Diagnostic("atxc"),
+        "prxc" => SortKey::Diagnostic("prxc"),
+        "ptxc" => SortKey::Diagnostic("ptxc"),
+        "pvs" => SortKey::Diagnostic("protocol_violations"),
+        "ivs" => SortKey::Diagnostic("ifac_violations"),
+        "flt" => SortKey::Diagnostic("packet_filter_hits"),
+        "txdrp" => SortKey::Diagnostic("tx_drops"),
+        "txdrb" => SortKey::Diagnostic("txdrb"),
+        "txbuf" => SortKey::Diagnostic("txbuffered"),
         "arx" => SortKey::AnnounceRx,
         "atx" => SortKey::AnnounceTx,
         "prx" => SortKey::PathRequestRx,
@@ -399,7 +456,7 @@ fn parse_sort_key(value: Option<&str>) -> Result<Option<SortKey>, String> {
         "held" => SortKey::Held,
         _ => {
             return Err(format!(
-                "--sort must be one of rate, traffic, rx, tx, rxs, txs, announces, arx, atx, prx, ptx or held; got {value}"
+                "--sort must be rate, traffic, rx, tx, rxs, txs, announces/anns, arx, atx, prx, ptx, arxc, atxc, prxc, ptxc, held, gravity/g, pvs, ivs, flt, txdrp, txdrb or txbuf; got {value}"
             ));
         }
     };
@@ -408,6 +465,12 @@ fn parse_sort_key(value: Option<&str>) -> Result<Option<SortKey>, String> {
 
 fn local_stat_sort_value(e: &rpc::InterfaceStatEntry, key: SortKey) -> f64 {
     match key {
+        SortKey::Diagnostic("tx_drops") => e.tx_drops as f64,
+        SortKey::Diagnostic(key) => local_interface_diagnostics(e)
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        SortKey::Gravity => e.gravity as f64,
         SortKey::Rate => e.bitrate as f64,
         SortKey::Rx => e.rx_bytes as f64,
         SortKey::Tx => e.tx_bytes as f64,
@@ -501,16 +564,25 @@ fn filtered_local_stats<'a>(
         .collect();
     if let Ok(Some(key)) = parse_sort_key(args.sort.as_deref()) {
         entries.sort_by(|a, b| {
-            let ord = local_stat_sort_value(a, key)
-                .partial_cmp(&local_stat_sort_value(b, key))
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let ord = if key == SortKey::Gravity {
+                a.gravity.cmp(&b.gravity)
+            } else {
+                local_stat_sort_value(a, key)
+                    .partial_cmp(&local_stat_sort_value(b, key))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            };
             if args.reverse { ord } else { ord.reverse() }
         });
     }
     entries
 }
 
-fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, args: &Args) {
+fn print_local_human(
+    stats: &[rpc::InterfaceStatEntry],
+    link_count: Option<i64>,
+    args: &Args,
+    diagnostics: &serde_json::Map<String, serde_json::Value>,
+) {
     println!(
         "Reticulum Status [rnstatus-rs {}]",
         env!("CARGO_PKG_VERSION")
@@ -527,6 +599,7 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
             println!("    Status   : {status}");
             println!("    Mode     : {}", mode_display_name(&entry.mode));
             println!("    Role     : {}", entry.role);
+            println!("    Gravity  : {}", entry.gravity);
             println!("    Bitrate  : {}", format::pretty_speed(entry.bitrate));
             println!("    MTU      : {} B", entry.mtu);
             if let Some(clients) = entry.clients {
@@ -590,13 +663,16 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
                 println!("    TX drops : {}", entry.tx_drops);
             }
             print_blocked_ips(entry.blocked_ips, &entry.blocked_ip_list, args.blocked_ips);
+            print_diagnostics(&local_interface_diagnostics(entry), "    ", args);
             println!();
         }
     }
 
+    print_diagnostics(diagnostics, "  ", args);
     if args.totals {
         let (rxb, txb) = stats
             .iter()
+            .filter(|e| e.role == "normal")
             .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
         println!("  Totals:");
         println!("    RX : {}", format::pretty_size(rxb));
@@ -605,23 +681,31 @@ fn print_local_human(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>,
     }
 
     if let Some(n) = link_count {
-        println!("  Active links: {n}");
+        println!("  Link table entries: {n}");
     }
 }
 
-fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, args: &Args) {
+fn print_local_json(
+    stats: &[rpc::InterfaceStatEntry],
+    link_count: Option<i64>,
+    args: &Args,
+    diagnostics: &serde_json::Map<String, serde_json::Value>,
+) {
     let (total_rxb, total_txb) = stats
         .iter()
+        .filter(|e| e.role == "normal")
         .fold((0u64, 0u64), |(r, t), e| (r + e.rx_bytes, t + e.tx_bytes));
     let entries = filtered_local_stats(stats, args);
 
     print!("{{\"interfaces\":[");
     for (i, e) in entries.iter().enumerate() {
+        let gravity = e.gravity;
+        let extra = diagnostic_json_fields(&local_interface_diagnostics(e));
         if i > 0 {
             print!(",");
         }
         print!(
-            "{{\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{},\"blocked_ips\":{},\"blocked_ip_list\":{}}}",
+            "{{{extra}\"gravity\":{gravity},\"name\":{},\"online\":{},\"mode\":{},\"role\":{},\"bitrate\":{},\"mtu\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"tx_drops\":{},\"blocked_ips\":{},\"blocked_ip_list\":{}}}",
             json_str(&e.name),
             e.online,
             json_str(&e.mode),
@@ -660,6 +744,7 @@ fn print_local_json(stats: &[rpc::InterfaceStatEntry], link_count: Option<i64>, 
     if let Some(n) = link_count {
         print!(",\"link_count\":{n}");
     }
+    print_diagnostic_json(diagnostics);
     println!("}}");
 }
 
@@ -991,7 +1076,7 @@ impl RemoteSession {
 
     async fn query_and_print(&self, args: &Args) -> ExitCode {
         // Wire format: msgpack 1-tuple `(include_link_count,)`.
-        let payload = match rmp_serde::to_vec(&(args.link_stats,)) {
+        let payload = match rmp_serde::to_vec(&(args.link_stats, args.profiling)) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("rnstatus-rs: msgpack encode failed: {e}");
@@ -1027,6 +1112,8 @@ impl RemoteSession {
 
 #[derive(Debug, Clone)]
 struct RemoteInterface {
+    diagnostics: serde_json::Map<String, serde_json::Value>,
+    gravity: i64,
     blocked_ips: u64,
     blocked_ip_list: Vec<String>,
     name: String,
@@ -1056,6 +1143,12 @@ struct RemoteInterface {
 impl RemoteInterface {
     fn sort_value(&self, key: SortKey) -> f64 {
         match key {
+            SortKey::Diagnostic(key) => self
+                .diagnostics
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            SortKey::Gravity => self.gravity as f64,
             SortKey::Rate => self.bitrate as f64,
             SortKey::Rx => self.rxb as f64,
             SortKey::Tx => self.txb as f64,
@@ -1098,6 +1191,8 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         }
     };
     let link_count = arr.get(1).and_then(|v| v.as_u64());
+    let mut diagnostics = diagnostic_fields(stats, true);
+    add_profiling(&mut diagnostics, args, arr.get(2));
 
     let interfaces = stats
         .iter()
@@ -1132,10 +1227,13 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         .unwrap_or_default();
     if let Ok(Some(key)) = parse_sort_key(args.sort.as_deref()) {
         parsed_interfaces.sort_by(|a, b| {
-            let ord = a
-                .sort_value(key)
-                .partial_cmp(&b.sort_value(key))
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let ord = if key == SortKey::Gravity {
+                a.gravity.cmp(&b.gravity)
+            } else {
+                a.sort_value(key)
+                    .partial_cmp(&b.sort_value(key))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            };
             if args.reverse { ord } else { ord.reverse() }
         });
     }
@@ -1144,11 +1242,13 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         print!("{{");
         print!("\"interfaces\":[");
         for (i, iface) in parsed_interfaces.iter().enumerate() {
+            let gravity = iface.gravity;
+            let extra = diagnostic_json_fields(&iface.diagnostics);
             if i > 0 {
                 print!(",");
             }
             print!(
-                "{{\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"blocked_ips\":{},\"blocked_ip_list\":{}}}",
+                "{{{extra}\"gravity\":{gravity},\"name\":{},\"online\":{},\"mode\":{},\"bitrate\":{},\"rxb\":{},\"txb\":{},\"rxs\":{},\"txs\":{},\"announce_queue\":{},\"held_announces\":{},\"incoming_announce_frequency\":{},\"outgoing_announce_frequency\":{},\"incoming_pr_frequency\":{},\"outgoing_pr_frequency\":{},\"burst_active\":{},\"burst_activated\":{},\"pr_burst_active\":{},\"pr_burst_activated\":{},\"clients\":{},\"announce_rate_target\":{},\"announce_rate_grace\":{},\"announce_rate_penalty\":{},\"blocked_ips\":{},\"blocked_ip_list\":{}}}",
                 json_str(&iface.name),
                 iface.online,
                 iface.mode,
@@ -1185,17 +1285,20 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         if let Some(n) = link_count {
             print!(",\"link_count\":{n}");
         }
+        print_diagnostic_json(&diagnostics);
         println!("}}");
         return ExitCode::SUCCESS;
     }
 
     println!("Remote Reticulum Status");
+    print_diagnostics(&diagnostics, "  ", args);
     println!();
 
     if !parsed_interfaces.is_empty() {
         for iface in &parsed_interfaces {
             let status = if iface.online { "Up" } else { "Down" };
             println!("  {}", iface.name);
+            println!("    Gravity  : {}", iface.gravity);
             println!("    Status   : {status}");
             println!("    Mode     : {}", remote_mode_display_name(iface.mode));
             println!("    Bitrate  : {}", format::pretty_speed(iface.bitrate));
@@ -1254,6 +1357,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
                 );
             }
             print_blocked_ips(iface.blocked_ips, &iface.blocked_ip_list, args.blocked_ips);
+            print_diagnostics(&iface.diagnostics, "    ", args);
             println!();
         }
     } else {
@@ -1267,7 +1371,7 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
         println!();
     }
     if let Some(n) = link_count {
-        println!("  Active links: {n}");
+        println!("  Link table entries: {n}");
     }
 
     ExitCode::SUCCESS
@@ -1275,6 +1379,12 @@ fn print_remote_status(bytes: &[u8], args: &Args) -> ExitCode {
 
 fn remote_interface_from_map(m: &[(rmpv::Value, rmpv::Value)]) -> RemoteInterface {
     RemoteInterface {
+        diagnostics: diagnostic_fields(m, false),
+        gravity: m
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("gravity"))
+            .and_then(|(_, value)| value.as_i64())
+            .unwrap_or(0),
         blocked_ips: map_u64(m, "blocked_ips").unwrap_or(0),
         blocked_ip_list: m
             .iter()
@@ -1324,6 +1434,171 @@ fn print_blocked_ips(count: u64, ips: &[String], show_list: bool) {
             for ip in ips {
                 println!("               {ip}");
             }
+        }
+    }
+}
+
+const CONTROL_FIELDS: &[&str] = &[
+    "arxb", "atxb", "arxc", "atxc", "prxb", "ptxb", "prxc", "ptxc", "arxs", "atxs", "prxs", "ptxs",
+];
+const QUEUE_FIELDS: &[&str] = &[
+    "rxqt",
+    "rxqtd",
+    "rxqd",
+    "rxqdd",
+    "rxqa",
+    "rxqad",
+    "rxqp",
+    "rxqpd",
+    "rxqil",
+    "rxqild",
+    "tqpressure",
+    "dqpressure",
+    "aqpressure",
+    "pqpressure",
+    "ilqpressure",
+];
+
+fn diagnostic_fields(
+    map: &[(rmpv::Value, rmpv::Value)],
+    global: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut result = serde_json::Map::new();
+    let extra: &[&str] = if global {
+        &[
+            "rxpps",
+            "txpps",
+            "rss",
+            "transport_uptime",
+            "active_link_count",
+        ]
+    } else {
+        &[
+            "protocol_violations",
+            "ifac_violations",
+            "packet_filter_hits",
+            "txbuffered",
+            "txstalled",
+            "tx_queue_frames",
+            "tx_drops",
+            "txdrp",
+            "txdrb",
+            "mtu",
+            "role",
+        ]
+    };
+    for key in CONTROL_FIELDS
+        .iter()
+        .chain(extra)
+        .chain(if global { QUEUE_FIELDS } else { &[] })
+    {
+        if let Some((_, value)) = map.iter().find(|(k, _)| k.as_str() == Some(key)) {
+            if let Ok(value) = serde_json::to_value(value) {
+                result.insert((*key).into(), value);
+            }
+        }
+    }
+    if !global && !result.contains_key("tx_drops") {
+        if let Some(value) = result.get("txdrp").cloned() {
+            result.insert("tx_drops".into(), value);
+        }
+    }
+    result
+}
+
+fn add_profiling(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    args: &Args,
+    data: Option<&rmpv::Value>,
+) {
+    if args.profiling {
+        let value = data
+            .and_then(|v| serde_json::to_value(v).ok())
+            .unwrap_or(serde_json::Value::Null);
+        fields.insert("profiling_supported".into(), (!value.is_null()).into());
+        fields.insert("profiling".into(), value);
+    }
+}
+
+fn local_interface_diagnostics(
+    entry: &rpc::InterfaceStatEntry,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut result = serde_json::to_value(entry.control_traffic)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    result.extend(
+        serde_json::to_value(entry.inbound_diagnostics)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    result.extend(
+        serde_json::to_value(entry.tx_diagnostics)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    result
+}
+
+fn diagnostic_json_fields(fields: &serde_json::Map<String, serde_json::Value>) -> String {
+    fields
+        .iter()
+        .map(|(key, value)| format!("{}:{value},", json_str(key)))
+        .collect()
+}
+
+fn print_diagnostic_json(fields: &serde_json::Map<String, serde_json::Value>) {
+    for (key, value) in fields {
+        print!(",{}:{value}", json_str(key));
+    }
+}
+
+fn print_diagnostics(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    indent: &str,
+    args: &Args,
+) {
+    if indent == "  " && args.pps && !fields.contains_key("rxpps") {
+        println!("  PPS: unavailable from this peer");
+    }
+    if indent == "  " && args.queues && !fields.contains_key("rxqt") {
+        println!("  Inbound queues: unavailable from this peer");
+    }
+    for (key, value) in fields {
+        if key == "profiling" && args.profiling {
+            if value.is_null() {
+                println!(
+                    "{indent}Profiling: unavailable (Rust exposes tracing spans, not Python profiler results)"
+                );
+            } else {
+                println!("{indent}Profiling: {value}");
+            }
+            continue;
+        }
+        let shown = if key == "active_link_count" {
+            args.link_stats
+        } else if key.starts_with("tx") && args.queues {
+            true
+        } else if QUEUE_FIELDS.contains(&key.as_str()) {
+            args.queues
+        } else if key.ends_with("pps") {
+            args.pps
+        } else if CONTROL_FIELDS.contains(&key.as_str()) {
+            if key.starts_with('a') {
+                args.announce_stats
+            } else {
+                args.pr_stats
+            }
+        } else {
+            value.as_f64().is_some_and(|v| v != 0.0) || value.as_bool() == Some(true)
+        };
+        if shown {
+            println!("{indent}{key}: {value}");
         }
     }
 }
@@ -1489,6 +1764,9 @@ mod tests {
             burst: false,
             blocked_ips: false,
             totals: false,
+            queues: false,
+            pps: false,
+            profiling: false,
             sort: None,
             reverse: false,
             json: false,
@@ -1513,6 +1791,7 @@ mod tests {
         pr_burst_active: bool,
     ) -> rpc::InterfaceStatEntry {
         rpc::InterfaceStatEntry {
+            tx_diagnostics: Default::default(),
             control_traffic: Default::default(),
             inbound_diagnostics: Default::default(),
             blocked_ips: 0,
@@ -1595,6 +1874,80 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["AnnounceBurstIf", "PrBurstIf", "ManualMatchIf"]);
+    }
+
+    #[test]
+    fn gravity_sort_and_legacy_remote_default() {
+        assert_eq!(
+            parse_sort_key(Some("gravity")).unwrap(),
+            Some(SortKey::Gravity)
+        );
+        assert_eq!(parse_sort_key(Some("g")).unwrap(), Some(SortKey::Gravity));
+        let mut low = local_entry("Low", false, false);
+        low.gravity = -42;
+        let mut high = local_entry("High", false, false);
+        high.gravity = i64::MAX;
+        let mut near = local_entry("Near", false, false);
+        near.gravity = i64::MAX - 1;
+        let stats = [near, low, high];
+        let mut args = test_args();
+        args.sort = Some("g".into());
+        assert_eq!(
+            filtered_local_stats(&stats, &args)
+                .iter()
+                .map(|e| e.gravity)
+                .collect::<Vec<_>>(),
+            [i64::MAX, i64::MAX - 1, -42]
+        );
+        args.reverse = true;
+        assert_eq!(
+            filtered_local_stats(&stats, &args)
+                .iter()
+                .map(|e| e.gravity)
+                .collect::<Vec<_>>(),
+            [-42, i64::MAX - 1, i64::MAX]
+        );
+        for gravity in [-42, i64::MAX] {
+            let remote = remote_interface_from_map(&[("gravity".into(), gravity.into())]);
+            assert_eq!(remote.gravity, gravity);
+        }
+        assert_eq!(remote_interface_from_map(&[]).gravity, 0);
+    }
+
+    #[test]
+    fn diagnostics_preserve_wire_values_and_optional_fields() {
+        let fields = diagnostic_fields(
+            &[
+                ("rxqt".into(), 3.into()),
+                ("dqpressure".into(), 0.5.into()),
+                ("rxpps".into(), 1.25.into()),
+                ("arxc".into(), 7.into()),
+            ],
+            true,
+        );
+        assert_eq!(fields["rxqt"], json!(3));
+        assert_eq!(fields["dqpressure"], json!(0.5));
+        assert_eq!(fields["rxpps"], json!(1.25));
+        assert!(!fields.contains_key("txpps"));
+        let encoded = format!("{{{}\"name\":\"test\"}}", diagnostic_json_fields(&fields));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["arxc"],
+            json!(7)
+        );
+        let remote = remote_interface_from_map(&[
+            ("txdrp".into(), 5.into()),
+            ("protocol_violations".into(), 9.into()),
+            ("txbuffered".into(), rmpv::Value::Nil),
+        ]);
+        assert_eq!(remote.diagnostics["tx_drops"], json!(5));
+        assert!(remote.diagnostics["txbuffered"].is_null());
+        assert_eq!(
+            remote.sort_value(parse_sort_key(Some("pvs")).unwrap().unwrap()),
+            9.0
+        );
+        let args =
+            Args::try_parse_from(["rnstatus-rs", "--queues", "--pps", "--profiling"]).unwrap();
+        assert!(args.queues && args.pps && args.profiling);
     }
 
     #[test]

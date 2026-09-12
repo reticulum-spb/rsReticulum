@@ -66,6 +66,8 @@ pub struct TransportActor {
     pub rate_table: RateTable,
     pub blackhole_table: BlackholeTable,
     pub traffic: TrafficCounter,
+    packet_rates: crate::traffic::PacketRateCounter,
+    interface_rates: HashMap<InterfaceId, crate::traffic::ByteRateSampler>,
     pub packet_metrics: HashMap<[u8; 32], PacketMetrics>,
     pub packet_metrics_order: VecDeque<[u8; 32]>,
 
@@ -364,6 +366,8 @@ impl TransportActor {
             rate_table: RateTable::new(),
             blackhole_table: BlackholeTable::new(),
             traffic: TrafficCounter::new(),
+            packet_rates: Default::default(),
+            interface_rates: HashMap::new(),
             packet_metrics: HashMap::new(),
             packet_metrics_order: VecDeque::new(),
             receipt_table: HashMap::new(),
@@ -1378,6 +1382,9 @@ impl TransportActor {
         };
         match entry.tx.try_send(data) {
             Ok(()) => {
+                if entry.role == InterfaceRole::Normal {
+                    self.packet_rates.tx = self.packet_rates.tx.saturating_add(1);
+                }
                 // Count the actual frame after hop/header mangling, but before
                 // IFAC. Queue rejection is not a transmitted control packet.
                 if let Ok((header, _)) = rns_wire::header::PacketHeader::unpack(raw) {

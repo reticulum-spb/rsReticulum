@@ -126,8 +126,47 @@ The shared-instance MessagePack `interface_stats` response includes the Python
 Queue counts and pressure come from one actor snapshot. Interface counters are
 sampled separately. The total drop counter saturates at `u64::MAX`, the maximum
 unsigned MessagePack integer. Existing Rust interface-only RPC decoders retain
-their response shape and ignore these additional fields. `rnstatus-rs` display
-and remote-management propagation of queue metrics remain pending.
+their response shape and ignore these additional fields. `rnstatus-rs` retains
+the authenticated raw snapshot for diagnostics; local and remote `--queues`
+show these fields, and JSON includes them whenever supplied by the peer.
+
+### rnstatus diagnostics
+
+Local and remote status include gravity, protocol/IFAC violations, packet-filter
+hits, blocked Backbone IPs, and detailed announce/path-request bytes, packet
+counts and rates. `-A` and `-P` show the respective traffic breakdowns. Existing
+JSON names/types remain unchanged; diagnostic fields are additive. Missing fields
+from older peers remain unavailable (gravity defaults to zero). `--blocked-ips`
+retains the existing address-list display.
+
+`--queues` shows inbound counts/drops/pressure and TX diagnostics. `-q` remains
+the existing Rust quiet flag, unlike Python. Byte-accounted drivers report
+`txbuffered` (encoded bytes reserved across queues and active writes), `txdrb`
+(dropped encoded bytes), and `txstalled` (egress gate). Plain channels report
+null for those byte/gate measurements, not zero; `tx_queue_frames` separately
+reports queued frames. `tx_drops` remains the packet drop counter; Python's
+`txdrp` is accepted as an alias when reading remote status.
+
+`-p`/`--pps` shows external packet rates. RX counts actor arrivals before protocol
+validation, excluding ingress reprocessing; TX counts successful queue admission,
+not confirmed physical transmission. Rates use elapsed monotonic time and are
+sampled at least one second apart, also on actor maintenance ticks. Interface
+RX/TX bit rates use driver byte-counter deltas over elapsed time; the initial
+sample establishes a baseline. Shared-server/client/peer roles are excluded from
+external totals and control-traffic totals, independent of display filters.
+
+`-l` retains `link_count` (all link-table entries) and adds `active_link_count`
+(validated entries), following the distinct Python queries. It is not a count
+of all application-owned LinkSession objects. Old peers lacking the new query
+continue showing only the original count.
+
+Sorting also accepts `anns`, `arxc`, `atxc`, `prxc`, `ptxc`, `pvs`, `ivs`, `flt`,
+`txdrp`, `txdrb`, and `txbuf`. Existing sort keys and reverse behavior remain.
+`-z`/`--profiling` requests and displays remote profiler data when available.
+Rust exposes tracing spans instead of the Python decorator profiler; it reports
+profiling as unavailable rather than synthesizing results. With this flag JSON
+contains `profiling` and `profiling_supported`. This does not install a profiler,
+enable tracing collection, or claim Python native-compilation status.
 
 ### Announce and path-request traffic counters (partial 1.5.2 coverage)
 
@@ -687,6 +726,12 @@ level as `type`:
 | `announces_from_internal` | boolean | `true` | Permit rebroadcast of announces learned from internal interfaces. |
 | `gravity` | signed integer or null | `null` | Inherit `reticulum.default_gravity` when absent; explicit `0` overrides that default. Accepted TCP/Backbone and Auto children inherit their parent's gravity. |
 | `announces_to_internal` | boolean or null | `null` | `true` permits this interface's boundary-origin announces on internal egress. False/null retain mode policy (not a blanket deny). Accepted children keep null, as in Python. |
+
+`rnstatus-rs` displays signed interface gravity in both local and remote status,
+including the additive JSON field `gravity`. `--sort gravity` (alias `--sort g`)
+orders highest first; `--reverse` orders lowest first, matching Python. Sorting
+compares integers without floating-point precision loss. A legacy remote reply
+without the field uses zero, consistent with the existing RPC default.
 
 Gravity breaks ties between equally dated announces when the candidate has no
 more hops than the current route. It does not override announce freshness or

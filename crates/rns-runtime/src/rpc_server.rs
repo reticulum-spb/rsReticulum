@@ -313,6 +313,7 @@ async fn process_rpc_request(
                     let rpc_entries = entries
                         .into_iter()
                         .map(|e| rpc::InterfaceStatEntry {
+                            tx_diagnostics: e.tx_diagnostics,
                             control_traffic: e.control_traffic,
                             inbound_diagnostics: e.inbound_diagnostics,
                             blocked_ips: e.blocked_ips,
@@ -349,12 +350,22 @@ async fn process_rpc_request(
                             tx_drops: e.tx_drops,
                         })
                         .collect();
-                    match query_transport(transport_tx, TransportQuery::GetInboundQueueStats).await
-                    {
-                        Some(TransportQueryResponse::InboundQueueStats(Some(queues))) => {
-                            RpcResponse::InterfaceStatsWithQueues(rpc_entries, queues)
-                        }
-                        _ => RpcResponse::InterfaceStats(rpc_entries),
+                    let queues =
+                        match query_transport(transport_tx, TransportQuery::GetInboundQueueStats)
+                            .await
+                        {
+                            Some(TransportQueryResponse::InboundQueueStats(queues)) => queues,
+                            _ => None,
+                        };
+                    let packets =
+                        match query_transport(transport_tx, TransportQuery::GetPacketStats).await {
+                            Some(TransportQueryResponse::PacketStats(packets)) => Some(packets),
+                            _ => None,
+                        };
+                    RpcResponse::InterfaceStatsSnapshot {
+                        interfaces: rpc_entries,
+                        queues,
+                        packets,
                     }
                 }
                 _ => RpcResponse::Error(
@@ -385,6 +396,12 @@ async fn process_rpc_request(
             match query_transport(transport_tx, TransportQuery::GetLinkCount).await {
                 Some(TransportQueryResponse::IntResult(n)) => RpcResponse::IntResult(n),
                 _ => RpcResponse::IntResult(0),
+            }
+        }
+        RpcRequest::GetActiveLinkCount => {
+            match query_transport(transport_tx, TransportQuery::GetActiveLinkCount).await {
+                Some(TransportQueryResponse::IntResult(n)) => RpcResponse::IntResult(n),
+                _ => RpcResponse::Error("active Link count unavailable".into()),
             }
         }
         RpcRequest::GetNextHopIfName { destination_hash } => {
@@ -1003,7 +1020,11 @@ listener.close()
         );
         let task = tokio::spawn(actor.run());
         let response = process_rpc_request(RpcRequest::GetInterfaceStats, &control).await;
-        let RpcResponse::InterfaceStatsWithQueues(_, queues) = response else {
+        let RpcResponse::InterfaceStatsSnapshot {
+            queues: Some(queues),
+            ..
+        } = response
+        else {
             panic!("missing queue stats")
         };
         assert_eq!(queues.capacities, [2, 3, 4, 5]);

@@ -2,6 +2,71 @@ use std::collections::HashMap;
 
 use crate::messages::InterfaceId;
 
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct PacketStats {
+    pub rxpps: f64,
+    pub txpps: f64,
+}
+
+/// Actor ingress / successful egress admissions on external interfaces only.
+pub struct PacketRateCounter {
+    pub rx: u64,
+    pub tx: u64,
+    sampled_at: std::time::Instant,
+    stats: PacketStats,
+}
+
+impl Default for PacketRateCounter {
+    fn default() -> Self {
+        Self {
+            rx: 0,
+            tx: 0,
+            sampled_at: std::time::Instant::now(),
+            stats: PacketStats::default(),
+        }
+    }
+}
+
+impl PacketRateCounter {
+    pub fn sample(&mut self) -> PacketStats {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.sampled_at).as_secs_f64();
+        if elapsed >= 1.0 {
+            self.stats = PacketStats {
+                rxpps: self.rx as f64 / elapsed,
+                txpps: self.tx as f64 / elapsed,
+            };
+            self.rx = 0;
+            self.tx = 0;
+            self.sampled_at = now;
+        }
+        self.stats
+    }
+}
+
+/// Control-plane packet counts and bytes, excluding IFAC and driver framing.
+#[derive(Default)]
+pub struct ByteRateSampler {
+    previous: Option<(std::time::Instant, u64, u64)>,
+    pub rates: (u64, u64),
+}
+
+impl ByteRateSampler {
+    pub fn sample(&mut self, rx: u64, tx: u64) {
+        let now = std::time::Instant::now();
+        if let Some((previous, old_rx, old_tx)) = self.previous {
+            let elapsed = now.duration_since(previous).as_secs_f64();
+            if elapsed > 0.0 {
+                self.rates = (
+                    (rx.saturating_sub(old_rx) as f64 * 8.0 / elapsed) as u64,
+                    (tx.saturating_sub(old_tx) as f64 * 8.0 / elapsed) as u64,
+                );
+            }
+        }
+        self.previous = Some((now, rx, tx));
+    }
+}
+
 /// Control-plane packet counts and bytes, excluding IFAC and driver framing.
 /// Owned by an interface registration, not by a destination or packet hash.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -50,6 +115,24 @@ impl ControlTrafficSampler {
 }
 
 impl ControlTraffic {
+    pub fn total(values: impl IntoIterator<Item = Self>) -> Self {
+        let mut sum = Self::default();
+        for value in values {
+            sum.arxb = sum.arxb.saturating_add(value.arxb);
+            sum.atxb = sum.atxb.saturating_add(value.atxb);
+            sum.arxc = sum.arxc.saturating_add(value.arxc);
+            sum.atxc = sum.atxc.saturating_add(value.atxc);
+            sum.prxb = sum.prxb.saturating_add(value.prxb);
+            sum.ptxb = sum.ptxb.saturating_add(value.ptxb);
+            sum.prxc = sum.prxc.saturating_add(value.prxc);
+            sum.ptxc = sum.ptxc.saturating_add(value.ptxc);
+            sum.arxs += value.arxs;
+            sum.atxs += value.atxs;
+            sum.prxs += value.prxs;
+            sum.ptxs += value.ptxs;
+        }
+        sum
+    }
     pub fn received_announce(&mut self, size: usize) {
         self.arxc = self.arxc.saturating_add(1);
         self.arxb = self.arxb.saturating_add(size as u64);
@@ -134,6 +217,28 @@ impl Default for TrafficCounter {
 #[cfg(test)]
 mod tests {
     use super::{ControlTraffic, ControlTrafficSampler};
+
+    #[test]
+    fn packet_rates_use_elapsed_time_and_reset_sample() {
+        let mut counter = super::PacketRateCounter::default();
+        counter.sampled_at -= std::time::Duration::from_secs(2);
+        counter.rx = 8;
+        counter.tx = 4;
+        let stats = counter.sample();
+        assert!((stats.rxpps - 4.0).abs() < 0.05);
+        assert!((stats.txpps - 2.0).abs() < 0.05);
+        assert_eq!((counter.rx, counter.tx), (0, 0));
+        assert_eq!(counter.sample().rxpps, stats.rxpps);
+        let mut bytes = super::ByteRateSampler::default();
+        bytes.previous = Some((
+            std::time::Instant::now() - std::time::Duration::from_secs(2),
+            100,
+            200,
+        ));
+        bytes.sample(300, 600);
+        assert!((799..=800).contains(&bytes.rates.0));
+        assert!((1599..=1600).contains(&bytes.rates.1));
+    }
 
     #[test]
     #[ignore = "requires local Python reference checkout"]

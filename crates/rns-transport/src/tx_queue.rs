@@ -25,6 +25,16 @@ pub struct TxSnapshot {
     pub gated: bool,
 }
 
+/// Optional byte-level statistics; plain channels cannot report encoded bytes.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TxDiagnostics {
+    pub txbuffered: Option<u64>,
+    pub txdrb: Option<u64>,
+    pub txstalled: Option<bool>,
+    pub tx_queue_frames: Option<usize>,
+}
+
 #[derive(Debug, Default)]
 pub struct TxAccounting(Mutex<TxSnapshot>);
 
@@ -107,6 +117,15 @@ pub fn byte_channel(
 }
 
 impl InterfaceTx {
+    pub fn diagnostics(&self) -> TxDiagnostics {
+        let snapshot = self.accounting().map(|accounting| accounting.snapshot());
+        TxDiagnostics {
+            txbuffered: snapshot.map(|s| s.buffered),
+            txdrb: snapshot.map(|s| s.dropped_bytes),
+            txstalled: snapshot.map(|s| s.gated),
+            tx_queue_frames: Some(self.max_capacity().saturating_sub(self.capacity())),
+        }
+    }
     pub fn accounting(&self) -> Option<Arc<TxAccounting>> {
         match self {
             Self::Plain(_) => None,
@@ -213,6 +232,10 @@ mod tests {
         ));
         let frame = rx.recv().await.unwrap();
         assert_eq!(accounting.snapshot().buffered, 10);
+        assert_eq!(tx.diagnostics().txbuffered, Some(10));
+        assert_eq!(tx.diagnostics().txdrb, Some(2));
+        let (plain, _) = mpsc::channel::<Bytes>(2);
+        assert_eq!(InterfaceTx::from(plain).diagnostics().txbuffered, None);
         frame.lease.as_ref().unwrap().written(3);
         assert_eq!(accounting.snapshot().buffered, 7);
         tx.try_send(Bytes::from_static(b"x")).unwrap();

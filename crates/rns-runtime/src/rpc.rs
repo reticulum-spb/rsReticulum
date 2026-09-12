@@ -72,6 +72,7 @@ pub enum RpcRequest {
     },
     GetMediumPathTimeout,
     GetLinkCount,
+    GetActiveLinkCount,
     GetPacketRssi {
         packet_hash: Vec<u8>,
     },
@@ -127,6 +128,11 @@ pub enum RpcResponse {
         Vec<InterfaceStatEntry>,
         rns_transport::inbound_queue::InboundQueueStats,
     ),
+    InterfaceStatsSnapshot {
+        interfaces: Vec<InterfaceStatEntry>,
+        queues: Option<rns_transport::inbound_queue::InboundQueueStats>,
+        packets: Option<rns_transport::traffic::PacketStats>,
+    },
     RateTable(Vec<RateTableEntry>),
     StringResult(Option<String>),
     HashResult(Option<Vec<u8>>),
@@ -150,6 +156,8 @@ pub struct PathTableEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceStatEntry {
+    #[serde(default, flatten)]
+    pub tx_diagnostics: rns_transport::tx_queue::TxDiagnostics,
     #[serde(default, flatten)]
     pub control_traffic: rns_transport::traffic::ControlTraffic,
     #[serde(default, flatten)]
@@ -317,6 +325,7 @@ fn request_to_py_value(req: &RpcRequest) -> PyValue {
         ]),
         RpcRequest::GetMediumPathTimeout => py_get("medium_path_timeout"),
         RpcRequest::GetLinkCount => py_get("link_count"),
+        RpcRequest::GetActiveLinkCount => py_get("active_link_count"),
         RpcRequest::GetPacketRssi { packet_hash } => py_dict(vec![
             ("get", PyValue::String("packet_rssi".to_string())),
             ("packet_hash", PyValue::Bytes(packet_hash.clone())),
@@ -421,6 +430,7 @@ fn py_value_to_request(value: &PyValue) -> Result<RpcRequest, RpcError> {
                 destination_hash: dict_bytes(entries, "destination_hash")?,
             }),
             "link_count" => Ok(RpcRequest::GetLinkCount),
+            "active_link_count" => Ok(RpcRequest::GetActiveLinkCount),
             "packet_rssi" => Ok(RpcRequest::GetPacketRssi {
                 packet_hash: dict_bytes(entries, "packet_hash")?,
             }),
@@ -531,7 +541,11 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 .collect(),
         ),
         RpcResponse::InterfaceStats(entries)
-        | RpcResponse::InterfaceStatsWithQueues(entries, _) => {
+        | RpcResponse::InterfaceStatsWithQueues(entries, _)
+        | RpcResponse::InterfaceStatsSnapshot {
+            interfaces: entries,
+            ..
+        } => {
             let interfaces = entries
                 .iter()
                 .map(|e| {
@@ -616,6 +630,35 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                                 .unwrap_or(PyValue::None),
                         ),
                         ("tx_drops", PyValue::Int(i128::from(e.tx_drops))),
+                        ("txdrp", PyValue::Int(i128::from(e.tx_drops))),
+                        (
+                            "txbuffered",
+                            e.tx_diagnostics
+                                .txbuffered
+                                .map(|v| PyValue::Int(v.into()))
+                                .unwrap_or(PyValue::None),
+                        ),
+                        (
+                            "txdrb",
+                            e.tx_diagnostics
+                                .txdrb
+                                .map(|v| PyValue::Int(v.into()))
+                                .unwrap_or(PyValue::None),
+                        ),
+                        (
+                            "txstalled",
+                            e.tx_diagnostics
+                                .txstalled
+                                .map(PyValue::Bool)
+                                .unwrap_or(PyValue::None),
+                        ),
+                        (
+                            "tx_queue_frames",
+                            e.tx_diagnostics
+                                .tx_queue_frames
+                                .map(|v| PyValue::Int(v as i128))
+                                .unwrap_or(PyValue::None),
+                        ),
                         (
                             "protocol_violations",
                             PyValue::Int(i128::from(e.inbound_diagnostics.protocol_violations)),
@@ -631,10 +674,19 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                     ])
                 })
                 .collect();
-            let rxb = entries.iter().map(|e| e.rx_bytes).sum::<u64>();
-            let txb = entries.iter().map(|e| e.tx_bytes).sum::<u64>();
-            let rxs = entries.iter().map(|e| e.rx_rate).sum::<u64>();
-            let txs = entries.iter().map(|e| e.tx_rate).sum::<u64>();
+            let external = || entries.iter().filter(|e| e.role == "normal");
+            let rxb = external()
+                .map(|e| e.rx_bytes)
+                .fold(0u64, u64::saturating_add);
+            let txb = external()
+                .map(|e| e.tx_bytes)
+                .fold(0u64, u64::saturating_add);
+            let rxs = external()
+                .map(|e| e.rx_rate)
+                .fold(0u64, u64::saturating_add);
+            let txs = external()
+                .map(|e| e.tx_rate)
+                .fold(0u64, u64::saturating_add);
             let mut fields = vec![
                 ("interfaces", PyValue::List(interfaces)),
                 ("rxb", PyValue::Int(i128::from(rxb))),
@@ -643,7 +695,35 @@ fn response_to_py_value(resp: &RpcResponse) -> PyValue {
                 ("txs", PyValue::Int(i128::from(txs))),
                 ("rss", PyValue::None),
             ];
-            if let RpcResponse::InterfaceStatsWithQueues(_, queues) = resp {
+            let traffic = rns_transport::traffic::ControlTraffic::total(
+                external().map(|e| e.control_traffic),
+            );
+            fields.push(("arxb", PyValue::Int(traffic.arxb.into())));
+            fields.push(("atxb", PyValue::Int(traffic.atxb.into())));
+            fields.push(("arxc", PyValue::Int(traffic.arxc.into())));
+            fields.push(("atxc", PyValue::Int(traffic.atxc.into())));
+            fields.push(("prxb", PyValue::Int(traffic.prxb.into())));
+            fields.push(("ptxb", PyValue::Int(traffic.ptxb.into())));
+            fields.push(("prxc", PyValue::Int(traffic.prxc.into())));
+            fields.push(("ptxc", PyValue::Int(traffic.ptxc.into())));
+            fields.push(("arxs", PyValue::Float(traffic.arxs)));
+            fields.push(("atxs", PyValue::Float(traffic.atxs)));
+            fields.push(("prxs", PyValue::Float(traffic.prxs)));
+            fields.push(("ptxs", PyValue::Float(traffic.ptxs)));
+            if let RpcResponse::InterfaceStatsSnapshot {
+                packets: Some(packets),
+                ..
+            } = resp
+            {
+                fields.push(("rxpps", PyValue::Float(packets.rxpps)));
+                fields.push(("txpps", PyValue::Float(packets.txpps)));
+            }
+            let queues = match resp {
+                RpcResponse::InterfaceStatsWithQueues(_, queues) => Some(queues),
+                RpcResponse::InterfaceStatsSnapshot { queues, .. } => queues.as_ref(),
+                _ => None,
+            };
+            if let Some(queues) = queues {
                 let snapshot = queues.snapshot;
                 fields.push(("rxqt", PyValue::Int(snapshot.total as i128)));
                 // MessagePack integers are at most u64; saturate the aggregate.
@@ -792,6 +872,7 @@ fn py_value_to_response_for_request(
         | RpcRequest::GetPacketSnr { .. }
         | RpcRequest::GetPacketQ { .. } => Ok(RpcResponse::FloatResult(py_optional_float(value)?)),
         RpcRequest::GetLinkCount
+        | RpcRequest::GetActiveLinkCount
         | RpcRequest::DropAllVia { .. }
         | RpcRequest::DropPathTable
         | RpcRequest::DropRecentAnnounces => Ok(RpcResponse::IntResult(py_required_int(value)?)),
@@ -878,6 +959,14 @@ fn parse_interface_stats(value: &PyValue) -> Result<Vec<InterfaceStatEntry>, Rpc
         .map(|(idx, entry)| {
             let m = as_dict(entry)?;
             Ok(InterfaceStatEntry {
+                tx_diagnostics: rns_transport::tx_queue::TxDiagnostics {
+                    txbuffered: dict_get(m, "txbuffered").and_then(py_u64),
+                    txdrb: dict_get(m, "txdrb").and_then(py_u64),
+                    txstalled: dict_get(m, "txstalled").and_then(py_bool),
+                    tx_queue_frames: dict_get(m, "tx_queue_frames")
+                        .and_then(py_u64)
+                        .and_then(|v| usize::try_from(v).ok()),
+                },
                 control_traffic: rns_transport::traffic::ControlTraffic {
                     arxb: dict_get(m, "arxb").and_then(py_u64).unwrap_or(0),
                     atxb: dict_get(m, "atxb").and_then(py_u64).unwrap_or(0),
@@ -1629,6 +1718,17 @@ pub async fn connect_and_request(
     request: &RpcRequest,
     timeout: std::time::Duration,
 ) -> Result<RpcResponse, RpcError> {
+    let raw = connect_and_request_raw(port, rpc_key, request, timeout).await?;
+    decode_response_for_request(&raw, request)
+}
+
+/// Authenticated response bytes, retaining optional/new diagnostic fields.
+pub async fn connect_and_request_raw(
+    port: u16,
+    rpc_key: &[u8],
+    request: &RpcRequest,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError> {
     let addr = format!("127.0.0.1:{port}");
 
     let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
@@ -1641,7 +1741,7 @@ pub async fn connect_and_request(
         })?
         .map_err(RpcError::Io)?;
 
-    request_over_stream(&mut stream, rpc_key, request, timeout).await
+    request_over_stream_raw(&mut stream, rpc_key, request, timeout).await
 }
 
 #[cfg(unix)]
@@ -1651,6 +1751,17 @@ pub async fn connect_unix_and_request(
     request: &RpcRequest,
     timeout: std::time::Duration,
 ) -> Result<RpcResponse, RpcError> {
+    let raw = connect_unix_and_request_raw(socket_path, rpc_key, request, timeout).await?;
+    decode_response_for_request(&raw, request)
+}
+
+#[cfg(unix)]
+pub async fn connect_unix_and_request_raw(
+    socket_path: &str,
+    rpc_key: &[u8],
+    request: &RpcRequest,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError> {
     let mut stream = tokio::time::timeout(timeout, connect_unix_stream(socket_path))
         .await
         .map_err(|_| {
@@ -1661,7 +1772,7 @@ pub async fn connect_unix_and_request(
         })?
         .map_err(RpcError::Io)?;
 
-    request_over_stream(&mut stream, rpc_key, request, timeout).await
+    request_over_stream_raw(&mut stream, rpc_key, request, timeout).await
 }
 
 #[cfg(unix)]
@@ -1709,12 +1820,25 @@ pub async fn connect_unix_and_request(
     )))
 }
 
-async fn request_over_stream<S>(
+#[cfg(not(unix))]
+pub async fn connect_unix_and_request_raw(
+    _socket_path: &str,
+    _rpc_key: &[u8],
+    _request: &RpcRequest,
+    _timeout: std::time::Duration,
+) -> Result<Vec<u8>, RpcError> {
+    Err(RpcError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Unix shared-instance RPC is not supported on this platform",
+    )))
+}
+
+async fn request_over_stream_raw<S>(
     mut stream: &mut S,
     rpc_key: &[u8],
     request: &RpcRequest,
     timeout: std::time::Duration,
-) -> Result<RpcResponse, RpcError>
+) -> Result<Vec<u8>, RpcError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1812,7 +1936,7 @@ where
             ))
         })??;
 
-    decode_response_for_request(&resp_buf, request)
+    Ok(resp_buf)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1933,6 +2057,7 @@ mod tests {
 
     fn interface_stat_entry() -> InterfaceStatEntry {
         InterfaceStatEntry {
+            tx_diagnostics: Default::default(),
             control_traffic: rns_transport::traffic::ControlTraffic {
                 arxb: 101,
                 atxb: 202,
@@ -1985,6 +2110,48 @@ mod tests {
             ifac_size: 0,
             tx_drops: 1,
         }
+    }
+
+    #[test]
+    fn rnstatus_snapshot_preserves_diagnostics_and_external_totals() {
+        let mut external = interface_stat_entry();
+        external.role = "normal".into();
+        external.tx_diagnostics.txbuffered = Some(123);
+        external.tx_diagnostics.txdrb = Some(4);
+        let mut internal = external.clone();
+        internal.role = "local_client".into();
+        let raw = encode_response(&RpcResponse::InterfaceStatsSnapshot {
+            interfaces: vec![external.clone(), internal],
+            queues: None,
+            packets: Some(rns_transport::traffic::PacketStats {
+                rxpps: 1.25,
+                txpps: 2.5,
+            }),
+        })
+        .unwrap();
+        let value = decode_umsgpack(&raw).unwrap();
+        let dict = as_dict(&value).unwrap();
+        assert_eq!(
+            dict_get(dict, "rxb"),
+            Some(&PyValue::Int(external.rx_bytes.into()))
+        );
+        assert_eq!(
+            dict_get(dict, "arxb"),
+            Some(&PyValue::Int(external.control_traffic.arxb.into()))
+        );
+        assert_eq!(dict_get(dict, "rxpps"), Some(&PyValue::Float(1.25)));
+        let RpcResponse::InterfaceStats(entries) =
+            decode_response_for_request(&raw, &RpcRequest::GetInterfaceStats).unwrap()
+        else {
+            panic!("legacy shape");
+        };
+        assert_eq!(entries[0].tx_diagnostics.txbuffered, Some(123));
+        assert_eq!(entries[0].tx_diagnostics.txdrb, Some(4));
+        let request = encode_request(&RpcRequest::GetActiveLinkCount).unwrap();
+        assert!(matches!(
+            decode_request(&request).unwrap(),
+            RpcRequest::GetActiveLinkCount
+        ));
     }
 
     #[test]

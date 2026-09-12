@@ -3380,3 +3380,67 @@ database_path/tracing prelude сохраняются. Новых test-only фа�
 Пробел приёма raw file response закрыт opt-in API. Границы: LinkResponse.data
 остаётся Vec под лимитом, не открытым файлом; генерация файловых request replies
 на сервере этим изменением не добавлялась. Утилиты не менялись, версия 1.0.1.
+
+### Этап 7: gravity в локальном и удалённом rnstatus
+
+По согласованному плану начат этап 7, первый пункт диагностики. Gravity уже
+передавался actor → runtime/RPC (включая signed i64 и fallback 0 для старого
+peer), но отсутствовал в rnstatus. Добавлен в human и JSON local/remote output.
+Поддержаны --sort gravity и alias g, по убыванию, --reverse по возрастанию,
+как в Python 1.5.2. Сравнение gravity целочисленное, без потери точности f64.
+Remote parser сохраняет отрицательные значения и использует 0 при отсутствии
+поля. Существующие JSON поля и остальные ключи сортировки сохранены.
+
+Короткий inline test проверяет aliases, отрицательное значение, соседние i64
+у верхнего предела, reverse и старый remote response без gravity:
+`cargo test -p rns-tools --bin rnstatus-rs gravity_sort --offline --quiet`:
+1 passed, 0.00s. Проверка rnstatus и workspace all-targets успешна;
+прежние warnings database_path/tracing prelude сохраняются. Reference ea98db4f
+чист. Новых test-only файлов нет, длительные проверки не запускались.
+
+Первый пункт этапа 7 ещё не закрыт: далее входящие очереди/потери, нарушения
+протокола, PPS, TX-буферы и подробная статистика трафика. Существующую поддержку
+blocked Backbone IP нужно сохранить и сверить, не реализовывать повторно.
+
+### Этап 7: завершён блок rnstatus одним набором изменений
+
+По указанию пользователя промежуточный gravity-коммит не выполнялся.
+Весь блок rnstatus подготовлен вместе, включая runtime/RPC и remote management:
+
+- Локальный RPC сохраняет raw authenticated snapshot для дополнительных полей,
+  старые typed decoders сохраняют InterfaceStats. Аутентификация и лимиты frame
+  не изменены. Unix/TCP пути поддержаны.
+- Очереди: высоты/потери/pressure доходят до local и remote --queues/JSON.
+  Remote management использует те же wire queue fields, что local RPC.
+- Protocol/IFAC violations, packet filter hits и arx/atx/prx/ptx bytes/counts/
+  rates передаются end-to-end. -A/-P показывают подробные счётчики.
+- TX diagnostics: encoded buffered/dropped bytes и gate берутся из существующего
+  ManagedTx accounting. Plain TX не притворяется побайтовым: эти поля null,
+  число queued frames выводится отдельно. Сохранены tx_drops/blocked IP list.
+- PPS: actor arrivals на Normal interfaces до validation (без повторного ingress
+  release), TX successful queue admissions, не подтверждённые физические кадры.
+  Скорость вычисляется по monotonic elapsed, без деления на условную секунду.
+  RX/TX bitrate интерфейсов теперь вычисляется по driver byte-counter deltas.
+- SharedServer/LocalClient/SharedInstancePeer исключены из внешних totals и
+  суммарного control traffic; per-interface counters и фильтры остаются отдельно.
+- link_count означает все записи link table, active_link_count — validated;
+  добавлены отдельные actor/RPC запросы, исправлена прежняя подпись Active links.
+- Дополнены сортировки Python (anns, counts, violations/filter, TX drops/buffer),
+  gravity/g и reverse. Старые JSON поля/типы сохранены, новые поля additive.
+- --profiling/-z запрашивает и показывает третий элемент remote Python status.
+  Rust-граница — существующие tracing spans, не Python decorator profiler;
+  отсутствие profiler данных обозначено явно, JSON profiling_supported=false.
+  -q сохраняет Rust quiet, очереди доступны через --queues.
+
+Проверки короткие: rnstatus binary unit tests — 11 passed; interface_stats
+runtime tests — 4 passed (0.34s); remote_management tests — 13 passed (0.00s);
+packet/byte-rate sampler и TX reservation diagnostics — по 1 passed (0.00s).
+Добавлена snapshot-проверка PPS/TX wire полей, исключения shared totals,
+сохранения legacy decoder и active_link_count request. Новых test-only файлов
+нет. Workspace all-targets check/fmt/diff check успешны; прежние warnings
+database_path/tracing prelude остаются. Длительные тесты и полная живая
+Python↔Rust матрица не запускались; аппаратные измерения не заявляются.
+
+Блок rnstatus закрыт с описанными границами измерений/profiling. Этап 7 целиком
+не завершён: далее отдельная сверка rnsh и ограничений rnpath remote/rncp
+--phy-rates по плану. Версия 1.0.1 сохранена.

@@ -463,8 +463,10 @@ pub enum TransportQuery {
     GetPathTable,
     GetInterfaceStats,
     GetInboundQueueStats,
+    GetPacketStats,
     GetRateTable,
     GetLinkCount,
+    GetActiveLinkCount,
     GetRecentAnnounces,
     /// Point lookup into the same cache `GetRecentAnnounces` exposes in
     /// full — mirrors Python `RNS.Identity.recall(destination_hash)`, which
@@ -659,6 +661,7 @@ pub enum TransportQueryResponse {
     InterfaceStats(Vec<InterfaceStatRpcEntry>),
     /// None for legacy single-channel actors without priority queue dispatch.
     InboundQueueStats(Option<crate::inbound_queue::InboundQueueStats>),
+    PacketStats(crate::traffic::PacketStats),
     RateTable(Vec<RateTableRpcEntry>),
     Announces(Vec<AnnounceRpcEntry>),
     /// Response to `Recall` — `None` if we've never seen a valid announce
@@ -695,6 +698,7 @@ pub struct PathTableRpcEntry {
 
 #[derive(Debug, Clone)]
 pub struct InterfaceStatRpcEntry {
+    pub tx_diagnostics: crate::tx_queue::TxDiagnostics,
     pub control_traffic: crate::traffic::ControlTraffic,
     pub inbound_diagnostics: InboundDiagnostics,
     pub blocked_ips: u64,
