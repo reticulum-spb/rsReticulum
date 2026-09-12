@@ -119,6 +119,7 @@ pub struct TransportActor {
     /// actually scheduled, so a tick that fires before storage init doesn't
     /// consume the boot slot.
     last_announce_cache_sweep: f64,
+    resource_proof_cache: VecDeque<([u8; 32], [u8; 16], bytes::Bytes)>,
     last_blackhole_check: f64,
     last_rate_cull: f64,
     last_held_announce_check: f64,
@@ -389,6 +390,7 @@ impl TransportActor {
             last_announces_check: 0.0,
             last_cache_clean: 0.0,
             last_announce_cache_sweep: 0.0,
+            resource_proof_cache: VecDeque::new(),
             last_blackhole_check: 0.0,
             last_rate_cull: 0.0,
             last_held_announce_check: 0.0,
@@ -9561,6 +9563,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_proof_cache_replays_on_leaf() {
+        use rns_wire::{context::PacketContext, flags::*, header::PacketHeader};
+        let (mut actor, _tx) = TransportActor::new();
+        let (iface, mut rx) = make_test_interface("proof-cache");
+        actor.interfaces.insert(1, iface);
+        let link_id = [0x77; 16];
+        actor.local_link_interfaces.insert(link_id, 1);
+        let mut header = PacketHeader {
+            flags: PacketFlags {
+                header_type: HeaderType::Header1,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: PacketContext::ResourcePrf,
+        };
+        let mut proof = header.pack().unwrap();
+        proof.extend_from_slice(&[42; 64]);
+        let hash = rns_wire::hash::packet_hash(&proof, HeaderType::Header1);
+        actor.on_outbound(crate::messages::OutboundRequest {
+            raw: Bytes::from(proof.clone()),
+            destination_hash: link_id,
+        });
+        let _ = rx.try_recv().unwrap(); // Simulate loss of the original proof.
+        header.flags.packet_type = PacketType::Data;
+        header.context = PacketContext::CacheRequest;
+        let mut query = header.pack().unwrap();
+        query.extend_from_slice(&hash);
+        actor.handle_cache_request(&query, &header, 1);
+        assert_eq!(rx.try_recv().unwrap().as_ref(), proof.as_slice());
+        header.destination_hash = [0x88; 16];
+        let mut wrong = header.pack().unwrap();
+        wrong.extend_from_slice(&hash);
+        actor.handle_cache_request(&wrong, &header, 1);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

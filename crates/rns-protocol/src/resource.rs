@@ -1226,6 +1226,8 @@ pub enum TransferAction {
     /// `(part_index, part_data)`.
     SendPart(usize, Vec<u8>),
     SendProof(Vec<u8>),
+    /// Plain CACHE_REQUEST payload: full hash of the expected proof packet.
+    QueryProof([u8; 32]),
     /// Hashmap update frame from receiver to sender.
     SendHmu(Vec<u8>),
     /// Receiver-to-sender request for specific parts. Payload layout:
@@ -1417,6 +1419,42 @@ impl OutboundTransfer {
         self.advertisement_retries += 1;
         self.advertised_at = Some(Instant::now());
         TransferAction::SendAdvertisement(self.create_advertisement())
+    }
+
+    pub fn check_sender_timeout(&mut self, link_id: [u8; 16]) -> TransferAction {
+        if self.resource.state != ResourceState::AwaitingProof {
+            return self.check_advertisement_timeout();
+        }
+        let wait = self.rtt.as_secs_f64() * PROOF_TIMEOUT_FACTOR + SENDER_GRACE_TIME;
+        if !self
+            .last_part_sent
+            .is_some_and(|sent| sent.elapsed().as_secs_f64() >= wait)
+        {
+            return TransferAction::None;
+        }
+        if self.retries >= MAX_RETRIES {
+            self.resource.state = ResourceState::Failed;
+            return TransferAction::SendCancel(CancelType::Icl, self.resource.resource_hash);
+        }
+        self.retries += 1;
+        self.last_part_sent = Some(Instant::now());
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::ResourcePrf,
+        };
+        let mut raw = header.pack().expect("proof header");
+        raw.extend_from_slice(&self.resource.resource_hash);
+        raw.extend_from_slice(&self.resource.expected_proof);
+        TransferAction::QueryProof(rns_wire::hash::packet_hash(&raw, header.flags.header_type))
     }
 
     /// Consume a hashmap-update frame from the receiver.
@@ -1691,8 +1729,7 @@ impl OutboundTransfer {
         }
 
         if sent_count > 0 {
-            let total_sent = self.confirmed_parts.iter().filter(|&&c| c).count() + sent_count;
-            if total_sent >= self.resource.num_parts() {
+            if self.sent_parts >= self.resource.num_parts() {
                 self.resource.state = ResourceState::AwaitingProof;
             }
         }
@@ -4055,6 +4092,38 @@ mod tests {
         sender.advertised_at = Some(Instant::now() - Duration::from_secs(5));
         assert!(matches!(
             sender.check_advertisement_timeout(),
+            TransferAction::None
+        ));
+    }
+
+    #[test]
+    fn proof_watchdog_uses_unique_parts_and_recovers() {
+        let mut sender =
+            OutboundTransfer::new(vec![42; 2000], false, Duration::from_millis(500)).unwrap();
+        sender.tick();
+        // Request each part individually: counting only the final request's
+        // parts would never enter AwaitingProof for a multi-window resource.
+        for hash in sender.resource.map_hashes.clone() {
+            let mut req = vec![HASHMAP_IS_NOT_EXHAUSTED];
+            req.extend_from_slice(&sender.resource.resource_hash);
+            req.extend_from_slice(&hash);
+            sender.handle_request(&req);
+        }
+        assert_eq!(sender.resource.state, ResourceState::AwaitingProof);
+        assert!(matches!(
+            sender.check_sender_timeout([7; 16]),
+            TransferAction::None
+        ));
+        sender.last_part_sent = Some(Instant::now() - Duration::from_secs(12));
+        assert!(matches!(
+            sender.check_sender_timeout([7; 16]),
+            TransferAction::QueryProof(_)
+        ));
+        let mut proof = sender.resource.resource_hash.to_vec();
+        proof.extend_from_slice(&sender.resource.expected_proof);
+        assert!(sender.handle_proof(&proof));
+        assert!(matches!(
+            sender.check_sender_timeout([7; 16]),
             TransferAction::None
         ));
     }

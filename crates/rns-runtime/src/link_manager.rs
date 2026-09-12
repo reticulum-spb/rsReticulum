@@ -1935,11 +1935,18 @@ impl LinkManager {
             let outbound_actions: Vec<_> = active
                 .outbound_resources
                 .values_mut()
-                .map(OutboundTransfer::check_advertisement_timeout)
+                .map(|transfer| transfer.check_sender_timeout(*link_id))
                 .filter(|action| !matches!(action, TransferAction::None))
                 .collect();
             for action in outbound_actions {
                 match action {
+                    TransferAction::QueryProof(hash) => Self::send_resource_control_packet(
+                        &self.transport_tx,
+                        active,
+                        link_id,
+                        rns_wire::context::PacketContext::CacheRequest,
+                        &hash,
+                    ),
                     TransferAction::SendAdvertisement(payload) => {
                         Self::send_resource_control_packet(
                             &self.transport_tx,
@@ -2109,7 +2116,12 @@ impl LinkManager {
         context: rns_wire::context::PacketContext,
         payload: &[u8],
     ) {
-        let Ok(encrypted) = active.link.encrypt(payload) else {
+        let encoded = if context == rns_wire::context::PacketContext::CacheRequest {
+            Ok(payload.to_vec())
+        } else {
+            active.link.encrypt(payload)
+        };
+        let Ok(encrypted) = encoded else {
             return;
         };
         let header = rns_wire::header::PacketHeader {

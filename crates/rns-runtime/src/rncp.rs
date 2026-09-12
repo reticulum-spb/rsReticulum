@@ -836,6 +836,10 @@ async fn send_transfer_action(
     }
 
     let (context, body) = match action {
+        TransferAction::QueryProof(hash) => (
+            rns_wire::context::PacketContext::CacheRequest,
+            Bytes::copy_from_slice(&hash),
+        ),
         TransferAction::SendAdvertisement(adv) => {
             let encrypted = link
                 .encrypt(&adv)

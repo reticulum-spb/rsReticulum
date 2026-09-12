@@ -475,10 +475,22 @@ encrypted `RESOURCE_ICL`; the manager releases the active transfer and queued
 split tail, while the session returns an error. No unsolicited parts are sent
 by this timer. The caller's overall deadline still takes precedence.
 
-This does not complete sender-side watchdog parity:
-lost final-proof recovery and signalling on the caller's overall deadline still
-need separate review. The rncp resource-proof wait also retains its existing
-120-second cap at this point.
+After all unique parts have been sent, LinkSession and LinkManager query for
+a missing final proof after `RTT * 3 + 10s`, with at most 16 cache queries before
+`RESOURCE_ICL`. Cache requests contain the hash of the expected full proof
+packet and are intentionally unencrypted Link Data packets, as in Python.
+Resource completion still requires normal proof validation.
+
+The transport retains up to 1024 locally emitted Resource proof packets in a
+FIFO memory cache, separate from the persisted announce cache. A matching Link
+ID and packet hash replay the proof on the requesting interface, including on
+leaf nodes. Entries are lost on restart or eviction; transit proofs are not
+cached by this implementation. Link-table routing carries queries to the
+receiver, whose cached proof remains available after transfer state is freed.
+
+Sender inactivity and signalling on the caller's overall deadline still need
+separate review. The separate rncp sender loop and its 120-second proof-wait
+cap have not yet been migrated to this watchdog.
 
 ### Ingress mappings
 

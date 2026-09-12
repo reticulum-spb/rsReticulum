@@ -3032,3 +3032,35 @@ push-parts, сброс времени ожидания, exhaustion и прекр
 rncp proof cap120s ещё требуют переноса/аудита. Этап6 открыт, версия1.0.1.
 Workspace all-targets check, fmt check и diff check успешны; Python reference
 ea98db4f чист. Прежние warnings database_path/tracing prelude сохраняются.
+
+### Этап 6: восстановление финального Resource proof
+
+OutboundTransfer::check_sender_timeout теперь включает ожидание proof:
+RTT*PROOF_TIMEOUT_FACTOR3+SENDER_GRACE_TIME10; до16 запросов, затем ICL.
+QueryProof содержит hash ожидаемого Header1 Link Proof/RESOURCE_PRF с payload
+resource_hash||expected_proof. LinkSession и LinkManager вызывают общий
+watchdog и отправляют plaintext CACHE_REQUEST, как Packet.py Python.
+Только валидный proof завершает Resource; cache hit не подменяет проверку.
+
+Исправлен переход AwaitingProof: используется sent_parts (уникальные части
+всех запросов), а не число частей только последнего RESOURCE_REQ. Это важно
+для передачи, которая не помещается в одно окно запросов.
+
+Transport хранит до1024 локально отправленных proof в FIFO memory cache,
+отдельно от announce cache. Ответ на Link CACHE_REQUEST проверяет packet hash
+и link_id, отправляет исходный proof на входящий интерфейс и работает на leaf.
+Запросы проходят по существующей link-table цепочке до получателя. Кэш
+не персистентен, вытесняется при переполнении, transit proofs не сохраняются —
+это явная граница с общим Python packet cache. Старый announce path сохранён.
+rncp action dispatcher умеет отправлять QueryProof, но собственный sender
+loop ещё не вызывает этот watchdog; его таймеры не объявляются перенесёнными.
+
+Два inline tests без ожидания реальных timeout:
+`cargo test -p rns-protocol --lib proof_watchdog --quiet` и
+`cargo test -p rns-transport --lib resource_proof_cache_replays --quiet`:
+по1 passed, 0.00s. Проверены multi-request transition, timer/query/valid proof,
+replay после имитации потери и отказ для чужого Link. Это не полный live
+interop. Новых test-only файлов нет. Workspace all-targets check успешен,
+прежние warnings database_path/tracing prelude сохраняются. Python reference
+ea98db4f чист. Sender inactivity, общий deadline cleanup и rncp loop ещё
+открыты; этап6 не завершён, версия1.0.1.

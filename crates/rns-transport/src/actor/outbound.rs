@@ -35,6 +35,24 @@ impl TransportActor {
         // from the fabric aren't re-processed.
         let pkt_hash = rns_wire::hash::packet_hash(&request.raw, parsed.flags.header_type);
         self.packet_hashlist.insert(pkt_hash);
+        // Keep locally produced proofs available after the receiver has dropped
+        // its transfer state. Bound memory independently of the announce cache.
+        if parsed.flags.packet_type == rns_wire::flags::PacketType::Proof
+            && parsed.flags.destination_type == rns_wire::flags::DestinationType::Link
+            && parsed.context == rns_wire::context::PacketContext::ResourcePrf
+            && request.raw.len() == parsed.pack().map_or(0, |h| h.len()) + 64
+        {
+            self.resource_proof_cache
+                .retain(|(hash, _, _)| *hash != pkt_hash);
+            if self.resource_proof_cache.len() >= 1024 {
+                self.resource_proof_cache.pop_front();
+            }
+            self.resource_proof_cache.push_back((
+                pkt_hash,
+                parsed.destination_hash,
+                request.raw.clone(),
+            ));
+        }
 
         // Generate a general-purpose receipt for every outbound Data packet to a
         // non-Plain destination so callers can observe delivery / timeout.
@@ -223,7 +241,7 @@ impl TransportActor {
         &mut self,
         raw: &[u8],
         header: &rns_wire::header::PacketHeader,
-        _interface_id: InterfaceId,
+        interface_id: InterfaceId,
     ) {
         let payload_start = match self.data_payload_offset(raw, header) {
             Some(offset) => offset,
@@ -244,6 +262,17 @@ impl TransportActor {
 
         let mut requested_hash = [0u8; 32];
         requested_hash.copy_from_slice(payload);
+        if header.flags.destination_type == rns_wire::flags::DestinationType::Link {
+            if let Some((_, _, proof)) = self
+                .resource_proof_cache
+                .iter()
+                .find(|(hash, link, _)| *hash == requested_hash && *link == header.destination_hash)
+            {
+                let proof = proof.clone();
+                self.send_to_interface(interface_id, &proof);
+            }
+            return;
+        }
 
         let dest_and_hops: Option<([u8; 16], u8)> = self
             .path_table

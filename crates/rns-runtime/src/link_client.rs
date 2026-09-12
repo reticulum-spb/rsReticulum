@@ -1331,7 +1331,11 @@ impl LinkSession {
             loop {
                 let event = tokio::select! {
                     _ = timer.tick() => {
-                        match transfer.check_advertisement_timeout() {
+                        match transfer.check_sender_timeout(link_id) {
+                            TransferAction::QueryProof(hash) => {
+                                send_link_data(&self.transport_tx, &self.link, link_id,
+                                    rns_wire::context::PacketContext::CacheRequest, &hash, false)?;
+                            }
                             TransferAction::SendAdvertisement(payload) => {
                                 send_link_data(&self.transport_tx, &self.link, link_id,
                                     rns_wire::context::PacketContext::ResourceAdv, &payload, true)?;
@@ -1339,7 +1343,7 @@ impl LinkSession {
                             TransferAction::SendCancel(_, hash) => {
                                 send_link_data(&self.transport_tx, &self.link, link_id,
                                     rns_wire::context::PacketContext::ResourceIcl, &hash, true)?;
-                                return Err(LinkClientError::Resource("resource advertisement retries exhausted".into()));
+                                return Err(LinkClientError::Resource("resource sender retries exhausted".into()));
                             }
                             _ => {}
                         }
