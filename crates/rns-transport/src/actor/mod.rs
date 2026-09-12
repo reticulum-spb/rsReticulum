@@ -10756,7 +10756,7 @@ mod tests {
                 egress_control: Some(true),
                 ..Default::default()
             });
-        for _ in 0..IC_BURST_MIN_SAMPLES {
+        for _ in 0..EC_BURST_MIN_SAMPLES {
             ingress.sent_path_request();
         }
     }

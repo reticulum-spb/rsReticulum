@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::constants::{
-    AR_FREQ_DECAY, EC_PR_FREQ, EGRESS_CONTROL, IA_FREQ_SAMPLES, IC_BURST_FREQ, IC_BURST_FREQ_NEW,
-    IC_BURST_HOLD, IC_BURST_MIN_SAMPLES, IC_BURST_PENALTY, IC_DEQUE_MIN_SAMPLE,
+    AR_FREQ_DECAY, EC_BURST_MIN_SAMPLES, EC_PR_FREQ, EGRESS_CONTROL, IA_FREQ_SAMPLES,
+    IC_BURST_FREQ, IC_BURST_FREQ_NEW, IC_BURST_HOLD, IC_BURST_PENALTY, IC_DEQUE_MIN_SAMPLE,
     IC_HELD_RELEASE_INTERVAL, IC_NEW_TIME, IC_PR_BURST_FREQ, IC_PR_BURST_FREQ_NEW, IP_FREQ_SAMPLES,
     MAX_HELD_ANNOUNCES, OA_FREQ_SAMPLES, OP_FREQ_SAMPLES, PATHFINDER_M, PR_FREQ_DECAY,
 };
@@ -302,6 +302,7 @@ impl IngressController {
             &mut self.ia_freq_deque,
             IC_DEQUE_MIN_SAMPLE,
             Duration::from_secs_f64(AR_FREQ_DECAY),
+            0,
         );
         let now = Instant::now();
 
@@ -346,6 +347,7 @@ impl IngressController {
             &mut self.ip_freq_deque,
             IC_DEQUE_MIN_SAMPLE,
             Duration::from_secs_f64(PR_FREQ_DECAY),
+            0,
         );
         let now = Instant::now();
 
@@ -380,7 +382,8 @@ impl IngressController {
     }
 
     /// Whether outgoing path-request transmission should be skipped on this
-    /// interface. This limiter is off by default in Reticulum 1.2.5.
+    /// interface, including the prospective send in the frequency estimate.
+    /// This limiter is off by default in Reticulum 1.5.2.
     pub fn should_egress_limit_pr(&mut self) -> bool {
         if !self.egress_control {
             return false;
@@ -390,8 +393,9 @@ impl IngressController {
             &mut self.op_freq_deque,
             1,
             Duration::from_secs_f64(PR_FREQ_DECAY),
+            1,
         );
-        op_freq > self.ec_pr_freq && self.op_freq_deque.len() >= IC_BURST_MIN_SAMPLES
+        op_freq > self.ec_pr_freq && self.op_freq_deque.len() >= EC_BURST_MIN_SAMPLES
     }
 
     pub fn hold_announce(&mut self, announce: HeldAnnounce) {
@@ -433,6 +437,7 @@ impl IngressController {
             &mut self.ia_freq_deque,
             IC_DEQUE_MIN_SAMPLE,
             Duration::from_secs_f64(AR_FREQ_DECAY),
+            0,
         );
         if ia_freq >= freq_threshold {
             return None;
@@ -503,10 +508,13 @@ fn frequency_from_deque(deque: &VecDeque<Instant>, min_samples: usize, decay: Du
 /// Mutable limiter frequency. Mirrors upstream's decay side effect by dropping
 /// one stale oldest sample when the observed window is older than the decay
 /// horizon, then calculating from the current sample count and oldest span.
+/// Prospective samples affect only the estimate, never the recorded deque or
+/// minimum-sample gate. PR egress uses one for the packet about to be sent.
 fn frequency_from_deque_mut(
     deque: &mut VecDeque<Instant>,
     min_samples: usize,
     decay: Duration,
+    prospective_samples: usize,
 ) -> f64 {
     let n = deque.len();
     if n <= min_samples {
@@ -519,7 +527,7 @@ fn frequency_from_deque_mut(
     if sample_age(now, oldest) > decay {
         deque.pop_front();
     }
-    frequency_from_parts(n, now, oldest, min_samples)
+    frequency_from_parts(n + prospective_samples, now, oldest, min_samples)
 }
 
 fn frequency_from_parts(n: usize, now: Instant, oldest: Instant, min_samples: usize) -> f64 {
@@ -554,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn reticulum_125_control_constants_are_pinned() {
+    fn reticulum_152_control_constants_are_pinned() {
         assert_eq!(IA_FREQ_SAMPLES, 48);
         assert_eq!(OA_FREQ_SAMPLES, 48);
         assert_eq!(IP_FREQ_SAMPLES, 48);
@@ -562,7 +570,7 @@ mod tests {
         assert_eq!(AR_FREQ_DECAY, 10.0);
         assert_eq!(PR_FREQ_DECAY, 10.0);
         assert_eq!(IC_DEQUE_MIN_SAMPLE, 2);
-        assert_eq!(IC_BURST_MIN_SAMPLES, 6);
+        assert_eq!(EC_BURST_MIN_SAMPLES, 2);
         assert_eq!(IC_BURST_FREQ_NEW, 3.0);
         assert_eq!(IC_BURST_FREQ, 10.0);
         assert_eq!(IC_PR_BURST_FREQ_NEW, 3.0);
@@ -794,12 +802,12 @@ mod tests {
     }
 
     #[test]
-    fn pr_egress_limiting_is_optional_and_requires_six_samples() {
+    fn pr_egress_limiting_is_optional_and_preemptive_after_two_samples() {
         let mut disabled = IngressController::new();
         push_samples(
             &mut disabled.op_freq_deque,
             OP_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES + 2,
+            EC_BURST_MIN_SAMPLES + 2,
             1.0,
             0.1,
         );
@@ -813,7 +821,7 @@ mod tests {
         push_samples(
             &mut ctrl.op_freq_deque,
             OP_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES - 1,
+            EC_BURST_MIN_SAMPLES - 1,
             1.0,
             0.1,
         );
@@ -823,11 +831,28 @@ mod tests {
         push_samples(
             &mut ctrl.op_freq_deque,
             OP_FREQ_SAMPLES,
-            IC_BURST_MIN_SAMPLES,
-            1.0,
+            EC_BURST_MIN_SAMPLES,
+            0.5,
             0.1,
         );
+        assert!(ctrl.outgoing_pr_frequency() < EC_PR_FREQ);
         assert!(ctrl.should_egress_limit_pr());
+        assert_eq!(ctrl.op_freq_deque.len(), EC_BURST_MIN_SAMPLES);
+        assert!(ctrl.outgoing_pr_frequency() < EC_PR_FREQ);
+
+        // Decay removes only a recorded sample, never appends the prospective
+        // send; the post-decay sample gate still applies as in upstream.
+        ctrl.op_freq_deque.clear();
+        push_samples(
+            &mut ctrl.op_freq_deque,
+            OP_FREQ_SAMPLES,
+            EC_BURST_MIN_SAMPLES,
+            PR_FREQ_DECAY + 1.0,
+            0.1,
+        );
+        ctrl.ec_pr_freq = 0.001;
+        assert!(!ctrl.should_egress_limit_pr());
+        assert_eq!(ctrl.op_freq_deque.len(), EC_BURST_MIN_SAMPLES - 1);
     }
 
     #[test]

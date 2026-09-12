@@ -184,9 +184,12 @@ pub const PR_FREQ_DECAY: f64 = 1.0 / PR_MINFREQ_HZ;
 /// Matches Python 1.2.5 `Interface.IC_DEQUE_MIN_SAMPLE = 2`.
 pub const IC_DEQUE_MIN_SAMPLE: usize = 2;
 
-/// Minimum samples required for burst state clearing / egress PR limiting.
-/// Matches Python 1.2.5 `Interface.IC_BURST_MIN_SAMPLES = 6`.
+/// Legacy Python 1.2.5 threshold, retained for source compatibility.
+/// Current limiters use IC_DEQUE_MIN_SAMPLE / EC_BURST_MIN_SAMPLES instead.
 pub const IC_BURST_MIN_SAMPLES: usize = 6;
+
+/// Minimum recorded outgoing PR samples for preemptive egress limiting (1.5.2).
+pub const EC_BURST_MIN_SAMPLES: usize = 2;
 
 /// Duration interface is treated as "new" (seconds).
 /// Matches Python `Interface.IC_NEW_TIME = 2*60*60`.

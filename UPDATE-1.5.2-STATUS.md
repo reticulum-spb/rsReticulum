@@ -90,7 +90,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | Отсутствуют: RPC имеет first_hop_timeout, что не является medium_path_timeout | 6 |
 | 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Отсутствует связь с medium helper | 6 |
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
-| 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Частично: actor и ingress существуют; каждую семантическую регрессию сверить с Python тестами/изменениями | 4, 6 |
+| 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Actor/inflight перенесены; финальная сверка дополнительно исправила sustained ingress, offline recursive PR, relay proof timeout и preemptive PR egress (порог 2). Остальные семантические изменения проверяются по upstream commits | 4, 6 |
 | 1.5.0 Backbone EPOLL starvation | EPOLL Python implementation неприменима; справедливость Tokio read/write проверить нагрузкой | 5 |
 | 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
 | 1.5.0 Link watchdog exception reset | Python watchdog_lock неприменим: Rust receive возвращает Result и не удерживает persistent receive lock. Пропуск malformed DATA/Response/ResourceReq/HMU, authenticated ADV teardown и продолжение после ошибок проверены короткими runtime cases. Произвольные panic пользовательских callbacks не входят в гарантию | 6 / архитектурная граница |
@@ -4073,3 +4073,25 @@ case проверяет отсутствие отправки/резерва д�
 
 Короткие проверки: `recursive_path_request_` — 5 passed, Link Request
 forwarding — 1 passed; обе группы 0.00s. Новых test-only файлов нет.
+
+## Финальная сверка: preemptive PR egress limiting
+
+Перенесён оставшийся расчёт из Python `6f6751d6`: egress limiter учитывает
+один потенциальный исходящий запрос сверх записанных отсчётов и использует
+`EC_BURST_MIN_SAMPLES = 2` вместо старого порога 6. Проверка минимального
+количества записанных отсчётов остаётся после decay, как в upstream.
+Потенциальная отправка не добавляется в deque и не влияет на status frequency.
+Ingress и held release вызывают общий расчёт без добавочного отсчёта.
+Старая публичная константа IC_BURST_MIN_SAMPLES сохранена для совместимости
+исходного кода, но текущие limiters её больше не используют.
+
+Поздняя проверка непосредственно в `send_path_request` уже существовала;
+между ней и отправкой нет await, состояние обрабатывает один actor. Нового
+lock или повторного учёта отправок не требуется. Egress control остаётся
+выключенным по умолчанию.
+
+Существующий inline case теперь проверяет два записанных PR с частотой ниже
+порога, при которых третий был бы выше порога, отсутствие изменения истории,
+минимум отсчётов и decay. Actor case ограниченного интерфейса теперь также
+использует только два исходящих отсчёта. Результаты: ingress — 22 passed,
+recursive PR — 5 passed (обе группы 0.00s). Отдельных test-only файлов нет.
