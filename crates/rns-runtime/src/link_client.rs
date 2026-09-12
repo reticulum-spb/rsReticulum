@@ -1275,16 +1275,14 @@ impl LinkSession {
                         self.pending_packets.push_back(packet);
                     }
                     rns_wire::context::PacketContext::ResourceAdv => {
-                        let plaintext = self.link.decrypt(body).map_err(|error| {
-                            LinkClientError::LinkCrypto(format!(
-                                "resource advertisement: {error:?}"
-                            ))
-                        })?;
-                        let adv = ResourceAdvertisement::unpack(&plaintext).map_err(|error| {
-                            LinkClientError::UnexpectedResponse(format!(
-                                "resource advertisement: {error}"
-                            ))
-                        })?;
+                        let Some(adv) = receive_resource_advertisement(
+                            &self.transport_tx,
+                            &mut self.link,
+                            body,
+                        )?
+                        else {
+                            continue;
+                        };
                         let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
                         if transfers.contains_key(&adv.resource_hash) {
                             continue;
@@ -2474,16 +2472,11 @@ async fn wait_for_response(
                             }
                         }
                         rns_wire::context::PacketContext::ResourceAdv => {
-                            let plaintext = link.decrypt(body).map_err(|e| {
-                                LinkClientError::LinkCrypto(format!(
-                                    "resource advertisement decrypt: {e:?}"
-                                ))
-                            })?;
-                            let adv = ResourceAdvertisement::unpack(&plaintext).map_err(|e| {
-                                LinkClientError::UnexpectedResponse(format!(
-                                    "resource advertisement: {e}"
-                                ))
-                            })?;
+                            let Some(adv) =
+                                receive_resource_advertisement(transport_tx, link, body)?
+                            else {
+                                continue;
+                            };
 
                             if !adv.flags.is_response
                                 || adv.request_id.as_deref() != Some(request_id.as_slice())
@@ -2857,6 +2850,38 @@ async fn wait_for_response(
     result
 }
 
+/// Match LinkManager: unauthenticated corruption is ignored; an authenticated
+/// but undecodable advertisement closes the Link. Teardown is best-effort and
+/// must not block local cleanup when the transport queue is full or closed.
+fn receive_resource_advertisement(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    link: &mut Link,
+    body: &[u8],
+) -> Result<Option<ResourceAdvertisement>, LinkClientError> {
+    let Ok(plaintext) = link.decrypt(body) else {
+        return Ok(None);
+    };
+    match ResourceAdvertisement::unpack(&plaintext) {
+        Ok(adv) => Ok(Some(adv)),
+        Err(error) => {
+            let link_id = link.link_id;
+            if let Some(payload) = link.teardown(CloseReason::InitiatorClosed) {
+                let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
+                    raw: build_data_packet(
+                        link_id,
+                        rns_wire::context::PacketContext::LinkClose,
+                        &payload,
+                    ),
+                    destination_hash: link_id,
+                }));
+            }
+            Err(LinkClientError::UnexpectedResponse(format!(
+                "resource advertisement: {error}"
+            )))
+        }
+    }
+}
+
 /// Drive the existing receive watchdog without extending the request deadline.
 fn retry_response_resources(
     transport_tx: &mpsc::Sender<TransportMessage>,
@@ -3010,6 +3035,84 @@ fn build_data_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resource_advertisement_error_closes_only_authenticated_peer() {
+        use rns_wire::context::PacketContext;
+        for response_wait in [false, true] {
+            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+            let public = key.public_key();
+            let (mut link, request) = Link::new_initiator([7; 16], 1);
+            let (mut peer, proof) = Link::new_responder(&request, &key, [7; 16], 1).unwrap();
+            let rtt = link
+                .validate_proof(&proof, &public, &public.to_bytes())
+                .unwrap();
+            peer.receive_rtt_packet(&rtt).unwrap();
+            let link_id = link.link_id;
+            let (tx, mut out) = mpsc::channel(4);
+            let (events, rx) = mpsc::channel(4);
+            assert!(
+                receive_resource_advertisement(&tx, &mut link, &[0; 32])
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(link.state, LinkState::Active);
+            assert!(out.try_recv().is_err());
+            // Exercise both callers: corruption must not short-circuit the wait
+            // before the following authenticated invalid advertisement arrives.
+            for body in [vec![0; 32], peer.encrypt(&[0xc1]).unwrap()] {
+                events
+                    .send(DestinationEvent::InboundPacket {
+                        raw: build_data_packet(link_id, PacketContext::ResourceAdv, &body),
+                        interface_id: 0,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut session = LinkSession {
+                transport_tx: tx,
+                identity: Arc::new(Identity::new()),
+                link,
+                event_rx: rx,
+                channel: None,
+                channel_packets: Vec::new(),
+                pending_packets: VecDeque::new(),
+                pending_resource_packets: VecDeque::new(),
+            };
+            let result = if response_wait {
+                wait_for_response(
+                    &session.transport_tx,
+                    &mut session.event_rx,
+                    &mut session.link,
+                    link_id,
+                    [8; 16],
+                    Duration::from_secs(1),
+                    100,
+                    ResourceResponseMode::Packed,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                session
+                    .recv_resource(Duration::from_secs(1))
+                    .await
+                    .map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(LinkClientError::UnexpectedResponse(_))
+            ));
+            assert_eq!(session.link.state, LinkState::Closed);
+            assert!(session.send(b"after invalid ADV").await.is_err());
+            let TransportMessage::Outbound(close) = out.try_recv().unwrap() else {
+                panic!("teardown")
+            };
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&close.raw).unwrap();
+            assert_eq!(header.context, PacketContext::LinkClose);
+            assert!(peer.receive_teardown(&close.raw[offset..]));
+            assert!(out.try_recv().is_err());
+        }
+    }
 
     #[tokio::test]
     async fn session_request_cleans_receipt_on_send_error_and_cancellation() {

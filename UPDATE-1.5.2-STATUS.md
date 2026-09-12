@@ -3945,3 +3945,28 @@ Responder учитывает исходящий ответ только посл
 Итог: rns-link `keepalive` — 11 passed (0.07s), runtime `keepalive` —
 3 passed (0.01s), runtime `response_` — 13 passed (0.04s).
 Default runtime check, fmt/diff checks прошли; длительных тестов нет.
+
+## Финальная сверка: ошибки Resource advertisement в клиентских путях
+
+Python Link.__receive и Rust LinkManager закрывают Link при успешно
+расшифрованном, но неразбираемом Resource advertisement. Клиентские
+recv_resource/response wait раньше только возвращали ошибку, сохраняя Link.
+Общий receive_resource_advertisement теперь обеспечивает одинаковое поведение:
+
+- Ошибка decrypt/HMAC не завершает операцию и не закрывает Link: кадр
+  игнорируется, ожидание продолжается в пределах прежнего deadline.
+- Ошибка ResourceAdvertisement::unpack после успешного decrypt переводит Link
+  в Closed и очищает ключи; возвращается UnexpectedResponse. Предварительно
+  строится authenticated teardown и передаётся transport через try_send.
+  При полной/закрытой очереди отправка best-effort, локальная очистка не ждёт.
+- Проверки размеров, request ID и согласованности сегментов остаются отдельными
+  ветками. Валидный ADV, отвергнутый прикладным лимитом, не приравнивается
+  к неразбираемому advertisement и не закрывает Link этим helper.
+
+Inline test прогоняет оба клиентских пути: corrupted ciphertext, затем
+authenticated invalid MessagePack; проверяет Closed, отказ следующей send,
+один outbound teardown и его проверку ключами реального peer Link.
+Результат: targeted — 1 passed (0.02s), runtime response_ — 13 passed (0.04s).
+Новых test-only файлов и длительных тестов нет. Далее остаётся обработка
+ошибок decrypt/parse обычных Link DATA/Response сообщений; общая готовность
+релиза пока не заявляется.
