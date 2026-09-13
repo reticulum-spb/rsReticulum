@@ -106,7 +106,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 adaptive dataplane ingress/egress | Отсутствует: `backbone_read_loop` ожидает общий mpsc; write path пишет отдельный HDLC frame | 5 |
 | 1.5.1 coalescing TX buffers | Отсутствует в Backbone backend | 5 |
 | 1.5.1 early invalid frames | Частично: deframer cap и parser checks; отсутствуют новые counters/early admission | 4, 5 |
-| 1.5.1 discovery implementation/version | Реализована wire metadata; требования при приёме перепроверить | 1 |
+| 1.5.1 discovery implementation/version | Публикуются TRANSPORT_IMPL=rsReticulum и TRANSPORT_VERS=CARGO_PKG_VERSION. Python 1.5.2 не требует эти ключи при приёме и не сохраняет их в info; Rust также игнорирует их при decode. Это metadata реализации, не объявление версии протокольной совместимости | 1 / сверено |
 | 1.5.1 Profiler/decorator/reentrant bounded capture/live output | Python decorator неприменим; live Rust profiling отсутствует, определить границу и измеримые метрики | 7 |
 | 1.5.1 PPS/MTU/TX drops/TX buffer rnstatus | MTU/TX drops локально реализованы; PPS/TX buffer и remote parity требуют реализации | 7 |
 | 1.5.1 throughput benchmarker | Новый сопоставимый локальный baseline ещё не выполнен | 5 |
@@ -4294,3 +4294,25 @@ location_cmd и operator LXMF в YAML/API. Ранее записанные ме�
 
 Результат: targeted address check — 1 passed (0.00s), client-only cargo check
 и fmt/diff checks прошли. Новых test-only файлов нет.
+
+## Финальная сверка: discovery implementation/version и publication guards
+
+Сопоставлены info_to_map/decode_info с Discovery.py на `ea98db4f`. Ключи
+0xFD/0xFC обязательны для новой публикации, но Python receiver не извлекает
+их в info и не делает по ним admission. Rust публикует собственные имя и
+package version, а не выдаёт себя за Python RNS; отсутствие этих ключей
+у старого peer не является причиной отказа. Хранение/вывод remote metadata
+не добавляется как якобы обязательная часть переноса 1.5.2.
+
+Сверена защита публикации Backbone/TCPServer без reachable_on: runtime
+вызывает resolve_discovery_address до announcer.tick_excluding; отсутствие,
+пустое/недопустимое значение и ошибка executable помечают этот интерфейс
+unavailable и не двигают его announce clock. Независимые интерфейсы продолжают
+публикацию. Location parsing дополнительно проверяет конечность координат
+и обе границы longitude; ошибочная проверка dlat вместо верхней границы dlon
+из Python не воспроизводится.
+
+Существующие короткие проверки: discovery app_data — 13 passed (0.00s),
+location parser — 1 passed (0.00s). Это codec/parser проверки, не новый
+сетевой interop прогон. Функциональных изменений в этом блоке не потребовалось;
+изменён только журнал, версия пакетов и совместимости остаётся прежней.
