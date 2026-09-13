@@ -52,7 +52,7 @@ tunnel synthesis и воспроизведение кешированных anno
 |---|---|---|
 | 1.3.9 rnsh security | Сверено с исходниками: identity gate и authorized state сохранены; fatal errors терминальны, ошибочный peer не завершает listener. Короткие allowed/denied проверки пройдены | 7 |
 | 1.3.9 rnsh config/identity paths | Перенесено: раздельные --config/--rnsconfig, identity[.SERVICE] и allowed_identities в выбранном rnsh каталоге; миграция описана в CONFIG.md | 7 |
-| 1.3.9 Backbone fast flapping | Отсутствует: listener/config в `rns-interface/src/backbone.rs` не ведут историю блокировок IP | 3 |
+| 1.3.9 Backbone fast flapping | FastFlapProtection и общая process-level таблица подключены к listener до регистрации child; disconnect/drop guard учитывает короткий сеанс. Defaults и YAML→factory перенос описаны в этапе 3, финальная проверка policy прошла | 3 / сверено |
 | 1.3.9 LOG_PATHING / logging | YAML/runtime/UI принимают 7 Pathing и 8 Extreme; оба соответствуют Rust TRACE. Граница шкалы и LOG_NONE описана в CONFIG | 7 / финальная сверка |
 | 1.3.9 internal discovery | apply_discovery_mode_autocorrect сохраняет Internal наряду с Gateway/AP; YAML/runtime и ранее выполненный Python receiver interop описаны в журнале этапа 1 | 1 / сверено |
 | 1.3.9 location script | location_cmd проходит конфигурацию и вызывается scheduler перед announce; ошибка отменяет только публикацию этого интерфейса. Лимиты 4096 bytes / 5s и refresh/deregister реализованы в этапе 1 | 1 / сверено |
@@ -61,9 +61,9 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.0 invalid discovery stamp cache | Закрыто при итоговой сверке: task-local FIFO до 2048 invalid digest entries | 1 / финальная сверка |
 | 1.4.0 valid discovery cache / sequential validation | Task-local FIFO до 2048 valid digest/value entries; source policy и обновление store остаются на каждом событии | 1 / финальная сверка |
 | 1.4.0 Link stale teardown / watchdog race | Частично: `rns-link/src/keepalive.rs:is_stale` учитывает outbound; проверить вызовы в runtime и ошибки приёма | 6 |
-| 1.4.0 Backbone None-check / exception logging | Python-specific None/exception детали; Rust Result/Option; эквивалентные disconnect ошибки проверить с fast flapping | 3 |
+| 1.4.0 Backbone None-check / exception logging | Python None/exception переменные не переносятся буквально. Rust Result/Option и совместное завершение read/write с disconnect guard реализованы; socket disconnect/отказ регистрации проверены loopback в этапе 3 | 3 / архитектурная граница |
 | 1.4.0 stamp default 16 | Реализовано в `discovery/constants.rs` и runtime | 1, сохранить |
-| 1.4.0 blocked IP ifstats | Отсутствует вместе с механизмом блокировок | 3, 7 |
+| 1.4.0 blocked IP ifstats | Driver diagnostics → actor InterfaceStats: count и list из одного снимка; поля проходят local/remote rnstatus и API/UI. Поведение и ранее выполненные проверки описаны в этапе 3 | 3, 7 / сверено |
 | 1.4.0 reduced log noise | Воспроизвести уровни на локальной нагрузке; Rust tracing не требует копирования Python сообщений | 7 |
 | 1.4.1 dynamic rebalance / gravity | Реализованы gravity selection, authenticated transit/local pending rebalance и привязка активного Link. Python↔Rust packet interop прошёл для 96/99-byte proofs; многодемонная сеть остаётся финальной интеграцией | 2 |
 | 1.4.1 set_max_request_size | Отсутствует в Destination и runtime request admission | 6 |
@@ -121,7 +121,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 rngit prefix/page init/large downloads | Самостоятельная утилита вне этого репозитория; общая Resource регрессия остаётся в этапе 6 | граница покрытия |
 | 1.5.1 RSSI/SNR reporting | Цепочка RNode/RNodeMulti → owned InboundPacket → record_packet_metrics → GetPacketRssi/Snr и RPC существует. Метрики копируются до очереди; Python исправление потери через mutable interface fields неприменимо к этой архитектуре. Аппаратная проверка не заявляется | 7 |
 | 1.5.1 non-epoll keepalive | Проверить служебные кадры всех Backbone-совместимых драйверов | 5 |
-| 1.5.1 blocked IP list includes unblocked | Новый механизм обязан отдавать только реально заблокированные IP | 3 |
+| 1.5.1 blocked IP list includes unblocked | blocked_ips_at сначала очищает expired entries, затем включает только flaps > grace; выключенная защита даёт пустой список. Это соответствует исправлению Python bfab2964; 3 короткие policy checks прошли | 3 / сверено |
 | 1.5.1 shared instance inter-app totals | `rnstatus.rs` суммирует interface stats; фильтрацию local/shared проверить | 7 |
 | 1.5.1 minor rnsh/rnir/identity fixes | rnsh сверено по diff 1.3.8..ea98db4f; пути, auth, повторная идентификация, копирование argv, timeout проверены. Python import/logging границы описаны; отдельная rnir отсутствует | 6, 7 |
 | 1.5.1 AES exception description / Python2 umsgpack removal | Python-specific exception/dead-code изменения | неприменимо |
@@ -4316,3 +4316,25 @@ unavailable и не двигают его announce clock. Независимые
 location parser — 1 passed (0.00s). Это codec/parser проверки, не новый
 сетевой interop прогон. Функциональных изменений в этом блоке не потребовалось;
 изменён только журнал, версия пакетов и совместимости остаётся прежней.
+
+## Финальная сверка: Backbone fast-flapping и blocked IP diagnostics
+
+Повторно сопоставлены FastFlapProtection, listener admission и diagnostics
+с Python BackboneInterface, включая `bfab2964`. История коротких разрывов
+не равна списку блокировок: до превышения grace адрес не показывается.
+Expiry проверяется по последнему короткому disconnect; rejected connect
+не обновляет историю. Выключенный listener не блокирует адреса из общей
+таблицы. Снимок очищает истёкшие записи и используется для согласованных
+blocked_ips/blocked_ip_list в actor statistics.
+
+Listener отвергает заблокированный адрес до выделения child id/регистрации.
+Read/write живут в одном select, disconnect guard фиксирует завершение;
+Python None/exception-local-variable ошибки здесь не имеют прямого аналога.
+YAML/factory параметры и локальный/удалённый вывод rnstatus уже подключены.
+Четыре устаревшие строки основной матрицы актуализированы без изменения кода.
+
+Короткая группа backbone_flap::tests — 3 passed (0.00s), управляемый Instant,
+без sleep и сокетов. Ранее выполненный loopback из этапа 3 не повторялся.
+Дополнительно подтверждены конечные ingress watermarks 90/68/10% из Python
+`83a30b18`; это статическая сверка, не новый benchmark throughput.
+Изменена только документация; аппаратная/многопроцессная проверка не заявляется.
