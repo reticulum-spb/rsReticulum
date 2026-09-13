@@ -78,14 +78,14 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.2 zero-bitrate recursive PR | Перенесён upstream offline guard (4760103a): recursive PR не ставится в очередь и не резервирует announce cap до online. Короткий actor case проверяет offline/bitrate=0 → online; аппаратная проверка не заявляется | 2 / закрыто |
 | 1.4.2 Android slow blackhole filtering | Общее фильтрование discovery перенесено через HashSet snapshot; Python runtime-specific slowdown/60s cache не копируется. Android hardware/performance не проверялись | 1 / граница платформенной проверки |
 | 1.5.0 discovery operator LXMF | Wire/runtime реализованы; YAML отсутствует | 1 |
-| 1.5.0 prioritized inbound / configurable four queue lengths | Отсутствуют: `TransportActor::new` создаёт один mpsc для control и inbound | 4 |
-| 1.5.0 early filtering / excessive hops | Частично: проверки в `actor/inbound.rs`, нет новой классификации до общей очереди | 4 |
-| 1.5.0 protocol violation tracking | Отсутствуют отдельные interface counters; BlackholeReason не заменяет статистику | 4, 7 |
-| 1.5.0 inflight PR tracking / batching | Частично: `path_requests`, `discovery_path_requests`, `pending_local_path_requests` имеют разные назначения; нового inflight множества ожидающих нет | 4 |
+| 1.5.0 prioritized inbound / configurable four queue lengths | Реализованы InboundQueues и отдельный control channel: Data/Announce/PathRequest/IngressLimited с приоритетом и defaults 1024/128/128/8. qlen_in_* проходят YAML → normalized config → runtime; legacy actor без control channel сохраняет прежний API | 4 / сверено |
+| 1.5.0 early filtering / excessive hops | prepare_inbound выполняет admission до class queue, PreparedInbound хранит результат классификации/проверки announce. Hops, пустой payload, IFAC и dedup фильтруются до dispatch; привязка интерфейса повторно проверяется после ожидания в очереди | 4 / сверено |
+| 1.5.0 protocol violation tracking | Отдельные per-interface protocol_violations, ifac_violations и packet_filter_hits реализованы; доступны через статистику, rnstatus и Web UI. Это не blackhole reason | 4, 7 / сверено |
+| 1.5.0 inflight PR tracking / batching | Отдельные inflight_path_requests и discovery waiters реализованы. Gate 45s, список requesting_interfaces, engaged state, tag dedup и queued-destination dedup сверены; slow-medium deadline подключён к обоим discovery paths | 4 / сверено |
 | 1.5.0 blackholed announce validation API | Воспроизвести `rns-identity/src/announce.rs` и runtime API; blackhole transport filtering не равен возвращаемому API статусу | 6 |
 | 1.5.0 Channel/Buffer full MDU | Частично: `Channel::channel_mdu` есть; вызовов за пределами собственных тестов поиском не найдено, проверить send/split реализацию | 6 |
-| 1.5.0 queue pressure/drop statistics | Отсутствует с новыми очередями | 4, 7 |
-| 1.5.0 detailed announce/PR flow, totals/frequencies/composition | Частично: `traffic.rs`, `ingress.rs`, RPC/CLI частоты есть; полная композиция отсутствует | 7 |
+| 1.5.0 queue pressure/drop statistics | InboundQueueStats содержит capacities, heights и drops четырёх классов; actor/RPC/rnstatus выводят статистику и pressure. Legacy actor без class queues сообщает недоступность, а не фиктивные нули | 4, 7 / сверено |
+| 1.5.0 detailed announce/PR flow, totals/frequencies/composition | ControlTraffic считает packet/byte totals и rates, rnstatus поддерживает отдельные направления и сортировку. Финальная сверка перенесла announce/PR frequency в успешную ветку TX admission, исключив пропуски и двойной учёт | 7 / сверено |
 | 1.5.0 active links / blocked IP listings | Частично: LinkCount есть; отдельную статистику active Links проверить; blocked IP отсутствуют | 7 |
 | 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | RPC/helpers реализованы; финальная сверка подключила общий medium_path_timeout к запуску recursive discovery и созданию списка ожидающих PR. Учитываются только online-интерфейсы с ненулевой скоростью, floor 15s; 9 коротких проверок прошли | 6 / финальная сверка |
 | 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Отсутствует связь с medium helper | 6 |
@@ -102,7 +102,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
-| 1.5.0 documentation queue/discovery | Отсутствуют новые YAML настройки в CONFIG/Web; обновить с реализацией | 1, 4 |
+| 1.5.0 documentation queue/discovery | CONFIG и YAML template содержат qlen_in_data/announce/pr/il и discovery options; API/UI и ограничения описаны в журналах этапов 1/4/7 | 1, 4 / реализовано |
 | 1.5.1 adaptive dataplane ingress/egress | Отсутствует: `backbone_read_loop` ожидает общий mpsc; write path пишет отдельный HDLC frame | 5 |
 | 1.5.1 coalescing TX buffers | Отсутствует в Backbone backend | 5 |
 | 1.5.1 early invalid frames | Частично: deframer cap и parser checks; отсутствуют новые counters/early admission | 4, 5 |
@@ -4248,3 +4248,28 @@ Deadline теперь равен now + max(15s, medium_path_timeout). Medium tim
 и обычные inflight guards. Результаты: medium timeout — 1 passed,
 recursive PR — 5 passed, inflight gate — 3 passed (0.00s/0.00s/0.06s).
 Ожидания по реальному deadline нет, новых test-only файлов нет.
+
+## Финальная сверка: cleanup Links и актуализация матрицы этапа 4
+
+Python `90ac6262` исправляет удаление элементов pending_links во время обхода.
+В Rust LinkTable::cull_stale использует HashMap::retain и отдельно возвращает
+метаданные истёкших unvalidated links. LinkManager::on_tick сначала собирает
+to_remove, затем закрывает Links после обхода active_links. Механическое
+копирование исправления списка не требуется; пропуск соседнего элемента
+при удалении не воспроизводится этой структурой обхода.
+
+Python `731a63b0` обновляет timestamp кеша interface hashes во время сохранения.
+Rust save_python_destination_table получает готовый interface_names snapshot
+и делает lookup по interface_id, без периодического обновления общей карты
+во время обхода. Python-переменной interface_hashes_updated_at здесь нет;
+стоимость повторного вычисления hash имени не объявляется оптимизированной.
+
+Обновлены семь устаревших строк основной матрицы: четыре inbound очереди,
+early admission, protocol counters, inflight batching, queue statistics,
+control traffic и документация. Проверены текущие InboundQueues,
+PreparedInbound, actor loop, YAML normalization, rnstatus и Web diagnostics.
+Это фиксация уже реализованного поведения, не новый перенос функционала.
+Оставшиеся строки и платформенные/нагрузочные границы не закрываются автоматически.
+
+Короткая существующая группа LinkTable — 5 passed (0.00s); diff check прошёл.
+Изменён только этот документ, код и тестовые файлы не менялись.
