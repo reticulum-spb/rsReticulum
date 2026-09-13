@@ -71,9 +71,9 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.1 autoconnect mode/gravity/to_internal, default_gravity, interface gravity/to_internal | YAML/normalized/factory/registration, autoconnect defaults, child metadata, RPC и API/UI реализованы; I2P live inheritance не подтверждено | 2 |
 | 1.4.1 rnstatus gravity display/sort | local/remote текст и JSON выводят gravity; gravity/g и reverse сортируют целые значения без потери точности через f64. Старые remote snapshots без поля используют default | 7 / сверено |
 | 1.4.1 boundary→boundary/gateway PR | Реализовано; mode-матрицы с recursive/internal flags проходят в transport tests | 2 |
-| 1.4.1 I2P tasks garbage collection | Python GC причина неприменима к Tokio; прочие minor I2P fixes требуют локального воспроизведения | 5 |
+| 1.4.1 I2P tasks garbage collection | Reader/writer/watchdog объединены scoped select: завершение одного прекращает остальные, drop guard сбрасывает online. Python GC/i2plib не переносятся буквально; lifecycle и keepalive описаны в этапе 5. Живой SAM/reconnect не проверен | 5 / архитектурная и интеграционная граница |
 | 1.4.1 ingress burst active deadlock | Перенесён порог снятия burst: IC_DEQUE_MIN_SAMPLE вместо IC_BURST_MIN_SAMPLES. Также перенесены sustained hold и PR cooldown из 1.5.2; 22 коротких ingress tests прошли. Maintenance выпускает held announces независимо от burst-флага | 4 / закрыто |
-| 1.4.1 memory efficiency / LOG_EXTREME | Воспроизвести нагрузку и числовые уровни, не переносить Python allocation детали без измерений | 5, 7 |
+| 1.4.1 memory efficiency / LOG_EXTREME | Уровень 8 Extreme принимается YAML/runtime/UI и отображается в TRACE, как 7 Pathing; граница LOG_NONE описана в CONFIG. CPU/memory profile отложен по указанию пользователя; Python allocation детали не являются обязательным устройством Rust | 5, 7 / функционал реализован, performance отложен |
 | 1.4.1 historical discovery blackhole cleanup | Закрыто: list_with_blackholes удаляет записи по network_id/transport_id; runtime и autoconnect используют актуальный control snapshot, expired TTL исключены | 1 / финальная сверка |
 | 1.4.2 zero-bitrate recursive PR | Перенесён upstream offline guard (4760103a): recursive PR не ставится в очередь и не резервирует announce cap до online. Короткий actor case проверяет offline/bitrate=0 → online; аппаратная проверка не заявляется | 2 / закрыто |
 | 1.4.2 Android slow blackhole filtering | Общее фильтрование discovery перенесено через HashSet snapshot; Python runtime-specific slowdown/60s cache не копируется. Android hardware/performance не проверялись | 1 / граница платформенной проверки |
@@ -91,7 +91,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Все три CLI используют medium_path_timeout для автоматических ожиданий; rnprobe сохраняет first-hop allowance. Explicit timeout имеет приоритет и не увеличивается — документированное отличие от Python rncp/rnpath max; старый daemon использует fallback | 6 / реализовано с границей CLI |
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
 | 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Actor/inflight перенесены; финальная сверка дополнительно исправила sustained ingress, offline recursive PR, relay proof timeout и preemptive PR egress (порог 2). Остальные семантические изменения проверяются по upstream commits | 4, 6 |
-| 1.5.0 Backbone EPOLL starvation | EPOLL Python implementation неприменима; справедливость Tokio read/write проверить нагрузкой | 5 |
+| 1.5.0 Backbone EPOLL starvation | Python EPOLL loop отсутствует. Tokio writer ограничивает batches и явно yield-ит после batch и Interrupted; reader/writer выполняются совместно. Это не доказательство scheduler fairness под длительной нагрузкой: soak отложен | 5 / архитектурная граница, performance отложен |
 | 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
 | 1.5.0 Link watchdog exception reset | Python watchdog_lock неприменим: Rust receive возвращает Result и не удерживает persistent receive lock. Пропуск malformed DATA/Response/ResourceReq/HMU, authenticated ADV teardown и продолжение после ошибок проверены короткими runtime cases. Произвольные panic пользовательских callbacks не входят в гарантию | 6 / архитектурная граница |
 | 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Cancel освобождает queued tail и tracking; receive_part/request_next используют одинаковую семантику consecutive_completed, chunks не перепривязывает исходный blob. Python fixes 65222e0d/0c410277 сверены; большой live interop не заявляется | 6 / сверено |
@@ -113,14 +113,14 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 compiled Python modules/build reporting | Python-specific; Rust уже компилируется нативно | неприменимо |
 | 1.5.1 HDLC/IFAC/HKDF parity tests | Rust crypto/wire тесты существуют; сравнить Python fixtures при изменениях | 5 |
 | 1.5.1 shared medium hints / auto MTU | Inclusive bitrate thresholds, capability-aware Link MTU, shared-instance Local backend и forced bitrate перенесены; точные границы и packet interop описаны в этапе 5. Неизвестный hardware MTU не подменяется receive limit | 5 / реализовано |
-| 1.5.1 memory/CPU, traffic classes, HKDF/IFAC, locks, hashmap Links, hash reuse | Архитектурно частично: Rust HashMaps и crypto primitives; новые классы отсутствуют, оптимизации обосновывать benchmark | 4, 5 |
+| 1.5.1 memory/CPU, traffic classes, HKDF/IFAC, locks, hashmap Links, hash reuse | Data/Announce/PathRequest/IngressLimited реализованы; PreparedInbound сохраняет результат admission и VerifiedAnnounce без повторной signature validation. Rust использует HashMaps и собственную модель владения/crypto; TX leases сохраняют byte accounting. Прирост CPU/memory/HKDF/IFAC throughput не измерен | 4, 5 / функционал реализован, performance отложен |
 | 1.5.1 announce signature cache | Реализовано в actor: `PreparedInbound` переносит `VerifiedAnnounce` от admission к dispatch без повторной криптографической проверки. Python кеширует флаг в одном Packet, не между пакетами; глобальный кеш не требуется | 5 |
 | 1.5.1 optimized HDLC deframer | Обработка обычных runs, decoded-size limits, escape/split/resync реализованы; 12 коротких HDLC checks прошли, 1 ignored не запускался. Побайтовая корректность не выдаётся за доказательство ускорения | 5 / сверено, performance отложен |
 | 1.5.1 inbound defaults / announce queuing tuning | Четыре inbound очереди реализованы ранее. Финальная сверка исправила отдельную outbound announce queue: 4096 записей, TTL 3 часа, отказ новым поступлениям при заполнении вместо вытеснения ожидающих; 3 короткие проверки прошли | 4 / финальная сверка |
 | 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | send_resource_reader отправляет по сегменту, send_resource_stream ограниченно spool-ит неизвестную длину, recv_resource_file принимает в tempfile. Vec API сохранены; public stream требует max_size. Source/admission и file receive cases описаны в этапе 6 | 6 / реализовано с границей API |
 | 1.5.1 rngit prefix/page init/large downloads | Самостоятельная утилита вне этого репозитория; общая Resource регрессия остаётся в этапе 6 | граница покрытия |
 | 1.5.1 RSSI/SNR reporting | Цепочка RNode/RNodeMulti → owned InboundPacket → record_packet_metrics → GetPacketRssi/Snr и RPC существует. Метрики копируются до очереди; Python исправление потери через mutable interface fields неприменимо к этой архитектуре. Аппаратная проверка не заявляется | 7 |
-| 1.5.1 non-epoll keepalive | Проверить служебные кадры всех Backbone-совместимых драйверов | 5 |
+| 1.5.1 non-epoll keepalive | Backbone/TCP HDLC/Local отбрасывают frames <= HEADER_MINSIZE; I2P отсекает пустые frames в initial и обычном read, TCP KISS — пустые и не-DATA. Python разделение epoll/non-epoll отсутствует; живые SAM и socket keepalive не проверялись | 5 / сверено с интеграционной границей |
 | 1.5.1 blocked IP list includes unblocked | blocked_ips_at сначала очищает expired entries, затем включает только flaps > grace; выключенная защита даёт пустой список. Это соответствует исправлению Python bfab2964; 3 короткие policy checks прошли | 3 / сверено |
 | 1.5.1 shared instance inter-app totals | Local totals включают только role=normal; SharedServer/LocalClient/SharedInstancePeer исключены. Remote вывод использует верхнеуровневые totals peer, не суммирует его интерфейсы заново | 7 / сверено |
 | 1.5.1 minor rnsh/rnir/identity fixes | rnsh сверено по diff 1.3.8..ea98db4f; пути, auth, повторная идентификация, копирование argv, timeout проверены. Python import/logging границы описаны; отдельная rnir отсутствует | 6, 7 |
@@ -4451,3 +4451,26 @@ rncp/rnpath/rnprobe увеличивают автоматические waits с
 
 Короткие проверки: keepalive — 11 passed (0.07s), retained ratchets —
 1 passed (0.00s); diff check прошёл.
+
+## Финальная сверка: I2P lifecycle и границы Python-specific оптимизаций
+
+Актуализированы пять строк матрицы по существующему коду, без нового
+функционального изменения. I2P connection объединяет reader/writer/watchdog
+в scoped select и сбрасывает online через drop guard. Подробности timeout,
+probe и backpressure остаются в журнале этапа 5; это не отчёт о живом SAM.
+Пустые служебные кадры отсеиваются в I2P, Backbone, TCP и Local до транспорта;
+TCP KISS также исключает управляющие команды. Различие размеров guards
+сохранено: I2P фильтрует empty frames, HDLC остальных трёх — короткие frames.
+
+Backbone writer уступает выполнение после ограниченного batch и при
+Interrupted. Это архитектурный ответ на Python EPOLL starvation, но не
+гарантия произвольной задержки при перегрузке. Длительные fairness/throughput
+и CPU/memory измерения остаются отложенными по указанию пользователя.
+
+Четыре traffic classes уже существуют; прежняя отметка об их отсутствии
+удалена. PreparedInbound/VerifiedAnnounce и TX leases подтверждают перенос
+соответствующего поведения, но не количественный выигрыш производительности.
+LOG_EXTREME реализован в рамках шкалы, документированной в CONFIG.
+
+Проверка этого блока — статическая сверка указанных путей и git diff --check.
+Повторные тесты не запускались; новых тестовых файлов нет.
