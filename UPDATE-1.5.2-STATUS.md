@@ -54,8 +54,8 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.3.9 rnsh config/identity paths | Перенесено: раздельные --config/--rnsconfig, identity[.SERVICE] и allowed_identities в выбранном rnsh каталоге; миграция описана в CONFIG.md | 7 |
 | 1.3.9 Backbone fast flapping | Отсутствует: listener/config в `rns-interface/src/backbone.rs` не ведут историю блокировок IP | 3 |
 | 1.3.9 LOG_PATHING / logging | YAML/runtime/UI принимают 7 Pathing и 8 Extreme; оба соответствуют Rust TRACE. Граница шкалы и LOG_NONE описана в CONFIG | 7 / финальная сверка |
-| 1.3.9 internal discovery | Расхождение: `apply_discovery_mode_autocorrect` разрешает только gateway/AP | 1 |
-| 1.3.9 location script | Отсутствует в YAML и scheduler; Python `Discovery.py:get_interface_announce_data` запускает executable | 1 |
+| 1.3.9 internal discovery | apply_discovery_mode_autocorrect сохраняет Internal наряду с Gateway/AP; YAML/runtime и ранее выполненный Python receiver interop описаны в журнале этапа 1 | 1 / сверено |
+| 1.3.9 location script | location_cmd проходит конфигурацию и вызывается scheduler перед announce; ошибка отменяет только публикацию этого интерфейса. Лимиты 4096 bytes / 5s и refresh/deregister реализованы в этапе 1 | 1 / сверено |
 | 1.3.9 RESOURCE_RCL, reliability | Реализована отмена в protocol/runtime, есть regression tests; межъязыковое поведение воспроизвести | 6 |
 | 1.4.0 transport persistence / interface hash / known destinations background cleaning и отказ от recombination | Snapshot writes вынесены с actor, SQLite работает на worker; shared client не пишет сетевой cache, disk recombination при save нет. Исправлен timeout used entries по last_used во всех backend и dirty после очистки. Legacy sweep остаётся целиком на actor; latency большого каталога не измерена | 0, 7 / граница производительности |
 | 1.4.0 invalid discovery stamp cache | Закрыто при итоговой сверке: task-local FIFO до 2048 invalid digest entries | 1 / финальная сверка |
@@ -77,7 +77,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.1 historical discovery blackhole cleanup | Закрыто: list_with_blackholes удаляет записи по network_id/transport_id; runtime и autoconnect используют актуальный control snapshot, expired TTL исключены | 1 / финальная сверка |
 | 1.4.2 zero-bitrate recursive PR | Перенесён upstream offline guard (4760103a): recursive PR не ставится в очередь и не резервирует announce cap до online. Короткий actor case проверяет offline/bitrate=0 → online; аппаратная проверка не заявляется | 2 / закрыто |
 | 1.4.2 Android slow blackhole filtering | Общее фильтрование discovery перенесено через HashSet snapshot; Python runtime-specific slowdown/60s cache не копируется. Android hardware/performance не проверялись | 1 / граница платформенной проверки |
-| 1.5.0 discovery operator LXMF | Wire/runtime реализованы; YAML отсутствует | 1 |
+| 1.5.0 discovery operator LXMF | discovery_lxmf_address реализован в YAML, normalized config, API и runtime publication; проверяется 32-character hex address. Wire interop описан в журнале этапа 1 | 1 / сверено |
 | 1.5.0 prioritized inbound / configurable four queue lengths | Реализованы InboundQueues и отдельный control channel: Data/Announce/PathRequest/IngressLimited с приоритетом и defaults 1024/128/128/8. qlen_in_* проходят YAML → normalized config → runtime; legacy actor без control channel сохраняет прежний API | 4 / сверено |
 | 1.5.0 early filtering / excessive hops | prepare_inbound выполняет admission до class queue, PreparedInbound хранит результат классификации/проверки announce. Hops, пустой payload, IFAC и dedup фильтруются до dispatch; привязка интерфейса повторно проверяется после ожидания в очереди | 4 / сверено |
 | 1.5.0 protocol violation tracking | Отдельные per-interface protocol_violations, ifac_violations и packet_filter_hits реализованы; доступны через статистику, rnstatus и Web UI. Это не blackhole reason | 4, 7 / сверено |
@@ -4273,3 +4273,24 @@ PreparedInbound, actor loop, YAML normalization, rnstatus и Web diagnostics.
 
 Короткая существующая группа LinkTable — 5 passed (0.00s); diff check прошёл.
 Изменён только этот документ, код и тестовые файлы не менялись.
+
+## Финальная сверка: исключённые адреса discovery autoconnect
+
+Перенесена недостающая часть Discovery.py 1.5.2: автоматическое подключение
+пропускает hostname с суффиксом `.onion` без учёта регистра и точные адреса
+`127.0.0.1` / `0.0.0.0`. Ранее был только фильтр Yggdrasil IPv6 `200::/7`.
+Проверка выполняется до резервирования autoconnect-слота и запуска драйвера;
+запись остаётся видимой в discovery, ручные интерфейсы не затронуты.
+
+Это перенос конкретной upstream policy, не общий фильтр приватных адресов:
+LAN, прочие loopback адреса, DNS-алиасы и иные IPv6 диапазоны не запрещаются
+новым правилом. Автоматическая настройка Tor/Yggdrasil не добавляется.
+Существующий inline case расширен смешанным регистром `.onion`, запрещёнными
+IP и разрешёнными соседними случаями; сетевых подключений он не делает.
+
+Также сверены и актуализированы три устаревшие строки этапа 1: internal mode,
+location_cmd и operator LXMF в YAML/API. Ранее записанные межъязыковые проверки
+публикации не запускались повторно; реализация этих трёх пунктов не менялась.
+
+Результат: targeted address check — 1 passed (0.00s), client-only cargo check
+и fmt/diff checks прошли. Новых test-only файлов нет.

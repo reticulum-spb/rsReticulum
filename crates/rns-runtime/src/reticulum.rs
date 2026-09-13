@@ -3051,8 +3051,8 @@ async fn maybe_autoconnect_discovered(handle: &ReticulumHandle, record: Discover
     let Some(host) = record.info.reachable_on.clone() else {
         return;
     };
-    if is_yggdrasil_ipv6(&host) {
-        tracing::debug!(host = %host, "skipping Yggdrasil IPv6 discovery autoconnect");
+    if discovery_autoconnect_host_is_excluded(&host) {
+        tracing::debug!(host = %host, "skipping unsupported discovery autoconnect address");
         return;
     }
     let Some(port) = record.info.port else {
@@ -3130,6 +3130,14 @@ async fn spawn_discovered_backbone_client(
     .await;
     tracing::info!(name = %name, id, endpoint = %format!("{host}:{port}"), "auto-connected discovered interface");
     Ok(id)
+}
+
+fn discovery_autoconnect_host_is_excluded(host: &str) -> bool {
+    // Match Python discovery policy, not a general-purpose IP safety filter.
+    // Manual interfaces remain available; Tor/Yggdrasil need external setup.
+    is_yggdrasil_ipv6(host)
+        || matches!(host, "127.0.0.1" | "0.0.0.0")
+        || host.to_ascii_lowercase().ends_with(".onion")
 }
 
 fn is_yggdrasil_ipv6(host: &str) -> bool {
@@ -5848,6 +5856,27 @@ mod tests {
         assert!(is_yggdrasil_ipv6("3ff:ffff::1"));
         assert!(!is_yggdrasil_ipv6("400::1"));
         assert!(!is_yggdrasil_ipv6("relay.example.org"));
+        for host in [
+            "200::1",
+            "3ff:ffff::1",
+            "hidden.onion",
+            "HIDDEN.OnIoN",
+            "127.0.0.1",
+            "0.0.0.0",
+        ] {
+            assert!(discovery_autoconnect_host_is_excluded(host), "{host}");
+        }
+        // Deliberately no broad LAN/loopback or hostname DNS policy change.
+        for host in [
+            "relay.example.org",
+            "192.168.1.10",
+            "127.0.0.2",
+            "::1",
+            "400::1",
+            "onion.example.org",
+        ] {
+            assert!(!discovery_autoconnect_host_is_excluded(host), "{host}");
+        }
     }
 
     #[test]
