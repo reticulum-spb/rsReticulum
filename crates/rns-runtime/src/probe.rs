@@ -267,6 +267,8 @@ pub async fn probe_once(
 
 /// Supply the shared daemon's medium timeout when the local actor is only a client.
 /// Explicit waits remain authoritative; the floor only affects automatic waits.
+// Preserve the public probe API and its existing callers.
+#[allow(clippy::too_many_arguments)]
 pub async fn probe_once_with_medium_timeout(
     transport_tx: mpsc::Sender<TransportMessage>,
     dest_hash: [u8; 16],

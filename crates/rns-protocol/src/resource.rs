@@ -1744,10 +1744,8 @@ impl OutboundTransfer {
             }
         }
 
-        if sent_count > 0 {
-            if self.sent_parts >= self.resource.num_parts() {
-                self.resource.state = ResourceState::AwaitingProof;
-            }
+        if sent_count > 0 && self.sent_parts >= self.resource.num_parts() {
+            self.resource.state = ResourceState::AwaitingProof;
         }
 
         actions

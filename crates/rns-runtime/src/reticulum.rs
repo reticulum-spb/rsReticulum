@@ -1210,8 +1210,7 @@ pub async fn init_with_options(
     let persisted_transport_identity =
         rns_identity::identity::Identity::from_file(&transport_identity_path).ok();
     let transport_identity_created = persisted_transport_identity.is_none();
-    let transport_identity =
-        persisted_transport_identity.unwrap_or_else(rns_identity::identity::Identity::new);
+    let transport_identity = persisted_transport_identity.unwrap_or_default();
     let _ = transport_tx.try_send(TransportMessage::SetTransportIdentity {
         identity_hash: transport_identity.hash,
     });
@@ -1591,8 +1590,10 @@ pub async fn init_with_options(
                 wire_ifac_size(&post_init),
                 iface_id,
                 interface_transport_tx.clone(),
-                id_gen.clone(),
-                handle_tx.clone(),
+                InterfaceRegistry {
+                    id_gen: id_gen.clone(),
+                    handle_tx: handle_tx.clone(),
+                },
                 &socket_base,
                 is_foreground.clone(),
             )
@@ -4117,8 +4118,10 @@ pub async fn spawn_interface_from_config(
         wire_ifac_size(&post_init),
         id,
         handle.interface_transport_tx.clone(),
-        handle.id_gen.clone(),
-        handle.handle_tx.clone(),
+        InterfaceRegistry {
+            id_gen: handle.id_gen.clone(),
+            handle_tx: handle.handle_tx.clone(),
+        },
         &handle.socket_base,
         handle.is_foreground.clone(),
     )
@@ -4178,16 +4181,21 @@ pub async fn spawn_interface_from_config(
     Ok(id)
 }
 
+struct InterfaceRegistry {
+    id_gen: Arc<AtomicU64>,
+    handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
+}
+
 async fn spawn_interface(
     iface_config: &interface_factory::InterfaceConfig,
     receive_ifac_size: usize,
     id: u64,
     transport_tx: mpsc::Sender<TransportMessage>,
-    id_gen: Arc<AtomicU64>,
-    handle_tx: mpsc::Sender<rns_interface::traits::InterfaceHandle>,
+    registry: InterfaceRegistry,
     socket_base: &Path,
     is_foreground: Arc<AtomicBool>,
 ) -> Result<Vec<rns_interface::traits::InterfaceHandle>, String> {
+    let InterfaceRegistry { id_gen, handle_tx } = registry;
     match iface_config {
         interface_factory::InterfaceConfig::TcpClient(c) => {
             let mut config = c.clone();

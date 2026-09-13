@@ -282,7 +282,7 @@ for line in sys.stdin.readlines():
                 frames.extend(decoder.feed(chunk));
                 assert!(decoder.buffer.len() <= 2 * limit);
             }
-            assert_eq!(frames, [payload.clone()]);
+            assert_eq!(frames, std::slice::from_ref(&payload));
             assert_eq!(decoder.oversized_frames(), 0);
         }
     }

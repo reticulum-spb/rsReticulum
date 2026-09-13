@@ -912,15 +912,15 @@ mod tests {
             paths.join("identity.сервис1")
         );
         assert_eq!(
-            identity_path(None, &paths, Some("default")),
+            identity_path(None, paths, Some("default")),
             PathBuf::from("/tmp/rnsh/identity.default")
         );
         assert_eq!(
-            identity_path(None, &paths, Some("svc/name!")),
+            identity_path(None, paths, Some("svc/name!")),
             PathBuf::from("/tmp/rnsh/identity.svcname")
         );
         assert_eq!(
-            identity_path(Some(Path::new("/tmp/custom")), &paths, None),
+            identity_path(Some(Path::new("/tmp/custom")), paths, None),
             PathBuf::from("/tmp/custom")
         );
     }

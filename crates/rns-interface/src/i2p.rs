@@ -526,9 +526,11 @@ pub async fn spawn_i2p_client(
                 &buffered,
                 id,
                 &transport_tx,
-                &online_task,
-                &task_rxb,
-                &task_txb,
+                I2pConnectionState {
+                    online: &online_task,
+                    rxb: &task_rxb,
+                    txb: &task_txb,
+                },
                 conn_rx,
             );
             tokio::pin!(connection);
@@ -742,9 +744,11 @@ pub async fn spawn_i2p_server_with_id(
                         &buffered,
                         client_id,
                         &transport_tx2,
-                        &c_online_r,
-                        &c_rxb_r,
-                        &c_txb_w,
+                        I2pConnectionState {
+                            online: &c_online_r,
+                            rxb: &c_rxb_r,
+                            txb: &c_txb_w,
+                        },
                         c_rx,
                     )
                     .await;
@@ -864,20 +868,25 @@ async fn i2p_write_loop<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
+struct I2pConnectionState<'a> {
+    online: &'a AtomicBool,
+    rxb: &'a AtomicU64,
+    txb: &'a AtomicU64,
+}
+
 async fn i2p_connection<R, W>(
     reader: R,
     writer: W,
     initial_data: &[u8],
     interface_id: InterfaceId,
     transport_tx: &mpsc::Sender<TransportMessage>,
-    online: &AtomicBool,
-    rxb: &AtomicU64,
-    txb: &AtomicU64,
+    state: I2pConnectionState<'_>,
     rx: mpsc::Receiver<Bytes>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let I2pConnectionState { online, rxb, txb } = state;
     struct OfflineOnDrop<'a>(&'a AtomicBool);
     impl Drop for OfflineOnDrop<'_> {
         fn drop(&mut self) {

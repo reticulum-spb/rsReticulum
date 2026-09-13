@@ -676,7 +676,7 @@ mod tests {
         let mut unauthorized = event_with(blob);
         unauthorized.identity_hash = Some([0x77; 16]);
         tx.send(unauthorized).await.unwrap();
-        let (bad, _) = stamped_blob(&info, &vec![0xCD; STAMP_SIZE]);
+        let (bad, _) = stamped_blob(&info, &[0xCD; STAMP_SIZE]);
         tx.send(event_with(bad.clone())).await.unwrap();
         tx.send(event_with(bad)).await.unwrap();
         // Drop tx so the task exits cleanly.

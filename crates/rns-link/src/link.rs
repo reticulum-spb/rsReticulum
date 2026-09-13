@@ -938,7 +938,7 @@ impl Link {
     /// Parse a decrypted packet or a fully reassembled request Resource.
     pub fn unpack_request(plaintext: &[u8]) -> Result<ParsedRequestData, LinkCryptoError> {
         // request_id = SHA-256(packed_request)[:16]
-        let request_id = truncated_hash(&plaintext);
+        let request_id = truncated_hash(plaintext);
 
         // Unpack msgpack array: [timestamp, path_hash, data]
         let value = rmpv::decode::read_value(&mut &plaintext[..])
@@ -1811,14 +1811,10 @@ mod tests {
             if expected_mdu > 0 {
                 let payload = vec![0x5A; expected_mdu];
                 let encrypted = initiator.encrypt(&payload).unwrap();
-                assert!(
-                    encrypted.len() + rns_wire::constants::HEADER_MINSIZE + 1 <= expected as usize
-                );
+                assert!(encrypted.len() + rns_wire::constants::HEADER_MINSIZE < expected as usize);
                 assert_eq!(responder.decrypt(&encrypted).unwrap(), payload);
                 let encrypted = responder.encrypt(&payload).unwrap();
-                assert!(
-                    encrypted.len() + rns_wire::constants::HEADER_MINSIZE + 1 <= expected as usize
-                );
+                assert!(encrypted.len() + rns_wire::constants::HEADER_MINSIZE < expected as usize);
                 assert_eq!(initiator.decrypt(&encrypted).unwrap(), payload);
             }
         }

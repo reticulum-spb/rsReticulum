@@ -1334,7 +1334,7 @@ async fn plugins() -> ApiResult<Json<Value>> {
                 }
             })
             .collect::<Vec<_>>();
-        return Ok(Json(json!({ "plugins": plugins })));
+        Ok(Json(json!({ "plugins": plugins })))
     }
     #[cfg(not(target_os = "linux"))]
     Ok(Json(json!({ "plugins": [] })))

@@ -229,12 +229,14 @@ mod tests {
         assert!((stats.txpps - 2.0).abs() < 0.05);
         assert_eq!((counter.rx, counter.tx), (0, 0));
         assert_eq!(counter.sample().rxpps, stats.rxpps);
-        let mut bytes = super::ByteRateSampler::default();
-        bytes.previous = Some((
-            std::time::Instant::now() - std::time::Duration::from_secs(2),
-            100,
-            200,
-        ));
+        let mut bytes = super::ByteRateSampler {
+            previous: Some((
+                std::time::Instant::now() - std::time::Duration::from_secs(2),
+                100,
+                200,
+            )),
+            ..Default::default()
+        };
         bytes.sample(300, 600);
         assert!((799..=800).contains(&bytes.rates.0));
         assert!((1599..=1600).contains(&bytes.rates.1));

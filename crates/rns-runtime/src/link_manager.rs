@@ -223,7 +223,7 @@ impl FileResourceReceiver {
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 use std::io::{Seek, Write};
-                let result = (|| -> std::io::Result<std::fs::File> {
+                (|| -> std::io::Result<std::fs::File> {
                     let mut file = match file {
                         Some(file) => file,
                         None => tempfile::tempfile()?,
@@ -235,8 +235,7 @@ impl FileResourceReceiver {
                     }
                     Ok(file)
                 })()
-                .map_err(|e| e.to_string());
-                result
+                .map_err(|e| e.to_string())
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()));

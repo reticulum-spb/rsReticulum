@@ -447,9 +447,7 @@ async fn connect_shared_inner(
 
     let identity_path = paths.storage_dir.join("transport_identity");
     let persisted_identity = rns_identity::identity::Identity::from_file(&identity_path).ok();
-    let identity = persisted_identity
-        .clone()
-        .unwrap_or_else(rns_identity::identity::Identity::new);
+    let identity = persisted_identity.clone().unwrap_or_default();
     let _ = transport_tx.try_send(TransportMessage::SetTransportIdentity {
         identity_hash: identity.hash,
     });

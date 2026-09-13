@@ -446,7 +446,7 @@ impl TransportActor {
     fn using_sqlite(&self) -> bool {
         #[cfg(feature = "sqlite")]
         {
-            return self.sqlite.is_some();
+            self.sqlite.is_some()
         }
         #[cfg(not(feature = "sqlite"))]
         {

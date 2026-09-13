@@ -905,7 +905,7 @@ pub async fn spawn_backbone_client(
         online,
         rxb: Some(shared_rxb),
         txb: Some(shared_txb),
-        tx: tx.into(),
+        tx,
         read_task,
     })
 }

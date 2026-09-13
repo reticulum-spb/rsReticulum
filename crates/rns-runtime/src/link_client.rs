@@ -136,13 +136,15 @@ impl Drop for PendingLinkRegistration {
     }
 }
 
+type LinkInboundReceiver = mpsc::Receiver<Result<Vec<u8>, LinkClientError>>;
+
 /// Command handle for a runtime task that exclusively owns a reusable
 /// outbound [`LinkSession`].
 #[derive(Clone)]
 pub struct LinkSessionHandle {
     link_id: [u8; 16],
     command_tx: mpsc::Sender<LinkSessionCommand>,
-    inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Result<Vec<u8>, LinkClientError>>>>,
+    inbound_rx: Arc<tokio::sync::Mutex<LinkInboundReceiver>>,
 }
 
 enum LinkSessionCommand {
@@ -1028,12 +1030,10 @@ impl LinkSession {
                 request_id
             }
         };
-        let link_id = session.link.link_id;
         wait_for_response(
             &session.transport_tx,
             &mut session.event_rx,
             &mut session.link,
-            link_id,
             response_id,
             time_remaining(expires)?,
             max_response_bytes,
@@ -2201,7 +2201,6 @@ impl LinkClient {
             &self.transport_tx,
             &mut dest_rx,
             &mut link,
-            link_id,
             packet_request_id,
             time_remaining(deadline)?,
             usize::MAX,
@@ -2395,12 +2394,12 @@ async fn wait_for_response(
     transport_tx: &mpsc::Sender<TransportMessage>,
     rx: &mut mpsc::Receiver<DestinationEvent>,
     link: &mut Link,
-    link_id: [u8; 16],
     request_id: [u8; 16],
     deadline: Duration,
     max_response_bytes: usize,
     response_mode: ResourceResponseMode,
 ) -> Result<LinkResponse, LinkClientError> {
+    let link_id = link.link_id;
     let mut inbound_resources: HashMap<[u8; 32], InboundTransfer> = HashMap::new();
     let fut = async {
         let mut segment_info: HashMap<[u8; 32], ([u8; 32], usize, usize)> = HashMap::new();
@@ -2821,7 +2820,7 @@ async fn wait_for_response(
             );
         }
     }
-    let result = result.unwrap_or_else(|_| Err(LinkClientError::Timeout("response")));
+    let result = result.unwrap_or(Err(LinkClientError::Timeout("response")));
     // Packet/packed responses can already have retired their own receipt in
     // Link. Retire any remaining entry on every exit (including PythonFile,
     // rejection and timeout), without disturbing other concurrent requests.
@@ -3126,7 +3125,6 @@ mod tests {
                         &session.transport_tx,
                         &mut session.event_rx,
                         &mut session.link,
-                        link_id,
                         [8; 16],
                         Duration::from_millis(10),
                         100,
@@ -3199,7 +3197,6 @@ mod tests {
                     &session.transport_tx,
                     &mut session.event_rx,
                     &mut session.link,
-                    link_id,
                     [8; 16],
                     Duration::from_secs(1),
                     100,
@@ -3359,7 +3356,6 @@ mod tests {
                 &tx,
                 &mut rx,
                 &mut link,
-                link_id,
                 [8; 16],
                 Duration::from_millis(5),
                 100,
@@ -3948,7 +3944,6 @@ mod tests {
                 &tx,
                 &mut rx,
                 &mut client,
-                link_id,
                 request_id,
                 Duration::from_secs(1),
                 payload.len() + 4,
@@ -4096,7 +4091,6 @@ mod tests {
                 &tx,
                 &mut rx,
                 &mut client,
-                link_id,
                 request_id,
                 Duration::from_secs(1),
                 limit,

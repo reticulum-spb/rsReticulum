@@ -21,9 +21,11 @@ async fn writer_failure_ends_connection_while_reader_is_idle() {
             &[],
             1,
             &transport,
-            &online,
-            &AtomicU64::new(0),
-            &txb,
+            I2pConnectionState {
+                online: &online,
+                rxb: &AtomicU64::new(0),
+                txb: &txb,
+            },
             rx,
         ),
     )
@@ -137,9 +139,11 @@ async fn watchdog_cancels_blocked_admission_and_writer() {
             &hdlc::frame(b"blocked admission"),
             1,
             &transport,
-            &state,
-            &AtomicU64::new(0),
-            &AtomicU64::new(0),
+            I2pConnectionState {
+                online: &state,
+                rxb: &AtomicU64::new(0),
+                txb: &AtomicU64::new(0),
+            },
             rx,
         )
         .await;
@@ -177,9 +181,11 @@ async fn connection_abort_closes_writer_and_marks_offline() {
             &[],
             1,
             &transport,
-            &state,
-            &AtomicU64::new(0),
-            &AtomicU64::new(0),
+            I2pConnectionState {
+                online: &state,
+                rxb: &AtomicU64::new(0),
+                txb: &AtomicU64::new(0),
+            },
             rx,
         )
         .await;

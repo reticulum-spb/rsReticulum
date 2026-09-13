@@ -512,6 +512,12 @@ pub async fn spawn_tcp_client(
     })
 }
 
+struct AcceptedTcpSettings {
+    kiss_framing: bool,
+    mode: InterfaceMode,
+    receive_ifac_size: usize,
+}
+
 /// Wrap an accepted TCP stream as an interface; no reconnect on disconnect.
 #[tracing::instrument(
     level = "debug",
@@ -525,10 +531,13 @@ async fn spawn_tcp_accepted(
     parent_id: InterfaceId,
     name: String,
     transport_tx: mpsc::Sender<TransportMessage>,
-    kiss_framing: bool,
-    mode: InterfaceMode,
-    receive_ifac_size: usize,
+    settings: AcceptedTcpSettings,
 ) -> InterfaceHandle {
+    let AcceptedTcpSettings {
+        kiss_framing,
+        mode,
+        receive_ifac_size,
+    } = settings;
     let online = Arc::new(AtomicBool::new(true));
     let online2 = online.clone();
     let (tx, conn_rx) = mpsc::channel::<Bytes>(1024);
@@ -642,9 +651,11 @@ pub async fn spawn_tcp_server(
                         id,
                         client_name,
                         transport_tx.clone(),
-                        kiss_framing,
-                        mode,
-                        receive_ifac_size,
+                        AcceptedTcpSettings {
+                            kiss_framing,
+                            mode,
+                            receive_ifac_size,
+                        },
                     )
                     .await;
                     if handle_tx.send(handle).await.is_err() {
