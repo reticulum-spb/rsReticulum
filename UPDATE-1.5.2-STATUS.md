@@ -56,7 +56,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.3.9 LOG_PATHING / logging | YAML/runtime/UI принимают 7 Pathing и 8 Extreme; оба соответствуют Rust TRACE. Граница шкалы и LOG_NONE описана в CONFIG | 7 / финальная сверка |
 | 1.3.9 internal discovery | apply_discovery_mode_autocorrect сохраняет Internal наряду с Gateway/AP; YAML/runtime и ранее выполненный Python receiver interop описаны в журнале этапа 1 | 1 / сверено |
 | 1.3.9 location script | location_cmd проходит конфигурацию и вызывается scheduler перед announce; ошибка отменяет только публикацию этого интерфейса. Лимиты 4096 bytes / 5s и refresh/deregister реализованы в этапе 1 | 1 / сверено |
-| 1.3.9 RESOURCE_RCL, reliability | Реализована отмена в protocol/runtime, есть regression tests; межъязыковое поведение воспроизвести | 6 |
+| 1.3.9 RESOURCE_RCL, reliability | Protocol/runtime используют RCL/ICL с проверкой decrypt и resource hash; cancel очищает transfer/coordinator и оставшиеся сегменты. Короткие runtime cases пройдены; полный межъязыковый сценарий отмены не заявляется | 6 / реализовано, граница interop |
 | 1.4.0 transport persistence / interface hash / known destinations background cleaning и отказ от recombination | Snapshot writes вынесены с actor, SQLite работает на worker; shared client не пишет сетевой cache, disk recombination при save нет. Исправлен timeout used entries по last_used во всех backend и dirty после очистки. Legacy sweep остаётся целиком на actor; latency большого каталога не измерена | 0, 7 / граница производительности |
 | 1.4.0 invalid discovery stamp cache | Закрыто при итоговой сверке: task-local FIFO до 2048 invalid digest entries | 1 / финальная сверка |
 | 1.4.0 valid discovery cache / sequential validation | Task-local FIFO до 2048 valid digest/value entries; source policy и обновление store остаются на каждом событии | 1 / финальная сверка |
@@ -94,7 +94,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 Backbone EPOLL starvation | EPOLL Python implementation неприменима; справедливость Tokio read/write проверить нагрузкой | 5 |
 | 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
 | 1.5.0 Link watchdog exception reset | Python watchdog_lock неприменим: Rust receive возвращает Result и не удерживает persistent receive lock. Пропуск malformed DATA/Response/ResourceReq/HMU, authenticated ADV teardown и продолжение после ошибок проверены короткими runtime cases. Произвольные panic пользовательских callbacks не входят в гарантию | 6 / архитектурная граница |
-| 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Частично: сегменты/RCL реализованы; проверить индексы и повторное связывание Python↔Rust | 6 |
+| 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Cancel освобождает queued tail и tracking; receive_part/request_next используют одинаковую семантику consecutive_completed, chunks не перепривязывает исходный blob. Python fixes 65222e0d/0c410277 сверены; большой live interop не заявляется | 6 / сверено |
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
 | 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
@@ -117,7 +117,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 announce signature cache | Реализовано в actor: `PreparedInbound` переносит `VerifiedAnnounce` от admission к dispatch без повторной криптографической проверки. Python кеширует флаг в одном Packet, не между пакетами; глобальный кеш не требуется | 5 |
 | 1.5.1 optimized HDLC deframer | Rust deframer существует; побайтовая совместимость и производительность проверяются отдельно | 5 |
 | 1.5.1 inbound defaults / announce queuing tuning | Четыре inbound очереди реализованы ранее. Финальная сверка исправила отдельную outbound announce queue: 4096 записей, TTL 3 часа, отказ новым поступлениям при заполнении вместо вытеснения ожидающих; 3 короткие проверки прошли | 4 / финальная сверка |
-| 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | Воспроизвести потоковые источники и граничные размеры Rust | 6 |
+| 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | send_resource_reader отправляет по сегменту, send_resource_stream ограниченно spool-ит неизвестную длину, recv_resource_file принимает в tempfile. Vec API сохранены; public stream требует max_size. Source/admission и file receive cases описаны в этапе 6 | 6 / реализовано с границей API |
 | 1.5.1 rngit prefix/page init/large downloads | Самостоятельная утилита вне этого репозитория; общая Resource регрессия остаётся в этапе 6 | граница покрытия |
 | 1.5.1 RSSI/SNR reporting | Цепочка RNode/RNodeMulti → owned InboundPacket → record_packet_metrics → GetPacketRssi/Snr и RPC существует. Метрики копируются до очереди; Python исправление потери через mutable interface fields неприменимо к этой архитектуре. Аппаратная проверка не заявляется | 7 |
 | 1.5.1 non-epoll keepalive | Проверить служебные кадры всех Backbone-совместимых драйверов | 5 |
@@ -127,7 +127,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 AES exception description / Python2 umsgpack removal | Python-specific exception/dead-code изменения | неприменимо |
 | 1.5.2 dataplane tuning | Требует этапа 5 с конечными параметрами 1.5.2 | 5 |
 | 1.5.2 rngit block unidentified config example | Утилита вне покрытия; аналогичные rnsh authorization проверки остаются | граница покрытия |
-| 1.5.2 Resource regression | Воспроизвести Python↔Rust, включая большой/многосегментный download | 6 |
+| 1.5.2 Resource regression | Stream proxy использует flush/rewind перед reader; сегментация учитывает общий размер с metadata. c1d7c12b/6bc0481c сверены; spool и reader boundary checks пройдены. Полный большой Python↔Rust download остаётся непроведённой интеграционной проверкой | 6 / функционал перенесён, граница interop |
 | 1.5.2 I2P keepalive→transport | Закрыто: i2p_read_loop фильтрует empty HDLC frames и в initial_data, и при чтении; probes обновляют last_read, но не попадают в transport. Scoped watchdog/reader/writer уже перенесены; живой SAM/I2P не проверялся | 5 |
 
 ## Цепочка конфигурации
@@ -4362,3 +4362,25 @@ response доступен через явный PythonFile mode. Лимит от
 negotiated_mdu_bounds — 1 passed (1.58s), blackhole_validation — 1 passed
 (0.02s). Новых функциональных расхождений в этом блоке не обнаружено;
 код и тестовые файлы не менялись, обновлена только матрица и журнал.
+
+## Финальная сверка: Resource streams, segment alignment и cancellation
+
+Сверены последние изменения Resource.py 1.3.8..ea98db4f и существующий перенос.
+Неизвестная длина обрабатывается через anonymous tempfile, ограниченный
+max_size; перед reader выполняются flush и rewind. Для известной длины
+read_exact читает один сегмент, последующие чтения начинаются после proof;
+metadata уменьшает бюджет первого сегмента, общий d повторяется в ADV.
+Верхние size/segment caps проверяются до подготовки передачи.
+
+Python-ошибки receive_part/request_next index и rebind data не требуют нового
+изменения: Rust хранит число подряд принятых частей и делит исходный blob
+через chunks. RCL/ICL cleanup переносился ранее, включая queued split tail
+и resource tracking. Это не гарантия доставки отмены по сети: её отправка
+на error paths остаётся best-effort, как описано в предыдущих разделах.
+
+Повторены только три короткие проверки: spool flush/rewind/limit — 1 passed
+(0.00s), reader segment boundary/source position — 1 passed (0.14s),
+cancel queued tail — 1 passed (0.01s). Reader case использует proofs от
+fixture без передачи всех частей; он не выдаётся за большой wire transfer.
+Полный Python↔Rust download и межъязыковая cancellation matrix не запускались.
+Актуализированы четыре строки основной матрицы; код менять не потребовалось.
