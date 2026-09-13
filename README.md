@@ -35,11 +35,6 @@ target are now `1.5.2` for the existing Rust surface, with the documented API
 differences and legacy backlog below. This is not a claim of complete Python
 feature parity or completed hardware/performance qualification.
 
-See the [current update status](UPDATE-1.5.2-STATUS.md#текущий-статус) for completed
-checks, documented differences and deferred validation. The historical entries
-in that journal are not the current backlog. [CONFIG.md](CONFIG.md) documents
-the migrated settings and the rnsh command-line/identity migration.
-
 ## Application ecosystem
 
 The workspace is also the transport foundation for adjacent Rust applications:
