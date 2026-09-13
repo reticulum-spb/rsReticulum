@@ -103,19 +103,19 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
 | 1.5.0 documentation queue/discovery | CONFIG и YAML template содержат qlen_in_data/announce/pr/il и discovery options; API/UI и ограничения описаны в журналах этапов 1/4/7 | 1, 4 / реализовано |
-| 1.5.1 adaptive dataplane ingress/egress | Отсутствует: `backbone_read_loop` ожидает общий mpsc; write path пишет отдельный HDLC frame | 5 |
-| 1.5.1 coalescing TX buffers | Отсутствует в Backbone backend | 5 |
-| 1.5.1 early invalid frames | Частично: deframer cap и parser checks; отсутствуют новые counters/early admission | 4, 5 |
+| 1.5.1 adaptive dataplane ingress/egress | IngressPolicy/reader gates и controlled_write_loop/EgressController подключены к Backbone. TX reservations учитывают encoded backlog, release/disconnect освобождают gate; подробности и границы backend описаны в этапе 5 | 5 / сверено |
+| 1.5.1 coalescing TX buffers | Backbone writer объединяет HDLC кадры в bounded batches и сохраняет reservations до write/drop. Это Rust batching с копированием в output buffer, не буквальная Python zero-copy структура | 5 / реализовано с архитектурной границей |
+| 1.5.1 early invalid frames | Backbone/TCP HDLC отбрасывают кадры без payload, deframer ограничивает decoded size и восстанавливает framing; actor admission добавляет per-interface diagnostics. Отдельные причины driver drop не объявляются protocol violation автоматически | 4, 5 / сверено |
 | 1.5.1 discovery implementation/version | Публикуются TRANSPORT_IMPL=rsReticulum и TRANSPORT_VERS=CARGO_PKG_VERSION. Python 1.5.2 не требует эти ключи при приёме и не сохраняет их в info; Rust также игнорирует их при decode. Это metadata реализации, не объявление версии протокольной совместимости | 1 / сверено |
 | 1.5.1 Profiler/decorator/reentrant bounded capture/live output | Rust использует tracing spans, Python decorator profiler не переносится. rnstatus --profiling/-z выводит profiling от remote Python; для отсутствующих данных явно unavailable / profiling_supported=false, не нулевые измерения | 7 / архитектурная граница |
 | 1.5.1 PPS/MTU/TX drops/TX buffer rnstatus | PPS, MTU, TX drops/encoded buffer/gate проходят RPC и local/remote diagnostics. PPS означает actor RX/TX admission, не физическую доставку; plain TX без byte accounting сообщает null, queued frames отдельно | 7 / сверено с границей измерений |
-| 1.5.1 throughput benchmarker | Новый сопоставимый локальный baseline ещё не выполнен | 5 |
+| 1.5.1 throughput benchmarker | Before/after baseline и длительная нагрузка отложены по указанию пользователя; функциональный перенос не является измерением прироста throughput | 5 / отложенная проверка производительности |
 | 1.5.1 compiled Python modules/build reporting | Python-specific; Rust уже компилируется нативно | неприменимо |
 | 1.5.1 HDLC/IFAC/HKDF parity tests | Rust crypto/wire тесты существуют; сравнить Python fixtures при изменениях | 5 |
-| 1.5.1 shared medium hints / auto MTU | Частично: `traits.rs:optimise_mtu` есть; финальные hints/пороги Python сверить | 5 |
+| 1.5.1 shared medium hints / auto MTU | Inclusive bitrate thresholds, capability-aware Link MTU, shared-instance Local backend и forced bitrate перенесены; точные границы и packet interop описаны в этапе 5. Неизвестный hardware MTU не подменяется receive limit | 5 / реализовано |
 | 1.5.1 memory/CPU, traffic classes, HKDF/IFAC, locks, hashmap Links, hash reuse | Архитектурно частично: Rust HashMaps и crypto primitives; новые классы отсутствуют, оптимизации обосновывать benchmark | 4, 5 |
 | 1.5.1 announce signature cache | Реализовано в actor: `PreparedInbound` переносит `VerifiedAnnounce` от admission к dispatch без повторной криптографической проверки. Python кеширует флаг в одном Packet, не между пакетами; глобальный кеш не требуется | 5 |
-| 1.5.1 optimized HDLC deframer | Rust deframer существует; побайтовая совместимость и производительность проверяются отдельно | 5 |
+| 1.5.1 optimized HDLC deframer | Обработка обычных runs, decoded-size limits, escape/split/resync реализованы; 12 коротких HDLC checks прошли, 1 ignored не запускался. Побайтовая корректность не выдаётся за доказательство ускорения | 5 / сверено, performance отложен |
 | 1.5.1 inbound defaults / announce queuing tuning | Четыре inbound очереди реализованы ранее. Финальная сверка исправила отдельную outbound announce queue: 4096 записей, TTL 3 часа, отказ новым поступлениям при заполнении вместо вытеснения ожидающих; 3 короткие проверки прошли | 4 / финальная сверка |
 | 1.5.1 stream Resource > MAX_EFFICIENT_SIZE | send_resource_reader отправляет по сегменту, send_resource_stream ограниченно spool-ит неизвестную длину, recv_resource_file принимает в tempfile. Vec API сохранены; public stream требует max_size. Source/admission и file receive cases описаны в этапе 6 | 6 / реализовано с границей API |
 | 1.5.1 rngit prefix/page init/large downloads | Самостоятельная утилита вне этого репозитория; общая Resource регрессия остаётся в этапе 6 | граница покрытия |
@@ -125,7 +125,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 shared instance inter-app totals | Local totals включают только role=normal; SharedServer/LocalClient/SharedInstancePeer исключены. Remote вывод использует верхнеуровневые totals peer, не суммирует его интерфейсы заново | 7 / сверено |
 | 1.5.1 minor rnsh/rnir/identity fixes | rnsh сверено по diff 1.3.8..ea98db4f; пути, auth, повторная идентификация, копирование argv, timeout проверены. Python import/logging границы описаны; отдельная rnir отсутствует | 6, 7 |
 | 1.5.1 AES exception description / Python2 umsgpack removal | Python-specific exception/dead-code изменения | неприменимо |
-| 1.5.2 dataplane tuning | Требует этапа 5 с конечными параметрами 1.5.2 | 5 |
+| 1.5.2 dataplane tuning | Конечные ingress 90/68/10%, interval 250ms и penalty 1.5s; egress 128KiB/4MiB, 3 stall ticks, ETA 10/5s и dead time 12s реализованы. Параметры сверены с ea98db4f, новый soak не проводился | 5 / сверено |
 | 1.5.2 rngit block unidentified config example | Утилита вне покрытия; аналогичные rnsh authorization проверки остаются | граница покрытия |
 | 1.5.2 Resource regression | Stream proxy использует flush/rewind перед reader; сегментация учитывает общий размер с metadata. c1d7c12b/6bc0481c сверены; spool и reader boundary checks пройдены. Полный большой Python↔Rust download остаётся непроведённой интеграционной проверкой | 6 / функционал перенесён, граница interop |
 | 1.5.2 I2P keepalive→transport | Закрыто: i2p_read_loop фильтрует empty HDLC frames и в initial_data, и при чтении; probes обновляют last_read, но не попадают в transport. Scoped watchdog/reader/writer уже перенесены; живой SAM/I2P не проверялся | 5 |
@@ -4407,3 +4407,24 @@ decorator profiler. Отсутствие данных явно показано 
 Код и тестовые файлы в этом блоке не изменялись; живая remote сеть не запускалась.
 
 Существующие rnstatus binary tests — 11 passed (0.00s); diff check прошёл.
+
+## Финальная сверка: dataplane/HDLC и отложенная производительность
+
+Проверено подключение IngressPolicy к reader control и EgressController к
+Backbone controlled_write_loop, а не только наличие самостоятельных policy
+типов. Writer формирует ограниченные HDLC batches, TX lease остаётся с
+кодируемым/записываемым сегментом до write либо drop. Rust при этом копирует
+обычные runs в output buffer; термин Python zero-copy не переносится как
+обещание отсутствия любых копирований.
+
+Конечные пороги и интервалы совпадают с BackboneInterface.py 1.5.2.
+Decoded HDLC guards и actor admission имеют разные уровни ответственности;
+не каждый driver drop автоматически увеличивает protocol_violations.
+Семантика auto-MTU/capabilities и shared Local backend уже описана в журнале
+этапа 5; новые hardware и межъязыковые прогоны не запускались.
+
+Семь строк матрицы актуализированы. Короткие проверки: egress ETA hysteresis —
+1 passed (0.00s), HDLC — 12 passed / 1 ignored (0.10s). Ignored case не запускался.
+Новый before/after benchmark, CPU/memory profile и длительный soak остаются
+отложенными по указанию пользователя, а не неявно успешно пройденными.
+Изменена только документация; функциональных изменений в этом блоке нет.
