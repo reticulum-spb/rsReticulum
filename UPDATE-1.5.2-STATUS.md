@@ -60,7 +60,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.0 transport persistence / interface hash / known destinations background cleaning и отказ от recombination | Snapshot writes вынесены с actor, SQLite работает на worker; shared client не пишет сетевой cache, disk recombination при save нет. Исправлен timeout used entries по last_used во всех backend и dirty после очистки. Legacy sweep остаётся целиком на actor; latency большого каталога не измерена | 0, 7 / граница производительности |
 | 1.4.0 invalid discovery stamp cache | Закрыто при итоговой сверке: task-local FIFO до 2048 invalid digest entries | 1 / финальная сверка |
 | 1.4.0 valid discovery cache / sequential validation | Task-local FIFO до 2048 valid digest/value entries; source policy и обновление store остаются на каждом событии | 1 / финальная сверка |
-| 1.4.0 Link stale teardown / watchdog race | Частично: `rns-link/src/keepalive.rs:is_stale` учитывает outbound; проверить вызовы в runtime и ошибки приёма | 6 |
+| 1.4.0 Link stale teardown / watchdog race | is_stale использует inbound/proof/activation, не outbound. Initiator keepalive учитывает тишину в любом направлении; runtime admission/teardown исправлены в финальной сверке. Python watchdog_lock отсутствует; arbitrary callback panic не объявляется изолированным | 6 / сверено с архитектурной границей |
 | 1.4.0 Backbone None-check / exception logging | Python None/exception переменные не переносятся буквально. Rust Result/Option и совместное завершение read/write с disconnect guard реализованы; socket disconnect/отказ регистрации проверены loopback в этапе 3 | 3 / архитектурная граница |
 | 1.4.0 stamp default 16 | Реализовано в `discovery/constants.rs` и runtime | 1, сохранить |
 | 1.4.0 blocked IP ifstats | Driver diagnostics → actor InterfaceStats: count и list из одного снимка; поля проходят local/remote rnstatus и API/UI. Поведение и ранее выполненные проверки описаны в этапе 3 | 3, 7 / сверено |
@@ -88,7 +88,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 detailed announce/PR flow, totals/frequencies/composition | ControlTraffic считает packet/byte totals и rates, rnstatus поддерживает отдельные направления и сортировку. Финальная сверка перенесла announce/PR frequency в успешную ветку TX admission, исключив пропуски и двойной учёт | 7 / сверено |
 | 1.5.0 active links / blocked IP listings | link_count считает все записи LinkTable, active_link_count — validated; отдельный query/RPC и диагностика реализованы. Blocked IP count/list подключены и сверены в Backbone audit | 7 / сверено |
 | 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | RPC/helpers реализованы; финальная сверка подключила общий medium_path_timeout к запуску recursive discovery и созданию списка ожидающих PR. Учитываются только online-интерфейсы с ненулевой скоростью, floor 15s; 9 коротких проверок прошли | 6 / финальная сверка |
-| 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Отсутствует связь с medium helper | 6 |
+| 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Все три CLI используют medium_path_timeout для автоматических ожиданий; rnprobe сохраняет first-hop allowance. Explicit timeout имеет приоритет и не увеличивается — документированное отличие от Python rncp/rnpath max; старый daemon использует fallback | 6 / реализовано с границей CLI |
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
 | 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Actor/inflight перенесены; финальная сверка дополнительно исправила sustained ingress, offline recursive PR, relay proof timeout и preemptive PR egress (порог 2). Остальные семантические изменения проверяются по upstream commits | 4, 6 |
 | 1.5.0 Backbone EPOLL starvation | EPOLL Python implementation неприменима; справедливость Tokio read/write проверить нагрузкой | 5 |
@@ -96,7 +96,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 Link watchdog exception reset | Python watchdog_lock неприменим: Rust receive возвращает Result и не удерживает persistent receive lock. Пропуск malformed DATA/Response/ResourceReq/HMU, authenticated ADV teardown и продолжение после ошибок проверены короткими runtime cases. Произвольные panic пользовательских callbacks не входят в гарантию | 6 / архитектурная граница |
 | 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Cancel освобождает queued tail и tracking; receive_part/request_next используют одинаковую семантику consecutive_completed, chunks не перепривязывает исходный blob. Python fixes 65222e0d/0c410277 сверены; большой live interop не заявляется | 6 / сверено |
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
-| 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
+| 1.5.0 retained ratchet cleanup | set_retained_ratchets сразу вызывает clean: лишние private keys zeroize до truncate; rotate также очищает вытесняемые ключи. Допустимый retained count остаётся 1..=512. Короткая проверка setters/cleanup повторно прошла | 6 / сверено с границей retention |
 | 1.5.0 invalid rnstatus stats / burst count | Optional diagnostic fields и legacy defaults сохранены, отсутствующие TX byte diagnostics остаются null; burst flags и фильтр обрабатываются в local/remote путях. Новая статистика не требует всех полей от старого peer | 7 / сверено |
 | 1.5.0 miscellaneous packet/link/interface fixes | Packet.py/interface guards и RequestReceipt сверены. LinkClosed/Resource teardown исправлены. Keepalive admission централизован; initiator игнорирует request без изменения активности, ответы ограничены last_outbound. Оставшиеся Link receive/error paths ещё требуют сверки | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
@@ -4428,3 +4428,26 @@ Decoded HDLC guards и actor admission имеют разные уровни от
 Новый before/after benchmark, CPU/memory profile и длительный soak остаются
 отложенными по указанию пользователя, а не неявно успешно пройденными.
 Изменена только документация; функциональных изменений в этом блоке нет.
+
+## Финальная сверка: Link liveness, ratchet retention и CLI timeout policy
+
+Убраны три устаревшие отметки: outbound уже не участвует в stale baseline,
+ratchet cleanup подключён к изменению retention, CLI уже используют medium
+helper. KeepaliveState::is_stale выбирает последний inbound/proof/activation;
+локальная отправка не доказывает живость peer. Initiator продолжает посылать
+keepalive при одностороннем трафике. Более поздние runtime fixes malformed
+packets/teardown/receipts сохраняются и описаны в отдельных разделах.
+
+RatchetRing ограничивает retained count 512 ключами; clean и вытеснение при
+rotate zeroize удаляемые private keys. Этот предел остаётся явной границей
+Rust API, не обещанием неограниченного Python retention.
+
+rncp/rnpath/rnprobe увеличивают автоматические waits с учётом medium timeout.
+У явно указанного timeout приоритет; это прежнее решение по плану, не точное
+повторение Python rncp/rnpath max. Fallback для недоступного/старого daemon
+и прежний first-hop расчёт не менялись. Полный live CLI network run не выполнялся.
+
+В этом блоке изменена только документация; новых тестовых файлов нет.
+
+Короткие проверки: keepalive — 11 passed (0.07s), retained ratchets —
+1 passed (0.00s); diff check прошёл.
