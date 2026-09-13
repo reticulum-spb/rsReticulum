@@ -66,8 +66,8 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.0 blocked IP ifstats | Driver diagnostics → actor InterfaceStats: count и list из одного снимка; поля проходят local/remote rnstatus и API/UI. Поведение и ранее выполненные проверки описаны в этапе 3 | 3, 7 / сверено |
 | 1.4.0 reduced log noise | Воспроизвести уровни на локальной нагрузке; Rust tracing не требует копирования Python сообщений | 7 |
 | 1.4.1 dynamic rebalance / gravity | Реализованы gravity selection, authenticated transit/local pending rebalance и привязка активного Link. Python↔Rust packet interop прошёл для 96/99-byte proofs; многодемонная сеть остаётся финальной интеграцией | 2 |
-| 1.4.1 set_max_request_size | Отсутствует в Destination и runtime request admission | 6 |
-| 1.4.1 max_response_size | Реализован `link_client.rs:request_with_metadata_limit`, включая Resource advertisement; сегменты проверить | 6, сохранить |
+| 1.4.1 set_max_request_size | Destination и LinkManager имеют set/get/clear; packed REQUEST проверяется до unpack, Resource request — по d до создания transfer state и по собранному размеру перед dispatch. Превышение Resource вызывает RCL; отдельный Destination не настраивает чужой manager | 6 / сверено |
+| 1.4.1 max_response_size | Лимит учитывает полный d многосегментного ответа без суммирования повторных ADV; проверяются split metadata и собранный размер. Сохранён Rust-контракт лимита возвращаемых bytes, не точная Python формула packb(data)-2; PythonFile выбирается явно | 6 / реализовано с границей API |
 | 1.4.1 autoconnect mode/gravity/to_internal, default_gravity, interface gravity/to_internal | YAML/normalized/factory/registration, autoconnect defaults, child metadata, RPC и API/UI реализованы; I2P live inheritance не подтверждено | 2 |
 | 1.4.1 rnstatus gravity display/sort | Gravity есть в runtime/local RPC/remote schema; вывод и сортировка CLI ещё не перенесены | 7 |
 | 1.4.1 boundary→boundary/gateway PR | Реализовано; mode-матрицы с recursive/internal flags проходят в transport tests | 2 |
@@ -82,8 +82,8 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 early filtering / excessive hops | prepare_inbound выполняет admission до class queue, PreparedInbound хранит результат классификации/проверки announce. Hops, пустой payload, IFAC и dedup фильтруются до dispatch; привязка интерфейса повторно проверяется после ожидания в очереди | 4 / сверено |
 | 1.5.0 protocol violation tracking | Отдельные per-interface protocol_violations, ifac_violations и packet_filter_hits реализованы; доступны через статистику, rnstatus и Web UI. Это не blackhole reason | 4, 7 / сверено |
 | 1.5.0 inflight PR tracking / batching | Отдельные inflight_path_requests и discovery waiters реализованы. Gate 45s, список requesting_interfaces, engaged state, tag dedup и queued-destination dedup сверены; slow-medium deadline подключён к обоим discovery paths | 4 / сверено |
-| 1.5.0 blackholed announce validation API | Воспроизвести `rns-identity/src/announce.rs` и runtime API; blackhole transport filtering не равен возвращаемому API статусу | 6 |
-| 1.5.0 Channel/Buffer full MDU | Частично: `Channel::channel_mdu` есть; вызовов за пределами собственных тестов поиском не найдено, проверить send/split реализацию | 6 |
+| 1.5.0 blackholed announce validation API | AnnounceError::Blackholed и validate_with_blackhole/verify_signature_with_blackhole с caller predicate реализованы. Отказ policy предшествует signature validation, как Python; старый validate сохраняет контракт | 6 / сверено |
+| 1.5.0 Channel/Buffer full MDU | Runtime связывает Channel с Link.mdu, send проверяет envelope до расходования sequence; Buffer получает payload budget с учётом заголовков и u16 ceiling. MDU 415/1100/70000 и zero capacity проверены; MAX_CHUNK_LEN 16KiB сохранён как в Python | 6 / сверено |
 | 1.5.0 queue pressure/drop statistics | InboundQueueStats содержит capacities, heights и drops четырёх классов; actor/RPC/rnstatus выводят статистику и pressure. Legacy actor без class queues сообщает недоступность, а не фиктивные нули | 4, 7 / сверено |
 | 1.5.0 detailed announce/PR flow, totals/frequencies/composition | ControlTraffic считает packet/byte totals и rates, rnstatus поддерживает отдельные направления и сортировку. Финальная сверка перенесла announce/PR frequency в успешную ветку TX admission, исключив пропуски и двойной учёт | 7 / сверено |
 | 1.5.0 active links / blocked IP listings | Частично: LinkCount есть; отдельную статистику active Links проверить; blocked IP отсутствуют | 7 |
@@ -4338,3 +4338,27 @@ YAML/factory параметры и локальный/удалённый выв�
 Дополнительно подтверждены конечные ingress watermarks 90/68/10% из Python
 `83a30b18`; это статическая сверка, не новый benchmark throughput.
 Изменена только документация; аппаратная/многопроцессная проверка не заявляется.
+
+## Финальная сверка: request limits, blackhole API и Channel MDU
+
+Актуализированы четыре устаревшие строки этапа 6 по коду и журналу переноса.
+Destination/LinkManager действительно предоставляют max_request_size API;
+лимит применяется к packed envelope, а не только пользовательским данным.
+Resource request имеет ранний отказ до transfer state и проверку после сборки.
+Отдельный Destination не служит глобальной конфигурацией runtime.
+
+Channel send использует согласованный MDU, LinkManager и LinkSession обновляют
+его перед работой с каналом; Buffer учитывает envelope/stream headers и предел
+u16. Явный старый API размера Buffer сохранён. Blackhole API возвращает отдельную
+ошибку caller policy и не выдаёт этот результат за проверенную подпись.
+
+Для max_response_size сохранена ранее зафиксированная граница: Rust считает
+возвращаемые bytes, Python — packb(response_data)-2; полный паритет этих двух
+контрактов не заявляется. Проверка d и split-state уже перенесена, raw file
+response доступен через явный PythonFile mode. Лимит ответа не объявляется
+общим ограничением памяти декомпрессии.
+
+Три существующие короткие проверки: max_request_size — 1 passed (0.01s),
+negotiated_mdu_bounds — 1 passed (1.58s), blackhole_validation — 1 passed
+(0.02s). Новых функциональных расхождений в этом блоке не обнаружено;
+код и тестовые файлы не менялись, обновлена только матрица и журнал.
