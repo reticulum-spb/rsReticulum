@@ -69,7 +69,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.1 set_max_request_size | Destination и LinkManager имеют set/get/clear; packed REQUEST проверяется до unpack, Resource request — по d до создания transfer state и по собранному размеру перед dispatch. Превышение Resource вызывает RCL; отдельный Destination не настраивает чужой manager | 6 / сверено |
 | 1.4.1 max_response_size | Лимит учитывает полный d многосегментного ответа без суммирования повторных ADV; проверяются split metadata и собранный размер. Сохранён Rust-контракт лимита возвращаемых bytes, не точная Python формула packb(data)-2; PythonFile выбирается явно | 6 / реализовано с границей API |
 | 1.4.1 autoconnect mode/gravity/to_internal, default_gravity, interface gravity/to_internal | YAML/normalized/factory/registration, autoconnect defaults, child metadata, RPC и API/UI реализованы; I2P live inheritance не подтверждено | 2 |
-| 1.4.1 rnstatus gravity display/sort | Gravity есть в runtime/local RPC/remote schema; вывод и сортировка CLI ещё не перенесены | 7 |
+| 1.4.1 rnstatus gravity display/sort | local/remote текст и JSON выводят gravity; gravity/g и reverse сортируют целые значения без потери точности через f64. Старые remote snapshots без поля используют default | 7 / сверено |
 | 1.4.1 boundary→boundary/gateway PR | Реализовано; mode-матрицы с recursive/internal flags проходят в transport tests | 2 |
 | 1.4.1 I2P tasks garbage collection | Python GC причина неприменима к Tokio; прочие minor I2P fixes требуют локального воспроизведения | 5 |
 | 1.4.1 ingress burst active deadlock | Перенесён порог снятия burst: IC_DEQUE_MIN_SAMPLE вместо IC_BURST_MIN_SAMPLES. Также перенесены sustained hold и PR cooldown из 1.5.2; 22 коротких ingress tests прошли. Maintenance выпускает held announces независимо от burst-флага | 4 / закрыто |
@@ -86,7 +86,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 Channel/Buffer full MDU | Runtime связывает Channel с Link.mdu, send проверяет envelope до расходования sequence; Buffer получает payload budget с учётом заголовков и u16 ceiling. MDU 415/1100/70000 и zero capacity проверены; MAX_CHUNK_LEN 16KiB сохранён как в Python | 6 / сверено |
 | 1.5.0 queue pressure/drop statistics | InboundQueueStats содержит capacities, heights и drops четырёх классов; actor/RPC/rnstatus выводят статистику и pressure. Legacy actor без class queues сообщает недоступность, а не фиктивные нули | 4, 7 / сверено |
 | 1.5.0 detailed announce/PR flow, totals/frequencies/composition | ControlTraffic считает packet/byte totals и rates, rnstatus поддерживает отдельные направления и сортировку. Финальная сверка перенесла announce/PR frequency в успешную ветку TX admission, исключив пропуски и двойной учёт | 7 / сверено |
-| 1.5.0 active links / blocked IP listings | Частично: LinkCount есть; отдельную статистику active Links проверить; blocked IP отсутствуют | 7 |
+| 1.5.0 active links / blocked IP listings | link_count считает все записи LinkTable, active_link_count — validated; отдельный query/RPC и диагностика реализованы. Blocked IP count/list подключены и сверены в Backbone audit | 7 / сверено |
 | 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | RPC/helpers реализованы; финальная сверка подключила общий medium_path_timeout к запуску recursive discovery и созданию списка ожидающих PR. Учитываются только online-интерфейсы с ненулевой скоростью, floor 15s; 9 коротких проверок прошли | 6 / финальная сверка |
 | 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Отсутствует связь с medium helper | 6 |
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
@@ -97,7 +97,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 Resource multisegment cancellation / part alignment/rebinding | Cancel освобождает queued tail и tracking; receive_part/request_next используют одинаковую семантику consecutive_completed, chunks не перепривязывает исходный blob. Python fixes 65222e0d/0c410277 сверены; большой live interop не заявляется | 6 / сверено |
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | Реализовано ограниченное кольцо и retention в `rns-identity/src/ratchet.rs`; сохранить описанную границу 512 и повторить lifecycle | 6 |
-| 1.5.0 invalid rnstatus stats / burst count | Частично: optional decode/defaults и burst flags есть; сравнить local/remote JSON | 7 |
+| 1.5.0 invalid rnstatus stats / burst count | Optional diagnostic fields и legacy defaults сохранены, отсутствующие TX byte diagnostics остаются null; burst flags и фильтр обрабатываются в local/remote путях. Новая статистика не требует всех полей от старого peer | 7 / сверено |
 | 1.5.0 miscellaneous packet/link/interface fixes | Packet.py/interface guards и RequestReceipt сверены. LinkClosed/Resource teardown исправлены. Keepalive admission централизован; initiator игнорирует request без изменения активности, ответы ограничены last_outbound. Оставшиеся Link receive/error paths ещё требуют сверки | 4–6 |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
@@ -107,8 +107,8 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 coalescing TX buffers | Отсутствует в Backbone backend | 5 |
 | 1.5.1 early invalid frames | Частично: deframer cap и parser checks; отсутствуют новые counters/early admission | 4, 5 |
 | 1.5.1 discovery implementation/version | Публикуются TRANSPORT_IMPL=rsReticulum и TRANSPORT_VERS=CARGO_PKG_VERSION. Python 1.5.2 не требует эти ключи при приёме и не сохраняет их в info; Rust также игнорирует их при decode. Это metadata реализации, не объявление версии протокольной совместимости | 1 / сверено |
-| 1.5.1 Profiler/decorator/reentrant bounded capture/live output | Python decorator неприменим; live Rust profiling отсутствует, определить границу и измеримые метрики | 7 |
-| 1.5.1 PPS/MTU/TX drops/TX buffer rnstatus | MTU/TX drops локально реализованы; PPS/TX buffer и remote parity требуют реализации | 7 |
+| 1.5.1 Profiler/decorator/reentrant bounded capture/live output | Rust использует tracing spans, Python decorator profiler не переносится. rnstatus --profiling/-z выводит profiling от remote Python; для отсутствующих данных явно unavailable / profiling_supported=false, не нулевые измерения | 7 / архитектурная граница |
+| 1.5.1 PPS/MTU/TX drops/TX buffer rnstatus | PPS, MTU, TX drops/encoded buffer/gate проходят RPC и local/remote diagnostics. PPS означает actor RX/TX admission, не физическую доставку; plain TX без byte accounting сообщает null, queued frames отдельно | 7 / сверено с границей измерений |
 | 1.5.1 throughput benchmarker | Новый сопоставимый локальный baseline ещё не выполнен | 5 |
 | 1.5.1 compiled Python modules/build reporting | Python-specific; Rust уже компилируется нативно | неприменимо |
 | 1.5.1 HDLC/IFAC/HKDF parity tests | Rust crypto/wire тесты существуют; сравнить Python fixtures при изменениях | 5 |
@@ -122,7 +122,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 RSSI/SNR reporting | Цепочка RNode/RNodeMulti → owned InboundPacket → record_packet_metrics → GetPacketRssi/Snr и RPC существует. Метрики копируются до очереди; Python исправление потери через mutable interface fields неприменимо к этой архитектуре. Аппаратная проверка не заявляется | 7 |
 | 1.5.1 non-epoll keepalive | Проверить служебные кадры всех Backbone-совместимых драйверов | 5 |
 | 1.5.1 blocked IP list includes unblocked | blocked_ips_at сначала очищает expired entries, затем включает только flaps > grace; выключенная защита даёт пустой список. Это соответствует исправлению Python bfab2964; 3 короткие policy checks прошли | 3 / сверено |
-| 1.5.1 shared instance inter-app totals | `rnstatus.rs` суммирует interface stats; фильтрацию local/shared проверить | 7 |
+| 1.5.1 shared instance inter-app totals | Local totals включают только role=normal; SharedServer/LocalClient/SharedInstancePeer исключены. Remote вывод использует верхнеуровневые totals peer, не суммирует его интерфейсы заново | 7 / сверено |
 | 1.5.1 minor rnsh/rnir/identity fixes | rnsh сверено по diff 1.3.8..ea98db4f; пути, auth, повторная идентификация, копирование argv, timeout проверены. Python import/logging границы описаны; отдельная rnir отсутствует | 6, 7 |
 | 1.5.1 AES exception description / Python2 umsgpack removal | Python-specific exception/dead-code изменения | неприменимо |
 | 1.5.2 dataplane tuning | Требует этапа 5 с конечными параметрами 1.5.2 | 5 |
@@ -4384,3 +4384,26 @@ cancel queued tail — 1 passed (0.01s). Reader case использует proofs
 fixture без передачи всех частей; он не выдаётся за большой wire transfer.
 Полный Python↔Rust download и межъязыковая cancellation matrix не запускались.
 Актуализированы четыре строки основной матрицы; код менять не потребовалось.
+
+## Финальная сверка: rnstatus diagnostics и границы profiling
+
+Сверены команды rnstatus, local RPC serialization и actor queries. В матрице
+актуализированы шесть строк: gravity, active Links/blocked IP, optional stats,
+profiling, PPS/TX diagnostics и shared totals. Эти возможности реализованы
+в этапе 7, прежние отметки «не перенесены» больше не отражали состояние кода.
+
+Gravity сравнивается как integer в local/remote sort. Диагностические поля
+сохраняют optional/null и совместимость с неполными snapshots старых peers.
+Local totals исключают роли shared instance; remote totals берутся из
+верхнего уровня ответа peer и не реконструируются суммированием interfaces.
+Active count означает validated записи LinkTable, не все незавершённые Links.
+
+Profiling не объявляется полностью перенесённым: Python remote payload можно
+запросить и показать, но Rust предоставляет tracing spans вместо Python
+decorator profiler. Отсутствие данных явно показано пользователю. PPS также
+не выдаётся за физические кадры: это actor admissions; TX buffer bytes
+доступны только там, где driver accounting их действительно предоставляет.
+
+Код и тестовые файлы в этом блоке не изменялись; живая remote сеть не запускалась.
+
+Существующие rnstatus binary tests — 11 passed (0.00s); diff check прошёл.
