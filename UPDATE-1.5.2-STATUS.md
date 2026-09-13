@@ -98,7 +98,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 stale BLE device reference | Закрыто статической сверкой: connect_rnode заново вызывает resolve_ble_target; отсутствие кандидата возвращает Err, нет fallback на прежний conn. Android native bridge не хранит BLE device в Rust. Кеш платформенного BLE backend и аппаратное переподключение не проверялись | 6 / граница платформенной проверки |
 | 1.5.0 retained ratchet cleanup | set_retained_ratchets сразу вызывает clean: лишние private keys zeroize до truncate; rotate также очищает вытесняемые ключи. Допустимый retained count остаётся 1..=512. Короткая проверка setters/cleanup повторно прошла | 6 / сверено с границей retention |
 | 1.5.0 invalid rnstatus stats / burst count | Optional diagnostic fields и legacy defaults сохранены, отсутствующие TX byte diagnostics остаются null; burst flags и фильтр обрабатываются в local/remote путях. Новая статистика не требует всех полей от старого peer | 7 / сверено |
-| 1.5.0 miscellaneous packet/link/interface fixes | Packet.py/interface guards и RequestReceipt сверены. LinkClosed/Resource teardown исправлены. Keepalive admission централизован; initiator игнорирует request без изменения активности, ответы ограничены last_outbound. Оставшиеся Link receive/error paths ещё требуют сверки | 4–6 |
+| 1.5.0 miscellaneous packet/link/interface fixes | Packet/interface guards, RequestReceipt и изменённые Link receive/error paths сверены. Malformed DATA/Response/Resource control не обрывают ожидание; authenticated invalid ADV закрывает Link. Teardown идемпотентен, первая identity сохраняется, Resource requests без handlers игнорируются. Произвольные callback panic не изолированы | 4–6 / сверено с границей callbacks |
 | 1.5.0 rngit Windows resources | Отсутствующая Rust утилита; общие Resource семантики остаются в этапе 6 | граница покрытия |
 | 1.5.0 rnodeconf WiFi summary | Закрыта исправленная upstream ветка режима: `--info` выводит ровно одно состояние Station/AP/Disabled и канал; короткие EEPROM обрабатываются безопасно. Полный config-sector summary не заявляется | 7 |
 | 1.5.0 speedtest stale link | Rust example не прерывает цикл на Stale. Исправлен runtime delivery-proof wait: валидный proof восстанавливает активность, закрытие Link завершает ожидание сразу. Rust использует окно подтверждений, не Python untracked flood | 6 |
@@ -4474,3 +4474,32 @@ LOG_EXTREME реализован в рамках шкалы, документи�
 
 Проверка этого блока — статическая сверка указанных путей и git diff --check.
 Повторные тесты не запускались; новых тестовых файлов нет.
+
+## Финальная сверка: завершение аудита изменённых Link receive/error paths
+
+Сверен diff RNS/Link.py от 1.3.8 до ea98db4f, включая receive wrapper,
+Resource request admission, повторную идентификацию и teardown. Предыдущие
+разделы уже описывают перенос max sizes, keepalive, RequestReceipt,
+malformed DATA/Response/ResourceReq/HMU и authenticated invalid ADV.
+Оставшаяся отметка о непроверенных receive/error ветках в строке miscellaneous
+больше не отражала состояние после этих исправлений и теперь обновлена.
+
+Дополнительно подтверждены существующие пути:
+
+- Link::teardown возвращает None для Closed, не формируя второй teardown.
+- Link::handle_identification сохраняет первую подтверждённую identity.
+- LinkManager игнорирует Resource request без зарегистрированных handlers.
+- close_active_link сначала забирает owned active entry, очищает file sources,
+  receivers/jobs и backchannel/identity tracking. Отдельные коллекции Resources
+  освобождаются вместе с owned entry, без Python iteration/cancel mutation.
+
+Это сверка изменённых upstream веток, не обещание устойчивости ко всем
+возможным ошибкам приложения. Rust callbacks остаются синхронными и не
+изолированы от panic; Python watchdog_lock не переносится буквально.
+MTU fallback и rebalanced metadata описаны в ранее завершённых блоках.
+
+Короткие существующие проверки: teardown idempotence, first identity wins,
+remote close cleanup, request Resource without handlers — 4 passed (0.05s
+суммарного времени выполнения). Изменена только документация; новые тестовые
+файлы и длительные проверки не добавлялись. Общая финальная сверка transport
+и оставшихся строк матрицы продолжается, версия пока не меняется.
