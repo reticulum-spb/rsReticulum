@@ -2,16 +2,17 @@
 
 ## Текущий статус
 
-Функциональные этапы 1–7 пройдены; сейчас выполняется итоговая сверка всей
-матрицы и стыков компонентов. Это не утверждение о завершённом релизе 1.5.2:
-финальная сверка продолжает выявлять пропуски, которые исправляются здесь.
-Версия пакетов остаётся 1.0.1, объявленная совместимость — 1.3.8 до завершения
-проверки. Исходная матрица и промежуточные записи ниже исторические; строки
-«отсутствует»/«этап открыт» следует читать вместе с последующими результатами.
+Функциональный перенос этапов 1–7 и классификация применимых изменений
+завершены 13 сентября 2026 года. Версия пакетов и цель совместимости — 1.5.2.
+Подтверждённых незакрытых функциональных пробелов в объёме обновления нет;
+несопоставленных пунктов матрицы нет. Это не заявление о полном паритете всех
+Python утилит или о прохождении всех интеграционных/нагрузочных проверок.
+Конечный список ограничений приведён ниже. Промежуточные записи журнала
+исторические: прежние «этап открыт» и номера версии не являются новым backlog.
 
 | Этап | Текущее состояние |
 |---|---|
-| 0 | Исходная матрица составлена; окончательная классификация всех её строк продолжается. |
+| 0 | Матрица классифицирована; функциональные пробелы закрыты, границы API/архитектуры и непроведённые проверки выделены явно. |
 | 1 | Discovery YAML/runtime/API/UI перенесены; при финальной сверке дополнены stamp caches и очистка historical blackholes. |
 | 2 | Gravity, выбор маршрута, Link rebalance и internal policy реализованы; есть packet interop, полная многодемонная матрица отложена. |
 | 3 | Backbone fast-flapping и диагностика блокировок реализованы. |
@@ -19,12 +20,34 @@
 | 5 | Функциональная часть flow control/MTU/keepalive закрыта; длительный soak и before/after нагрузка отложены. |
 | 6 | API/timeouts/Channel/Resource перенесены; Python file responses доступны явно через PythonFile, а не сменой старого API. |
 | 7 | rnstatus, rnsh, rncp rates завершены; rnpath remote restrictions соответствуют отсутствующим Python endpoints. |
-| Финал | Короткие проверки API/UI/config/features и codec interop выполняются; полный workspace test, живая межъязыковая матрица и проверки других ОС не объявлены пройденными. |
+| Финал | Функциональный перенос завершён с перечисленными ограничениями. Полный workspace test, полная живая межъязыковая матрица и проверки других ОС не объявлены пройденными. |
 
 Новые test-only файлы не включаются в коммиты. Длительные тесты и аппаратные
 проверки не запускаются согласно текущему указанию пользователя. Существующий
 backlog rnodeconf/flashing и документированные границы API не выдаются за
 полный функциональный паритет Python.
+
+### Конечный список: что осталось за границей завершённого переноса
+
+- **Непроведённые проверки:** полный workspace test, длительный soak,
+  before/after throughput и CPU/memory; полная многодемонная gravity-матрица,
+  большой Python↔Rust Resource download/cancel, живой I2P SAM/reconnect,
+  аппаратные BLE/RNode и другие ОС. Это отложенная валидация, не обнаруженные
+  отсутствующие функции. Результаты выполненных локальных/codec interop
+  проверок сохранены в журнале; они не заменяют перечисленные сценарии.
+- **Границы API:** PythonFile выбирается явно; streaming неизвестной длины
+  требует max_size; response limit считает возвращаемые Rust bytes;
+  retained ratchets ограничены 512; explicit CLI timeout имеет приоритет.
+- **Границы архитектуры/диагностики:** нет Python decorator profiler, GC,
+  watchdog/receipt mutex или отдельного epoll backend. Tracing 7/8 → TRACE,
+  LOG_NONE=-1 отсутствует; callbacks не изолированы от panic. PPS/TX buffer
+  означают описанные actor/driver измерения, не доказательство радиодоставки.
+- **Старый backlog, не часть обновления:** отсутствующие rnx/rnir/rnpkg/rngit/
+  git-remote-rns; полный flashing/update/bootstrap/wipe/signing-key workflow
+  rnodeconf; аппаратная квалификация rns-ratkey.
+
+Новая работа начинается по конкретному воспроизведённому дефекту или отдельной
+задаче из этого списка, а не повторным обходом уже закрытых записей журнала.
 
 ## Основание проверки
 
@@ -39,16 +62,15 @@ Rust до начала работ: `15be6c0077e5398fed91e6dc4c17a26fe0b66219`.
 tunnel synthesis и воспроизведение кешированных announces через transport.
 Эти изменения сохраняются. Документы PKCS7/TOKEN/PROOF уточняют границы паритета.
 
-Матрица ниже описывает исходное состояние, без незавершённых изменений текущего
-рабочего дерева. «Реализовано» здесь означает наличие прочитанной реализации,
-а не прохождение нового межъязыкового теста. «Воспроизвести» — обязательная
-открытая проверка; она не является исключением из объёма обновления.
+Матрица ниже актуализирована по результатам переноса. «Реализовано» означает
+наличие реализации и указанных проверок, а не прохождение всех возможных
+межъязыковых сценариев. Промежуточные записи после матрицы сохранены как история.
 
 ## Матрица changelog 1.3.9–1.5.2
 
 Пути Rust ниже относительно `crates/`, Python — относительно `RNS/`.
 
-| Версия / изменение | Исходное состояние и доказательство | Дальнейший этап |
+| Версия / изменение | Итоговое состояние и доказательство | Этап / граница |
 |---|---|---|
 | 1.3.9 rnsh security | Сверено с исходниками: identity gate и authorized state сохранены; fatal errors терминальны, ошибочный peer не завершает listener. Короткие allowed/denied проверки пройдены | 7 |
 | 1.3.9 rnsh config/identity paths | Перенесено: раздельные --config/--rnsconfig, identity[.SERVICE] и allowed_identities в выбранном rnsh каталоге; миграция описана в CONFIG.md | 7 |
@@ -64,7 +86,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.4.0 Backbone None-check / exception logging | Python None/exception переменные не переносятся буквально. Rust Result/Option и совместное завершение read/write с disconnect guard реализованы; socket disconnect/отказ регистрации проверены loopback в этапе 3 | 3 / архитектурная граница |
 | 1.4.0 stamp default 16 | Реализовано в `discovery/constants.rs` и runtime | 1, сохранить |
 | 1.4.0 blocked IP ifstats | Driver diagnostics → actor InterfaceStats: count и list из одного снимка; поля проходят local/remote rnstatus и API/UI. Поведение и ранее выполненные проверки описаны в этапе 3 | 3, 7 / сверено |
-| 1.4.0 reduced log noise | Воспроизвести уровни на локальной нагрузке; Rust tracing не требует копирования Python сообщений | 7 |
+| 1.4.0 reduced log noise | Python log formatting/guards не копируются буквально; Rust tracing фильтрует события по настроенному уровню. Числовая шкала и её отличия описаны в CONFIG; равенство количества сообщений под нагрузкой не заявляется | 7 / архитектурная граница |
 | 1.4.1 dynamic rebalance / gravity | Реализованы gravity selection, authenticated transit/local pending rebalance и привязка активного Link. Python↔Rust packet interop прошёл для 96/99-byte proofs; многодемонная сеть остаётся финальной интеграцией | 2 |
 | 1.4.1 set_max_request_size | Destination и LinkManager имеют set/get/clear; packed REQUEST проверяется до unpack, Resource request — по d до создания transfer state и по собранному размеру перед dispatch. Превышение Resource вызывает RCL; отдельный Destination не настраивает чужой manager | 6 / сверено |
 | 1.4.1 max_response_size | Лимит учитывает полный d многосегментного ответа без суммирования повторных ADV; проверяются split metadata и собранный размер. Сохранён Rust-контракт лимита возвращаемых bytes, не точная Python формула packb(data)-2; PythonFile выбирается явно | 6 / реализовано с границей API |
@@ -90,7 +112,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.0 medium bitrate helpers/RPC, slow-medium discovery PR timeout | RPC/helpers реализованы; финальная сверка подключила общий medium_path_timeout к запуску recursive discovery и созданию списка ожидающих PR. Учитываются только online-интерфейсы с ненулевой скоростью, floor 15s; 9 коротких проверок прошли | 6 / финальная сверка |
 | 1.5.0 adaptive rncp/rnpath/rnprobe timeouts | Все три CLI используют medium_path_timeout для автоматических ожиданий; rnprobe сохраняет first-hop allowance. Explicit timeout имеет приоритет и не увеличивается — документированное отличие от Python rncp/rnpath max; старый daemon использует fallback | 6 / реализовано с границей CLI |
 | 1.5.0 adaptive rnx/rngit timeouts | В этом репозитории соответствующие CLI не обнаружены; не добавлять полные новые утилиты в обновление ядра | граница покрытия |
-| 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Actor/inflight перенесены; финальная сверка дополнительно исправила sustained ingress, offline recursive PR, relay proof timeout и preemptive PR egress (порог 2). Остальные семантические изменения проверяются по upstream commits | 4, 6 |
+| 1.5.0 inbound/PR processing, limiting, jobs, pending link/announce state fixes | Actor/inflight, tag generations, gate 45s и queued destination dedup реализованы; исправлены sustained ingress, offline recursive PR, relay proof timeout и preemptive egress. Pending Links удаляются безопасно; tunnel/path expiry — раздельные поля, без Python variable rebind | 4, 6 / сверено |
 | 1.5.0 Backbone EPOLL starvation | Python EPOLL loop отсутствует. Tokio writer ограничивает batches и явно yield-ит после batch и Interrupted; reader/writer выполняются совместно. Это не доказательство scheduler fairness под длительной нагрузкой: soak отложен | 5 / архитектурная граница, performance отложен |
 | 1.5.0 receipt callback deadlock | Python receipts_lock неприменим к штатному runtime API: RegisterReceipt не принимает callback, DeliveryProof передаётся через destination channel без ожидания приложения. Прямые PacketReceipt callbacks синхронные; произвольный блокирующий callback не объявляется безопасным | 6 / архитектурная граница |
 | 1.5.0 Link watchdog exception reset | Python watchdog_lock неприменим: Rust receive возвращает Result и не удерживает persistent receive lock. Пропуск malformed DATA/Response/ResourceReq/HMU, authenticated ADV teardown и продолжение после ошибок проверены короткими runtime cases. Произвольные panic пользовательских callbacks не входят в гарантию | 6 / архитектурная граница |
@@ -111,7 +133,7 @@ tunnel synthesis и воспроизведение кешированных anno
 | 1.5.1 PPS/MTU/TX drops/TX buffer rnstatus | PPS, MTU, TX drops/encoded buffer/gate проходят RPC и local/remote diagnostics. PPS означает actor RX/TX admission, не физическую доставку; plain TX без byte accounting сообщает null, queued frames отдельно | 7 / сверено с границей измерений |
 | 1.5.1 throughput benchmarker | Before/after baseline и длительная нагрузка отложены по указанию пользователя; функциональный перенос не является измерением прироста throughput | 5 / отложенная проверка производительности |
 | 1.5.1 compiled Python modules/build reporting | Python-specific; Rust уже компилируется нативно | неприменимо |
-| 1.5.1 HDLC/IFAC/HKDF parity tests | Rust crypto/wire тесты существуют; сравнить Python fixtures при изменениях | 5 |
+| 1.5.1 HDLC/IFAC/HKDF parity tests | Upstream сравнивает новые и legacy Python реализации; эти backend не переносятся в Rust. Rust сохраняет RFC5869 vector, IFAC roundtrip/tamper/size tests и HDLC boundary checks; полное воспроизведение Python parity suite не заявляется | 5 / граница тестового backend |
 | 1.5.1 shared medium hints / auto MTU | Inclusive bitrate thresholds, capability-aware Link MTU, shared-instance Local backend и forced bitrate перенесены; точные границы и packet interop описаны в этапе 5. Неизвестный hardware MTU не подменяется receive limit | 5 / реализовано |
 | 1.5.1 memory/CPU, traffic classes, HKDF/IFAC, locks, hashmap Links, hash reuse | Data/Announce/PathRequest/IngressLimited реализованы; PreparedInbound сохраняет результат admission и VerifiedAnnounce без повторной signature validation. Rust использует HashMaps и собственную модель владения/crypto; TX leases сохраняют byte accounting. Прирост CPU/memory/HKDF/IFAC throughput не измерен | 4, 5 / функционал реализован, performance отложен |
 | 1.5.1 announce signature cache | Реализовано в actor: `PreparedInbound` переносит `VerifiedAnnounce` от admission к dispatch без повторной криптографической проверки. Python кеширует флаг в одном Packet, не между пакетами; глобальный кеш не требуется | 5 |
@@ -4503,3 +4525,42 @@ remote close cleanup, request Resource without handlers — 4 passed (0.05s
 суммарного времени выполнения). Изменена только документация; новые тестовые
 файлы и длительные проверки не добавлялись. Общая финальная сверка transport
 и оставшихся строк матрицы продолжается, версия пока не меняется.
+
+## Завершение функционального обновления — 13 сентября 2026
+
+По указанию пользователя повторная проверка закрытых пунктов прекращена.
+Оставшиеся неопределённые строки сведены к конечной классификации:
+
+- Transport jobs/state: изменения PR gates/tags/inflight/queues и pending
+  Links уже перенесены предыдущими функциональными коммитами. Последняя
+  проверка e31c570d не выявила gap: PythonTunnelEntry и PythonTunnelPath
+  хранят expires отдельно, сериализация использует соответствующее поле,
+  переменная времени tunnel не переиспользуется как expiry отдельного path.
+- Reduced log noise: Python formatting/level guards — архитектурная граница
+  tracing, не отсутствующий транспортный функционал. Измерение объёма логов
+  под нагрузкой не выполнялось и не стало условием завершения переноса.
+- HDLC/IFAC/HKDF parity suite сравнивает Python legacy/optimized backend.
+  Rust использует свои реализации и существующие vector/boundary tests;
+  перенос полного Python test suite не является добавлением функции.
+
+Подтверждённых открытых функциональных дефектов в объёме плана не осталось.
+Неопределённое «финальная сверка продолжается» заменено конечным списком
+границ в начале документа. Он отделяет старый backlog и различия API от
+непроведённых проверок, не объявляя эти проверки успешными.
+
+Workspace package/dependency versions, Cargo.lock и CLI compatibility constant
+обновлены до 1.5.2; README объявляет ограниченную существующим Rust surface
+цель совместимости. Исторические записи и user-owned исходный план не менялись.
+Новых test-only файлов нет; push и публикация release не выполнялись.
+
+Проверки после изменения версии:
+
+- `cargo check --offline --workspace --all-targets` — passed (17.21s).
+- `cargo check --offline -p rns-runtime --no-default-features --features client`
+  — passed (6.28s).
+- `cargo check --offline -p rns-runtime --features api,serial,rnode-tcp,sqlite-bundled --all-targets`
+  — passed (16.76s).
+- `cargo fmt --all -- --check` и `git diff --check` — passed.
+
+Cargo.lock изменил только версии 12 workspace packages, без обновления внешних
+зависимостей. Полный workspace test и длительные проверки не запускались.

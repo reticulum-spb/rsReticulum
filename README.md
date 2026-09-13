@@ -7,7 +7,7 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![Reticulum 1.3.8](https://img.shields.io/badge/target-Reticulum%201.3.8-success.svg)](https://reticulum.network/)
+[![Reticulum 1.5.2](https://img.shields.io/badge/target-Reticulum%201.5.2-success.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [Reticulum Manual](https://reticulum.network/manual/) |
@@ -30,13 +30,13 @@ rsReticulum can live beside other Reticulum tools on `PATH` without worry.
 
 The functional migration stages are implemented, including discovery publication,
 gravity/rebalancing, Backbone protection and flow control, priority queues,
-Resource/Channel APIs, and diagnostic tools. Final cross-component validation
-is still in progress; this is **not yet a completed 1.5.2 compatibility release**.
-Package version `1.0.1` and the currently advertised compatibility version remain
-unchanged until that review is complete.
+Resource/Channel APIs, and diagnostic tools. Package version and compatibility
+target are now `1.5.2` for the existing Rust surface, with the documented API
+differences and legacy backlog below. This is not a claim of complete Python
+feature parity or completed hardware/performance qualification.
 
 See the [current update status](UPDATE-1.5.2-STATUS.md#текущий-статус) for completed
-checks, documented differences and remaining validation. The historical entries
+checks, documented differences and deferred validation. The historical entries
 in that journal are not the current backlog. [CONFIG.md](CONFIG.md) documents
 the migrated settings and the rnsh command-line/identity migration.
 
@@ -406,9 +406,9 @@ Most daemon and utility flows are implemented for the public `*-rs` tools:
 `rnsd-rs`, `rnstatus-rs`, `rnpath-rs`, `rnid-rs`, `rnprobe-rs`, `rncp-rs`,
 `rnsh-rs`, and `rnodeconf-rs`.
 
-The current compatibility target is Reticulum 1.3.8 where the matching Rust
-surface is implemented and tested. `rnid-rs` has explicit 1.3.8 coverage for
-the normal identity utility flow.
+The current compatibility target is Reticulum 1.5.2 for the existing Rust
+surface, subject to the limits below and the update report. `rnid-rs` retains
+its explicit 1.3.8 coverage for the normal identity utility flow.
 
 Known gaps and intentional limits:
 
