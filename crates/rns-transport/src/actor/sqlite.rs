@@ -9,6 +9,31 @@ const CACHE_ENTRIES: usize = 256;
 const CACHE_BYTES: usize = 256 * 1024;
 const QUEUE_ENTRIES: usize = 64;
 const QUEUE_BYTES: usize = 256 * 1024;
+// Bound a deleting transaction more tightly than read-only keep-set staging.
+const GC_PAGE_ENTRIES: usize = 16;
+const GC_REST_FACTOR: u32 = 3;
+
+#[derive(Clone, Copy, Default)]
+enum GcPhase {
+    #[default]
+    Idle,
+    Clean(Option<[u8; 16]>),
+    Collect(Option<[u8; 32]>),
+}
+
+#[derive(Debug)]
+enum BackgroundResult {
+    Sweep,
+    Maintenance,
+    Cleaned {
+        next: Option<[u8; 16]>,
+        removed: usize,
+    },
+    Collected {
+        next: Option<[u8; 32]>,
+        removed: usize,
+    },
+}
 
 pub(super) struct SqliteState {
     worker: StorageHandle,
@@ -23,6 +48,11 @@ pub(super) struct SqliteState {
     last_vacuum: f64,
     vacuum_interval: f64,
     vacuum_pages: u32,
+    gc_phase: GcPhase,
+    next_gc: tokio::time::Instant,
+    gc_started: Option<std::time::Instant>,
+    gc_announces: usize,
+    gc_packets: usize,
 }
 
 struct Queued {
@@ -164,6 +194,11 @@ impl TransportActor {
             last_vacuum: crate::now_f64(),
             vacuum_interval,
             vacuum_pages,
+            gc_phase: GcPhase::Idle,
+            next_gc: tokio::time::Instant::now(),
+            gc_started: None,
+            gc_announces: 0,
+            gc_packets: 0,
         });
         self.storage_dir = Some(directory);
         // SQLite mode intentionally starts empty. Legacy msgpack files and
@@ -400,7 +435,8 @@ impl TransportActor {
         // A sweep is many worker operations (and filesystem reads). Keeping it
         // separate lets packet preparation run between those operations. The
         // single storage worker still serializes SQL and committed mutations.
-        let mut background: Option<JoinHandle<storage::Result<Prepared>>> = None;
+        let mut background: Option<JoinHandle<storage::Result<BackgroundResult>>> = None;
+        let mut background_started = std::time::Instant::now();
         let mut clear_after_job = false;
         let mut stopping = false;
         let mut was_foreground = true;
@@ -465,12 +501,7 @@ impl TransportActor {
                             "SQLite sweep completed"
                         );
                         result?;
-                        Ok(Prepared {
-                            message: None,
-                            entries: Vec::new(),
-                            raw: HashMap::new(),
-                            clear: true,
-                        })
+                        Ok(BackgroundResult::Sweep)
                     }));
                 } else if !stopping
                     && background.is_none()
@@ -484,17 +515,31 @@ impl TransportActor {
                     let vacuum_pages = state.vacuum_pages;
                     background = Some(tokio::spawn(async move {
                         maintain(&worker, vacuum_pages).await;
-                        Ok(Prepared {
-                            message: None,
-                            entries: Vec::new(),
-                            raw: HashMap::new(),
-                            clear: false,
-                        })
+                        Ok(BackgroundResult::Maintenance)
                     }));
+                } else if !stopping
+                    && background.is_none()
+                    && state.error.is_none()
+                    && !matches!(state.gc_phase, GcPhase::Idle)
+                    && tokio::time::Instant::now() >= state.next_gc
+                    && self.inbound_queues.snapshot().total == 0
+                    && self.rx.is_empty()
+                    && self.control_rx.as_ref().is_none_or(|rx| rx.is_empty())
+                {
+                    // No foreground job, staged writes or queued input remains.
+                    // An arrival can wait for at most this already-started page;
+                    // no second GC page is queued behind it.
+                    let phase = state.gc_phase;
+                    background_started = std::time::Instant::now();
+                    background = Some(tokio::spawn(gc_page(worker, phase)));
                 }
             }
             self.sqlite.as_mut().unwrap().busy = job.is_some() || background.is_some();
             tokio::select! {
+                _ = tokio::time::sleep_until(self.sqlite.as_ref().unwrap().next_gc),
+                    if !stopping && background.is_none()
+                        && !matches!(self.sqlite.as_ref().unwrap().gc_phase, GcPhase::Idle)
+                        && self.sqlite.as_ref().unwrap().next_gc > tokio::time::Instant::now() => {},
                 _ = ingress_tick.tick(), if !stopping => self.evaluate_dataplane_ingress(false),
                 _=std::future::ready(()), if !stopping && self.inbound_queues.snapshot().total > 0 => {
                     let packet = self.inbound_queues.pop().unwrap();
@@ -530,12 +575,48 @@ impl TransportActor {
                     background=None;
                     self.sqlite.as_mut().unwrap().busy=job.is_some();
                     match result {
-                        Ok(Ok(prepared)) => {
-                            if prepared.clear {
-                                // A long sweep must still leave a full idle interval.
-                                self.sqlite.as_mut().unwrap().last_sweep = crate::now_f64();
+                        Ok(Ok(result)) => {
+                            let state = self.sqlite.as_mut().unwrap();
+                            match result {
+                                BackgroundResult::Sweep => {
+                                    state.last_sweep = crate::now_f64();
+                                    clear_after_job = true;
+                                    // Refreshing pins must not restart a partially
+                                    // completed GC scan at the first key.
+                                    if matches!(state.gc_phase, GcPhase::Idle) {
+                                        state.gc_phase = GcPhase::Clean(None);
+                                        state.gc_started = Some(std::time::Instant::now());
+                                        state.gc_announces = 0;
+                                        state.gc_packets = 0;
+                                    }
+                                }
+                                BackgroundResult::Maintenance => {}
+                                BackgroundResult::Cleaned { next, removed } => {
+                                    state.gc_announces += removed;
+                                    clear_after_job |= removed > 0;
+                                    state.gc_phase = match next {
+                                        Some(key) => GcPhase::Clean(Some(key)),
+                                        None => GcPhase::Collect(None),
+                                    };
+                                    state.next_gc = gc_resume_at(background_started.elapsed());
+                                }
+                                BackgroundResult::Collected { next, removed } => {
+                                    state.gc_packets += removed;
+                                    state.gc_phase = match next {
+                                        Some(key) => GcPhase::Collect(Some(key)),
+                                        None => GcPhase::Idle,
+                                    };
+                                    state.next_gc = gc_resume_at(background_started.elapsed());
+                                    if matches!(state.gc_phase, GcPhase::Idle) {
+                                        tracing::info!(
+                                            duration_ms = state.gc_started.take().map_or(0, |t| t.elapsed().as_millis() as u64),
+                                            removed_announces = state.gc_announces,
+                                            removed_packets = state.gc_packets,
+                                            "SQLite garbage collection completed"
+                                        );
+                                    }
+                                }
                             }
-                            clear_after_job |= prepared.clear;
                         }
                         error => {
                             let error=format!("{error:?}");
@@ -874,24 +955,50 @@ async fn clean(worker: &StorageHandle) -> storage::Result<()> {
     Ok(())
 }
 
-async fn collect(worker: &StorageHandle) -> storage::Result<()> {
-    let mut after = None;
-    loop {
-        let Reply::CollectedPage { next, .. } = call(
-            worker,
+fn gc_resume_at(elapsed: Duration) -> tokio::time::Instant {
+    // At most roughly 25% of worker time for a GC backlog, even while idle.
+    // Input pressure can defer it further. A single SQL operation cannot be
+    // preempted, hence the smaller page bound above.
+    tokio::time::Instant::now() + elapsed.saturating_mul(GC_REST_FACTOR)
+}
+
+async fn gc_page(worker: StorageHandle, phase: GcPhase) -> storage::Result<BackgroundResult> {
+    match phase {
+        GcPhase::Clean(after) => {
+            let now = crate::now_f64();
+            match call(
+                &worker,
+                Request::CleanKnownPage {
+                    unused_before: now - UNUSED_DESTINATION_LINGER,
+                    used_before: now - DESTINATION_TIMEOUT as f64 * 1.25,
+                    after,
+                    limit: GC_PAGE_ENTRIES,
+                },
+            )
+            .await?
+            {
+                Reply::CleanedPage { next, removed } => {
+                    Ok(BackgroundResult::Cleaned { next, removed })
+                }
+                _ => Err(storage::StorageError::Invalid("cleanup page reply")),
+            }
+        }
+        GcPhase::Collect(after) => match call(
+            &worker,
             Request::CollectPacketsPage {
                 after,
-                limit: storage::MAX_BATCH_ITEMS,
+                limit: GC_PAGE_ENTRIES,
             },
         )
         .await?
-        else {
-            return Err(storage::StorageError::Invalid("collection page reply"));
-        };
-        let Some(next) = next else { break };
-        after = Some(next);
+        {
+            Reply::CollectedPage { next, removed } => {
+                Ok(BackgroundResult::Collected { next, removed })
+            }
+            _ => Err(storage::StorageError::Invalid("collection page reply")),
+        },
+        GcPhase::Idle => Err(storage::StorageError::Invalid("idle GC page")),
     }
-    Ok(())
 }
 
 async fn sweep(
@@ -946,8 +1053,7 @@ async fn sweep(
         .await?;
     }
     call(worker, Request::FinishSweep { generation }).await?;
-    clean(worker).await?;
-    collect(worker).await?;
+    // GC is scheduled one page at a time by the actor, after foreground work.
     Ok(())
 }
 
@@ -1400,6 +1506,211 @@ mod tests {
             started.elapsed().as_millis()
         );
         drop(outbound_receivers);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn obsolete_backlog_yields_to_four_peers_and_finishes_incrementally() {
+        exercise_obsolete_backlog(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_does_not_wait_for_obsolete_backlog() {
+        exercise_obsolete_backlog(true).await;
+    }
+
+    async fn exercise_obsolete_backlog(stop_early: bool) {
+        struct SlowGc {
+            db: storage::SqliteTransportStorage,
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            finished: Option<tokio::sync::oneshot::Sender<()>>,
+            applies: usize,
+            pages: std::sync::Arc<
+                std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant, usize)>>,
+            >,
+        }
+        impl storage::TransportStorage for SlowGc {
+            fn execute(&mut self, request: Request) -> storage::Result<Reply> {
+                let limit = match &request {
+                    Request::CleanKnownPage { limit, .. }
+                    | Request::CollectPacketsPage { limit, .. } => Some(*limit),
+                    _ => None,
+                };
+                let started = std::time::Instant::now();
+                if let Some(limit) = limit {
+                    assert!(limit <= GC_PAGE_ENTRIES);
+                    if let Some(ready) = self.started.take() {
+                        let _ = ready.send(());
+                        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                    // Model a slow device independently of the host SSD.
+                    std::thread::sleep(Duration::from_millis(limit as u64 * 4));
+                }
+                if matches!(&request, Request::Apply(_)) {
+                    self.applies += 1;
+                }
+                let result = self.db.execute(request);
+                if limit.is_some() {
+                    self.pages.lock().unwrap().push((
+                        started,
+                        std::time::Instant::now(),
+                        self.applies,
+                    ));
+                }
+                if matches!(&result, Ok(Reply::CollectedPage { next: None, .. })) {
+                    if let Some(done) = self.finished.take() {
+                        let _ = done.send(());
+                    }
+                }
+                result
+            }
+        }
+        let (dir, db) = tokio::task::spawn_blocking(|| storage::obsolete_store(96))
+            .await
+            .unwrap();
+        drop(db);
+        let (mut actor, tx) = TransportActor::new();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        actor
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .worker
+            .try_shutdown()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let pages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = pages.clone();
+        let database_path = dir.join("transport.sqlite");
+        let worker = StorageHandle::start(8, move || {
+            Ok(SlowGc {
+                db: storage::SqliteTransportStorage::open(
+                    &database_path,
+                    storage::StorageRole::Standalone,
+                    Default::default(),
+                )?,
+                started: Some(started),
+                release: wait,
+                finished: Some(finished),
+                applies: 0,
+                pages: observed,
+            })
+        })
+        .await
+        .unwrap();
+        actor.sqlite.as_mut().unwrap().worker = worker.clone();
+        let mut interface_receivers = Vec::new();
+        let mut streams = Vec::new();
+        for interface in 1..=4 {
+            let (mut entry, rx) = make_test_interface("peer");
+            entry.ingress = crate::ingress::IngressController::disabled();
+            actor.interfaces.insert(interface, entry);
+            interface_receivers.push(rx);
+            streams.push((
+                interface,
+                (0..8)
+                    .map(|_| make_valid_announce("lxmf.delivery", 1))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let task = tokio::spawn(actor.run_sqlite());
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut producers = Vec::new();
+        for (interface, packets) in streams {
+            let tx = tx.clone();
+            producers.push(tokio::spawn(async move {
+                let destinations: Vec<_> = packets.iter().map(|(_, dest)| *dest).collect();
+                for (raw, _) in packets {
+                    tx.send(TransportMessage::Inbound(crate::messages::InboundPacket {
+                        raw,
+                        interface_id: interface,
+                        rssi: None,
+                        snr: None,
+                        q: None,
+                    }))
+                    .await
+                    .unwrap();
+                }
+                for destination_hash in destinations {
+                    assert!(matches!(
+                        query(&tx, Q::Recall { destination_hash }).await,
+                        R::Announce(Some(_))
+                    ));
+                }
+                std::time::Instant::now()
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while worker.available_slots() > 6 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let released = std::time::Instant::now();
+        release.send(()).unwrap();
+        let mut last_peer = released;
+        for producer in producers {
+            last_peer = last_peer.max(producer.await.unwrap());
+        }
+        if !stop_early {
+            tokio::time::timeout(Duration::from_secs(15), done)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        let actor = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must not drain the remaining GC backlog")
+            .unwrap();
+        assert_eq!(actor.channel_drops, 0);
+        let state = actor.sqlite.as_ref().unwrap();
+        assert!(state.error.is_none());
+        assert!(
+            actor.sqlite_snapshot_ready(),
+            "paused GC must not block final route persistence"
+        );
+        if stop_early {
+            assert!(!matches!(state.gc_phase, GcPhase::Idle));
+            assert!(state.gc_announces < 96);
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        assert!(matches!(state.gc_phase, GcPhase::Idle));
+        assert_eq!(state.gc_announces, 96);
+        assert_eq!(state.gc_packets, 96);
+        let pages = pages.lock().unwrap();
+        assert!(pages.len() > 2);
+        // The entire accepted burst is served before scheduling another page.
+        assert!(
+            pages[1].2 >= 32,
+            "all accepted announce writes precede the next GC page"
+        );
+        for pair in pages.windows(2) {
+            let work = pair[0].1.duration_since(pair[0].0);
+            let rest = pair[1].0.duration_since(pair[0].1);
+            assert!(
+                rest >= work.saturating_mul(GC_REST_FACTOR),
+                "GC did not leave its worker budget to foreground traffic"
+            );
+        }
+        eprintln!(
+            "four peers / 32 announces: {}ms after blocked page released; {} GC pages, all 96 obsolete records and packets removed",
+            last_peer.duration_since(released).as_millis(),
+            pages.len()
+        );
+        drop(pages);
+        drop(interface_receivers);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

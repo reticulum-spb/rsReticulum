@@ -15,7 +15,7 @@ mod worker;
 
 pub use memory::MemoryTransportStorage;
 #[cfg(all(test, feature = "sqlite"))]
-pub(crate) use sqlite::failure_tests::populated_store;
+pub(crate) use sqlite::failure_tests::{obsolete_store, populated_store};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteOptions, SqliteTransportStorage};
 pub use worker::{Pending, Rejected, StorageHandle};

@@ -680,6 +680,16 @@ pub(crate) mod failure_tests {
         (dir, store, hashes)
     }
 
+    pub(crate) fn obsolete_store(count: u32) -> (PathBuf, SqliteTransportStorage) {
+        let (dir, store, _) = populated_store(count);
+        store.connection.execute_batch(
+            "DELETE FROM packet_keep;
+             INSERT INTO announces(destination_hash,hops,timestamp,packet_hash,is_path_response,retained,name_hash)
+             SELECT destination_hash,1,0,packet_hash,0,0,zeroblob(10) FROM packet_blobs;",
+        ).unwrap();
+        (dir, store)
+    }
+
     #[test]
     fn failed_keep_chunk_rolls_back_scratch_and_durable_changes() {
         let (dir, mut store, hashes) = populated_store(3);
