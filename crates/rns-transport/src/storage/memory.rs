@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 #[derive(Default, Clone)]
 pub struct MemoryTransportStorage {
     generation: i64,
+    active_sweep: bool,
     keep: BTreeMap<PacketHash, i64>,
     announces: BTreeMap<DestinationHash, RecentAnnounce>,
     packets: BTreeMap<PacketHash, Vec<u8>>,
@@ -81,10 +82,11 @@ impl TransportStorage for MemoryTransportStorage {
         Ok(match request {
             Request::BeginSweep => {
                 self.generation += 1;
+                self.active_sweep = true;
                 Reply::Generation(self.generation)
             }
             Request::KeepPackets { generation, hashes } => {
-                if generation != self.generation {
+                if !self.active_sweep || generation != self.generation {
                     return Err(StorageError::Invalid("stale sweep"));
                 }
                 for hash in hashes {
@@ -95,10 +97,11 @@ impl TransportStorage for MemoryTransportStorage {
                 Reply::Applied
             }
             Request::FinishSweep { generation } => {
-                if generation != self.generation {
+                if !self.active_sweep || generation != self.generation {
                     return Err(StorageError::Invalid("stale sweep"));
                 }
                 self.keep.retain(|_, g| *g == generation);
+                self.active_sweep = false;
                 Reply::Applied
             }
             Request::ClearAnnounces => {
@@ -134,6 +137,66 @@ impl TransportStorage for MemoryTransportStorage {
                     self.announces.remove(k);
                 }
                 Reply::Removed(keys.len())
+            }
+            Request::CleanKnownPage {
+                unused_before,
+                used_before,
+                after,
+                limit,
+            } => {
+                let keys: Vec<_> = self
+                    .announces
+                    .keys()
+                    .filter(|key| after.is_none_or(|a| **key > a))
+                    .take(limit)
+                    .copied()
+                    .collect();
+                let mut removed = 0;
+                for key in &keys {
+                    let a = &self.announces[key];
+                    if !a.retained
+                        && a.last_used
+                            .map_or(a.timestamp < unused_before, |t| t < used_before)
+                        && !self
+                            .references
+                            .keys()
+                            .any(|o| o.destination() == Some(*key))
+                        && !self
+                            .keep
+                            .keys()
+                            .any(|h| self.packet_destination(h).ok() == Some(*key))
+                    {
+                        self.announces.remove(key);
+                        removed += 1;
+                    }
+                }
+                Reply::CleanedPage {
+                    removed,
+                    next: keys.last().copied(),
+                }
+            }
+            Request::CollectPacketsPage { after, limit } => {
+                let keys: Vec<_> = self
+                    .packets
+                    .keys()
+                    .filter(|key| after.is_none_or(|a| **key > a))
+                    .take(limit)
+                    .copied()
+                    .collect();
+                let mut removed = 0;
+                for key in &keys {
+                    if !self.announces.values().any(|a| a.packet_hash == Some(*key))
+                        && !self.keep.contains_key(key)
+                        && !self.references.values().any(|h| h == key)
+                    {
+                        self.packets.remove(key);
+                        removed += 1;
+                    }
+                }
+                Reply::CollectedPage {
+                    removed,
+                    next: keys.last().copied(),
+                }
             }
             Request::Apply(mutations) => {
                 let mut staged = self.clone();

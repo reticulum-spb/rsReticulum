@@ -531,6 +531,10 @@ impl TransportActor {
                     self.sqlite.as_mut().unwrap().busy=job.is_some();
                     match result {
                         Ok(Ok(prepared)) => {
+                            if prepared.clear {
+                                // A long sweep must still leave a full idle interval.
+                                self.sqlite.as_mut().unwrap().last_sweep = crate::now_f64();
+                            }
                             clear_after_job |= prepared.clear;
                         }
                         error => {
@@ -849,15 +853,44 @@ async fn direct_query(worker: &StorageHandle, query: Q) -> storage::Result<R> {
 
 async fn clean(worker: &StorageHandle) -> storage::Result<()> {
     let now = crate::now_f64();
-    call(
-        worker,
-        Request::CleanKnown {
-            unused_before: now - UNUSED_DESTINATION_LINGER,
-            used_before: now - DESTINATION_TIMEOUT as f64 * 1.25,
-            limit: 128,
-        },
-    )
-    .await?;
+    let mut after = None;
+    loop {
+        let Reply::CleanedPage { next, .. } = call(
+            worker,
+            Request::CleanKnownPage {
+                unused_before: now - UNUSED_DESTINATION_LINGER,
+                used_before: now - DESTINATION_TIMEOUT as f64 * 1.25,
+                after,
+                limit: storage::MAX_BATCH_ITEMS,
+            },
+        )
+        .await?
+        else {
+            return Err(storage::StorageError::Invalid("cleanup page reply"));
+        };
+        let Some(next) = next else { break };
+        after = Some(next);
+    }
+    Ok(())
+}
+
+async fn collect(worker: &StorageHandle) -> storage::Result<()> {
+    let mut after = None;
+    loop {
+        let Reply::CollectedPage { next, .. } = call(
+            worker,
+            Request::CollectPacketsPage {
+                after,
+                limit: storage::MAX_BATCH_ITEMS,
+            },
+        )
+        .await?
+        else {
+            return Err(storage::StorageError::Invalid("collection page reply"));
+        };
+        let Some(next) = next else { break };
+        after = Some(next);
+    }
     Ok(())
 }
 
@@ -899,33 +932,22 @@ async fn sweep(
     let Reply::Generation(generation) = call(worker, Request::BeginSweep).await? else {
         unreachable!()
     };
-    let mut chunk = Vec::new();
-    for hash in keep {
-        chunk.push(hash);
-        if chunk.len() == 128 {
-            call(
-                worker,
-                Request::KeepPackets {
-                    generation,
-                    hashes: std::mem::take(&mut chunk),
-                },
-            )
-            .await?;
-        }
-    }
-    if !chunk.is_empty() {
+    // Sequential keys avoid random B-tree page churn with the small page cache.
+    let mut hashes: Vec<_> = keep.into_iter().collect();
+    hashes.sort_unstable();
+    for chunk in hashes.chunks(storage::MAX_BATCH_ITEMS) {
         call(
             worker,
             Request::KeepPackets {
                 generation,
-                hashes: chunk,
+                hashes: chunk.to_vec(),
             },
         )
         .await?;
     }
     call(worker, Request::FinishSweep { generation }).await?;
     clean(worker).await?;
-    call(worker, Request::CollectPackets { limit: 128 }).await?;
+    collect(worker).await?;
     Ok(())
 }
 
@@ -1114,6 +1136,7 @@ mod tests {
             tx.send(packet(make_lrproof_packet([0x77; 16], 0, &identity, None)))
                 .await
                 .unwrap();
+            let before_release = crate::now_f64();
             // An actual signed path-response announce must also pass admission.
             let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
             let (mut header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
@@ -1171,6 +1194,10 @@ mod tests {
             tx.send(TransportMessage::Shutdown).await.unwrap();
             let actor = task.await.unwrap();
             assert!(actor.sqlite.as_ref().unwrap().error.is_none());
+            assert!(
+                actor.sqlite.as_ref().unwrap().last_sweep >= before_release,
+                "cooldown must start at completion, not before the stalled sweep"
+            );
             assert!(actor.link_table.get(&[0x77; 16]).unwrap().validated);
             assert!(
                 !actor
@@ -1232,6 +1259,147 @@ mod tests {
         assert_eq!(state.queue[1].priority, 1);
         assert_eq!(actor.channel_drops, 2);
         state.worker.try_shutdown().unwrap().wait().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn four_peer_announce_and_link_load_during_large_sqlite_sweep() {
+        use super::super::tests::{insert_announce_for, make_lrproof_packet};
+        let (dir, store, hashes) = tokio::task::spawn_blocking(|| storage::populated_store(22_000))
+            .await
+            .unwrap();
+        drop(store);
+        let (mut actor, tx) = TransportActor::new();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        actor.is_transport_enabled = true;
+        let mut outbound_receivers = Vec::new();
+        let mut peers = Vec::new();
+        for peer in 0..4u8 {
+            let interface = u64::from(peer) + 1;
+            let origin = interface + 100;
+            let (mut entry, rx) = make_test_interface("peer");
+            entry.ingress = crate::ingress::IngressController::disabled();
+            actor.interfaces.insert(interface, entry);
+            outbound_receivers.push(rx);
+            let (entry, output) = make_test_interface("initiator");
+            actor.interfaces.insert(origin, entry);
+            let identity = rns_identity::identity::Identity::new();
+            let destination = [0xe0 + peer; 16];
+            let link = [0xa0 + peer; 16];
+            insert_announce_for(&mut actor, destination, &identity);
+            let mut announce = actor.recent_announces.remove(&destination).unwrap();
+            announce.retained = true;
+            call(
+                &actor.sqlite.as_ref().unwrap().worker,
+                Request::Apply(vec![Mutation::PutAnnounce {
+                    announce,
+                    raw: None,
+                }]),
+            )
+            .await
+            .unwrap();
+            actor.link_table.insert(
+                link,
+                crate::link_table::LinkEntry {
+                    timestamp: crate::now_f64(),
+                    next_hop: None,
+                    interface_id: interface,
+                    remaining_hops: 1,
+                    destination_hash: destination,
+                    established: false,
+                    validated: false,
+                    proof_timeout: crate::now_f64() + 30.0,
+                    receiving_interface: origin,
+                    taken_hops: 0,
+                },
+            );
+            peers.push((interface, identity, link, output));
+        }
+        for hash in hashes {
+            let mut path = crate::path_table::PathEntry::new(None, 1, 1, InterfaceMode::Full);
+            path.packet_hash = Some(hash);
+            actor.path_table.insert(
+                rns_wire::types::DestHash::new(hash[..16].try_into().unwrap()),
+                path,
+            );
+        }
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(actor.run_sqlite());
+        let mut producers = Vec::new();
+        for (interface, identity, link, mut output) in peers {
+            let tx = tx.clone();
+            producers.push(tokio::spawn(async move {
+                let packet = |raw| {
+                    TransportMessage::Inbound(crate::messages::InboundPacket {
+                        raw,
+                        interface_id: interface,
+                        rssi: None,
+                        snr: None,
+                        q: None,
+                    })
+                };
+                let mut max_recall = Duration::ZERO;
+                let mut proof_latency = Duration::ZERO;
+                for round in 0..32 {
+                    let (mut raw, destination_hash) = make_valid_announce("lxmf.delivery", 1);
+                    if round % 8 == 0 {
+                        let (mut header, offset) =
+                            rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                        header.context = rns_wire::context::PacketContext::PathResponse;
+                        let mut response = header.pack().unwrap();
+                        response.extend_from_slice(&raw[offset..]);
+                        raw = Bytes::from(response);
+                    }
+                    let sent = std::time::Instant::now();
+                    tx.send(packet(raw)).await.unwrap();
+                    assert!(matches!(
+                        query(&tx, Q::Recall { destination_hash }).await,
+                        R::Announce(Some(_))
+                    ));
+                    max_recall = max_recall.max(sent.elapsed());
+                    if round == 2 {
+                        let sent = std::time::Instant::now();
+                        tx.send(packet(make_lrproof_packet(link, 0, &identity, None)))
+                            .await
+                            .unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                let raw = output.recv().await.expect("interface remains open");
+                                let (header, _) =
+                                    rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                                if header.destination_hash == link
+                                    && header.context == rns_wire::context::PacketContext::Lrproof
+                                {
+                                    break;
+                                }
+                            }
+                        })
+                        .await
+                        .expect("proof must make progress during sweep");
+                        proof_latency = sent.elapsed();
+                    }
+                }
+                (max_recall, proof_latency)
+            }));
+        }
+        for producer in producers {
+            let (max_recall, proof_latency) = producer.await.unwrap();
+            eprintln!(
+                "peer: max announce/recall={}ms, cold proof={}ms",
+                max_recall.as_millis(),
+                proof_latency.as_millis()
+            );
+        }
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        let actor = task.await.unwrap();
+        assert!(actor.sqlite.as_ref().unwrap().error.is_none());
+        assert_eq!(actor.channel_drops, 0);
+        assert!(actor.recent_announces.len() <= CACHE_ENTRIES);
+        eprintln!(
+            "four peers, 128 announces, four cold proofs, 22000 pins: {}ms",
+            started.elapsed().as_millis()
+        );
+        drop(outbound_receivers);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

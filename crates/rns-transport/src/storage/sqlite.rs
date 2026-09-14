@@ -40,6 +40,7 @@ impl Default for SqliteOptions {
 pub struct SqliteTransportStorage {
     connection: Connection,
     path: PathBuf,
+    active_sweep: Option<i64>,
     // An advisory OS lock is held for the entire backend lifetime, including
     // idle periods. Never unlink the lock file (that would break ownership).
     _owner: File,
@@ -171,6 +172,12 @@ impl SqliteTransportStorage {
         )?;
         connection.pragma_update(None, "wal_autocheckpoint", 128)?;
         connection.set_prepared_statement_cache_capacity(16);
+        // The observed keep-set is scratch state, not a second durable copy.
+        // FILE storage and an explicit page-cache budget bound its RAM use.
+        connection.execute_batch(
+            "PRAGMA temp.cache_size=-256;
+             CREATE TEMP TABLE sweep_seen(packet_hash BLOB PRIMARY KEY) WITHOUT ROWID;",
+        )?;
         // Detect an incomplete schema at open, not as a later lookup miss.
         connection.prepare(&format!("SELECT {COLUMNS} FROM announces LIMIT 0"))?;
         connection
@@ -183,6 +190,7 @@ impl SqliteTransportStorage {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            active_sweep: None,
             _owner: owner,
         })
     }
@@ -406,19 +414,54 @@ impl TransportStorage for SqliteTransportStorage {
         request.validate()?;
         Ok(match request {
             Request::BeginSweep => {
-                self.connection.execute("UPDATE sweep_state SET generation=generation+1 WHERE id=1",[])?;
-                Reply::Generation(self.connection.query_row("SELECT generation FROM sweep_state WHERE id=1",[],|r|r.get(0))?)
+                let tx = self.connection.transaction()?;
+                tx.execute("DELETE FROM temp.sweep_seen", [])?;
+                tx.execute("UPDATE sweep_state SET generation=generation+1 WHERE id=1", [])?;
+                let generation = tx.query_row("SELECT generation FROM sweep_state WHERE id=1", [], |r| r.get(0))?;
+                tx.commit()?;
+                self.active_sweep = Some(generation);
+                Reply::Generation(generation)
             }
             Request::KeepPackets { generation, hashes } => {
-                let tx=self.connection.transaction()?;
-                check_generation(&tx,generation)?;
-                for hash in hashes { tx.execute("INSERT INTO packet_keep(packet_hash,generation) SELECT packet_hash,?2 FROM packet_blobs WHERE packet_hash=?1 ON CONFLICT(packet_hash) DO UPDATE SET generation=excluded.generation",params![hash.as_slice(),generation])?; }
-                tx.commit()?; Reply::Applied
+                if self.active_sweep != Some(generation) {
+                    return Err(StorageError::Invalid("inactive sweep"));
+                }
+                let tx = self.connection.transaction()?;
+                check_generation(&tx, generation)?;
+                {
+                    let mut seen = tx.prepare_cached(
+                        "INSERT INTO temp.sweep_seen(packet_hash) SELECT packet_hash FROM packet_blobs
+                         WHERE packet_hash=?1 ON CONFLICT(packet_hash) DO NOTHING",
+                    )?;
+                    let mut keep = tx.prepare_cached(
+                        "INSERT INTO packet_keep(packet_hash,generation) SELECT packet_hash,?2 FROM packet_blobs
+                         WHERE packet_hash=?1 AND NOT EXISTS(SELECT 1 FROM packet_keep WHERE packet_hash=?1)",
+                    )?;
+                    for hash in hashes {
+                        seen.execute([hash.as_slice()])?;
+                        // Existing pins need no main-DB write or fsync. New pins
+                        // are still committed durably before acknowledging this chunk.
+                        keep.execute(params![hash.as_slice(), generation])?;
+                    }
+                }
+                tx.commit()?;
+                Reply::Applied
             }
             Request::FinishSweep { generation } => {
-                let tx=self.connection.transaction()?; check_generation(&tx,generation)?;
-                tx.execute("DELETE FROM packet_keep WHERE generation!=?1",[generation])?;
-                tx.commit()?; Reply::Applied
+                // After restart the scratch set is gone. Refuse to finish an
+                // interrupted sweep: durable old AND new pins must survive.
+                if self.active_sweep != Some(generation) {
+                    return Err(StorageError::Invalid("inactive sweep"));
+                }
+                let tx = self.connection.transaction()?;
+                check_generation(&tx, generation)?;
+                tx.execute(
+                    "DELETE FROM packet_keep WHERE NOT EXISTS
+                     (SELECT 1 FROM temp.sweep_seen s WHERE s.packet_hash=packet_keep.packet_hash)", [],
+                )?;
+                tx.commit()?;
+                self.active_sweep = None;
+                Reply::Applied
             }
             Request::ClearAnnounces => Reply::Removed(self.connection.execute("DELETE FROM announces",[])?),
             Request::CleanKnown { unused_before,used_before,limit } => Reply::Removed(self.connection.execute(
@@ -427,6 +470,46 @@ impl TransportStorage for SqliteTransportStorage {
                 AND NOT EXISTS(SELECT 1 FROM packet_refs r WHERE r.destination_hash=a.destination_hash)
                 AND NOT EXISTS(SELECT 1 FROM packet_keep k JOIN packet_blobs p ON p.packet_hash=k.packet_hash WHERE p.destination_hash=a.destination_hash)
                 ORDER BY destination_hash LIMIT ?3)",params![unused_before,used_before,limit as i64])?),
+            Request::CleanKnownPage { unused_before, used_before, after, limit } => {
+                let tx = self.connection.transaction()?;
+                let keys = gc_page_keys::<16>(&tx,
+                    "SELECT destination_hash FROM announces WHERE destination_hash>?1 ORDER BY destination_hash LIMIT ?2",
+                    after.as_ref().map(|key| key.as_slice()), limit)?;
+                let mut removed = 0;
+                {
+                    let mut delete = tx.prepare_cached(
+                        "DELETE FROM announces WHERE destination_hash=?1 AND retained=0
+                         AND ((last_used IS NULL AND timestamp<?2) OR (last_used IS NOT NULL AND last_used<?3))
+                         AND NOT EXISTS(SELECT 1 FROM packet_refs r WHERE r.destination_hash=announces.destination_hash)
+                         AND NOT EXISTS(SELECT 1 FROM packet_blobs p JOIN packet_keep k ON k.packet_hash=p.packet_hash WHERE p.destination_hash=announces.destination_hash)",
+                    )?;
+                    for key in &keys {
+                        removed += delete.execute(params![key.as_slice(), unused_before, used_before])?;
+                    }
+                }
+                tx.commit()?;
+                Reply::CleanedPage { removed, next: keys.last().copied() }
+            }
+            Request::CollectPacketsPage { after, limit } => {
+                let tx = self.connection.transaction()?;
+                let keys = gc_page_keys::<32>(&tx,
+                    "SELECT packet_hash FROM packet_blobs WHERE packet_hash>?1 ORDER BY packet_hash LIMIT ?2",
+                    after.as_ref().map(|key| key.as_slice()), limit)?;
+                let mut removed = 0;
+                {
+                    let mut delete = tx.prepare_cached(
+                        "DELETE FROM packet_blobs WHERE packet_hash=?1
+                         AND NOT EXISTS(SELECT 1 FROM announces a WHERE a.packet_hash=?1)
+                         AND NOT EXISTS(SELECT 1 FROM packet_keep k WHERE k.packet_hash=?1)
+                         AND NOT EXISTS(SELECT 1 FROM packet_refs r WHERE r.packet_hash=?1)",
+                    )?;
+                    for key in &keys {
+                        removed += delete.execute([key.as_slice()])?;
+                    }
+                }
+                tx.commit()?;
+                Reply::CollectedPage { removed, next: keys.last().copied() }
+            }
             Request::Apply(mutations) => { self.apply(mutations)?; Reply::Applied }
             Request::Announce(dest) => Reply::Announce(self.connection.prepare_cached(
                 &format!("SELECT {COLUMNS} FROM announces WHERE destination_hash=?1"))?
@@ -482,7 +565,7 @@ impl TransportStorage for SqliteTransportStorage {
                 let page_count = pragma_u64(&self.connection, "page_count")?;
                 let free_before = pragma_u64(&self.connection, "freelist_count")?;
                 let (busy, wal_frames, checkpointed): (u64, u64, u64) = self.connection
-                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                    .query_row("PRAGMA main.wal_checkpoint(PASSIVE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
                 let requested = u64::from(vacuum_pages).min(free_before);
                 if requested > 0 {
                     self.connection.execute_batch(&format!("PRAGMA incremental_vacuum({requested})"))?;
@@ -501,11 +584,25 @@ impl TransportStorage for SqliteTransportStorage {
                 })
             }
             Request::Checkpoint => {
-                let (_, frames, done): (i64,i64,i64) = self.connection.query_row("PRAGMA wal_checkpoint(PASSIVE)",[], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                let (_, frames, done): (i64,i64,i64) = self.connection.query_row("PRAGMA main.wal_checkpoint(PASSIVE)",[], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                 Reply::Checkpoint { remaining_frames: (frames-done).max(0) }
             }
         })
     }
+}
+
+fn gc_page_keys<const N: usize>(
+    connection: &Connection,
+    sql: &str,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<[u8; N]>> {
+    let mut statement = connection.prepare_cached(sql)?;
+    Ok(statement
+        .query_map(params![after.unwrap_or(&[]), limit as i64], |row| {
+            fixed::<N>(row, 0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn pragma_u64(connection: &Connection, name: &str) -> Result<u64> {
@@ -531,8 +628,182 @@ fn sqlite_sidecar(database_path: &Path, suffix: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod failure_tests {
+pub(crate) mod failure_tests {
     use super::*;
+
+    // A database the size of the observed RNS-Gate keep-set. Seed directly
+    // because these tests measure storage work, not signature verification.
+    pub(crate) fn populated_store(
+        count: u32,
+    ) -> (PathBuf, SqliteTransportStorage, Vec<PacketHash>) {
+        let dir = std::env::temp_dir().join(format!(
+            "rns-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let mut store = SqliteTransportStorage::open(
+            &dir.join("transport.sqlite"),
+            StorageRole::Standalone,
+            Default::default(),
+        )
+        .unwrap();
+        let mut hashes: Vec<_> = (0..count)
+            .map(|n| rns_crypto::sha::full_hash(&n.to_be_bytes()))
+            .collect();
+        hashes.sort_unstable();
+        let tx = store.connection.transaction().unwrap();
+        {
+            let mut packet = tx
+                .prepare("INSERT INTO packet_blobs VALUES(?1,?2,zeroblob(200))")
+                .unwrap();
+            let mut keep = tx.prepare("INSERT INTO packet_keep VALUES(?1,0)").unwrap();
+            for hash in &hashes {
+                packet
+                    .execute(params![hash.as_slice(), &hash[..16]])
+                    .unwrap();
+                keep.execute([hash.as_slice()]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        store
+            .connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        store
+            .connection
+            .execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        (dir, store, hashes)
+    }
+
+    #[test]
+    fn failed_keep_chunk_rolls_back_scratch_and_durable_changes() {
+        let (dir, mut store, hashes) = populated_store(3);
+        store
+            .connection
+            .execute(
+                "DELETE FROM packet_keep WHERE packet_hash=?1",
+                [hashes[2].as_slice()],
+            )
+            .unwrap();
+        let Reply::Generation(generation) = store.execute(Request::BeginSweep).unwrap() else {
+            panic!()
+        };
+        store
+            .execute(Request::KeepPackets {
+                generation,
+                hashes: vec![hashes[0]],
+            })
+            .unwrap();
+        store.connection.execute_batch("CREATE TEMP TRIGGER fail_new_pin BEFORE INSERT ON main.packet_keep BEGIN SELECT RAISE(ABORT,'injected pin failure'); END;").unwrap();
+        assert!(
+            store
+                .execute(Request::KeepPackets {
+                    generation,
+                    hashes: vec![hashes[1], hashes[2]]
+                })
+                .is_err()
+        );
+        // Even scratch updates earlier in the failed transaction must roll back.
+        let seen: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM temp.sweep_seen", [], |r| r.get(0))
+            .unwrap();
+        let pins: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM packet_keep", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(pins, 2);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER temp.fail_new_pin")
+            .unwrap();
+        store
+            .execute(Request::KeepPackets {
+                generation,
+                hashes: vec![hashes[1], hashes[2]],
+            })
+            .unwrap();
+        store.execute(Request::FinishSweep { generation }).unwrap();
+        assert!(matches!(
+            store
+                .execute(Request::CollectPacketsPage {
+                    after: None,
+                    limit: 128
+                })
+                .unwrap(),
+            Reply::CollectedPage { removed: 0, .. }
+        ));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unchanged_keep_set_does_not_rewrite_wal() {
+        let (dir, mut store, hashes) = populated_store(22_000);
+        let Reply::Generation(generation) = store.execute(Request::BeginSweep).unwrap() else {
+            panic!()
+        };
+        let wal = sqlite_sidecar(&store.path, "-wal");
+        let before = file_size(&wal);
+        let started = std::time::Instant::now();
+        for chunk in hashes.chunks(MAX_BATCH_ITEMS) {
+            store
+                .execute(Request::KeepPackets {
+                    generation,
+                    hashes: chunk.to_vec(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            file_size(&wal),
+            before,
+            "unchanged pins must not write the main WAL"
+        );
+        store.execute(Request::FinishSweep { generation }).unwrap();
+        assert_eq!(
+            file_size(&wal),
+            before,
+            "unchanged finish must not rewrite pins"
+        );
+        eprintln!(
+            "unchanged sweep: packets={} elapsed_ms={} wal_bytes={}",
+            hashes.len(),
+            started.elapsed().as_millis(),
+            before
+        );
+        // Compare the old generation-rewrite algorithm with the same sorted
+        // keys, connection, durability settings and page cache.
+        store
+            .connection
+            .execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let started = std::time::Instant::now();
+        for chunk in hashes.chunks(MAX_BATCH_ITEMS) {
+            let tx = store.connection.transaction().unwrap();
+            for hash in chunk {
+                tx.execute("INSERT INTO packet_keep(packet_hash,generation) SELECT packet_hash,?2 FROM packet_blobs WHERE packet_hash=?1 ON CONFLICT(packet_hash) DO UPDATE SET generation=excluded.generation", params![hash.as_slice(), generation + 1]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let old_bytes = file_size(&wal);
+        eprintln!(
+            "old sorted sweep: elapsed_ms={} wal_bytes={}",
+            started.elapsed().as_millis(),
+            old_bytes
+        );
+        assert!(
+            old_bytes > before * 100,
+            "fixture must expose write amplification"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

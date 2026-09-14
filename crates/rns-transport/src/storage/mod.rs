@@ -14,6 +14,8 @@ mod sqlite;
 mod worker;
 
 pub use memory::MemoryTransportStorage;
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) use sqlite::failure_tests::populated_store;
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteOptions, SqliteTransportStorage};
 pub use worker::{Pending, Rejected, StorageHandle};
@@ -173,6 +175,19 @@ pub enum Request {
         used_before: f64,
         limit: usize,
     },
+    /// Scan at most `limit` metadata rows, including protected rows. Unlike
+    /// CleanKnown's deletion limit this bounds work when most rows are live.
+    CleanKnownPage {
+        unused_before: f64,
+        used_before: f64,
+        after: Option<DestinationHash>,
+        limit: usize,
+    },
+    /// Bounded scan of packet candidates. A full pass is driven by the actor.
+    CollectPacketsPage {
+        after: Option<PacketHash>,
+        limit: usize,
+    },
     Apply(Vec<Mutation>),
     Announce(DestinationHash),
     Packet(PacketHash),
@@ -225,6 +240,14 @@ pub enum Reply {
     Packet(Option<Vec<u8>>),
     Page(AnnouncePage),
     Removed(usize),
+    CleanedPage {
+        removed: usize,
+        next: Option<DestinationHash>,
+    },
+    CollectedPage {
+        removed: usize,
+        next: Option<PacketHash>,
+    },
     Stats(StorageStats),
     Maintenance(StorageMaintenance),
     /// SQLite PASSIVE checkpoint returns how many WAL frames are uncheckpointed.
@@ -267,6 +290,8 @@ impl Request {
             Self::KeepPackets { .. } => "keep_packets",
             Self::FinishSweep { .. } => "finish_sweep",
             Self::CleanKnown { .. } => "clean_known",
+            Self::CleanKnownPage { .. } => "clean_known_page",
+            Self::CollectPacketsPage { .. } => "collect_packets_page",
             Self::Apply(_) => "apply",
             Self::Announce(_) => "announce",
             Self::Packet(_) => "packet",
@@ -288,6 +313,12 @@ impl Request {
                 unused_before,
                 used_before,
                 limit,
+            }
+            | Self::CleanKnownPage {
+                unused_before,
+                used_before,
+                limit,
+                ..
             } if !unused_before.is_finite()
                 || !used_before.is_finite()
                 || *limit == 0
@@ -354,7 +385,9 @@ impl Request {
             {
                 return Err(StorageError::Invalid("expiry bounds"));
             }
-            Self::CollectPackets { limit } if *limit == 0 || *limit > MAX_BATCH_ITEMS => {
+            Self::CollectPackets { limit } | Self::CollectPacketsPage { limit, .. }
+                if *limit == 0 || *limit > MAX_BATCH_ITEMS =>
+            {
                 return Err(StorageError::Invalid("GC limit"));
             }
             _ => {}

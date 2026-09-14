@@ -298,6 +298,230 @@ fn pages_contract(store: &mut dyn TransportStorage) {
     );
 }
 
+fn gc_pages_contract(store: &mut dyn TransportStorage) {
+    let mut entries: Vec<_> = (0..6)
+        .map(|_| fixture(&rns_identity::identity::Identity::new()))
+        .collect();
+    entries.sort_by_key(|(a, _)| a.dest_hash);
+    entries[2].0.retained = true;
+    entries[3].0.last_used = Some(1000.0);
+    let destinations: Vec<_> = entries.iter().map(|(a, _)| a.dest_hash).collect();
+    let hashes: Vec<_> = entries
+        .iter()
+        .map(|(a, _)| a.packet_hash.unwrap())
+        .collect();
+    apply(
+        store,
+        entries
+            .into_iter()
+            .map(|(announce, raw)| Mutation::PutAnnounce {
+                announce,
+                raw: Some(raw),
+            })
+            .collect(),
+    );
+    apply(
+        store,
+        vec![Mutation::SetReference {
+            owner: PacketOwner::Path(destinations[1]),
+            hash: hashes[1],
+        }],
+    );
+    let generation = begin_sweep(store);
+    store
+        .execute(Request::KeepPackets {
+            generation,
+            hashes: vec![hashes[0]],
+        })
+        .unwrap();
+    store.execute(Request::FinishSweep { generation }).unwrap();
+    let mut after = None;
+    for (page, expected) in [0, 0, 2].into_iter().enumerate() {
+        let Reply::CleanedPage { removed, next } = store
+            .execute(Request::CleanKnownPage {
+                unused_before: 500.0,
+                used_before: 500.0,
+                after,
+                limit: 2,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(removed, expected);
+        assert_eq!(
+            next,
+            Some(destinations[page * 2 + 1]),
+            "page bounds include protected rows"
+        );
+        after = next;
+    }
+    assert!(matches!(
+        store
+            .execute(Request::CleanKnownPage {
+                unused_before: 500.0,
+                used_before: 500.0,
+                after,
+                limit: 2,
+            })
+            .unwrap(),
+        Reply::CleanedPage {
+            removed: 0,
+            next: None
+        }
+    ));
+    let mut after = None;
+    let mut total = 0;
+    let mut sorted = hashes.clone();
+    sorted.sort_unstable();
+    for page in 0..3 {
+        let Reply::CollectedPage { removed, next } = store
+            .execute(Request::CollectPacketsPage { after, limit: 2 })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(next, Some(sorted[page * 2 + 1]));
+        total += removed;
+        after = next;
+    }
+    assert_eq!(total, 2);
+    assert!(matches!(
+        store
+            .execute(Request::CollectPacketsPage { after, limit: 2 })
+            .unwrap(),
+        Reply::CollectedPage {
+            removed: 0,
+            next: None
+        }
+    ));
+    for hash in &hashes[..4] {
+        assert!(packet(store, *hash).is_some());
+    }
+    for hash in &hashes[4..] {
+        assert!(packet(store, *hash).is_none());
+    }
+    assert!(
+        store
+            .execute(Request::CollectPacketsPage {
+                after: None,
+                limit: MAX_BATCH_ITEMS + 1
+            })
+            .is_err()
+    );
+    assert!(
+        store
+            .execute(Request::CleanKnownPage {
+                unused_before: f64::NAN,
+                used_before: 0.0,
+                after: None,
+                limit: 128
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn memory_gc_pages_contract() {
+    gc_pages_contract(&mut MemoryTransportStorage::default());
+}
+
+fn begin_sweep(store: &mut dyn TransportStorage) -> i64 {
+    let Reply::Generation(generation) = store.execute(Request::BeginSweep).unwrap() else {
+        panic!()
+    };
+    generation
+}
+
+fn sweep_contract(store: &mut dyn TransportStorage) {
+    let (first, raw1) = fixture(&rns_identity::identity::Identity::new());
+    let (second, raw2) = fixture(&rns_identity::identity::Identity::new());
+    let h1 = first.packet_hash.unwrap();
+    let h2 = second.packet_hash.unwrap();
+    apply(
+        store,
+        vec![
+            Mutation::PutPacket {
+                hash: h1,
+                raw: raw1,
+            },
+            Mutation::PutPacket {
+                hash: h2,
+                raw: raw2,
+            },
+        ],
+    );
+    let g1 = begin_sweep(store);
+    store
+        .execute(Request::KeepPackets {
+            generation: g1,
+            hashes: vec![h1],
+        })
+        .unwrap();
+    store
+        .execute(Request::FinishSweep { generation: g1 })
+        .unwrap();
+    let g2 = begin_sweep(store);
+    store
+        .execute(Request::KeepPackets {
+            generation: g2,
+            hashes: vec![h2, [0xff; 32]],
+        })
+        .unwrap();
+    // An incomplete sweep protects old pins and every acknowledged new pin.
+    removed(store, Request::CollectPackets { limit: 128 }, 0);
+    assert!(
+        store
+            .execute(Request::FinishSweep { generation: g1 })
+            .is_err()
+    );
+    assert!(
+        store
+            .execute(Request::KeepPackets {
+                generation: g1,
+                hashes: vec![h1]
+            })
+            .is_err()
+    );
+    let g3 = begin_sweep(store);
+    removed(store, Request::CollectPackets { limit: 128 }, 0);
+    store
+        .execute(Request::KeepPackets {
+            generation: g3,
+            hashes: vec![h2, h2],
+        })
+        .unwrap();
+    store
+        .execute(Request::FinishSweep { generation: g3 })
+        .unwrap();
+    removed(store, Request::CollectPackets { limit: 128 }, 1);
+    assert!(packet(store, h1).is_none());
+    assert!(packet(store, h2).is_some());
+    assert!(
+        store
+            .execute(Request::FinishSweep { generation: g3 })
+            .is_err()
+    );
+    assert!(
+        store
+            .execute(Request::KeepPackets {
+                generation: g3,
+                hashes: vec![h2]
+            })
+            .is_err()
+    );
+    let g4 = begin_sweep(store);
+    store
+        .execute(Request::FinishSweep { generation: g4 })
+        .unwrap();
+    removed(store, Request::CollectPackets { limit: 128 }, 1);
+}
+
+#[test]
+fn memory_sweep_contract() {
+    sweep_contract(&mut MemoryTransportStorage::default());
+}
+
 #[test]
 fn memory_contract() {
     replacement_contract(&mut MemoryTransportStorage::default());
@@ -413,6 +637,49 @@ mod disk {
     }
     fn open(path: &Path) -> SqliteTransportStorage {
         SqliteTransportStorage::open(path, StorageRole::Standalone, Default::default()).unwrap()
+    }
+
+    #[test]
+    fn sqlite_gc_pages_contract() {
+        let t = Temp::new();
+        gc_pages_contract(&mut open(&t.path()));
+    }
+
+    #[test]
+    fn sqlite_sweep_contract_and_interrupted_restart() {
+        let t = Temp::new();
+        let path = t.path();
+        let mut store = open(&path);
+        sweep_contract(&mut store);
+        let (a, raw) = fixture(&rns_identity::identity::Identity::new());
+        let hash = a.packet_hash.unwrap();
+        apply(&mut store, vec![Mutation::PutPacket { hash, raw }]);
+        let generation = begin_sweep(&mut store);
+        store
+            .execute(Request::KeepPackets {
+                generation,
+                hashes: vec![hash],
+            })
+            .unwrap();
+        drop(store);
+        let mut store = open(&path);
+        assert!(
+            store.execute(Request::FinishSweep { generation }).is_err(),
+            "lost scratch set cannot complete"
+        );
+        assert!(
+            store
+                .execute(Request::KeepPackets {
+                    generation,
+                    hashes: vec![hash]
+                })
+                .is_err()
+        );
+        removed(&mut store, Request::CollectPackets { limit: 128 }, 0);
+        assert!(packet(&mut store, hash).is_some());
+        let generation = begin_sweep(&mut store);
+        store.execute(Request::FinishSweep { generation }).unwrap();
+        removed(&mut store, Request::CollectPackets { limit: 128 }, 1);
     }
 
     #[test]
@@ -713,12 +980,39 @@ mod disk {
                 raw: Some(raw2),
             }],
         );
+        let (third, raw3) = fixture(&rns_identity::identity::Identity::new());
+        let h3 = third.packet_hash.unwrap();
+        apply(
+            &mut s,
+            vec![Mutation::PutPacket {
+                hash: h3,
+                raw: raw3,
+            }],
+        );
+        let old_generation = begin_sweep(&mut s);
+        s.execute(Request::KeepPackets {
+            generation: old_generation,
+            hashes: vec![h1],
+        })
+        .unwrap();
+        s.execute(Request::FinishSweep {
+            generation: old_generation,
+        })
+        .unwrap();
+        let interrupted_generation = begin_sweep(&mut s);
+        s.execute(Request::KeepPackets {
+            generation: interrupted_generation,
+            hashes: vec![h3],
+        })
+        .unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE; UPDATE announces SET app_data=x'00';")
             .unwrap();
         let mut marker = dest.to_vec();
         marker.extend(h1);
         marker.extend(h2);
+        marker.extend(h3);
+        marker.extend(interrupted_generation.to_be_bytes());
         std::fs::write(dir.join("marker"), marker).unwrap();
         // Skip Rust destructors, connection close and all orderly checkpoints.
         // This models process death, not hardware power-loss durability.
@@ -747,7 +1041,15 @@ mod disk {
         let dest: [u8; 16] = marker[..16].try_into().unwrap();
         let h1: [u8; 32] = marker[16..48].try_into().unwrap();
         let h2: [u8; 32] = marker[48..80].try_into().unwrap();
+        let h3: [u8; 32] = marker[80..112].try_into().unwrap();
+        let interrupted_generation = i64::from_be_bytes(marker[112..120].try_into().unwrap());
         let mut s = open(&t.path());
+        assert!(
+            s.execute(Request::FinishSweep {
+                generation: interrupted_generation
+            })
+            .is_err()
+        );
         let a = get(&mut s, dest).unwrap();
         assert_eq!(a.packet_hash, Some(h2));
         assert_eq!(
@@ -764,6 +1066,22 @@ mod disk {
                 destination: dest,
             })],
         );
+        removed(&mut s, Request::CollectPackets { limit: 128 }, 0);
+        assert!(
+            packet(&mut s, h1).is_some(),
+            "old sweep pin survives process death"
+        );
+        assert!(
+            packet(&mut s, h3).is_some(),
+            "acknowledged new pin survives process death"
+        );
+        let generation = begin_sweep(&mut s);
+        s.execute(Request::KeepPackets {
+            generation,
+            hashes: vec![h3],
+        })
+        .unwrap();
+        s.execute(Request::FinishSweep { generation }).unwrap();
         removed(&mut s, Request::CollectPackets { limit: 128 }, 1);
     }
 }
