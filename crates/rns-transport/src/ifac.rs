@@ -12,8 +12,29 @@
 //! everything except the tag masked.
 
 use rns_crypto::ed25519::Ed25519PrivateKey;
-use rns_crypto::hkdf::hkdf_sha256;
+use rns_crypto::hmac::hmac_sha256;
 use subtle::ConstantTimeEq;
+
+/// Python's IFAC wire mask wraps the HKDF block counter after 255 blocks.
+/// Large-MTU frames reach this extension of RFC 5869. Keep it private to IFAC:
+/// key derivation through rns_crypto::hkdf_sha256 retains its 8160-byte limit.
+/// Each block still includes the previous digest, including across the wrap.
+fn ifac_mask(length: usize, tag: &[u8], key: &[u8; 64]) -> Vec<u8> {
+    let prk = hmac_sha256(key, tag);
+    let mut mask = vec![0; length];
+    let mut input = [0u8; 33];
+    let mut previous_len = 0;
+    let mut counter = 1u8;
+    for chunk in mask.chunks_mut(32) {
+        input[previous_len] = counter;
+        let block = hmac_sha256(&prk, &input[..previous_len + 1]);
+        chunk.copy_from_slice(&block[..chunk.len()]);
+        input[..32].copy_from_slice(&block);
+        previous_len = 32;
+        counter = counter.wrapping_add(1);
+    }
+    mask
+}
 
 /// Bit 7 of byte 0 signals IFAC presence, regardless of `ifac_size`.
 const IFAC_FLAG: u8 = 0x80;
@@ -38,8 +59,7 @@ pub fn ifac_sign(packet: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Vec<u8
     let tag = &signature[64 - ifac_size..];
 
     let mask_len = packet.len() + ifac_size;
-    let mask =
-        hkdf_sha256(mask_len, tag, Some(ifac_key), None).expect("HKDF mask generation failed");
+    let mask = ifac_mask(mask_len, tag, ifac_key);
 
     let mut new_raw = Vec::with_capacity(2 + ifac_size + packet.len() - 2);
     new_raw.push(packet[0] | IFAC_FLAG);
@@ -81,7 +101,7 @@ pub fn ifac_verify(raw: &[u8], ifac_key: &[u8; 64], ifac_size: usize) -> Option<
 
     let ifac = &raw[2..2 + ifac_size];
 
-    let mask = hkdf_sha256(raw.len(), ifac, Some(ifac_key), None).ok()?;
+    let mask = ifac_mask(raw.len(), ifac, ifac_key);
 
     let mut unmasked_raw = Vec::with_capacity(raw.len());
     for (i, &byte) in raw.iter().enumerate() {
