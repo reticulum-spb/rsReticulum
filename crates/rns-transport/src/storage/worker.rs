@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 struct Work {
+    queued: std::time::Instant,
     request: Option<Request>,
     reply: oneshot::Sender<Result<Reply>>,
 }
@@ -35,6 +36,11 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
+    #[cfg(all(test, feature = "sqlite"))]
+    pub(crate) fn available_slots(&self) -> usize {
+        self.slots.available_permits()
+    }
+
     /// Initializes the backend on a dedicated blocking thread. The normal
     /// bound is 8 in-flight operations; callers can choose 1..=32. SQLite's
     /// connection, transactions, busy waits and checkpoints never run on Tokio.
@@ -64,7 +70,29 @@ impl StorageHandle {
                 let mut shutdown_replies = Vec::new();
                 while let Some(work) = rx.blocking_recv() {
                     if let Some(request) = work.request {
-                        let _ = work.reply.send(backend.execute(request));
+                        let operation = request.operation();
+                        let queue_ms = work.queued.elapsed().as_millis() as u64;
+                        let started = std::time::Instant::now();
+                        tracing::debug!(operation, queue_ms, "transport storage operation started");
+                        let result = backend.execute(request);
+                        let execution_ms = started.elapsed().as_millis() as u64;
+                        if queue_ms >= 100 || execution_ms >= 100 {
+                            tracing::warn!(
+                                operation,
+                                queue_ms,
+                                execution_ms,
+                                failed = result.is_err(),
+                                "transport storage operation delayed"
+                            );
+                        } else {
+                            tracing::debug!(
+                                operation,
+                                queue_ms,
+                                execution_ms,
+                                "transport storage operation completed"
+                            );
+                        }
+                        let _ = work.reply.send(result);
                     } else {
                         // Reject future sends, but finish every accepted operation.
                         rx.close();
@@ -137,7 +165,11 @@ impl StorageHandle {
             }
         };
         let (tx, rx) = oneshot::channel();
-        match self.tx.try_send(Work { request, reply: tx }) {
+        match self.tx.try_send(Work {
+            queued: std::time::Instant::now(),
+            request,
+            reply: tx,
+        }) {
             Ok(()) => Ok(Pending {
                 reply: rx,
                 _permit: permit,

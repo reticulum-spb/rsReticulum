@@ -13,7 +13,7 @@ const QUEUE_BYTES: usize = 256 * 1024;
 pub(super) struct SqliteState {
     worker: StorageHandle,
     pub raw: HashMap<[u8; 32], Vec<u8>>,
-    queue: VecDeque<TransportMessage>,
+    queue: VecDeque<Queued>,
     bytes: usize,
     writes: Vec<Mutation>,
     pub busy: bool,
@@ -23,6 +23,12 @@ pub(super) struct SqliteState {
     last_vacuum: f64,
     vacuum_interval: f64,
     vacuum_pages: u32,
+}
+
+struct Queued {
+    enqueued: std::time::Instant,
+    message: TransportMessage,
+    priority: u8,
 }
 
 #[derive(Default)]
@@ -187,12 +193,30 @@ impl TransportActor {
     }
 
     pub(super) fn enqueue_sqlite(&mut self, msg: TransportMessage) {
+        let priority = self.sqlite_packet_priority(&msg);
         let state = self.sqlite.as_mut().unwrap();
         if let Some(error) = &state.error {
             reject(msg, error);
             return;
         }
         let bytes = weight(&msg);
+        // Reserve admission for link setup / discovery by evicting lower
+        // priority inbound traffic. RPC mutations retain their FIFO ordering.
+        while priority > 0
+            && (state.queue.len() >= QUEUE_ENTRIES || state.bytes + bytes > QUEUE_BYTES)
+        {
+            let Some(index) = state.queue.iter().rposition(|queued| {
+                matches!(
+                    &queued.message,
+                    TransportMessage::Inbound(_) | TransportMessage::AdmittedInbound(_)
+                ) && queued.priority == 0
+            }) else {
+                break;
+            };
+            let removed = state.queue.remove(index).unwrap();
+            state.bytes = state.bytes.saturating_sub(weight(&removed.message));
+            self.channel_drops += 1;
+        }
         if state.queue.len() >= QUEUE_ENTRIES || state.bytes + bytes > QUEUE_BYTES {
             self.channel_drops += 1;
             warn!(drops = self.channel_drops, "SQLite admission queue full");
@@ -200,7 +224,44 @@ impl TransportActor {
             return;
         }
         state.bytes += bytes;
-        state.queue.push_back(msg);
+        let index = if priority > 0 {
+            state
+                .queue
+                .iter()
+                .position(|queued| queued.priority < priority)
+                .unwrap_or(state.queue.len())
+        } else {
+            state.queue.len()
+        };
+        state.queue.insert(
+            index,
+            Queued {
+                enqueued: std::time::Instant::now(),
+                message: msg,
+                priority,
+            },
+        );
+    }
+
+    fn sqlite_packet_priority(&self, msg: &TransportMessage) -> u8 {
+        // Reuse IFAC verification for the single-channel actor as well as the
+        // already admitted header from the two-channel actor.
+        let header = self.sqlite_header(msg).map(|(header, _)| header);
+        header.map_or(0, |h| {
+            if h.context == rns_wire::context::PacketContext::Lrproof
+                && h.flags.packet_type == rns_wire::flags::PacketType::Proof
+                && self.link_table.contains(&h.destination_hash)
+            {
+                2
+            } else if (h.context == rns_wire::context::PacketContext::PathResponse
+                && h.flags.packet_type == rns_wire::flags::PacketType::Announce)
+                || h.destination_hash == Self::path_request_dest_hash()
+            {
+                1
+            } else {
+                0
+            }
+        })
     }
 
     fn sqlite_header(
@@ -251,7 +312,8 @@ impl TransportActor {
                     h.flags.packet_type == rns_wire::flags::PacketType::Announce
                         || h.flags.destination_type == rns_wire::flags::DestinationType::Plain
                         || h.context == rns_wire::context::PacketContext::CacheRequest
-                        || h.context == rns_wire::context::PacketContext::Lrproof
+                        || (h.context == rns_wire::context::PacketContext::Lrproof
+                            && !self.sqlite_reads(msg).keys.is_empty())
                 })
             }
             _ => false,
@@ -335,17 +397,40 @@ impl TransportActor {
         let mut ingress_tick = tokio::time::interval(crate::backbone_ingress::INTERVAL);
         ingress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut job: Option<JoinHandle<storage::Result<Prepared>>> = None;
+        // A sweep is many worker operations (and filesystem reads). Keeping it
+        // separate lets packet preparation run between those operations. The
+        // single storage worker still serializes SQL and committed mutations.
+        let mut background: Option<JoinHandle<storage::Result<Prepared>>> = None;
+        let mut clear_after_job = false;
         let mut stopping = false;
         let mut was_foreground = true;
         let mut interface_open = true;
         let mut control_open = self.control_rx.is_some();
         loop {
             if job.is_none() {
-                let state = self.sqlite.as_mut().unwrap();
-                let message = state.queue.pop_front();
-                if let Some(msg) = &message {
-                    state.bytes = state.bytes.saturating_sub(weight(msg));
+                // A prepared read may have relied on a cache hit. Invalidate
+                // only after its message has consumed that entry.
+                if clear_after_job {
+                    self.recent_announces.clear();
+                    self.sqlite.as_mut().unwrap().order.clear();
+                    clear_after_job = false;
                 }
+                let state = self.sqlite.as_mut().unwrap();
+                let message = state.queue.pop_front().map(|queued| {
+                    let msg = queued.message;
+                    state.bytes = state.bytes.saturating_sub(weight(&msg));
+                    let admission_ms = queued.enqueued.elapsed().as_millis() as u64;
+                    if admission_ms >= 100 {
+                        warn!(
+                            admission_ms,
+                            message = crate::messages::msg_variant_name(&msg),
+                            priority = queued.priority,
+                            queue_entries = state.queue.len(),
+                            "SQLite admission delayed"
+                        );
+                    }
+                    msg
+                });
                 let writes = std::mem::take(&mut state.writes);
                 let worker = state.worker.clone();
                 if let Some(message) = message {
@@ -358,9 +443,11 @@ impl TransportActor {
                         None,
                         Reads::default(),
                     )));
-                } else if stopping {
+                } else if stopping && background.is_none() {
                     break;
-                } else if crate::now_f64() - state.last_sweep >= 60.0
+                } else if !stopping
+                    && background.is_none()
+                    && crate::now_f64() - state.last_sweep >= 60.0
                     && state.error.is_none()
                     && !self
                         .routing_save_in_flight
@@ -369,8 +456,15 @@ impl TransportActor {
                     state.last_sweep = crate::now_f64();
                     let keep = self.sqlite_live_packets();
                     let directory = self.storage_dir.clone().unwrap();
-                    job = Some(tokio::spawn(async move {
-                        sweep(&worker, directory, keep).await?;
+                    background = Some(tokio::spawn(async move {
+                        let started = std::time::Instant::now();
+                        let result = sweep(&worker, directory, keep).await;
+                        tracing::info!(
+                            duration_ms = started.elapsed().as_millis() as u64,
+                            failed = result.is_err(),
+                            "SQLite sweep completed"
+                        );
+                        result?;
                         Ok(Prepared {
                             message: None,
                             entries: Vec::new(),
@@ -378,7 +472,9 @@ impl TransportActor {
                             clear: true,
                         })
                     }));
-                } else if crate::now_f64() - state.last_vacuum >= state.vacuum_interval
+                } else if !stopping
+                    && background.is_none()
+                    && crate::now_f64() - state.last_vacuum >= state.vacuum_interval
                     && state.error.is_none()
                     && !self
                         .routing_save_in_flight
@@ -386,7 +482,7 @@ impl TransportActor {
                 {
                     state.last_vacuum = crate::now_f64();
                     let vacuum_pages = state.vacuum_pages;
-                    job = Some(tokio::spawn(async move {
+                    background = Some(tokio::spawn(async move {
                         maintain(&worker, vacuum_pages).await;
                         Ok(Prepared {
                             message: None,
@@ -397,7 +493,7 @@ impl TransportActor {
                     }));
                 }
             }
-            self.sqlite.as_mut().unwrap().busy = job.is_some();
+            self.sqlite.as_mut().unwrap().busy = job.is_some() || background.is_some();
             tokio::select! {
                 _ = ingress_tick.tick(), if !stopping => self.evaluate_dataplane_ingress(false),
                 _=std::future::ready(()), if !stopping && self.inbound_queues.snapshot().total > 0 => {
@@ -407,7 +503,7 @@ impl TransportActor {
                 },
                 result=async {job.as_mut().unwrap().await}, if job.is_some()=> {
                     job=None;
-                    self.sqlite.as_mut().unwrap().busy=false;
+                    self.sqlite.as_mut().unwrap().busy=background.is_some();
                     match result {
                         Ok(Ok(prepared))=> {
                             if prepared.clear {self.recent_announces.clear();self.sqlite.as_mut().unwrap().order.clear();}
@@ -425,7 +521,24 @@ impl TransportActor {
                             tracing::error!(%error,"SQLite storage failed; announce admission suspended");
                             let state=self.sqlite.as_mut().unwrap();
                             state.error=Some(error.clone());
-                            for msg in state.queue.drain(..) {reject(msg,&error);}
+                            for queued in state.queue.drain(..) {reject(queued.message,&error);}
+                            state.bytes=0;
+                        }
+                    }
+                }
+                result=async {background.as_mut().unwrap().await}, if background.is_some()=> {
+                    background=None;
+                    self.sqlite.as_mut().unwrap().busy=job.is_some();
+                    match result {
+                        Ok(Ok(prepared)) => {
+                            clear_after_job |= prepared.clear;
+                        }
+                        error => {
+                            let error=format!("{error:?}");
+                            tracing::error!(%error,"SQLite background storage failed; announce admission suspended");
+                            let state=self.sqlite.as_mut().unwrap();
+                            state.error=Some(error.clone());
+                            for queued in state.queue.drain(..) {reject(queued.message,&error);}
                             state.bytes=0;
                         }
                     }
@@ -534,6 +647,30 @@ async fn maintain(worker: &StorageHandle, vacuum_pages: u32) {
 }
 
 async fn prepare(
+    worker: StorageHandle,
+    writes: Vec<Mutation>,
+    message: Option<TransportMessage>,
+    reads: Reads,
+) -> storage::Result<Prepared> {
+    let started = std::time::Instant::now();
+    let message_kind = message
+        .as_ref()
+        .map(crate::messages::msg_variant_name)
+        .unwrap_or("writes");
+    let result = prepare_inner(worker, writes, message, reads).await;
+    let preparation_ms = started.elapsed().as_millis() as u64;
+    if preparation_ms >= 100 {
+        warn!(
+            preparation_ms,
+            message = message_kind,
+            failed = result.is_err(),
+            "SQLite preparation delayed"
+        );
+    }
+    result
+}
+
+async fn prepare_inner(
     worker: StorageHandle,
     writes: Vec<Mutation>,
     mut message: Option<TransportMessage>,
@@ -867,6 +1004,235 @@ mod tests {
 
         assert!(actor.sqlite_dependent(&message));
         assert_eq!(actor.sqlite_reads(&message).keys, vec![destination_hash]);
+    }
+
+    /// Stop the first sweep operation without tying the test to disk speed.
+    struct PausedSweep {
+        db: storage::MemoryTransportStorage,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        operations: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl storage::TransportStorage for PausedSweep {
+        fn execute(&mut self, request: Request) -> storage::Result<Reply> {
+            self.operations.lock().unwrap().push(request.operation());
+            if matches!(request, Request::BeginSweep) {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                    self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            }
+            self.db.execute(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn link_proofs_and_path_responses_during_sweep() {
+        use super::super::tests::{insert_announce_for, make_lrproof_packet};
+        for cached in [true, false] {
+            let dir = temp();
+            let (mut actor, tx) = TransportActor::new();
+            actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+            actor.is_transport_enabled = true;
+            let (entry, mut output) = make_test_interface("initiator");
+            actor.interfaces.insert(1, entry);
+            let (mut entry, _) = make_test_interface("destination");
+            entry.ingress = crate::ingress::IngressController::disabled();
+            actor.interfaces.insert(2, entry);
+            let identity = rns_identity::identity::Identity::new();
+            let destination = [0xcc; 16];
+            insert_announce_for(&mut actor, destination, &identity);
+            let announce = actor.recent_announces[&destination].clone();
+            if !cached {
+                actor.recent_announces.clear();
+            }
+            for link in [[0x77; 16], [0x78; 16]] {
+                actor.link_table.insert(
+                    link,
+                    crate::link_table::LinkEntry {
+                        timestamp: crate::now_f64(),
+                        next_hop: None,
+                        interface_id: 2,
+                        remaining_hops: 1,
+                        destination_hash: destination,
+                        established: false,
+                        validated: false,
+                        proof_timeout: crate::now_f64() + 120.0,
+                        receiving_interface: 1,
+                        taken_hops: 0,
+                    },
+                );
+            }
+            actor
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .worker
+                .try_shutdown()
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = operations.clone();
+            let worker = StorageHandle::start(8, move || {
+                use storage::TransportStorage;
+                let mut db = storage::MemoryTransportStorage::default();
+                db.execute(Request::Apply(vec![Mutation::PutAnnounce {
+                    announce,
+                    raw: None,
+                }]))?;
+                Ok(PausedSweep {
+                    db,
+                    started: Some(started),
+                    release: wait,
+                    operations: observed,
+                })
+            })
+            .await
+            .unwrap();
+            actor.sqlite.as_mut().unwrap().worker = worker.clone();
+            let task = tokio::spawn(actor.run_sqlite());
+            tokio::time::timeout(Duration::from_secs(2), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = |raw| {
+                TransportMessage::Inbound(crate::messages::InboundPacket {
+                    raw,
+                    interface_id: 2,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                })
+            };
+            let mut invalid = make_lrproof_packet([0x78; 16], 0, &identity, None).to_vec();
+            *invalid.last_mut().unwrap() ^= 1;
+            tx.send(packet(Bytes::from(invalid))).await.unwrap();
+            tx.send(packet(make_lrproof_packet([0x77; 16], 0, &identity, None)))
+                .await
+                .unwrap();
+            // An actual signed path-response announce must also pass admission.
+            let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+            let (mut header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            header.context = rns_wire::context::PacketContext::PathResponse;
+            let mut response = header.pack().unwrap();
+            response.extend_from_slice(&raw[offset..]);
+            tx.send(packet(Bytes::from(response))).await.unwrap();
+            if cached {
+                // Both signature checks run while the storage operation remains paused.
+                let raw = tokio::time::timeout(Duration::from_millis(500), output.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                assert_eq!(header.destination_hash, [0x77; 16]);
+                assert!(output.try_recv().is_err());
+                // The path response also starts its lookup before sweep completion.
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    while worker.available_slots() > 6 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                release.send(()).unwrap();
+            } else {
+                // Ensure the miss is submitted while the sweep is still paused.
+                // Before the fix, admission waits for the entire sweep here.
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    while worker.available_slots() > 6 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                release.send(()).unwrap();
+                let raw = tokio::time::timeout(Duration::from_secs(2), output.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                assert_eq!(header.destination_hash, [0x77; 16]);
+                assert!(output.try_recv().is_err());
+            }
+            assert!(matches!(
+                query(
+                    &tx,
+                    Q::Recall {
+                        destination_hash: dest
+                    }
+                )
+                .await,
+                R::Announce(Some(_))
+            ));
+            tx.send(TransportMessage::Shutdown).await.unwrap();
+            let actor = task.await.unwrap();
+            assert!(actor.sqlite.as_ref().unwrap().error.is_none());
+            assert!(actor.link_table.get(&[0x77; 16]).unwrap().validated);
+            assert!(
+                !actor
+                    .link_table
+                    .get(&[0x78; 16])
+                    .is_some_and(|e| e.validated)
+            );
+            {
+                let operations = operations.lock().unwrap();
+                assert!(
+                    operations.iter().position(|op| *op == "announce").unwrap()
+                        < operations
+                            .iter()
+                            .position(|op| *op == "finish_sweep")
+                            .unwrap()
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_and_proof_admission_survive_announce_queue_overflow() {
+        let dir = temp();
+        let (mut actor, _tx) = TransportActor::new();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        let (raw, _) = make_valid_announce("lxmf.delivery", 1);
+        for _ in 0..QUEUE_ENTRIES {
+            actor.enqueue_sqlite(inbound(raw.clone()));
+        }
+        let (mut header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        header.context = rns_wire::context::PacketContext::PathResponse;
+        let mut response = header.pack().unwrap();
+        response.extend_from_slice(&raw[offset..]);
+        actor.enqueue_sqlite(inbound(Bytes::from(response)));
+        actor.link_table.insert(
+            [7; 16],
+            crate::link_table::LinkEntry {
+                timestamp: crate::now_f64(),
+                next_hop: None,
+                interface_id: 1,
+                remaining_hops: 1,
+                destination_hash: [8; 16],
+                established: false,
+                validated: false,
+                proof_timeout: crate::now_f64() + 120.0,
+                receiving_interface: 2,
+                taken_hops: 0,
+            },
+        );
+        let identity = rns_identity::identity::Identity::new();
+        actor.enqueue_sqlite(inbound(super::super::tests::make_lrproof_packet(
+            [7; 16], 0, &identity, None,
+        )));
+        let state = actor.sqlite.as_ref().unwrap();
+        assert_eq!(state.queue.len(), QUEUE_ENTRIES);
+        assert!(state.bytes <= QUEUE_BYTES);
+        assert_eq!(state.queue[0].priority, 2);
+        assert_eq!(state.queue[1].priority, 1);
+        assert_eq!(actor.channel_drops, 2);
+        state.worker.try_shutdown().unwrap().wait().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

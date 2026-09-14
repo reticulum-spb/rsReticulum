@@ -259,6 +259,26 @@ fn validate_packet(hash: &PacketHash, raw: &[u8]) -> Result<DestinationHash> {
 }
 
 impl Request {
+    /// Operation name only: never log packet bytes, identities or RPC payloads.
+    pub(crate) fn operation(&self) -> &'static str {
+        match self {
+            Self::ClearAnnounces => "clear_announces",
+            Self::BeginSweep => "begin_sweep",
+            Self::KeepPackets { .. } => "keep_packets",
+            Self::FinishSweep { .. } => "finish_sweep",
+            Self::CleanKnown { .. } => "clean_known",
+            Self::Apply(_) => "apply",
+            Self::Announce(_) => "announce",
+            Self::Packet(_) => "packet",
+            Self::Page(_) => "page",
+            Self::ExpireAnnounces { .. } => "expire_announces",
+            Self::CollectPackets { .. } => "collect_packets",
+            Self::Stats => "stats",
+            Self::Maintain { .. } => "maintain",
+            Self::Checkpoint => "checkpoint",
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         match self {
             Self::KeepPackets { hashes, .. } if hashes.capacity() > MAX_BATCH_ITEMS => {
@@ -329,10 +349,10 @@ impl Request {
             Self::Page(q) if q.limit() > MAX_PAGE_ITEMS => {
                 return Err(StorageError::Invalid("page limit"));
             }
-            Self::ExpireAnnounces { before, limit } => {
-                if !before.is_finite() || *limit == 0 || *limit > MAX_BATCH_ITEMS {
-                    return Err(StorageError::Invalid("expiry bounds"));
-                }
+            Self::ExpireAnnounces { before, limit }
+                if !before.is_finite() || *limit == 0 || *limit > MAX_BATCH_ITEMS =>
+            {
+                return Err(StorageError::Invalid("expiry bounds"));
             }
             Self::CollectPackets { limit } if *limit == 0 || *limit > MAX_BATCH_ITEMS => {
                 return Err(StorageError::Invalid("GC limit"));

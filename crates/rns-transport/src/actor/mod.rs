@@ -4201,7 +4201,7 @@ mod tests {
         Bytes::from(raw)
     }
 
-    fn make_lrproof_packet(
+    pub(super) fn make_lrproof_packet(
         link_id: [u8; 16],
         hops: u8,
         destination_identity: &rns_identity::identity::Identity,
@@ -13142,7 +13142,7 @@ mod tests {
     }
 
     /// Helper: insert a synthetic recent_announce for `(dest_hash, identity)`.
-    fn insert_announce_for(
+    pub(super) fn insert_announce_for(
         actor: &mut TransportActor,
         dest_hash: [u8; 16],
         identity: &rns_identity::identity::Identity,
