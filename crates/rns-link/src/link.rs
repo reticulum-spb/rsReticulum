@@ -1447,6 +1447,13 @@ impl Link {
         self.link_closed_callback = Some(Box::new(cb));
     }
 
+    /// Ciphertext bytes carried by each Resource part on this Link.
+    /// Resources are encrypted before splitting, so token/padding overhead
+    /// belongs to the whole transfer, not to every part (Python Resource.sdu).
+    pub fn resource_sdu(&self) -> usize {
+        (self.mtu as usize).saturating_sub(rns_wire::constants::HEADER_MAXSIZE + 1)
+    }
+
     /// Recompute MDU from the current MTU.
     ///
     /// MDU = `floor((mtu - header - token) / AES block) * AES block - 1`; the

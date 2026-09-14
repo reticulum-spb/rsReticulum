@@ -25,3 +25,20 @@ Cross-implementation checks live in `../reticulum-e2e-tests`:
 - `tests/test_rsreticulum_interop.py` sends actual encrypted Python Resource
   advertisements over a live link and observes Rust's rejection, alongside
   normal 100 KB and segmented 1.5 MB transfers in both directions.
+
+## Negotiated Resource part size
+
+`Link::resource_sdu` matches Python's `Resource.sdu`: negotiated MTU minus
+`HEADER_MAXSIZE` and one reserved IFAC byte. Link encryption covers the entire
+Resource blob before splitting, so per-packet token overhead is not subtracted
+from each part. LinkSession and LinkManager propagate this SDU to ordinary,
+request/response, file and multi-segment sends. Inbound timing and throughput
+accounting use the same SDU. Existing constructors retain their base-MTU defaults.
+
+Resource advertisement/HMU hashmap segment size remains fixed at 74 hashes,
+as in Reticulum 1.5.2, even when the negotiated Link MDU is larger.
+`spec/rust/python/resource_mtu_reference.py` and
+`spec/rust/tests/resource_mtu_python.rs` in the sibling test repository pin
+these distinct sizes using real Python Link/Resource objects. Live tests force
+Resource mode for small payloads and verify complete 100 KB/1.5 MB deliveries
+in both directions; request boundaries use the established Link MDU.

@@ -1350,6 +1350,7 @@ impl LinkSession {
                         .map_err(|error| {
                             LinkClientError::UnexpectedResponse(format!("resource: {error:?}"))
                         })?;
+                        transfer.resource.sdu = self.link.resource_sdu();
                         if let TransferAction::SendRequest(request) = transfer.request_next() {
                             send_link_data(
                                 &self.transport_tx,
@@ -1693,7 +1694,7 @@ impl LinkSession {
                     chunk,
                     auto_compress,
                     metadata.take(),
-                    None,
+                    Some(self.link.resource_sdu()),
                     Some(&encrypt),
                 )
                 .map_err(|error| LinkClientError::Resource(format!("reader segment: {error:?}")))?;
@@ -1744,26 +1745,30 @@ impl LinkSession {
             rns_link::encryption::link_encrypt(&keys, plaintext)
                 .unwrap_or_else(|_| plaintext.to_vec())
         };
-        let (resource_hash, resources) = if data.len()
-            + metadata.as_ref().map_or(0, |m| m.len() + 3)
-            <= MAX_EFFICIENT_SIZE
-        {
-            let resource =
-                OutboundResource::with_options(data, auto_compress, metadata, None, Some(&encrypt))
-                    .map_err(|error| LinkClientError::Resource(format!("{error:?}")))?;
-            (resource.resource_hash, vec![resource])
-        } else {
-            let resource = MultiSegmentOutbound::with_options(
-                data,
-                auto_compress,
-                metadata,
-                None,
-                false,
-                Some(&encrypt),
-            )
-            .map_err(|error| LinkClientError::Resource(format!("{error:?}")))?;
-            (resource.original_hash, resource.segments)
-        };
+        let (resource_hash, resources) =
+            if data.len() + metadata.as_ref().map_or(0, |m| m.len() + 3) <= MAX_EFFICIENT_SIZE {
+                let resource = OutboundResource::with_options(
+                    data,
+                    auto_compress,
+                    metadata,
+                    Some(self.link.resource_sdu()),
+                    Some(&encrypt),
+                )
+                .map_err(|error| LinkClientError::Resource(format!("{error:?}")))?;
+                (resource.resource_hash, vec![resource])
+            } else {
+                let resource = MultiSegmentOutbound::with_options_and_sdu(
+                    data,
+                    auto_compress,
+                    metadata,
+                    None,
+                    false,
+                    Some(&encrypt),
+                    Some(self.link.resource_sdu()),
+                )
+                .map_err(|error| LinkClientError::Resource(format!("{error:?}")))?;
+                (resource.original_hash, resource.segments)
+            };
         let deadline = Instant::now() + deadline;
         for mut resource in resources {
             if let Some(id) = request_id {
@@ -2543,6 +2548,7 @@ async fn wait_for_response(
                                 ))
                             })?;
 
+                            transfer.resource.sdu = link.resource_sdu();
                             if let TransferAction::SendRequest(req) = transfer.request_next() {
                                 send_link_data(
                                     transport_tx,

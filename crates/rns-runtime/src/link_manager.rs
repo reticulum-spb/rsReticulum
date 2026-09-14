@@ -287,6 +287,7 @@ struct FileResourceSource {
     auto_compress: bool,
     keys: rns_link::key_derivation::LinkKeys,
     rtt: std::time::Duration,
+    sdu: usize,
 }
 
 impl FileResourceSource {
@@ -296,6 +297,7 @@ impl FileResourceSource {
         auto_compress: bool,
         keys: rns_link::key_derivation::LinkKeys,
         rtt: std::time::Duration,
+        sdu: usize,
     ) -> Result<Self, String> {
         let stat = file.metadata().map_err(|e| e.to_string())?;
         if !stat.is_file() {
@@ -328,6 +330,7 @@ impl FileResourceSource {
             auto_compress,
             keys,
             rtt,
+            sdu,
         })
     }
 
@@ -352,7 +355,7 @@ impl FileResourceSource {
             data,
             self.auto_compress,
             self.metadata.take(),
-            None,
+            Some(self.sdu),
             Some(&encrypt),
         )
         .map_err(|e| format!("{e:?}"))?;
@@ -1420,6 +1423,7 @@ impl LinkManager {
                                 map_hashes,
                                 rtt,
                             ) {
+                                transfer.resource.sdu = active.link.resource_sdu();
                                 // Python Resource.accept → request_next: initial request
                                 // accepts the ADV and names the parts.
                                 let action = transfer.request_next();
@@ -2227,6 +2231,7 @@ impl LinkManager {
                                 .link
                                 .rtt
                                 .unwrap_or(std::time::Duration::from_millis(500)),
+                            active.link.resource_sdu(),
                         )
                         .ok()
                     })
@@ -3300,34 +3305,26 @@ impl LinkManager {
         };
         let metadata_wire_size = metadata.as_ref().map(|m| 3 + m.len()).unwrap_or(0);
         let resources = if metadata_wire_size + data.len() <= MAX_EFFICIENT_SIZE {
-            let mut resource = if metadata.is_some() {
-                rns_protocol::resource::OutboundResource::with_options(
-                    data,
-                    auto_compress,
-                    metadata,
-                    None,
-                    Some(&encrypt_fn),
-                )
-                .ok()?
-            } else {
-                rns_protocol::resource::OutboundResource::new(
-                    data,
-                    auto_compress,
-                    Some(&encrypt_fn),
-                )
-                .ok()?
-            };
+            let mut resource = rns_protocol::resource::OutboundResource::with_options(
+                data,
+                auto_compress,
+                metadata,
+                Some(active.link.resource_sdu()),
+                Some(&encrypt_fn),
+            )
+            .ok()?;
             resource.flags.is_response = is_response;
             resource.request_id = request_id.clone();
             vec![resource]
         } else {
-            MultiSegmentOutbound::with_options(
+            MultiSegmentOutbound::with_options_and_sdu(
                 data,
                 auto_compress,
                 metadata,
                 request_id.clone(),
                 is_response,
                 Some(&encrypt_fn),
+                Some(active.link.resource_sdu()),
             )
             .ok()?
             .segments
@@ -4211,6 +4208,7 @@ mod tests {
             false,
             link.session_keys().unwrap(),
             std::time::Duration::from_millis(500),
+            link.resource_sdu(),
         )
         .unwrap();
         // Starts at offset zero even though the original handle is at EOF.

@@ -384,6 +384,9 @@ impl OutboundResource {
         let expected_proof = compute_expected_proof(&full_data, &resource_hash);
 
         let sdu = link_sdu.unwrap_or(SDU);
+        if sdu == 0 {
+            return Err(ResourceError::InvalidPartSize);
+        }
 
         let parts: Vec<Vec<u8>> = blob.chunks(sdu).map(|c| c.to_vec()).collect();
 
@@ -762,6 +765,8 @@ impl InboundResource {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResourceError {
+    #[error("resource part size must be nonzero")]
+    InvalidPartSize,
     #[error("resource too large")]
     TooLarge,
     #[error("resource transfer incomplete")]
@@ -836,6 +841,28 @@ impl MultiSegmentOutbound {
         is_response: bool,
         encrypt_fn: Option<&ResourceEncryptor<'_>>,
     ) -> Result<Self, ResourceError> {
+        Self::with_options_and_sdu(
+            data,
+            auto_compress,
+            metadata,
+            request_id,
+            is_response,
+            encrypt_fn,
+            None,
+        )
+    }
+
+    /// Split using the negotiated Link Resource SDU for every segment.
+    /// Hashmap segments still use the base protocol MDU, as in Python.
+    pub fn with_options_and_sdu(
+        data: Vec<u8>,
+        auto_compress: bool,
+        metadata: Option<Vec<u8>>,
+        request_id: Option<Vec<u8>>,
+        is_response: bool,
+        encrypt_fn: Option<&ResourceEncryptor<'_>>,
+        link_sdu: Option<usize>,
+    ) -> Result<Self, ResourceError> {
         if data.len() > MAX_RESOURCE_SIZE {
             return Err(ResourceError::TooLarge);
         }
@@ -880,7 +907,7 @@ impl MultiSegmentOutbound {
                 chunk,
                 auto_compress,
                 segment_metadata,
-                None,
+                link_sdu,
                 encrypt_fn,
             )?;
             resource.flags.split = true;
@@ -1546,7 +1573,7 @@ impl OutboundTransfer {
             if newly_confirmed > 0 {
                 let elapsed = self.started_at.elapsed().as_secs_f64();
                 let rate = if elapsed > 0.0 {
-                    (newly_confirmed * SDU) as f64 / elapsed
+                    (newly_confirmed * self.resource.sdu) as f64 / elapsed
                 } else {
                     0.0
                 };
@@ -2058,7 +2085,7 @@ impl InboundTransfer {
                 let elapsed = self.started_at.elapsed().as_secs_f64();
                 let received = self.resource.received_count();
                 let rate = if elapsed > 0.0 {
-                    (received * SDU) as f64 / elapsed
+                    (received * self.resource.sdu) as f64 / elapsed
                 } else {
                     0.0
                 };
