@@ -914,54 +914,57 @@ fn print_discovered_details(records: &[DiscoveredInterface]) {
             println!("Port         : {port}");
         }
         println!("Stamp Value  : {}", record.stamp_value);
-        println!("\nConfiguration Entry:");
+        println!("\ninterfaces:");
         for line in discovered_config_entry(record).lines() {
-            println!("  {line}");
+            println!("{line}");
         }
     }
 }
 
 fn discovered_config_entry(record: &DiscoveredInterface) -> String {
     let info = &record.info;
+
+    let interface_type = match info.interface_type.as_str() {
+        "BackboneInterface" => "backbone",
+        "TCPServerInterface" => "tcp_server",
+        "TCPClientInterface" => "tcp_client",
+        "RNodeInterface" => "rnode",
+        "WeaveInterface" => "weave",
+        "I2PInterface" => "i2p",
+        "KISSInterface" => "kiss",
+        &_ => todo!()
+    };
+
     let mut lines = vec![
-        format!("[[{}]]", info.name),
-        format!("type = {}", info.interface_type),
-        "interface_enabled = True".to_string(),
-        format!(
-            "transport = {}",
-            if info.transport_enabled {
-                "True"
-            } else {
-                "False"
-            }
-        ),
+        format!("- name: {}", info.name),
+        format!("  type: {}", interface_type),
     ];
     if let Some(addr) = &info.reachable_on {
-        lines.push(format!("target_host = {addr}"));
+        lines.push(format!("  target_host: {addr}"));
     }
     if let Some(port) = info.port {
-        lines.push(format!("target_port = {port}"));
+        lines.push(format!("  port: {port}"));
     }
     if let Some(freq) = info.frequency {
-        lines.push(format!("frequency = {freq}"));
+        lines.push(format!("  frequency: {freq}"));
     }
     if let Some(bw) = info.bandwidth {
-        lines.push(format!("bandwidth = {bw}"));
+        lines.push(format!("  bandwidth: {bw}"));
     }
     if let Some(sf) = info.spreading_factor {
-        lines.push(format!("spreading_factor = {sf}"));
+        lines.push(format!("  spreading_factor: {sf}"));
     }
     if let Some(cr) = info.coding_rate {
-        lines.push(format!("coding_rate = {cr}"));
+        lines.push(format!("  coding_rate: {cr}"));
     }
     if let Some(modu) = &info.modulation {
-        lines.push(format!("modulation = {modu}"));
+        lines.push(format!("  modulation: {modu}"));
     }
     if let Some(ch) = info.channel {
-        lines.push(format!("channel = {ch}"));
+        lines.push(format!("  channel: {ch}"));
     }
     if let Some(netname) = &info.ifac_netname {
-        lines.push(format!("ifac_netname = {netname}"));
+        lines.push(format!("  ifac_netname: {netname}"));
     }
     lines.join("\n")
 }
