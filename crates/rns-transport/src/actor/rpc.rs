@@ -160,6 +160,51 @@ impl TransportActor {
                     .filter(|(_, entry)| entry.validated)
                     .count() as i64,
             ),
+            TransportQuery::GetAnnouncesPage { after, limit } => {
+                let limit = if limit == 0 {
+                    crate::storage::MAX_PAGE_ITEMS
+                } else {
+                    limit
+                };
+                if limit > crate::storage::MAX_PAGE_ITEMS {
+                    return TransportQueryResponse::Error("announce page limit exceeded".into());
+                }
+                // Bound temporary selection memory even for the memory backend.
+                let mut selected: Vec<&RecentAnnounce> = Vec::with_capacity(limit + 1);
+                for a in self
+                    .recent_announces
+                    .values()
+                    .filter(|a| after.is_none_or(|key| a.dest_hash > key))
+                {
+                    let index = selected.partition_point(|entry| entry.dest_hash < a.dest_hash);
+                    if index < limit {
+                        selected.insert(index, a);
+                        if selected.len() > limit {
+                            selected.pop();
+                        }
+                    }
+                }
+                let mut bytes = 0;
+                let entries = selected
+                    .into_iter()
+                    .take_while(|a| {
+                        bytes += crate::storage::metadata_bytes(a);
+                        bytes <= crate::storage::MAX_PAGE_BYTES
+                    })
+                    .map(|a| AnnounceRpcEntry {
+                        dest_hash: a.dest_hash,
+                        hops: a.hops,
+                        app_data: a.app_data.clone(),
+                        timestamp: a.timestamp,
+                        public_key: a.public_key,
+                        ratchet: a.ratchet,
+                        name_hash: a.name_hash,
+                        is_path_response: a.is_path_response,
+                        retained: a.retained,
+                    })
+                    .collect();
+                TransportQueryResponse::Announces(entries)
+            }
             TransportQuery::GetRecentAnnounces => {
                 let mut entries: Vec<AnnounceRpcEntry> = self
                     .recent_announces

@@ -402,6 +402,7 @@ impl TransportActor {
             TransportMessage::Rpc { query, .. } => matches!(
                 query,
                 Q::GetRecentAnnounces
+                    | Q::GetAnnouncesPage { .. }
                     | Q::Recall { .. }
                     | Q::DropRecentAnnounces
                     | Q::GetBlackholedIdentities
@@ -836,8 +837,8 @@ impl TransportActor {
         }
     }
 
-    fn sqlite_live_packets(&self) -> HashSet<[u8; 32]> {
-        let mut keep: HashSet<_> = self
+    fn sqlite_live_packets(&self) -> Vec<[u8; 32]> {
+        let mut keep: Vec<_> = self
             .path_table
             .iter()
             .filter_map(|(_, p)| p.packet_hash)
@@ -851,7 +852,7 @@ impl TransportActor {
                 .as_ref()
                 .and_then(|h| h.as_slice().try_into().ok())
             {
-                keep.insert(h);
+                keep.push(h);
             }
         }
         for t in &self.pending_tunnel_entries {
@@ -861,7 +862,7 @@ impl TransportActor {
                     .as_ref()
                     .and_then(|h| h.as_slice().try_into().ok())
                 {
-                    keep.insert(h);
+                    keep.push(h);
                 }
             }
         }
@@ -933,6 +934,7 @@ async fn prepare_inner(
         if matches!(
             query,
             Q::GetRecentAnnounces
+                | Q::GetAnnouncesPage { .. }
                 | Q::DropRecentAnnounces
                 | Q::RetainDestination { .. }
                 | Q::RetainIdentity { .. }
@@ -944,7 +946,7 @@ async fn prepare_inner(
                 unreachable!()
             };
             let invalidation = match &query {
-                Q::GetRecentAnnounces => Invalidation::None,
+                Q::GetRecentAnnounces | Q::GetAnnouncesPage { .. } => Invalidation::None,
                 Q::RetainDestination { dest }
                 | Q::UnretainDestination { dest }
                 | Q::UseDestination { dest } => Invalidation::Destinations(vec![*dest]),
@@ -970,6 +972,13 @@ async fn prepare_inner(
             result.entries.push(a);
         }
     }
+    let all_identity_destinations = matches!(
+        &message,
+        Some(TransportMessage::Rpc {
+            query: Q::BlackholeIdentity { .. },
+            ..
+        })
+    );
     for identity in reads.identities {
         let mut cursor = None;
         loop {
@@ -978,6 +987,11 @@ async fn prepare_inner(
                 AnnouncePageQuery {
                     identity_hash: Some(identity),
                     after: cursor,
+                    limit: if all_identity_destinations {
+                        storage::MAX_PAGE_ITEMS
+                    } else {
+                        1
+                    },
                     ..Default::default()
                 },
             )
@@ -987,6 +1001,9 @@ async fn prepare_inner(
             }
             cursor = p.next;
             result.entries.extend(p.entries);
+            if !all_identity_destinations {
+                break;
+            }
         }
     }
     for hash in reads.packets {
@@ -1007,6 +1024,21 @@ async fn prepare_inner(
 
 async fn direct_query(worker: &StorageHandle, query: Q) -> storage::Result<R> {
     Ok(match query {
+        Q::GetAnnouncesPage { after, limit } => {
+            if limit > storage::MAX_PAGE_ITEMS {
+                return Ok(R::Error("announce page limit exceeded".into()));
+            }
+            let p = page(
+                worker,
+                AnnouncePageQuery {
+                    after,
+                    limit,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            R::Announces(p.entries.into_iter().map(dto).collect())
+        }
         Q::GetRecentAnnounces => {
             let mut entries = Vec::new();
             let mut cursor = None;
@@ -1177,45 +1209,16 @@ async fn gc_page(worker: StorageHandle, phase: GcPhase) -> storage::Result<Backg
 async fn sweep(
     worker: &StorageHandle,
     directory: PathBuf,
-    mut keep: HashSet<[u8; 32]>,
+    mut keep: Vec<[u8; 32]>,
 ) -> storage::Result<()> {
-    // The old *and* new durable snapshot must protect packets. Reading files
-    // also protects paths if a prior snapshot write failed. No legacy root is
-    // inspected; these files belong solely to the SQLite namespace.
-    keep = tokio::task::spawn_blocking(move || -> storage::Result<_> {
-        let p = directory.join("path_table.msgpack");
-        if p.exists() {
-            for e in crate::persistence::load_path_table(&p).map_err(|_| {
-                storage::StorageError::Invalid("path snapshot unreadable; refusing GC")
-            })? {
-                if let Some(h) = e.packet_hash.and_then(|h| h.try_into().ok()) {
-                    keep.insert(h);
-                }
-            }
-        }
-        let p = directory.join("tunnel_table.msgpack");
-        if p.exists() {
-            for t in crate::persistence::load_tunnel_table(&p).map_err(|_| {
-                storage::StorageError::Invalid("tunnel snapshot unreadable; refusing GC")
-            })? {
-                for e in t.paths {
-                    if let Some(h) = e.packet_hash.and_then(|h| h.try_into().ok()) {
-                        keep.insert(h);
-                    }
-                }
-            }
-        }
-        Ok(keep)
-    })
-    .await
-    .map_err(|_| storage::StorageError::Closed)??;
     let Reply::Generation(generation) = call(worker, Request::BeginSweep).await? else {
         unreachable!()
     };
-    // Sequential keys avoid random B-tree page churn with the small page cache.
-    let mut hashes: Vec<_> = keep.into_iter().collect();
-    hashes.sort_unstable();
-    for chunk in hashes.chunks(storage::MAX_BATCH_ITEMS) {
+    // This compact snapshot preserves the actor's view while it continues to
+    // mutate routes. Do not hold a second hash set or decoded disk snapshot.
+    keep.sort_unstable();
+    keep.dedup();
+    for chunk in keep.chunks(storage::MAX_BATCH_ITEMS) {
         call(
             worker,
             Request::KeepPackets {
@@ -1225,8 +1228,47 @@ async fn sweep(
         )
         .await?;
     }
+    drop(keep);
+    let owned_worker = worker.clone();
+    tokio::task::spawn_blocking(move || -> storage::Result<()> {
+        let runtime = tokio::runtime::Handle::current();
+        let mut chunk = Vec::with_capacity(storage::MAX_BATCH_ITEMS);
+        let flush = |chunk: &mut Vec<[u8; 32]>| -> storage::Result<()> {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            chunk.sort_unstable();
+            chunk.dedup();
+            let hashes = std::mem::replace(chunk, Vec::with_capacity(storage::MAX_BATCH_ITEMS));
+            runtime.block_on(call(
+                &owned_worker,
+                Request::KeepPackets { generation, hashes },
+            ))?;
+            Ok(())
+        };
+        for (file, kind) in [
+            ("path_table.msgpack", storage::snapshot::Kind::Paths),
+            ("tunnel_table.msgpack", storage::snapshot::Kind::Tunnels),
+        ] {
+            let path = directory.join(file);
+            // Missing snapshots are normal on first start. Other IO errors
+            // must abort the sweep, preserving all old and newly staged pins.
+            match storage::snapshot::visit(&path, kind, &mut |hash| {
+                chunk.push(hash);
+                if chunk.len() == storage::MAX_BATCH_ITEMS {
+                    flush(&mut chunk)?;
+                }
+                Ok(())
+            }) {
+                Err(storage::StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+        }
+        flush(&mut chunk)
+    })
+    .await
+    .map_err(|_| storage::StorageError::Closed)??;
     call(worker, Request::FinishSweep { generation }).await?;
-    // GC is scheduled one page at a time by the actor, after foreground work.
     Ok(())
 }
 
@@ -1266,6 +1308,92 @@ mod tests {
     }
 
     type Batches = std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>;
+
+    #[test]
+    fn memory_announce_pages_obey_byte_budget_and_key_order() {
+        let (mut actor, _tx) = TransportActor::new();
+        for n in (1..=20).rev() {
+            let key = [n; 16];
+            actor.recent_announces.insert(
+                key,
+                RecentAnnounce {
+                    dest_hash: key,
+                    hops: 1,
+                    app_data: Some(vec![0; 32 * 1024]),
+                    timestamp: 0.0,
+                    public_key: None,
+                    ratchet: None,
+                    packet_hash: None,
+                    is_path_response: false,
+                    retained: false,
+                    last_used: None,
+                    name_hash: [0; 10],
+                },
+            );
+        }
+        let mut after = None;
+        let mut count = 0;
+        loop {
+            let R::Announces(entries) =
+                actor.handle_query(Q::GetAnnouncesPage { after, limit: 128 })
+            else {
+                panic!()
+            };
+            if entries.is_empty() {
+                break;
+            }
+            assert!(
+                entries.len() <= 7,
+                "byte budget must apply before the row limit"
+            );
+            for entry in entries {
+                assert!(after.is_none_or(|key| entry.dest_hash > key));
+                after = Some(entry.dest_hash);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 20);
+    }
+
+    #[tokio::test]
+    async fn corrupt_streamed_snapshot_preserves_old_and_new_pins() {
+        let (actor, _tx, _, dir) = batch_actor(false).await;
+        let worker = &actor.sqlite.as_ref().unwrap().worker;
+        let mut hashes = Vec::new();
+        for _ in 0..2 {
+            let (raw, _) = make_valid_announce("lxmf.delivery", 1);
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            let hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+            write(
+                worker,
+                vec![Mutation::PutPacket {
+                    hash,
+                    raw: raw.to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+            hashes.push(hash);
+        }
+        sweep(worker, dir.clone(), vec![hashes[0]]).await.unwrap();
+        // Root array and entries are readable; the version field is truncated.
+        std::fs::write(dir.join("path_table.msgpack"), [0x92, 0x90]).unwrap();
+        assert!(sweep(worker, dir.clone(), vec![hashes[1]]).await.is_err());
+        assert!(matches!(
+            call(worker, Request::CollectPackets { limit: 128 })
+                .await
+                .unwrap(),
+            Reply::Removed(0)
+        ));
+        for hash in hashes {
+            assert!(matches!(
+                call(worker, Request::Packet(hash)).await.unwrap(),
+                Reply::Packet(Some(_))
+            ));
+        }
+        worker.try_shutdown().unwrap().wait().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     async fn batch_actor(
         fail: bool,
@@ -2251,6 +2379,45 @@ mod tests {
             panic!()
         };
         assert_eq!(all.len(), 300, "full RPC sees database, not just RAM cache");
+        let mut after = None;
+        let mut paged = Vec::new();
+        loop {
+            let R::Announces(entries) = query(&tx, Q::GetAnnouncesPage { after, limit: 17 }).await
+            else {
+                panic!()
+            };
+            if entries.is_empty() {
+                break;
+            }
+            assert!(entries.len() <= 17);
+            for entry in entries {
+                assert!(after.is_none_or(|key| entry.dest_hash > key));
+                after = Some(entry.dest_hash);
+                paged.push(entry.dest_hash);
+            }
+        }
+        assert_eq!(paged.len(), 300);
+        assert!(matches!(
+            query(
+                &tx,
+                Q::GetAnnouncesPage {
+                    after: None,
+                    limit: 129
+                }
+            )
+            .await,
+            R::Error(_)
+        ));
+        assert!(matches!(
+            query(
+                &tx,
+                Q::Recall {
+                    destination_hash: first.unwrap()
+                }
+            )
+            .await,
+            R::Announce(Some(_))
+        ));
         tx.send(TransportMessage::Shutdown).await.unwrap();
         task.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();

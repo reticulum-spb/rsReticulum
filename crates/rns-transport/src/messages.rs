@@ -470,6 +470,13 @@ pub enum TransportQuery {
     GetLinkCount,
     GetActiveLinkCount,
     GetRecentAnnounces,
+    /// Bounded metadata page, sorted by destination hash. Returns Announces;
+    /// resume after its last dest_hash until an empty page. No cross-page
+    /// snapshot is held. limit=0 selects 128, maximum 128 and 256 KiB per page.
+    GetAnnouncesPage {
+        after: Option<[u8; 16]>,
+        limit: usize,
+    },
     /// Point lookup into the same cache `GetRecentAnnounces` exposes in
     /// full — mirrors Python `RNS.Identity.recall(destination_hash)`, which
     /// reads `Identity.known_destinations` (populated unconditionally in

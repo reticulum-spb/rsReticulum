@@ -29,7 +29,7 @@ use rns_protocol::rnsh::{
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
 use crate::lifecycle::ShutdownSignal;
@@ -1790,20 +1790,18 @@ async fn lookup_pubkey(
     let (resp_tx, resp_rx) = oneshot::channel();
     transport_tx
         .send(TransportMessage::Rpc {
-            query: TransportQuery::GetRecentAnnounces,
+            query: TransportQuery::Recall {
+                destination_hash: dest_hash,
+            },
             response_tx: resp_tx,
         })
         .await
         .map_err(|_| RnshError::TransportUnavailable)?;
     let resp = resp_rx.await.map_err(|_| RnshError::TransportUnavailable)?;
-    let announces: Vec<AnnounceRpcEntry> = match resp {
-        TransportQueryResponse::Announces(v) => v,
-        _ => Vec::new(),
-    };
-    Ok(announces
-        .into_iter()
-        .find(|a| a.dest_hash == dest_hash)
-        .and_then(|a| a.public_key))
+    Ok(match resp {
+        TransportQueryResponse::Announce(entry) => entry.and_then(|a| a.public_key),
+        _ => None,
+    })
 }
 
 async fn wait_for_link_proof(

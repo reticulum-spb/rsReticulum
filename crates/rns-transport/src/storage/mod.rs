@@ -11,6 +11,8 @@
 mod memory;
 pub(crate) mod metrics;
 #[cfg(feature = "sqlite")]
+pub(crate) mod snapshot;
+#[cfg(feature = "sqlite")]
 mod sqlite;
 mod worker;
 
@@ -271,6 +273,7 @@ pub(super) fn metadata_bytes(a: &RecentAnnounce) -> usize {
 }
 
 /// Allocated payload bytes in addition to the mutation vector itself.
+#[cfg(feature = "sqlite")]
 impl Mutation {
     pub(crate) fn payload_bytes(&self) -> usize {
         match self {
@@ -284,6 +287,7 @@ impl Mutation {
     }
 }
 
+#[cfg(feature = "sqlite")]
 pub(crate) fn mutation_batch_bytes(mutations: &Vec<Mutation>) -> usize {
     mutations.capacity() * std::mem::size_of::<Mutation>()
         + mutations.iter().map(Mutation::payload_bytes).sum::<usize>()

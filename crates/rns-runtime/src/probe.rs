@@ -12,7 +12,7 @@ use rns_identity::destination::{DestType, Destination, Direction, ProofStrategy}
 use rns_identity::identity::Identity;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
-    AnnounceRpcEntry, OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
+    OutboundRequest, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 use rns_wire::constants::MTU;
 use rns_wire::context::PacketContext;
@@ -333,11 +333,18 @@ pub async fn probe_once_with_medium_timeout(
         }
     }
 
-    let announces = match query(&transport_tx, TransportQuery::GetRecentAnnounces).await? {
-        TransportQueryResponse::Announces(v) => v,
-        _ => Vec::new(),
-    };
-    let pubkey = find_public_key(&announces, &dest_hash).ok_or(ProbeError::NoIdentity)?;
+    let pubkey = match query(
+        &transport_tx,
+        TransportQuery::Recall {
+            destination_hash: dest_hash,
+        },
+    )
+    .await?
+    {
+        TransportQueryResponse::Announce(entry) => entry.and_then(|a| a.public_key),
+        _ => None,
+    }
+    .ok_or(ProbeError::NoIdentity)?;
 
     let remote_identity =
         Identity::from_public_key(&pubkey).map_err(|e| ProbeError::EncryptError(e.to_string()))?;
@@ -515,13 +522,6 @@ async fn query(
     resp_rx.await.map_err(|_| ProbeError::TransportClosed)
 }
 
-fn find_public_key(announces: &[AnnounceRpcEntry], dest_hash: &[u8; 16]) -> Option<[u8; 64]> {
-    announces
-        .iter()
-        .find(|a| &a.dest_hash == dest_hash)
-        .and_then(|a| a.public_key)
-}
-
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -559,36 +559,6 @@ mod tests {
     #[test]
     fn parse_dest_hash_non_hex_errors() {
         assert!(parse_dest_hash("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
-    }
-
-    #[test]
-    fn find_public_key_returns_match() {
-        let entries = vec![
-            AnnounceRpcEntry {
-                dest_hash: [0xAA; 16],
-                hops: 0,
-                app_data: None,
-                timestamp: 0.0,
-                public_key: Some([0x11; 64]),
-                ratchet: None,
-                name_hash: [0; 10],
-                is_path_response: false,
-                retained: false,
-            },
-            AnnounceRpcEntry {
-                dest_hash: [0xBB; 16],
-                hops: 1,
-                app_data: None,
-                timestamp: 0.0,
-                public_key: Some([0x22; 64]),
-                ratchet: None,
-                name_hash: [0; 10],
-                is_path_response: false,
-                retained: false,
-            },
-        ];
-        assert_eq!(find_public_key(&entries, &[0xBB; 16]), Some([0x22; 64]));
-        assert_eq!(find_public_key(&entries, &[0xCC; 16]), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
