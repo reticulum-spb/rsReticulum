@@ -46,6 +46,7 @@ pub(super) struct SqliteState {
     bytes: usize,
     writes: Vec<Mutation>,
     flush_at: Option<tokio::time::Instant>,
+    path_response_flush: bool,
     pub busy: bool,
     order: VecDeque<[u8; 16]>,
     error: Option<String>,
@@ -61,9 +62,58 @@ pub(super) struct SqliteState {
     metrics: AdmissionMetrics,
 }
 
+// Conditions can overlap: count each active trigger instead of assigning an
+// arbitrary winner that hides a read barrier behind an expired timer.
+#[derive(Clone, Copy)]
+enum FlushTrigger {
+    Shutdown,
+    Background,
+    PathResponse,
+    Timer,
+    ItemLimit,
+    ByteLimit,
+    Rpc,
+    Priority,
+    PacketRead,
+    NextCapacity,
+}
+
+#[derive(Default)]
+struct BatchFlushMetrics {
+    batches: u64,
+    items: u64,
+    singletons: u64,
+    triggers: [u64; 10],
+}
+
+impl BatchFlushMetrics {
+    fn report(&self) {
+        if self.batches == 0 {
+            return;
+        }
+        tracing::info!(
+            batches = self.batches,
+            items = self.items,
+            singletons = self.singletons,
+            shutdown = self.triggers[FlushTrigger::Shutdown as usize],
+            background = self.triggers[FlushTrigger::Background as usize],
+            path_response = self.triggers[FlushTrigger::PathResponse as usize],
+            timer = self.triggers[FlushTrigger::Timer as usize],
+            item_limit = self.triggers[FlushTrigger::ItemLimit as usize],
+            byte_limit = self.triggers[FlushTrigger::ByteLimit as usize],
+            rpc = self.triggers[FlushTrigger::Rpc as usize],
+            priority = self.triggers[FlushTrigger::Priority as usize],
+            packet_read = self.triggers[FlushTrigger::PacketRead as usize],
+            next_capacity = self.triggers[FlushTrigger::NextCapacity as usize],
+            "SQLite batch flush summary"
+        );
+    }
+}
+
 struct AdmissionMetrics {
     since: std::time::Instant,
     admission: storage::metrics::Timing,
+    flushes: BatchFlushMetrics,
     hits: u64,
     misses: u64,
     max_queue_entries: usize,
@@ -76,6 +126,7 @@ impl Default for AdmissionMetrics {
         Self {
             since: std::time::Instant::now(),
             admission: Default::default(),
+            flushes: BatchFlushMetrics::default(),
             hits: 0,
             misses: 0,
             max_queue_entries: 0,
@@ -95,6 +146,7 @@ impl AdmissionMetrics {
             max_staged_bytes = self.max_staged_bytes,
             "SQLite admission summary"
         );
+        self.flushes.report();
         self.admission
             .report("admission", "wait_before_preparation");
         *self = Self::default();
@@ -244,6 +296,7 @@ impl TransportActor {
             bytes: 0,
             writes: Vec::with_capacity(WRITE_BATCH_ITEMS),
             flush_at: None,
+            path_response_flush: false,
             busy: false,
             order: VecDeque::new(),
             error: None,
@@ -285,6 +338,7 @@ impl TransportActor {
             .is_ok_and(|(h, _)| h.context == rns_wire::context::PacketContext::PathResponse)
         {
             state.flush_at = Some(tokio::time::Instant::now());
+            state.path_response_flush = true;
         }
         state.writes.push(Mutation::PutAnnounce {
             announce: a.clone(),
@@ -570,32 +624,60 @@ impl TransportActor {
                 }
                 // Only ordinary inbound announces can pass a staged write.
                 // All RPCs, packet reads and discovery/proof traffic are barriers.
-                let can_batch_next = self
-                    .sqlite
-                    .as_ref()
-                    .unwrap()
-                    .queue
-                    .front()
-                    .is_some_and(|q| {
-                        let state = self.sqlite.as_ref().unwrap();
-                        q.priority == 0
-                            && self.sqlite_header(&q.message).is_some_and(|(h, _)| {
-                                h.flags.packet_type == rns_wire::flags::PacketType::Announce
-                            })
-                            && state.writes.len() < WRITE_BATCH_ITEMS
-                            && storage::mutation_batch_bytes(&state.writes) + weight(&q.message) * 2
-                                <= WRITE_BATCH_BYTES
-                    });
+                let state = self.sqlite.as_ref().unwrap();
+                let staged_bytes = storage::mutation_batch_bytes(&state.writes);
+                let next_barrier = state.queue.front().and_then(|q| {
+                    if matches!(q.message, TransportMessage::Rpc { .. }) {
+                        Some(FlushTrigger::Rpc)
+                    } else if q.priority != 0 {
+                        Some(FlushTrigger::Priority)
+                    } else if !self.sqlite_header(&q.message).is_some_and(|(h, _)| {
+                        h.flags.packet_type == rns_wire::flags::PacketType::Announce
+                    }) {
+                        Some(FlushTrigger::PacketRead)
+                    } else if state.writes.len() >= WRITE_BATCH_ITEMS
+                        || staged_bytes + weight(&q.message) * 2 > WRITE_BATCH_BYTES
+                    {
+                        Some(FlushTrigger::NextCapacity)
+                    } else {
+                        None
+                    }
+                });
                 let state = self.sqlite.as_mut().unwrap();
+                let deadline = state
+                    .flush_at
+                    .is_some_and(|at| tokio::time::Instant::now() >= at);
+                let item_limit = state.writes.len() >= WRITE_BATCH_ITEMS;
+                let byte_limit = staged_bytes >= WRITE_BATCH_BYTES;
                 let flush = !state.writes.is_empty()
                     && (stopping
                         || background.is_some()
-                        || state
-                            .flush_at
-                            .is_some_and(|at| tokio::time::Instant::now() >= at)
-                        || state.writes.len() >= WRITE_BATCH_ITEMS
-                        || storage::mutation_batch_bytes(&state.writes) >= WRITE_BATCH_BYTES
-                        || (!state.queue.is_empty() && !can_batch_next));
+                        || deadline
+                        || item_limit
+                        || byte_limit
+                        || next_barrier.is_some());
+                if flush {
+                    let metrics = &mut state.metrics.flushes;
+                    metrics.batches += 1;
+                    metrics.items += state.writes.len() as u64;
+                    metrics.singletons += u64::from(state.writes.len() == 1);
+                    for (trigger, active) in [
+                        (FlushTrigger::Shutdown, stopping),
+                        (FlushTrigger::Background, background.is_some()),
+                        (
+                            FlushTrigger::PathResponse,
+                            deadline && state.path_response_flush,
+                        ),
+                        (FlushTrigger::Timer, deadline && !state.path_response_flush),
+                        (FlushTrigger::ItemLimit, item_limit),
+                        (FlushTrigger::ByteLimit, byte_limit),
+                    ] {
+                        metrics.triggers[trigger as usize] += u64::from(active);
+                    }
+                    if let Some(trigger) = next_barrier {
+                        metrics.triggers[trigger as usize] += 1;
+                    }
+                }
                 let message = state.queue.pop_front().map(|queued| {
                     let msg = queued.message;
                     state.bytes = state.bytes.saturating_sub(weight(&msg));
@@ -615,6 +697,7 @@ impl TransportActor {
                 });
                 let writes = if flush {
                     state.flush_at = None;
+                    state.path_response_flush = false;
                     std::mem::replace(&mut state.writes, Vec::with_capacity(WRITE_BATCH_ITEMS))
                 } else {
                     Vec::new()
