@@ -728,6 +728,8 @@ pub struct ReticulumConfig {
     /// Python 1.3.8 logging timestamp behavior (Reticulum.py:459-461,
     /// RNS/__init__.py:85 default True): log lines carry a timestamp prefix.
     pub log_timestamps: bool,
+    /// Seconds between process RSS samples; zero disables logging.
+    pub rss_interval: u32,
 
     /// Bootstrap config files loaded on startup. Python `bootstrap_configs`.
     pub bootstrap_configs: Vec<PathBuf>,
@@ -776,6 +778,7 @@ impl Default for ReticulumConfig {
             blackhole_update_interval:
                 rns_transport::discovery::blackhole_subscriber::UPDATE_INTERVAL.as_secs_f64(),
             log_timestamps: true,
+            rss_interval: 300,
             bootstrap_configs: Vec::new(),
             api_port: None,
             api_user: None,
@@ -1095,6 +1098,11 @@ impl ReticulumConfig {
         if let Some(sec) = config.section("logging") {
             if let Some(level) = config_int("logging", sec, "loglevel")? {
                 rc.loglevel = level.clamp(0, 8) as i32;
+            }
+            if let Some(value) = config_uint("logging", sec, "rss_interval")? {
+                rc.rss_interval = u32::try_from(value).map_err(|_| {
+                    invalid_config_value("logging", "rss_interval", "value exceeds u32")
+                })?;
             }
             if let Some(value) = config_bool("logging", sec, "logtimestamps")? {
                 rc.log_timestamps = value;
@@ -1715,6 +1723,13 @@ pub async fn init_with_options(
     });
 
     if instance_mode != InstanceMode::Client {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if rc.rss_interval > 0 {
+            tokio::spawn(crate::process_memory::run(
+                rc.rss_interval,
+                shutdown.clone(),
+            ));
+        }
         let job_tx = transport_tx.clone();
         let cache_dir = paths.cache_dir.clone();
         let job_shutdown = shutdown.clone();

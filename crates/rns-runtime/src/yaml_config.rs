@@ -27,6 +27,7 @@ reticulum:
 logging:
   level: 4
   timestamps: true
+  rss_interval: 300
 
 interfaces:
   - type: auto
@@ -352,6 +353,11 @@ impl Config {
                 section.set("database_path", path.to_string_lossy().as_ref());
             }
             set_num(section, "page_cache_size", self.storage.page_cache_size);
+            set_num(
+                section,
+                "wal_checkpoint_pages",
+                self.storage.wal_checkpoint_pages,
+            );
             set_num(section, "vacuum_interval", self.storage.vacuum_interval);
             set_num(section, "vacuum_pages", self.storage.vacuum_pages);
         }
@@ -359,6 +365,7 @@ impl Config {
             let section = output.ensure_section("logging");
             set_num(section, "loglevel", self.logging.level);
             set_bool(section, "logtimestamps", self.logging.timestamps);
+            set_num(section, "rss_interval", self.logging.rss_interval);
         }
         if self.api.port.is_some() || self.api.user.is_some() || self.api.password.is_some() {
             let section = output.ensure_section("api");
@@ -428,6 +435,7 @@ pub struct StorageConfig {
     /// Transport database directory or database file. Relative to config dir.
     pub database_path: Option<PathBuf>,
     pub page_cache_size: u32,
+    pub wal_checkpoint_pages: u32,
     pub vacuum_interval: u64,
     pub vacuum_pages: u32,
 }
@@ -437,6 +445,7 @@ impl Default for StorageConfig {
         Self {
             database_path: None,
             page_cache_size: 1024,
+            wal_checkpoint_pages: 128,
             vacuum_interval: 3600,
             vacuum_pages: 128,
         }
@@ -504,6 +513,8 @@ pub enum SharedInstanceType {
 pub struct LoggingConfig {
     pub level: i32,
     pub timestamps: bool,
+    /// Process RSS logging interval in seconds; zero disables sampling.
+    pub rss_interval: u32,
 }
 
 impl Default for LoggingConfig {
@@ -511,6 +522,7 @@ impl Default for LoggingConfig {
         Self {
             level: 4,
             timestamps: true,
+            rss_interval: 300,
         }
     }
 }
@@ -2312,7 +2324,7 @@ mod tests {
     #[test]
     fn sqlite_maintenance_settings_reach_runtime_config() {
         let config = Config::parse(
-            "storage:\n  vacuum_interval: 900\n  vacuum_pages: 32\ninterfaces: []\n",
+            "storage:\n  vacuum_interval: 900\n  vacuum_pages: 32\n  wal_checkpoint_pages: 512\ninterfaces: []\n",
             "config.yaml",
         )
         .unwrap();
@@ -2320,6 +2332,7 @@ mod tests {
         let storage = runtime.section("storage").unwrap();
         assert_eq!(storage.get("vacuum_interval"), Some("900"));
         assert_eq!(storage.get("vacuum_pages"), Some("32"));
+        assert_eq!(storage.get("wal_checkpoint_pages"), Some("512"));
     }
 
     #[test]
@@ -2398,6 +2411,35 @@ mod tests {
         let config = Config::default();
         let yaml = config.to_yaml().unwrap();
         assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+    }
+
+    #[test]
+    fn rss_interval_survives_configuration_pipeline() {
+        assert_eq!(Config::default().logging.rss_interval, 300);
+        for seconds in [0, 17, 600] {
+            let cfg = Config::parse(
+                &format!("logging:\n  rss_interval: {seconds}\n"),
+                "config.yaml",
+            )
+            .unwrap();
+            assert_eq!(
+                Config::parse(&cfg.to_yaml().unwrap(), "config.yaml").unwrap(),
+                cfg
+            );
+            let normalized = cfg.to_runtime_config().unwrap();
+            assert_eq!(
+                normalized.section("logging").unwrap().get("rss_interval"),
+                Some(seconds.to_string().as_str())
+            );
+            #[cfg(feature = "full")]
+            assert_eq!(
+                crate::reticulum::ReticulumConfig::try_from_config(&normalized)
+                    .unwrap()
+                    .rss_interval,
+                seconds
+            );
+        }
+        assert!(Config::parse("logging:\n  rss_interval: -1\n", "config.yaml").is_err());
     }
 
     #[test]

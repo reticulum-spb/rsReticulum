@@ -142,6 +142,9 @@ configuration directory unless absolute; a leading `~/` is expanded.
 | --- | --- | --- | --- |
 | `level` | integer | `4` | Log level `0..=8`; `7` = Pathing, `8` = Extreme. |
 | `timestamps` | boolean | `true` | Include timestamps in formatted logs. |
+| `rss_interval` | unsigned integer | `300` | Seconds between process RSS logs; `0` disables sampling. Linux/Android, owning runtime only (not attached clients). Requires INFO logging (`level: 4` or higher). |
+
+RSS entries (`process memory`) contain `rss_kib` and, when available, `peak_rss_kib` for the entire process. The first sample is taken after one interval. Values come from `/proc/self/status` and are approximate; the peak covers the process lifetime. Sampling uses a fixed 16 KiB buffer and retains no history. Configuration changes take effect after restart.
 
 `rnsd-rs` maps levels 0–1 to ERROR, 2 to WARN, 3–4 to INFO, 5–6 to DEBUG,
 and 7–8 to TRACE. Pathing and Extreme are distinct stored configuration values
@@ -495,6 +498,7 @@ reticulum:
 logging:
   level: 4
   timestamps: true
+  rss_interval: 300
 
 interfaces:
   - type: auto

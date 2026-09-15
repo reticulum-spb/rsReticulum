@@ -42,3 +42,6 @@ pub mod rpc_server;
 mod shared_client;
 #[cfg(feature = "api")]
 pub mod web_logs;
+
+#[cfg(all(feature = "full", any(target_os = "linux", target_os = "android")))]
+mod process_memory;
