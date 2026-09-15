@@ -59,6 +59,8 @@ pub(super) struct SqliteState {
     gc_started: Option<std::time::Instant>,
     gc_announces: usize,
     gc_packets: usize,
+    gc_pages: u64,
+    gc_page_time: Duration,
     metrics: AdmissionMetrics,
 }
 
@@ -326,6 +328,8 @@ impl TransportActor {
             gc_started: None,
             gc_announces: 0,
             gc_packets: 0,
+            gc_pages: 0,
+            gc_page_time: Duration::ZERO,
             metrics: AdmissionMetrics::default(),
         });
         tracing::info!(
@@ -896,6 +900,10 @@ impl TransportActor {
                     match result {
                         Ok(Ok(result)) => {
                             let state = self.sqlite.as_mut().unwrap();
+                            if matches!(&result, BackgroundResult::Cleaned { .. } | BackgroundResult::Collected { .. }) {
+                                state.gc_pages += 1;
+                                state.gc_page_time += background_started.elapsed();
+                            }
                             match result {
                                 BackgroundResult::Sweep => {
                                     state.last_sweep = crate::now_f64();
@@ -906,6 +914,8 @@ impl TransportActor {
                                         state.gc_started = Some(std::time::Instant::now());
                                         state.gc_announces = 0;
                                         state.gc_packets = 0;
+                                        state.gc_pages = 0;
+                                        state.gc_page_time = Duration::ZERO;
                                     }
                                 }
                                 BackgroundResult::Maintenance => {}
@@ -928,6 +938,8 @@ impl TransportActor {
                                     if matches!(state.gc_phase, GcPhase::Idle) {
                                         tracing::info!(
                                             duration_ms = state.gc_started.take().map_or(0, |t| t.elapsed().as_millis() as u64),
+                                            pages = state.gc_pages,
+                                            page_time_ms = state.gc_page_time.as_millis() as u64,
                                             removed_announces = state.gc_announces,
                                             removed_packets = state.gc_packets,
                                             "SQLite garbage collection completed"

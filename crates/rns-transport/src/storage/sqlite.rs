@@ -221,6 +221,7 @@ impl SqliteTransportStorage {
 
     fn apply(&mut self, mutations: Vec<Mutation>) -> Result<()> {
         let started = std::time::Instant::now();
+        let main_rows_before = self.connection.total_changes();
         let items = mutations.len();
         let bytes = mutation_batch_bytes(&mutations);
         let tx = self
@@ -281,7 +282,8 @@ impl SqliteTransportStorage {
                 }
             }
         }
-        self.transactions[0].commit(tx, started, items, bytes)?;
+        let affected_main_rows = tx.total_changes().saturating_sub(main_rows_before);
+        self.transactions[0].commit(tx, started, items, bytes, affected_main_rows)?;
         Ok(())
     }
 }
@@ -435,9 +437,9 @@ impl TransportStorage for SqliteTransportStorage {
                 let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 tx.execute("DELETE FROM temp.sweep_seen", [])?;
-                tx.execute("UPDATE sweep_state SET generation=generation+1 WHERE id=1", [])?;
+                let affected_main_rows = tx.execute("UPDATE sweep_state SET generation=generation+1 WHERE id=1", [])? as u64;
                 let generation = tx.query_row("SELECT generation FROM sweep_state WHERE id=1", [], |r| r.get(0))?;
-                self.transactions[1].commit(tx, started, 0, 0)?;
+                self.transactions[1].commit(tx, started, 0, 0, affected_main_rows)?;
                 self.active_sweep = Some(generation);
                 Reply::Generation(generation)
             }
@@ -448,6 +450,7 @@ impl TransportStorage for SqliteTransportStorage {
                 let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 check_generation(&tx, generation)?;
+                let mut affected_main_rows = 0;
                 {
                     let mut seen = tx.prepare_cached(
                         "INSERT INTO temp.sweep_seen(packet_hash) SELECT packet_hash FROM packet_blobs
@@ -461,10 +464,10 @@ impl TransportStorage for SqliteTransportStorage {
                         seen.execute([hash.as_slice()])?;
                         // Existing pins need no main-DB write or fsync. New pins
                         // are still committed durably before acknowledging this chunk.
-                        keep.execute(params![hash.as_slice(), generation])?;
+                        affected_main_rows += keep.execute(params![hash.as_slice(), generation])? as u64;
                     }
                 }
-                self.transactions[2].commit(tx, started, hashes.len(), hashes.capacity() * 32)?;
+                self.transactions[2].commit(tx, started, hashes.len(), hashes.capacity() * 32, affected_main_rows)?;
                 Reply::Applied
             }
             Request::FinishSweep { generation } => {
@@ -476,11 +479,11 @@ impl TransportStorage for SqliteTransportStorage {
                 let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 check_generation(&tx, generation)?;
-                tx.execute(
+                let affected_main_rows = tx.execute(
                     "DELETE FROM packet_keep WHERE NOT EXISTS
                      (SELECT 1 FROM temp.sweep_seen s WHERE s.packet_hash=packet_keep.packet_hash)", [],
                 )?;
-                self.transactions[3].commit(tx, started, 0, 0)?;
+                self.transactions[3].commit(tx, started, 0, 0, affected_main_rows as u64)?;
                 self.active_sweep = None;
                 Reply::Applied
             }
@@ -493,6 +496,7 @@ impl TransportStorage for SqliteTransportStorage {
                 ORDER BY destination_hash LIMIT ?3)",params![unused_before,used_before,limit as i64])?),
             Request::CleanKnownPage { unused_before, used_before, after, limit } => {
                 let started = std::time::Instant::now();
+                let main_rows_before = self.connection.total_changes();
                 let tx = self.connection.transaction()?;
                 let keys = gc_page_keys::<16>(&tx,
                     "SELECT destination_hash FROM announces WHERE destination_hash>?1 ORDER BY destination_hash LIMIT ?2",
@@ -511,11 +515,13 @@ impl TransportStorage for SqliteTransportStorage {
                         }
                     }
                 }
-                self.transactions[4].commit(tx, started, keys.len(), keys.len() * 16)?;
+                let affected_main_rows = tx.total_changes().saturating_sub(main_rows_before);
+                self.transactions[4].commit(tx, started, keys.len(), keys.len() * 16, affected_main_rows)?;
                 Reply::CleanedPage { removed: destinations.len(), destinations, next: keys.last().copied() }
             }
             Request::CollectPacketsPage { after, limit } => {
                 let started = std::time::Instant::now();
+                let main_rows_before = self.connection.total_changes();
                 let tx = self.connection.transaction()?;
                 let keys = gc_page_keys::<32>(&tx,
                     "SELECT packet_hash FROM packet_blobs WHERE packet_hash>?1 ORDER BY packet_hash LIMIT ?2",
@@ -532,7 +538,8 @@ impl TransportStorage for SqliteTransportStorage {
                         removed += delete.execute([key.as_slice()])?;
                     }
                 }
-                self.transactions[5].commit(tx, started, keys.len(), keys.len() * 32)?;
+                let affected_main_rows = tx.total_changes().saturating_sub(main_rows_before);
+                self.transactions[5].commit(tx, started, keys.len(), keys.len() * 32, affected_main_rows)?;
                 Reply::CollectedPage { removed, next: keys.last().copied() }
             }
             Request::Apply(mutations) => { self.apply(mutations)?; Reply::Applied }
@@ -798,6 +805,70 @@ pub(crate) mod failure_tests {
                 .unwrap(),
             Reply::CollectedPage { removed: 0, .. }
         ));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transaction_metrics_exclude_temp_writes_and_count_real_gc_changes() {
+        let (dir, mut store, hashes) = populated_store(3);
+        let Reply::Generation(generation) = store.execute(Request::BeginSweep).unwrap() else {
+            panic!()
+        };
+        store
+            .execute(Request::KeepPackets {
+                generation,
+                hashes: hashes.clone(),
+            })
+            .unwrap();
+        // Three temp.sweep_seen inserts must not be counted as main writes.
+        assert_eq!(store.transactions[2].main_write_counts(), (0, 0));
+        store
+            .connection
+            .execute(
+                "DELETE FROM packet_keep WHERE packet_hash=?1",
+                [hashes[0].as_slice()],
+            )
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .execute(Request::KeepPackets {
+                    generation,
+                    hashes: vec![hashes[0]],
+                })
+                .unwrap();
+        }
+        assert_eq!(store.transactions[2].main_write_counts(), (1, 1));
+        store.execute(Request::FinishSweep { generation }).unwrap();
+        assert_eq!(store.transactions[3].main_write_counts(), (0, 0));
+        let Reply::Generation(generation) = store.execute(Request::BeginSweep).unwrap() else {
+            panic!()
+        };
+        // Clearing the previous temp set does not inflate the main row count.
+        assert_eq!(store.transactions[1].main_write_counts(), (2, 2));
+        store
+            .execute(Request::KeepPackets {
+                generation,
+                hashes: vec![hashes[0]],
+            })
+            .unwrap();
+        store.execute(Request::FinishSweep { generation }).unwrap();
+        assert_eq!(store.transactions[3].main_write_counts(), (2, 1));
+        for expected in [2, 0] {
+            assert!(
+                matches!(store.execute(Request::CollectPacketsPage { after: None, limit: 16 }).unwrap(), Reply::CollectedPage { removed, .. } if removed == expected)
+            );
+        }
+        assert_eq!(store.transactions[5].main_write_counts(), (2, 1));
+        store
+            .execute(Request::CleanKnownPage {
+                unused_before: crate::now_f64(),
+                used_before: crate::now_f64(),
+                after: None,
+                limit: 16,
+            })
+            .unwrap();
+        assert_eq!(store.transactions[4].main_write_counts(), (0, 0));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

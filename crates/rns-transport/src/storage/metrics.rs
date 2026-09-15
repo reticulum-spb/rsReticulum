@@ -139,6 +139,10 @@ pub(super) struct Transactions {
     max_bytes: usize,
     failures: u64,
     name: &'static str,
+    affected_main_rows: u64,
+    main_write_transactions: u64,
+    main_write_commit_us: u64,
+    no_main_write_commit_us: u64,
 }
 
 #[cfg(feature = "sqlite")]
@@ -154,6 +158,10 @@ impl Transactions {
             max_bytes: 0,
             failures: 0,
             name,
+            affected_main_rows: 0,
+            main_write_transactions: 0,
+            main_write_commit_us: 0,
+            no_main_write_commit_us: 0,
         }
     }
 
@@ -163,12 +171,22 @@ impl Transactions {
         started: Instant,
         items: usize,
         bytes: usize,
+        affected_main_rows: u64,
     ) -> super::Result<()> {
+        self.affected_main_rows += affected_main_rows;
+        self.main_write_transactions += u64::from(affected_main_rows > 0);
         self.sql.record(started.elapsed());
         let started = Instant::now();
         let result = tx.commit();
         // Includes SQLite's automatic checkpoint. It is not a pure fsync timer.
-        self.commit.record(started.elapsed());
+        let elapsed = started.elapsed();
+        self.commit.record(elapsed);
+        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        if affected_main_rows > 0 {
+            self.main_write_commit_us += elapsed_us;
+        } else {
+            self.no_main_write_commit_us += elapsed_us;
+        }
         self.items += items as u64;
         self.bytes += bytes as u64;
         self.max_items = self.max_items.max(items);
@@ -178,6 +196,11 @@ impl Transactions {
             self.report();
         }
         Ok(result?)
+    }
+
+    #[cfg(test)]
+    pub(super) fn main_write_counts(&self) -> (u64, u64) {
+        (self.affected_main_rows, self.main_write_transactions)
     }
 
     fn report(&mut self) {
@@ -192,6 +215,11 @@ impl Transactions {
             max_items = self.max_items,
             max_allocated_bytes = self.max_bytes,
             commit_failures = self.failures,
+            affected_main_rows = self.affected_main_rows,
+            main_write_transactions = self.main_write_transactions,
+            no_main_write_transactions = self.commit.count - self.main_write_transactions,
+            main_write_commit_us = self.main_write_commit_us,
+            no_main_write_commit_us = self.no_main_write_commit_us,
             "SQLite transaction summary"
         );
         self.sql.report(self.name, "sql_before_commit");
@@ -202,6 +230,10 @@ impl Transactions {
         self.max_items = 0;
         self.max_bytes = 0;
         self.failures = 0;
+        self.affected_main_rows = 0;
+        self.main_write_transactions = 0;
+        self.main_write_commit_us = 0;
+        self.no_main_write_commit_us = 0;
         self.since = Instant::now();
     }
 }
