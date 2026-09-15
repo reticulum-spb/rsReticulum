@@ -409,6 +409,19 @@ RUST_LOG='info,rns_interface::plugin=debug' rnsd-rs
 RUST_LOG='warn,rns_transport::actor::sqlite=debug' rnsd-rs --service
 ```
 
+SQLite timing, batching, GC, sweep, and maintenance summaries use DEBUG. Enable
+the summaries and actor diagnostics with:
+
+```yaml
+logging:
+  filter: "info,rns_transport::actor::sqlite=debug,rns_transport::storage::metrics=debug"
+```
+
+For individual worker operations as well, add `rns_transport::storage::worker=debug`
+or use `rns_transport::storage=debug` for all storage diagnostics. Queue overflow,
+maintenance failures, and other operational warnings retain WARN; storage errors
+retain their existing error levels. Process RSS logging remains at INFO.
+
 Settings take precedence in this order:
 
 1. `RUST_LOG`, when set, replaces the configuration filter completely.

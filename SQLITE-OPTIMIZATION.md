@@ -513,7 +513,7 @@ Sweep выполнил по опубликованным сводкам 527 тр
 
 После анализа `logfile.next` добавлена строка `SQLite batch flush summary`
 в существующий минутный отчёт actor и его отчёт при остановке. Для неё достаточно
-уровня INFO у `rns_transport::actor::sqlite`.
+уровня DEBUG у `rns_transport::actor::sqlite`.
 
 - `batches`, `items`, `singletons`: число отправленных пакетов записей, операций
   в них и пакетов из одной операции. Это отправки накопленных announce из actor,
@@ -601,7 +601,7 @@ storage:
   announce_batch_delay_ms: 50
 
 logging:
-  filter: "info"
+  filter: "info,rns_transport::actor::sqlite=debug,rns_transport::storage::metrics=debug"
   rss_interval: 300
 ```
 
@@ -1102,3 +1102,24 @@ RSS на 5/10/15/20/25/30/35-й минутах, КиБ:
 Окно 2000 мс и checkpoint при следующем эксперименте сохранить.
 
 Рабочий код по результатам этого анализа не менялся. Логи в git не включены.
+
+
+## Уровни диагностического логирования SQLite
+
+Сводки транзакций и времени операций, admission/batch, настройка batching,
+завершение sweep/GC/maintenance и сообщения о задержках переведены на DEBUG.
+Существующие WARN о переполнении, сбоях обслуживания и некорректных действиях,
+а также ERROR хранилища сохранены. RSS процесса остаётся INFO.
+
+Для следующего замера включить:
+
+```yaml
+logging:
+  filter: "info,rns_transport::actor::sqlite=debug,rns_transport::storage::metrics=debug"
+  rss_interval: 300
+```
+
+Это включает агрегированные сводки и диагностику actor. При необходимости
+добавить `rns_transport::storage::worker=debug` для сообщений начала, завершения
+и задержки каждой операции worker. Старые разделы с анализом WARN описывают
+уровни, действовавшие во время соответствующего теста.

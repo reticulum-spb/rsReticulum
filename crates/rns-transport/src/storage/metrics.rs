@@ -41,7 +41,7 @@ impl Timing {
         if self.count == 0 {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             operation,
             phase,
             count = self.count,
@@ -107,7 +107,7 @@ impl WorkerMetrics {
         for op in &mut self.operations {
             if let Some(name) = op.name {
                 if op.execution.count > 0 {
-                    tracing::info!(
+                    tracing::debug!(
                         operation = name,
                         failed = op.failed,
                         "transport storage result summary"
@@ -207,7 +207,7 @@ impl Transactions {
         if self.commit.count == 0 {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             operation = self.name,
             transactions = self.commit.count,
             items = self.items,

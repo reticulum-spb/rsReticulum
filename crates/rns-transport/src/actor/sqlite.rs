@@ -103,7 +103,7 @@ impl BatchFlushMetrics {
         if self.batches == 0 && self.unknown_path_bypasses == 0 {
             return;
         }
-        tracing::info!(
+        tracing::debug!(
             batches = self.batches,
             items = self.items,
             singletons = self.singletons,
@@ -155,7 +155,7 @@ impl Default for AdmissionMetrics {
 
 impl AdmissionMetrics {
     fn report(&mut self) {
-        tracing::info!(
+        tracing::debug!(
             cache_hits = self.hits,
             cache_misses = self.misses,
             max_queue_entries = self.max_queue_entries,
@@ -332,7 +332,7 @@ impl TransportActor {
             gc_page_time: Duration::ZERO,
             metrics: AdmissionMetrics::default(),
         });
-        tracing::info!(
+        tracing::debug!(
             delay_ms = batch_delay.as_millis() as u64,
             max_items = WRITE_BATCH_ITEMS,
             max_bytes = WRITE_BATCH_BYTES,
@@ -765,7 +765,7 @@ impl TransportActor {
                     state.metrics.admission.record(admission);
                     let admission_ms = admission.as_millis() as u64;
                     if admission_ms >= 100 {
-                        warn!(
+                        debug!(
                             admission_ms,
                             message = crate::messages::msg_variant_name(&msg),
                             priority = queued.priority,
@@ -815,7 +815,7 @@ impl TransportActor {
                     background = Some(tokio::spawn(async move {
                         let started = std::time::Instant::now();
                         let result = sweep(&worker, directory, keep).await;
-                        tracing::info!(
+                        tracing::debug!(
                             duration_ms = started.elapsed().as_millis() as u64,
                             failed = result.is_err(),
                             "SQLite sweep completed"
@@ -936,7 +936,7 @@ impl TransportActor {
                                     };
                                     state.next_gc = gc_resume_at(background_started.elapsed());
                                     if matches!(state.gc_phase, GcPhase::Idle) {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             duration_ms = state.gc_started.take().map_or(0, |t| t.elapsed().as_millis() as u64),
                                             pages = state.gc_pages,
                                             page_time_ms = state.gc_page_time.as_millis() as u64,
@@ -1044,7 +1044,7 @@ impl TransportActor {
 async fn maintain(worker: &StorageHandle, vacuum_pages: u32) {
     let started = std::time::Instant::now();
     match call(worker, Request::Maintain { vacuum_pages }).await {
-        Ok(Reply::Maintenance(stats)) => tracing::info!(
+        Ok(Reply::Maintenance(stats)) => tracing::debug!(
             database_bytes = stats.database_bytes,
             wal_bytes = stats.wal_bytes,
             page_size = stats.page_size,
@@ -1076,7 +1076,7 @@ async fn prepare(
     let result = prepare_inner(worker, writes, message, reads).await;
     let preparation_ms = started.elapsed().as_millis() as u64;
     if preparation_ms >= 100 {
-        warn!(
+        debug!(
             preparation_ms,
             message = message_kind,
             failed = result.is_err(),

@@ -81,7 +81,7 @@ impl StorageHandle {
                         let execution_ms = execution.as_millis() as u64;
                         metrics.record(operation, queue, execution, result.is_err());
                         if queue_ms >= 100 || execution_ms >= 100 {
-                            tracing::warn!(
+                            tracing::debug!(
                                 operation,
                                 queue_ms,
                                 execution_ms,
