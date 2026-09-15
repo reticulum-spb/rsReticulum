@@ -112,9 +112,21 @@ pub(crate) async fn main() {
             );
             std::process::exit(1);
         }
-        rns_tools::init_tracing(level, log_timestamps, false, LogFileWriter::new(log_path));
+        rns_tools::init_tracing_with_filter(
+            level,
+            log_timestamps,
+            false,
+            LogFileWriter::new(log_path),
+            rns_tools::config_log_filter(&config_dir).as_deref(),
+        );
     } else {
-        rns_tools::init_tracing(level, log_timestamps, true, std::io::stdout);
+        rns_tools::init_tracing_with_filter(
+            level,
+            log_timestamps,
+            true,
+            std::io::stdout,
+            rns_tools::config_log_filter(&config_dir).as_deref(),
+        );
     }
 
     tracing::info!("rnsd-rs {RS_RETICULUM_VERSION} starting");

@@ -305,11 +305,12 @@ fn init_logging(verbose: u8, quiet: u8, config_dir: Option<&Path>) {
         _ => tracing::Level::ERROR,
     };
     let resolved = resolve_config_dir(config_dir.and_then(|path| path.to_str()));
-    rns_tools::init_tracing(
+    rns_tools::init_tracing_with_filter(
         level,
         rns_tools::config_log_timestamps(&resolved),
         true,
         std::io::stderr,
+        rns_tools::config_log_filter(&resolved).as_deref(),
     );
 }
 

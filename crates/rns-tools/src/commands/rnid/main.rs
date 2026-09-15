@@ -274,11 +274,12 @@ async fn run(args: Args) -> ExitCode {
         _ => tracing::Level::TRACE,
     };
     let config_dir = rns_runtime::platform::resolve_config_dir(args.config.as_deref());
-    rns_tools::init_tracing(
+    rns_tools::init_tracing_with_filter(
         level,
         rns_tools::config_log_timestamps(&config_dir),
         true,
         std::io::stderr,
+        rns_tools::config_log_filter(&config_dir).as_deref(),
     );
 
     // Python truthiness: empty path lists (`-s` with no values) and an empty

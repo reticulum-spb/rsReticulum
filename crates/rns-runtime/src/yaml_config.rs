@@ -513,6 +513,8 @@ pub enum SharedInstanceType {
 pub struct LoggingConfig {
     pub level: i32,
     pub timestamps: bool,
+    /// Standard target filter; RUST_LOG takes precedence in CLI tools.
+    pub filter: Option<String>,
     /// Process RSS logging interval in seconds; zero disables sampling.
     pub rss_interval: u32,
 }
@@ -522,6 +524,7 @@ impl Default for LoggingConfig {
         Self {
             level: 4,
             timestamps: true,
+            filter: None,
             rss_interval: 300,
         }
     }
@@ -2411,6 +2414,24 @@ mod tests {
         let config = Config::default();
         let yaml = config.to_yaml().unwrap();
         assert_eq!(Config::parse(&yaml, "config.yaml").unwrap(), config);
+    }
+
+    #[test]
+    fn logging_filter_round_trips() {
+        let cfg = Config::parse(
+            "logging:\n  filter: 'info,rns_interface::plugin=debug'\n",
+            "config.yaml",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.logging.filter.as_deref(),
+            Some("info,rns_interface::plugin=debug")
+        );
+        assert_eq!(
+            Config::parse(&cfg.to_yaml().unwrap(), "config.yaml").unwrap(),
+            cfg
+        );
+        assert_eq!(Config::default().logging.filter, None);
     }
 
     #[test]

@@ -63,6 +63,7 @@ multi-segment response Resources are reassembled before request decoding.
 - [Tool Usage](#tool-usage)
 - [Web Configurator](#web-configurator)
 - [Configuration](#configuration)
+- [Logging](#logging)
 - [Interface Support](#interface-support)
 - [Compatibility Notes](#compatibility-notes)
 - [Contributing](#contributing)
@@ -374,6 +375,62 @@ reticulum:
   shared_instance_port: 37432
   instance_control_port: 37433
 ```
+
+## Logging
+
+Use `logging.filter` in `config.yaml` to select levels by the target names printed
+in log lines (usually Rust module paths):
+
+```yaml
+logging:
+  level: 4
+  timestamps: true
+  filter: "info,rns_interface::plugin=debug,rns_transport::storage=warn"
+  rss_interval: 300
+```
+
+This keeps general logging at INFO, enables DEBUG for plugin messages, and limits
+`rns_transport::storage` to WARN and ERROR. Copy the target from the log to select
+another component; there is no predefined component list. Plugin messages forwarded
+through the host API share `rns_interface::plugin`, so this selects all plugins.
+
+The format is a comma-separated list of `target=level` rules plus an optional bare
+default level. Levels are `off`, `error`, `warn`, `info`, `debug`, and `trace`.
+Targets match prefixes; the longest matching prefix wins. For example,
+`rns_transport=warn,rns_transport::actor::sqlite=debug` enables SQLite actor diagnostics
+while keeping other transport logs at WARN. `off` disables matching messages.
+This uses the standard `tracing-subscriber` `Targets` filter; span context and
+field-value expressions from `EnvFilter` are not supported.
+
+For a temporary override, set `RUST_LOG` when starting a command:
+
+```bash
+RUST_LOG='info,rns_interface::plugin=debug' rnsd-rs
+RUST_LOG='warn,rns_transport::actor::sqlite=debug' rnsd-rs --service
+```
+
+Settings take precedence in this order:
+
+1. `RUST_LOG`, when set, replaces the configuration filter completely.
+2. Otherwise, `logging.filter` supplies the filter.
+3. Without either filter, existing verbosity behavior applies: `rnsd-rs` uses
+   `logging.level` (adjusted by `-v`/`-q` outside service mode); CLI tools retain
+   their existing defaults and verbosity flags.
+
+If the chosen filter has no bare default level, unmatched targets use that existing
+verbosity level. An empty filter also uses existing verbosity, with no target rules;
+thus an empty `RUST_LOG` bypasses `logging.filter`. Invalid level/directive syntax
+reports an error and exits. Unmatched target names are allowed, so check spelling.
+
+The filter applies equally to console, service logfile, and web logs, and is
+supported by the CLI tools as well as `rnsd-rs`. Restart the process after changing
+its configuration or environment. Filtering happens before output formatting and
+web-history storage; enabling verbose messages can still increase log volume.
+
+`rss_interval` controls process memory logging on Linux/Android in the owning
+runtime: seconds between samples, default `300`, or `0` to disable. To see these
+INFO messages, allow INFO globally or add `rns_runtime::process_memory=info`.
+See [CONFIG.md](CONFIG.md#logging) for the configuration reference.
 
 ## Interface Support
 
