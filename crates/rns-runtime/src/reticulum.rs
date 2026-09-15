@@ -1489,6 +1489,12 @@ pub async fn init_with_options(
                             .and_then(|v| v.parse::<u32>().ok())
                             .unwrap_or(1024)
                             .clamp(16, 16_384),
+                        wal_checkpoint_pages: config
+                            .section("storage")
+                            .and_then(|s| s.get("wal_checkpoint_pages"))
+                            .and_then(|v| v.parse::<u32>().ok())
+                            .unwrap_or(128)
+                            .clamp(64, 4096),
                         vacuum_interval: Duration::from_secs(
                             config
                                 .section("storage")
@@ -4910,7 +4916,15 @@ mod tests {
         assert!(handle.discovery_enabled().await);
         let raw = raw.expect("runtime did not publish discovery");
         let mut child = tokio::process::Command::new("python3.11")
-            .args(["-B", "-c", include_str!("../tests/discovery_receiver.py")])
+            .args([
+                "-B",
+                "-c",
+                &std::fs::read_to_string(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/discovery_receiver.py"
+                ))
+                .expect("optional Python reference script is required to run this ignored test"),
+            ])
             .arg(if encrypted {
                 identity_path.to_str().unwrap()
             } else {

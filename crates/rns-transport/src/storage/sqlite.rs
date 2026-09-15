@@ -15,6 +15,8 @@ const COLUMNS: &str = "destination_hash,hops,app_data,timestamp,public_key,ratch
 #[derive(Debug, Clone)]
 pub struct SqliteOptions {
     pub page_cache_kib: u32,
+    /// Automatic checkpoint threshold in WAL pages, not a memory allocation.
+    pub wal_checkpoint_pages: u32,
     pub busy_timeout: Duration,
     /// Period between passive checkpoint / incremental vacuum passes.
     pub vacuum_interval: Duration,
@@ -29,6 +31,7 @@ impl Default for SqliteOptions {
     fn default() -> Self {
         Self {
             page_cache_kib: 1024,
+            wal_checkpoint_pages: 128,
             busy_timeout: Duration::from_millis(50),
             vacuum_interval: Duration::from_secs(3600),
             vacuum_pages: 128,
@@ -71,6 +74,7 @@ impl SqliteTransportStorage {
             return Err(StorageError::NotOwner);
         }
         if !(16..=16384).contains(&options.page_cache_kib)
+            || !(64..=4096).contains(&options.wal_checkpoint_pages)
             || options.busy_timeout > Duration::from_secs(1)
         {
             return Err(StorageError::Invalid("SQLite cache/timeout bounds"));
@@ -171,7 +175,7 @@ impl SqliteTransportStorage {
                 "NORMAL"
             },
         )?;
-        connection.pragma_update(None, "wal_autocheckpoint", 128)?;
+        connection.pragma_update(None, "wal_autocheckpoint", options.wal_checkpoint_pages)?;
         connection.set_prepared_statement_cache_capacity(16);
         // The observed keep-set is scratch state, not a second durable copy.
         // FILE storage and an explicit page-cache budget bound its RAM use.
@@ -699,6 +703,30 @@ pub(crate) mod failure_tests {
              SELECT destination_hash,1,0,packet_hash,0,0,zeroblob(10) FROM packet_blobs;",
         ).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn checkpoint_threshold_is_configurable_without_growing_page_cache() {
+        for pages in [128, 512, 1024] {
+            let (dir, store, _) = populated_store(1);
+            drop(store);
+            let store = SqliteTransportStorage::open(
+                &dir.join("transport.sqlite"),
+                StorageRole::Standalone,
+                SqliteOptions {
+                    wal_checkpoint_pages: pages,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                pragma_u64(&store.connection, "wal_autocheckpoint").unwrap(),
+                u64::from(pages)
+            );
+            assert_eq!(pragma_i64(&store.connection, "cache_size").unwrap(), -1024);
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

@@ -132,6 +132,7 @@ configuration directory unless absolute; a leading `~/` is expanded.
 | --- | --- | --- | --- |
 | `database_path` | path or null | `null` | SQLite database file; default `storage/sqlite/transport.sqlite` under the config directory. |
 | `page_cache_size` | integer | `1024` | Page-cache budget in KiB; runtime clamps to `16..=16384`. |
+| `wal_checkpoint_pages` | integer | `128` | Automatic WAL checkpoint threshold in pages; runtime clamps to `64..=4096`. Does not change the page-cache budget. |
 | `vacuum_interval` | integer | `3600` | Maintenance interval in seconds; runtime enforces at least `60`. |
 | `vacuum_pages` | integer | `128` | Maximum free pages reclaimed per incremental vacuum; `0` disables reclamation, not WAL checkpointing. |
 

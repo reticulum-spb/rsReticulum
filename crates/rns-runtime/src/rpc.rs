@@ -2178,7 +2178,11 @@ mod tests {
         .args([
             "-B",
             "-c",
-            include_str!("../tests/control_traffic_rpc_receiver.py"),
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/control_traffic_rpc_receiver.py"
+            ))
+            .expect("optional Python reference script is required to run this ignored test"),
         ])
         .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
         .arg(hex::encode(encoded))
