@@ -11,7 +11,6 @@ const QUEUE_ENTRIES: usize = 64;
 const QUEUE_BYTES: usize = 256 * 1024;
 const WRITE_BATCH_ITEMS: usize = 32;
 const WRITE_BATCH_BYTES: usize = 64 * 1024;
-const WRITE_BATCH_DELAY: Duration = Duration::from_millis(10);
 // Bound a deleting transaction more tightly than read-only keep-set staging.
 const GC_PAGE_ENTRIES: usize = 16;
 const GC_REST_FACTOR: u32 = 3;
@@ -45,6 +44,7 @@ pub(super) struct SqliteState {
     queue: VecDeque<Queued>,
     bytes: usize,
     writes: Vec<Mutation>,
+    batch_delay: Duration,
     flush_at: Option<tokio::time::Instant>,
     path_response_flush: bool,
     pub busy: bool,
@@ -286,6 +286,7 @@ impl TransportActor {
             .max(Duration::from_secs(60))
             .as_secs_f64();
         let vacuum_pages = options.vacuum_pages;
+        let batch_delay = options.announce_batch_delay;
         let worker =
             StorageHandle::open_sqlite(database_path, storage::StorageRole::Standalone, options)
                 .await?;
@@ -295,6 +296,7 @@ impl TransportActor {
             queue: VecDeque::new(),
             bytes: 0,
             writes: Vec::with_capacity(WRITE_BATCH_ITEMS),
+            batch_delay,
             flush_at: None,
             path_response_flush: false,
             busy: false,
@@ -311,6 +313,12 @@ impl TransportActor {
             gc_packets: 0,
             metrics: AdmissionMetrics::default(),
         });
+        tracing::info!(
+            delay_ms = batch_delay.as_millis() as u64,
+            max_items = WRITE_BATCH_ITEMS,
+            max_bytes = WRITE_BATCH_BYTES,
+            "SQLite announce batching configured"
+        );
         self.storage_dir = Some(directory);
         // SQLite mode intentionally starts empty. Legacy msgpack files and
         // announce cache files are neither read nor imported; this avoids
@@ -332,7 +340,7 @@ impl TransportActor {
         };
         state
             .flush_at
-            .get_or_insert_with(|| tokio::time::Instant::now() + WRITE_BATCH_DELAY);
+            .get_or_insert_with(|| tokio::time::Instant::now() + state.batch_delay);
         // Discovery replies must not wait for a batching timer.
         if rns_wire::header::PacketHeader::unpack(raw)
             .is_ok_and(|(h, _)| h.context == rns_wire::context::PacketContext::PathResponse)
@@ -1534,6 +1542,42 @@ mod tests {
         interface.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, interface);
         (actor, tx, batches, dir)
+    }
+
+    #[tokio::test]
+    async fn configured_batch_window_starts_at_first_write_without_sliding() {
+        let dir = temp();
+        let (mut actor, _tx) = TransportActor::new();
+        actor
+            .initialize_sqlite_storage_with_options(
+                dir.clone(),
+                storage::SqliteOptions {
+                    announce_batch_delay: Duration::from_millis(50),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+        let before = tokio::time::Instant::now();
+        actor.handle_message(inbound(raw.clone()));
+        let after = tokio::time::Instant::now();
+        let deadline = actor.sqlite.as_ref().unwrap().flush_at.unwrap();
+        assert!(deadline >= before + Duration::from_millis(50));
+        assert!(deadline <= after + Duration::from_millis(50));
+        actor.record_sqlite_announce(dest, &raw);
+        assert_eq!(actor.sqlite.as_ref().unwrap().flush_at, Some(deadline));
+        actor
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .worker
+            .try_shutdown()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

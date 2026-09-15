@@ -1503,6 +1503,14 @@ pub async fn init_with_options(
                             .and_then(|v| v.parse::<u32>().ok())
                             .unwrap_or(128)
                             .clamp(64, 4096),
+                        announce_batch_delay: Duration::from_millis(
+                            config
+                                .section("storage")
+                                .and_then(|s| s.get("announce_batch_delay_ms"))
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(10)
+                                .clamp(1, 1000),
+                        ),
                         vacuum_interval: Duration::from_secs(
                             config
                                 .section("storage")

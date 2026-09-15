@@ -17,6 +17,8 @@ pub struct SqliteOptions {
     pub page_cache_kib: u32,
     /// Automatic checkpoint threshold in WAL pages, not a memory allocation.
     pub wal_checkpoint_pages: u32,
+    /// Maximum accumulation window for ordinary announces in the owning actor.
+    pub announce_batch_delay: Duration,
     pub busy_timeout: Duration,
     /// Period between passive checkpoint / incremental vacuum passes.
     pub vacuum_interval: Duration,
@@ -32,6 +34,7 @@ impl Default for SqliteOptions {
         Self {
             page_cache_kib: 1024,
             wal_checkpoint_pages: 128,
+            announce_batch_delay: Duration::from_millis(10),
             busy_timeout: Duration::from_millis(50),
             vacuum_interval: Duration::from_secs(3600),
             vacuum_pages: 128,
@@ -78,6 +81,13 @@ impl SqliteTransportStorage {
             || options.busy_timeout > Duration::from_secs(1)
         {
             return Err(StorageError::Invalid("SQLite cache/timeout bounds"));
+        }
+        if !(Duration::from_millis(1)..=Duration::from_secs(1))
+            .contains(&options.announce_batch_delay)
+        {
+            return Err(StorageError::Invalid(
+                "announce batch delay must be 1..=1000 ms",
+            ));
         }
         // Resolve symlinks so two configured names for one database cannot
         // obtain different owner locks. Parent storage must already exist.

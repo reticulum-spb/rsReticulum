@@ -189,6 +189,11 @@ impl Config {
             &self.reticulum.interface_discovery_sources,
         )?;
         validate_hashes("blackhole_sources", &self.reticulum.blackhole_sources)?;
+        if !(1..=1000).contains(&self.storage.announce_batch_delay_ms) {
+            return Err(YamlConfigError::Validation(
+                "storage.announce_batch_delay_ms must be in 1..=1000".into(),
+            ));
+        }
         if !(0..=8).contains(&self.logging.level) {
             return Err(YamlConfigError::Validation(
                 "logging.level must be in 0..=8".into(),
@@ -358,6 +363,11 @@ impl Config {
                 "wal_checkpoint_pages",
                 self.storage.wal_checkpoint_pages,
             );
+            set_num(
+                section,
+                "announce_batch_delay_ms",
+                self.storage.announce_batch_delay_ms,
+            );
             set_num(section, "vacuum_interval", self.storage.vacuum_interval);
             set_num(section, "vacuum_pages", self.storage.vacuum_pages);
         }
@@ -436,6 +446,7 @@ pub struct StorageConfig {
     pub database_path: Option<PathBuf>,
     pub page_cache_size: u32,
     pub wal_checkpoint_pages: u32,
+    pub announce_batch_delay_ms: u32,
     pub vacuum_interval: u64,
     pub vacuum_pages: u32,
 }
@@ -446,6 +457,7 @@ impl Default for StorageConfig {
             database_path: None,
             page_cache_size: 1024,
             wal_checkpoint_pages: 128,
+            announce_batch_delay_ms: 10,
             vacuum_interval: 3600,
             vacuum_pages: 128,
         }
@@ -2322,6 +2334,39 @@ mod tests {
         assert_eq!(config.logging.level, 4);
         assert_eq!(config.storage.vacuum_interval, 3600);
         assert_eq!(config.storage.vacuum_pages, 128);
+    }
+
+    #[test]
+    fn announce_batch_window_roundtrip_and_bounds() {
+        assert_eq!(Config::default().storage.announce_batch_delay_ms, 10);
+        for delay in [1, 10, 25, 50, 1000] {
+            let cfg = Config::parse(
+                &format!("storage:\n  announce_batch_delay_ms: {delay}\n"),
+                "config.yaml",
+            )
+            .unwrap();
+            assert_eq!(
+                Config::parse(&cfg.to_yaml().unwrap(), "config.yaml").unwrap(),
+                cfg
+            );
+            assert_eq!(
+                cfg.to_runtime_config()
+                    .unwrap()
+                    .section("storage")
+                    .unwrap()
+                    .get("announce_batch_delay_ms"),
+                Some(delay.to_string().as_str())
+            );
+        }
+        for delay in [0, 1001] {
+            assert!(
+                Config::parse(
+                    &format!("storage:\n  announce_batch_delay_ms: {delay}\n"),
+                    "config.yaml"
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
