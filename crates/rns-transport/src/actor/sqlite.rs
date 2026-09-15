@@ -12,7 +12,7 @@ const QUEUE_BYTES: usize = 256 * 1024;
 const WRITE_BATCH_ITEMS: usize = 32;
 const WRITE_BATCH_BYTES: usize = 64 * 1024;
 // Bound a deleting transaction more tightly than read-only keep-set staging.
-const GC_PAGE_ENTRIES: usize = 16;
+const GC_PAGE_ENTRIES: usize = 32;
 const GC_REST_FACTOR: u32 = 3;
 
 #[derive(Clone, Copy, Default)]
