@@ -9,6 +9,9 @@ const CACHE_ENTRIES: usize = 256;
 const CACHE_BYTES: usize = 256 * 1024;
 const QUEUE_ENTRIES: usize = 64;
 const QUEUE_BYTES: usize = 256 * 1024;
+const WRITE_BATCH_ITEMS: usize = 32;
+const WRITE_BATCH_BYTES: usize = 64 * 1024;
+const WRITE_BATCH_DELAY: Duration = Duration::from_millis(10);
 // Bound a deleting transaction more tightly than read-only keep-set staging.
 const GC_PAGE_ENTRIES: usize = 16;
 const GC_REST_FACTOR: u32 = 3;
@@ -42,6 +45,7 @@ pub(super) struct SqliteState {
     queue: VecDeque<Queued>,
     bytes: usize,
     writes: Vec<Mutation>,
+    flush_at: Option<tokio::time::Instant>,
     pub busy: bool,
     order: VecDeque<[u8; 16]>,
     error: Option<String>,
@@ -150,8 +154,8 @@ async fn call(worker: &StorageHandle, req: Request) -> storage::Result<Reply> {
 }
 
 async fn write(worker: &StorageHandle, writes: Vec<Mutation>) -> storage::Result<()> {
-    // Actor currently stages at most one accepted announce. RPC bulk mutations
-    // are applied page-by-page below; no unbounded write-behind queue exists.
+    // The actor batches ordinary announces within a fixed byte/item budget.
+    // RPC mutations remain ordered commit barriers; there is no unbounded queue.
     if !writes.is_empty() {
         call(worker, Request::Apply(writes)).await?;
     }
@@ -238,7 +242,8 @@ impl TransportActor {
             raw: HashMap::new(),
             queue: VecDeque::new(),
             bytes: 0,
-            writes: Vec::new(),
+            writes: Vec::with_capacity(WRITE_BATCH_ITEMS),
+            flush_at: None,
             busy: false,
             order: VecDeque::new(),
             error: None,
@@ -272,6 +277,15 @@ impl TransportActor {
         let Some(a) = self.recent_announces.get(&dest) else {
             return;
         };
+        state
+            .flush_at
+            .get_or_insert_with(|| tokio::time::Instant::now() + WRITE_BATCH_DELAY);
+        // Discovery replies must not wait for a batching timer.
+        if rns_wire::header::PacketHeader::unpack(raw)
+            .is_ok_and(|(h, _)| h.context == rns_wire::context::PacketContext::PathResponse)
+        {
+            state.flush_at = Some(tokio::time::Instant::now());
+        }
         state.writes.push(Mutation::PutAnnounce {
             announce: a.clone(),
             raw: Some(raw.to_vec()),
@@ -504,11 +518,20 @@ impl TransportActor {
             .map(|a| 256 + a.app_data.as_ref().map_or(0, Vec::capacity))
             .sum();
         while self.recent_announces.len() > CACHE_ENTRIES || bytes > CACHE_BYTES {
+            let clean = |key: &[u8; 16]| {
+                !state.writes.iter().any(|m| {
+                    matches!(m,
+                Mutation::PutAnnounce { announce, .. } if announce.dest_hash == *key)
+                })
+            };
             let key = state
                 .order
-                .pop_front()
-                .or_else(|| self.recent_announces.keys().next().copied());
+                .iter()
+                .copied()
+                .find(clean)
+                .or_else(|| self.recent_announces.keys().copied().find(clean));
             let Some(key) = key else { break };
+            state.order.retain(|k| *k != key);
             if let Some(a) = self.recent_announces.remove(&key) {
                 bytes = bytes.saturating_sub(256 + a.app_data.as_ref().map_or(0, Vec::capacity));
             }
@@ -544,7 +567,34 @@ impl TransportActor {
                         &mut invalidate_after_job,
                     )));
                 }
+                // Only ordinary inbound announces can pass a staged write.
+                // All RPCs, packet reads and discovery/proof traffic are barriers.
+                let can_batch_next = self
+                    .sqlite
+                    .as_ref()
+                    .unwrap()
+                    .queue
+                    .front()
+                    .is_some_and(|q| {
+                        let state = self.sqlite.as_ref().unwrap();
+                        q.priority == 0
+                            && self.sqlite_header(&q.message).is_some_and(|(h, _)| {
+                                h.flags.packet_type == rns_wire::flags::PacketType::Announce
+                            })
+                            && state.writes.len() < WRITE_BATCH_ITEMS
+                            && storage::mutation_batch_bytes(&state.writes) + weight(&q.message) * 2
+                                <= WRITE_BATCH_BYTES
+                    });
                 let state = self.sqlite.as_mut().unwrap();
+                let flush = !state.writes.is_empty()
+                    && (stopping
+                        || background.is_some()
+                        || state
+                            .flush_at
+                            .is_some_and(|at| tokio::time::Instant::now() >= at)
+                        || state.writes.len() >= WRITE_BATCH_ITEMS
+                        || storage::mutation_batch_bytes(&state.writes) >= WRITE_BATCH_BYTES
+                        || (!state.queue.is_empty() && !can_batch_next));
                 let message = state.queue.pop_front().map(|queued| {
                     let msg = queued.message;
                     state.bytes = state.bytes.saturating_sub(weight(&msg));
@@ -562,7 +612,12 @@ impl TransportActor {
                     }
                     msg
                 });
-                let writes = std::mem::take(&mut state.writes);
+                let writes = if flush {
+                    state.flush_at = None;
+                    std::mem::replace(&mut state.writes, Vec::with_capacity(WRITE_BATCH_ITEMS))
+                } else {
+                    Vec::new()
+                };
                 let worker = state.worker.clone();
                 if let Some(message) = message {
                     let reads = self.sqlite_reads(&message);
@@ -577,6 +632,9 @@ impl TransportActor {
                         None,
                         Reads::default(),
                     )));
+                } else if !state.writes.is_empty() {
+                    // Wait for input or the flush deadline. Background work and
+                    // route snapshots cannot observe this uncommitted batch.
                 } else if stopping && background.is_none() {
                     break;
                 } else if !stopping
@@ -633,7 +691,10 @@ impl TransportActor {
                 }
             }
             self.sqlite.as_mut().unwrap().busy = job.is_some() || background.is_some();
+            let flush_at = self.sqlite.as_ref().unwrap().flush_at;
             tokio::select! {
+                _ = tokio::time::sleep_until(flush_at.unwrap_or_else(tokio::time::Instant::now)),
+                    if job.is_none() && flush_at.is_some() => {},
                 _ = tokio::time::sleep_until(self.sqlite.as_ref().unwrap().next_gc),
                     if !stopping && background.is_none()
                         && !matches!(self.sqlite.as_ref().unwrap().gc_phase, GcPhase::Idle)
@@ -1204,6 +1265,185 @@ mod tests {
         })
     }
 
+    type Batches = std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>;
+
+    async fn batch_actor(
+        fail: bool,
+    ) -> (
+        TransportActor,
+        mpsc::Sender<TransportMessage>,
+        Batches,
+        PathBuf,
+    ) {
+        struct Observed {
+            db: storage::MemoryTransportStorage,
+            batches: Batches,
+            fail: bool,
+        }
+        impl storage::TransportStorage for Observed {
+            fn execute(&mut self, request: Request) -> storage::Result<Reply> {
+                if let Request::Apply(mutations) = &request {
+                    self.batches
+                        .lock()
+                        .unwrap()
+                        .push((mutations.len(), storage::mutation_batch_bytes(mutations)));
+                    if self.fail {
+                        return Err(storage::StorageError::Invalid("injected commit failure"));
+                    }
+                }
+                self.db.execute(request)
+            }
+        }
+        let dir = temp();
+        let (mut actor, tx) = TransportActor::new();
+        actor.initialize_sqlite_storage(dir.clone()).await.unwrap();
+        actor
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .worker
+            .try_shutdown()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let batches = Batches::default();
+        let observed = batches.clone();
+        actor.sqlite.as_mut().unwrap().worker = StorageHandle::start(8, move || {
+            Ok(Observed {
+                db: Default::default(),
+                batches: observed,
+                fail,
+            })
+        })
+        .await
+        .unwrap();
+        actor.sqlite.as_mut().unwrap().last_sweep = crate::now_f64();
+        let (mut interface, _) = make_test_interface("batch");
+        interface.ingress = crate::ingress::IngressController::disabled();
+        actor.interfaces.insert(1, interface);
+        (actor, tx, batches, dir)
+    }
+
+    #[tokio::test]
+    async fn announce_batch_is_bounded_and_rpc_observes_committed_rows() {
+        let (mut actor, tx, batches, dir) = batch_actor(false).await;
+        // Make the item limit deterministic even on a very slow debug runner.
+        actor.sqlite.as_mut().unwrap().flush_at =
+            Some(tokio::time::Instant::now() + Duration::from_secs(3600));
+        let mut destinations = Vec::new();
+        for _ in 0..WRITE_BATCH_ITEMS {
+            let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+            destinations.push(dest);
+            actor.enqueue_sqlite(inbound(raw));
+        }
+        let task = tokio::spawn(actor.run_sqlite());
+        assert!(matches!(
+            query(
+                &tx,
+                Q::RetainDestination {
+                    dest: destinations[0]
+                }
+            )
+            .await,
+            R::BoolResult(true)
+        ));
+        let recorded = batches.lock().unwrap().clone();
+        assert_eq!(recorded[0].0, WRITE_BATCH_ITEMS);
+        assert_eq!(
+            recorded[1].0, 1,
+            "RPC pin is committed after the announce batch"
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|(n, bytes)| *n <= WRITE_BATCH_ITEMS && *bytes <= WRITE_BATCH_BYTES)
+        );
+        for dest in destinations {
+            assert!(matches!(
+                query(
+                    &tx,
+                    Q::Recall {
+                        destination_hash: dest
+                    }
+                )
+                .await,
+                R::Announce(Some(_))
+            ));
+        }
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        let actor = task.await.unwrap();
+        assert!(actor.sqlite_snapshot_ready());
+        assert!(actor.sqlite.as_ref().unwrap().writes.is_empty());
+        assert_eq!(actor.channel_drops, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lone_announce_flushes_on_timer_and_failed_batch_blocks_snapshot() {
+        for fail in [false, true] {
+            let (mut actor, tx, batches, dir) = batch_actor(fail).await;
+            let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+            actor.enqueue_sqlite(inbound(raw));
+            let task = tokio::spawn(actor.run_sqlite());
+            // No RPC or shutdown is available to force this flush.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while batches.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let recalled = query(
+                &tx,
+                Q::Recall {
+                    destination_hash: dest,
+                },
+            )
+            .await;
+            if fail {
+                assert!(matches!(recalled, R::Error(_)));
+            } else {
+                assert!(matches!(recalled, R::Announce(Some(_))));
+            }
+            tx.send(TransportMessage::Shutdown).await.unwrap();
+            let actor = task.await.unwrap();
+            assert_eq!(actor.sqlite_snapshot_ready(), !fail);
+            assert_eq!(actor.sqlite.as_ref().unwrap().error.is_some(), fail);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_rpc_keeps_cache_and_gc_invalidation_preserves_dirty_rows() {
+        let (mut actor, _tx, _, dir) = batch_actor(false).await;
+        let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+        actor.handle_message(inbound(raw));
+        actor.invalidate_sqlite_cache(Invalidation::Destinations(vec![dest]));
+        assert!(actor.recent_announces.contains_key(&dest));
+        let writes = std::mem::take(&mut actor.sqlite.as_mut().unwrap().writes);
+        let worker = actor.sqlite.as_ref().unwrap().worker.clone();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let prepared = prepare_inner(
+            worker.clone(),
+            writes,
+            Some(TransportMessage::Rpc {
+                query: Q::GetRecentAnnounces,
+                response_tx,
+            }),
+            Reads::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response_rx.await.unwrap(), R::Announces(entries) if entries.len() == 1));
+        actor.invalidate_sqlite_cache(prepared.invalidate);
+        assert!(actor.recent_announces.contains_key(&dest));
+        actor.invalidate_sqlite_cache(Invalidation::Destinations(vec![dest]));
+        assert!(!actor.recent_announces.contains_key(&dest));
+        worker.try_shutdown().unwrap().wait().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn lrproof_loads_destination_identity_before_transit_validation() {
         let (mut actor, _tx) = TransportActor::new();
@@ -1659,8 +1899,8 @@ mod tests {
                     // Model a slow device independently of the host SSD.
                     std::thread::sleep(Duration::from_millis(limit as u64 * 4));
                 }
-                if matches!(&request, Request::Apply(_)) {
-                    self.applies += 1;
+                if let Request::Apply(mutations) = &request {
+                    self.applies += mutations.len();
                 }
                 let result = self.db.execute(request);
                 if limit.is_some() {

@@ -220,8 +220,12 @@ mod tests {
     #[test]
     fn percentiles_include_fast_operations_and_overflow() {
         let mut timing = Timing::default();
-        for _ in 0..95 { timing.record(Duration::from_micros(500)); }
-        for _ in 0..4 { timing.record(Duration::from_millis(170)); }
+        for _ in 0..95 {
+            timing.record(Duration::from_micros(500));
+        }
+        for _ in 0..4 {
+            timing.record(Duration::from_millis(170));
+        }
         timing.record(Duration::from_secs(1000));
         assert_eq!(timing.count, 100);
         assert_eq!(timing.percentile_ms(50), 1);
