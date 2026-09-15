@@ -1552,7 +1552,7 @@ mod tests {
             .initialize_sqlite_storage_with_options(
                 dir.clone(),
                 storage::SqliteOptions {
-                    announce_batch_delay: Duration::from_millis(50),
+                    announce_batch_delay: Duration::from_millis(10000),
                     ..Default::default()
                 },
             )
@@ -1563,8 +1563,8 @@ mod tests {
         actor.handle_message(inbound(raw.clone()));
         let after = tokio::time::Instant::now();
         let deadline = actor.sqlite.as_ref().unwrap().flush_at.unwrap();
-        assert!(deadline >= before + Duration::from_millis(50));
-        assert!(deadline <= after + Duration::from_millis(50));
+        assert!(deadline >= before + Duration::from_millis(10000));
+        assert!(deadline <= after + Duration::from_millis(10000));
         actor.record_sqlite_announce(dest, &raw);
         assert_eq!(actor.sqlite.as_ref().unwrap().flush_at, Some(deadline));
         actor

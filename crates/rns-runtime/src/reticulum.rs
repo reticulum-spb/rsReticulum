@@ -1509,7 +1509,7 @@ pub async fn init_with_options(
                                 .and_then(|s| s.get("announce_batch_delay_ms"))
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .unwrap_or(10)
-                                .clamp(1, 1000),
+                                .clamp(1, 10000),
                         ),
                         vacuum_interval: Duration::from_secs(
                             config

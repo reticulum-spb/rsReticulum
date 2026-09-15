@@ -189,9 +189,9 @@ impl Config {
             &self.reticulum.interface_discovery_sources,
         )?;
         validate_hashes("blackhole_sources", &self.reticulum.blackhole_sources)?;
-        if !(1..=1000).contains(&self.storage.announce_batch_delay_ms) {
+        if !(1..=10000).contains(&self.storage.announce_batch_delay_ms) {
             return Err(YamlConfigError::Validation(
-                "storage.announce_batch_delay_ms must be in 1..=1000".into(),
+                "storage.announce_batch_delay_ms must be in 1..=10000".into(),
             ));
         }
         if !(0..=8).contains(&self.logging.level) {
@@ -2339,7 +2339,7 @@ mod tests {
     #[test]
     fn announce_batch_window_roundtrip_and_bounds() {
         assert_eq!(Config::default().storage.announce_batch_delay_ms, 10);
-        for delay in [1, 10, 25, 50, 1000] {
+        for delay in [1, 10, 25, 50, 1000, 2000, 10000] {
             let cfg = Config::parse(
                 &format!("storage:\n  announce_batch_delay_ms: {delay}\n"),
                 "config.yaml",
@@ -2358,7 +2358,7 @@ mod tests {
                 Some(delay.to_string().as_str())
             );
         }
-        for delay in [0, 1001] {
+        for delay in [0, 10001] {
             assert!(
                 Config::parse(
                     &format!("storage:\n  announce_batch_delay_ms: {delay}\n"),

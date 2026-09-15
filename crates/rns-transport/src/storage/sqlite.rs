@@ -82,11 +82,11 @@ impl SqliteTransportStorage {
         {
             return Err(StorageError::Invalid("SQLite cache/timeout bounds"));
         }
-        if !(Duration::from_millis(1)..=Duration::from_secs(1))
+        if !(Duration::from_millis(1)..=Duration::from_secs(10))
             .contains(&options.announce_batch_delay)
         {
             return Err(StorageError::Invalid(
-                "announce batch delay must be 1..=1000 ms",
+                "announce batch delay must be 1..=10000 ms",
             ));
         }
         // Resolve symlinks so two configured names for one database cannot
