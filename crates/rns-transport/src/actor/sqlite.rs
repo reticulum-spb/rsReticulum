@@ -78,17 +78,27 @@ enum FlushTrigger {
     NextCapacity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriorityKind {
+    PathRequest,
+    PathResponse,
+    Lrproof,
+    Other,
+}
+
 #[derive(Default)]
 struct BatchFlushMetrics {
     batches: u64,
     items: u64,
     singletons: u64,
     triggers: [u64; 10],
+    priority_kinds: [u64; 4],
+    unknown_path_bypasses: u64,
 }
 
 impl BatchFlushMetrics {
     fn report(&self) {
-        if self.batches == 0 {
+        if self.batches == 0 && self.unknown_path_bypasses == 0 {
             return;
         }
         tracing::info!(
@@ -103,6 +113,11 @@ impl BatchFlushMetrics {
             byte_limit = self.triggers[FlushTrigger::ByteLimit as usize],
             rpc = self.triggers[FlushTrigger::Rpc as usize],
             priority = self.triggers[FlushTrigger::Priority as usize],
+            priority_path_request = self.priority_kinds[PriorityKind::PathRequest as usize],
+            priority_path_response = self.priority_kinds[PriorityKind::PathResponse as usize],
+            priority_lrproof = self.priority_kinds[PriorityKind::Lrproof as usize],
+            priority_other = self.priority_kinds[PriorityKind::Other as usize],
+            unknown_path_bypasses = self.unknown_path_bypasses,
             packet_read = self.triggers[FlushTrigger::PacketRead as usize],
             next_capacity = self.triggers[FlushTrigger::NextCapacity as usize],
             "SQLite batch flush summary"
@@ -414,6 +429,42 @@ impl TransportActor {
         );
     }
 
+    /// Classify the queued priority message and allow only path requests that
+    /// cannot observe pending SQLite state to pass an uncommitted batch.
+    fn sqlite_priority_dependency(&self, msg: &TransportMessage) -> (PriorityKind, bool) {
+        use rns_wire::{
+            context::PacketContext,
+            flags::{DestinationType, PacketType},
+        };
+        let Some((header, payload)) = self.sqlite_header(msg) else {
+            return (PriorityKind::Other, false);
+        };
+        if header.context == PacketContext::Lrproof && header.flags.packet_type == PacketType::Proof
+        {
+            return (PriorityKind::Lrproof, false);
+        }
+        if header.context == PacketContext::PathResponse
+            && header.flags.packet_type == PacketType::Announce
+        {
+            return (PriorityKind::PathResponse, false);
+        }
+        if header.destination_hash != Self::path_request_dest_hash() {
+            return (PriorityKind::Other, false);
+        }
+        let independent = header.flags.packet_type == PacketType::Data
+            && header.flags.destination_type == DestinationType::Plain
+            && header.context == PacketContext::None
+            && payload.len() >= 16
+            && {
+                let dest: [u8; 16] = payload[..16].try_into().unwrap();
+                self.path_table.get(&dest).is_none()
+                    && self.sqlite.as_ref().is_some_and(|state| !state.writes.iter().any(|m| {
+                        matches!(m, Mutation::PutAnnounce { announce, .. } if announce.dest_hash == dest)
+                    }))
+            };
+        (PriorityKind::PathRequest, independent)
+    }
+
     fn sqlite_packet_priority(&self, msg: &TransportMessage) -> u8 {
         // Reuse IFAC verification for the single-channel actor as well as the
         // already admitted header from the two-channel actor.
@@ -630,15 +681,26 @@ impl TransportActor {
                         &mut invalidate_after_job,
                     )));
                 }
-                // Only ordinary inbound announces can pass a staged write.
-                // All RPCs, packet reads and discovery/proof traffic are barriers.
+                // Ordinary announces and independent requests for unknown paths
+                // can pass staged writes. Reads of stored packets remain barriers.
                 let state = self.sqlite.as_ref().unwrap();
                 let staged_bytes = storage::mutation_batch_bytes(&state.writes);
+                let priority_dependency = state
+                    .queue
+                    .front()
+                    .filter(|q| q.priority != 0)
+                    .map(|q| self.sqlite_priority_dependency(&q.message));
+                let independent_path_request =
+                    priority_dependency.is_some_and(|(_, independent)| independent);
                 let next_barrier = state.queue.front().and_then(|q| {
                     if matches!(q.message, TransportMessage::Rpc { .. }) {
                         Some(FlushTrigger::Rpc)
                     } else if q.priority != 0 {
-                        Some(FlushTrigger::Priority)
+                        if independent_path_request {
+                            None
+                        } else {
+                            Some(FlushTrigger::Priority)
+                        }
                     } else if !self.sqlite_header(&q.message).is_some_and(|(h, _)| {
                         h.flags.packet_type == rns_wire::flags::PacketType::Announce
                     }) {
@@ -684,7 +746,13 @@ impl TransportActor {
                     }
                     if let Some(trigger) = next_barrier {
                         metrics.triggers[trigger as usize] += 1;
+                        if matches!(trigger, FlushTrigger::Priority) {
+                            let (kind, _) = priority_dependency.unwrap();
+                            metrics.priority_kinds[kind as usize] += 1;
+                        }
                     }
+                } else if !state.writes.is_empty() && independent_path_request {
+                    state.metrics.flushes.unknown_path_bypasses += 1;
                 }
                 let message = state.queue.pop_front().map(|queued| {
                     let msg = queued.message;
@@ -1542,6 +1610,95 @@ mod tests {
         interface.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, interface);
         (actor, tx, batches, dir)
+    }
+
+    fn path_request_message(dest: [u8; 16]) -> TransportMessage {
+        use rns_wire::flags::*;
+        let header = rns_wire::header::PacketHeader {
+            flags: PacketFlags {
+                header_type: HeaderType::Header1,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type: DestinationType::Plain,
+                packet_type: PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: TransportActor::path_request_dest_hash(),
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack().unwrap();
+        raw.extend_from_slice(&dest);
+        raw.extend_from_slice(&[0xBA; 16]);
+        inbound(Bytes::from(raw))
+    }
+
+    #[tokio::test]
+    async fn unknown_path_request_forwards_without_flushing_unrelated_announces() {
+        for fail in [false, true] {
+            let (mut actor, tx, batches, dir) = batch_actor(fail).await;
+            actor.is_transport_enabled = true;
+            actor.sqlite.as_mut().unwrap().batch_delay = Duration::from_secs(10);
+            let (raw, dest) = make_valid_announce("lxmf.delivery", 1);
+            actor.handle_message(inbound(raw));
+            assert_eq!(actor.sqlite.as_ref().unwrap().writes.len(), 1);
+            let unknown = [0xF3; 16];
+            assert_eq!(
+                actor.sqlite_priority_dependency(&path_request_message(unknown)),
+                (PriorityKind::PathRequest, true)
+            );
+            assert_eq!(
+                actor.sqlite_priority_dependency(&path_request_message(dest)),
+                (PriorityKind::PathRequest, false)
+            );
+            let (mut outgoing, mut output) = make_test_interface("path-request-output");
+            outgoing.ingress = crate::ingress::IngressController::disabled();
+            actor.interfaces.insert(2, outgoing);
+            let task = tokio::spawn(actor.run_sqlite());
+            tx.send(path_request_message(unknown)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let raw = output.recv().await.unwrap();
+                    let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                    if header.destination_hash == TransportActor::path_request_dest_hash() {
+                        assert_eq!(&raw[offset..offset + 16], &unknown);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                batches.lock().unwrap().is_empty(),
+                "unknown-path forwarding must not commit unrelated data, even if commit would fail"
+            );
+            // A path request for the staged destination must still commit first.
+            tx.send(path_request_message(dest)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while batches.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let recalled = query(
+                &tx,
+                Q::Recall {
+                    destination_hash: dest,
+                },
+            )
+            .await;
+            assert!(if fail {
+                matches!(recalled, R::Error(_))
+            } else {
+                matches!(recalled, R::Announce(Some(_)))
+            });
+            assert_eq!(batches.lock().unwrap().len(), 1);
+            tx.send(TransportMessage::Shutdown).await.unwrap();
+            let actor = task.await.unwrap();
+            assert_eq!(actor.sqlite_snapshot_ready(), !fail);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]
