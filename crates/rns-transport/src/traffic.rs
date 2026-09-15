@@ -256,8 +256,11 @@ mod tests {
         command.args([
             "-B",
             "-c",
-            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/control_rates_reference.py"))
-                .expect("optional Python reference script is required to run this ignored test"),
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/control_rates_reference.py"
+            ))
+            .expect("optional Python reference script is required to run this ignored test"),
         ]);
         command.arg(
             std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()),

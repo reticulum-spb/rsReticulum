@@ -151,7 +151,7 @@ impl TransportStorage for MemoryTransportStorage {
                     .take(limit)
                     .copied()
                     .collect();
-                let mut removed = 0;
+                let mut destinations = Vec::new();
                 for key in &keys {
                     let a = &self.announces[key];
                     if !a.retained
@@ -167,11 +167,12 @@ impl TransportStorage for MemoryTransportStorage {
                             .any(|h| self.packet_destination(h).ok() == Some(*key))
                     {
                         self.announces.remove(key);
-                        removed += 1;
+                        destinations.push(*key);
                     }
                 }
                 Reply::CleanedPage {
-                    removed,
+                    removed: destinations.len(),
+                    destinations,
                     next: keys.last().copied(),
                 }
             }

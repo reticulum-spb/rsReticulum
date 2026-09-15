@@ -28,6 +28,7 @@ enum BackgroundResult {
     Cleaned {
         next: Option<[u8; 16]>,
         removed: usize,
+        destinations: Vec<[u8; 16]>,
     },
     Collected {
         next: Option<[u8; 32]>,
@@ -53,6 +54,47 @@ pub(super) struct SqliteState {
     gc_started: Option<std::time::Instant>,
     gc_announces: usize,
     gc_packets: usize,
+    metrics: AdmissionMetrics,
+}
+
+struct AdmissionMetrics {
+    since: std::time::Instant,
+    admission: storage::metrics::Timing,
+    hits: u64,
+    misses: u64,
+    max_queue_entries: usize,
+    max_queue_bytes: usize,
+    max_staged_bytes: usize,
+}
+
+impl Default for AdmissionMetrics {
+    fn default() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            admission: Default::default(),
+            hits: 0,
+            misses: 0,
+            max_queue_entries: 0,
+            max_queue_bytes: 0,
+            max_staged_bytes: 0,
+        }
+    }
+}
+
+impl AdmissionMetrics {
+    fn report(&mut self) {
+        tracing::info!(
+            cache_hits = self.hits,
+            cache_misses = self.misses,
+            max_queue_entries = self.max_queue_entries,
+            max_queue_bytes = self.max_queue_bytes,
+            max_staged_bytes = self.max_staged_bytes,
+            "SQLite admission summary"
+        );
+        self.admission
+            .report("admission", "wait_before_preparation");
+        *self = Self::default();
+    }
 }
 
 struct Queued {
@@ -66,13 +108,23 @@ struct Reads {
     keys: Vec<[u8; 16]>,
     identities: Vec<[u8; 16]>,
     packets: Vec<[u8; 32]>,
+    cached: usize,
 }
 #[derive(Debug)]
 struct Prepared {
     message: Option<TransportMessage>,
     entries: Vec<RecentAnnounce>,
     raw: HashMap<[u8; 32], Vec<u8>>,
-    clear: bool,
+    invalidate: Invalidation,
+}
+
+#[derive(Debug, Default)]
+enum Invalidation {
+    #[default]
+    None,
+    All,
+    Destinations(Vec<[u8; 16]>),
+    Identity([u8; 16]),
 }
 
 fn weight(msg: &TransportMessage) -> usize {
@@ -199,6 +251,7 @@ impl TransportActor {
             gc_started: None,
             gc_announces: 0,
             gc_packets: 0,
+            metrics: AdmissionMetrics::default(),
         });
         self.storage_dir = Some(directory);
         // SQLite mode intentionally starts empty. Legacy msgpack files and
@@ -223,6 +276,10 @@ impl TransportActor {
             announce: a.clone(),
             raw: Some(raw.to_vec()),
         });
+        state.metrics.max_staged_bytes = state
+            .metrics
+            .max_staged_bytes
+            .max(storage::mutation_batch_bytes(&state.writes));
         state.order.retain(|d| *d != dest);
         state.order.push_back(dest);
     }
@@ -259,6 +316,9 @@ impl TransportActor {
             return;
         }
         state.bytes += bytes;
+        state.metrics.max_queue_bytes = state.metrics.max_queue_bytes.max(state.bytes);
+        state.metrics.max_queue_entries =
+            state.metrics.max_queue_entries.max(state.queue.len() + 1);
         let index = if priority > 0 {
             state
                 .queue
@@ -401,10 +461,39 @@ impl TransportActor {
             },
             _ => {}
         }
+        let requested = reads.keys.len();
         reads
             .keys
             .retain(|k| !self.recent_announces.contains_key(k));
+        reads.cached = requested - reads.keys.len();
         reads
+    }
+
+    fn invalidate_sqlite_cache(&mut self, invalidation: Invalidation) {
+        if matches!(invalidation, Invalidation::None) {
+            return;
+        }
+        let state = self.sqlite.as_mut().unwrap();
+        self.recent_announces.retain(|key, a| {
+            // A foreground announce may have refreshed a row after the GC
+            // transaction but before its completion was consumed by the actor.
+            let dirty = state.writes.iter().any(|m| {
+                matches!(m,
+                Mutation::PutAnnounce { announce, .. } if announce.dest_hash == *key)
+            });
+            dirty
+                || !match &invalidation {
+                    Invalidation::None => false,
+                    Invalidation::All => true,
+                    Invalidation::Destinations(keys) => keys.contains(key),
+                    Invalidation::Identity(hash) => a
+                        .public_key
+                        .is_some_and(|pk| rns_crypto::sha::truncated_hash(&pk) == *hash),
+                }
+        });
+        state
+            .order
+            .retain(|key| self.recent_announces.contains_key(key));
     }
 
     fn trim_sqlite_cache(&mut self) {
@@ -437,25 +526,31 @@ impl TransportActor {
         // single storage worker still serializes SQL and committed mutations.
         let mut background: Option<JoinHandle<storage::Result<BackgroundResult>>> = None;
         let mut background_started = std::time::Instant::now();
-        let mut clear_after_job = false;
+        let mut invalidate_after_job = Vec::new();
         let mut stopping = false;
         let mut was_foreground = true;
         let mut interface_open = true;
         let mut control_open = self.control_rx.is_some();
         loop {
+            let metrics = &mut self.sqlite.as_mut().unwrap().metrics;
+            if metrics.since.elapsed() >= Duration::from_secs(60) {
+                metrics.report();
+            }
             if job.is_none() {
                 // A prepared read may have relied on a cache hit. Invalidate
                 // only after its message has consumed that entry.
-                if clear_after_job {
-                    self.recent_announces.clear();
-                    self.sqlite.as_mut().unwrap().order.clear();
-                    clear_after_job = false;
+                if !invalidate_after_job.is_empty() {
+                    self.invalidate_sqlite_cache(Invalidation::Destinations(std::mem::take(
+                        &mut invalidate_after_job,
+                    )));
                 }
                 let state = self.sqlite.as_mut().unwrap();
                 let message = state.queue.pop_front().map(|queued| {
                     let msg = queued.message;
                     state.bytes = state.bytes.saturating_sub(weight(&msg));
-                    let admission_ms = queued.enqueued.elapsed().as_millis() as u64;
+                    let admission = queued.enqueued.elapsed();
+                    state.metrics.admission.record(admission);
+                    let admission_ms = admission.as_millis() as u64;
                     if admission_ms >= 100 {
                         warn!(
                             admission_ms,
@@ -471,6 +566,9 @@ impl TransportActor {
                 let worker = state.worker.clone();
                 if let Some(message) = message {
                     let reads = self.sqlite_reads(&message);
+                    let metrics = &mut self.sqlite.as_mut().unwrap().metrics;
+                    metrics.hits += reads.cached as u64;
+                    metrics.misses += reads.keys.len() as u64;
                     job = Some(tokio::spawn(prepare(worker, writes, Some(message), reads)));
                 } else if !writes.is_empty() {
                     job = Some(tokio::spawn(prepare(
@@ -551,7 +649,7 @@ impl TransportActor {
                     self.sqlite.as_mut().unwrap().busy=background.is_some();
                     match result {
                         Ok(Ok(prepared))=> {
-                            if prepared.clear {self.recent_announces.clear();self.sqlite.as_mut().unwrap().order.clear();}
+                            self.invalidate_sqlite_cache(prepared.invalidate);
                             for a in prepared.entries {
                                 let state=self.sqlite.as_mut().unwrap();
                                 state.order.retain(|d|*d!=a.dest_hash);state.order.push_back(a.dest_hash);
@@ -580,7 +678,6 @@ impl TransportActor {
                             match result {
                                 BackgroundResult::Sweep => {
                                     state.last_sweep = crate::now_f64();
-                                    clear_after_job = true;
                                     // Refreshing pins must not restart a partially
                                     // completed GC scan at the first key.
                                     if matches!(state.gc_phase, GcPhase::Idle) {
@@ -591,9 +688,9 @@ impl TransportActor {
                                     }
                                 }
                                 BackgroundResult::Maintenance => {}
-                                BackgroundResult::Cleaned { next, removed } => {
+                                BackgroundResult::Cleaned { next, removed, destinations } => {
                                     state.gc_announces += removed;
-                                    clear_after_job |= removed > 0;
+                                    invalidate_after_job = destinations;
                                     state.gc_phase = match next {
                                         Some(key) => GcPhase::Clean(Some(key)),
                                         None => GcPhase::Collect(None),
@@ -654,6 +751,7 @@ impl TransportActor {
                 stopping = true;
             }
         }
+        self.sqlite.as_mut().unwrap().metrics.report();
         self.on_shutdown();
         let worker = &self.sqlite.as_ref().unwrap().worker;
         match worker.try_shutdown() {
@@ -766,7 +864,7 @@ async fn prepare_inner(
         message: None,
         entries: Vec::new(),
         raw: HashMap::new(),
-        clear: false,
+        invalidate: Invalidation::None,
     };
     // These RPCs are answered directly from the source of truth. Only the
     // existing explicit full-list API materializes the complete response.
@@ -784,6 +882,14 @@ async fn prepare_inner(
             let TransportMessage::Rpc { query, response_tx } = message.take().unwrap() else {
                 unreachable!()
             };
+            let invalidation = match &query {
+                Q::GetRecentAnnounces => Invalidation::None,
+                Q::RetainDestination { dest }
+                | Q::UnretainDestination { dest }
+                | Q::UseDestination { dest } => Invalidation::Destinations(vec![*dest]),
+                Q::RetainIdentity { identity_hash } => Invalidation::Identity(*identity_hash),
+                _ => Invalidation::All,
+            };
             let response = direct_query(&worker, query).await;
             match response {
                 Ok(response) => {
@@ -794,7 +900,7 @@ async fn prepare_inner(
                     return Err(error);
                 }
             }
-            result.clear = true;
+            result.invalidate = invalidation;
             return Ok(result);
         }
     }
@@ -977,9 +1083,15 @@ async fn gc_page(worker: StorageHandle, phase: GcPhase) -> storage::Result<Backg
             )
             .await?
             {
-                Reply::CleanedPage { next, removed } => {
-                    Ok(BackgroundResult::Cleaned { next, removed })
-                }
+                Reply::CleanedPage {
+                    next,
+                    removed,
+                    destinations,
+                } => Ok(BackgroundResult::Cleaned {
+                    next,
+                    removed,
+                    destinations,
+                }),
                 _ => Err(storage::StorageError::Invalid("cleanup page reply")),
             }
         }

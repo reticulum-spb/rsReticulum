@@ -9,6 +9,7 @@
 //! pending result does not cancel an accepted operation.
 
 mod memory;
+pub(crate) mod metrics;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod worker;
@@ -242,6 +243,8 @@ pub enum Reply {
     Removed(usize),
     CleanedPage {
         removed: usize,
+        /// Exact bounded invalidation set for the actor metadata cache.
+        destinations: Vec<DestinationHash>,
         next: Option<DestinationHash>,
     },
     CollectedPage {
@@ -265,6 +268,25 @@ pub trait TransportStorage: Send {
 
 pub(super) fn metadata_bytes(a: &RecentAnnounce) -> usize {
     256 + a.app_data.as_ref().map_or(0, Vec::len)
+}
+
+/// Allocated payload bytes in addition to the mutation vector itself.
+impl Mutation {
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match self {
+            Self::PutAnnounce { announce, raw } => {
+                announce.app_data.as_ref().map_or(0, Vec::capacity)
+                    + raw.as_ref().map_or(0, Vec::capacity)
+            }
+            Self::PutPacket { raw, .. } => raw.capacity(),
+            _ => 0,
+        }
+    }
+}
+
+pub(crate) fn mutation_batch_bytes(mutations: &Vec<Mutation>) -> usize {
+    mutations.capacity() * std::mem::size_of::<Mutation>()
+        + mutations.iter().map(Mutation::payload_bytes).sum::<usize>()
 }
 
 fn validate_packet(hash: &PacketHash, raw: &[u8]) -> Result<DestinationHash> {

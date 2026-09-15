@@ -41,6 +41,7 @@ pub struct SqliteTransportStorage {
     connection: Connection,
     path: PathBuf,
     active_sweep: Option<i64>,
+    transactions: [metrics::Transactions; 6],
     // An advisory OS lock is held for the entire backend lifetime, including
     // idle periods. Never unlink the lock file (that would break ownership).
     _owner: File,
@@ -191,11 +192,23 @@ impl SqliteTransportStorage {
             connection,
             path: path.to_path_buf(),
             active_sweep: None,
+            transactions: [
+                "apply",
+                "begin_sweep",
+                "keep_packets",
+                "finish_sweep",
+                "clean_known_page",
+                "collect_packets_page",
+            ]
+            .map(metrics::Transactions::new),
             _owner: owner,
         })
     }
 
     fn apply(&mut self, mutations: Vec<Mutation>) -> Result<()> {
+        let started = std::time::Instant::now();
+        let items = mutations.len();
+        let bytes = mutation_batch_bytes(&mutations);
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -208,7 +221,7 @@ impl SqliteTransportStorage {
                         }
                         require_packet(&tx, &hash, Some(a.dest_hash))?;
                     }
-                    tx.execute("INSERT INTO announces
+                    tx.prepare_cached("INSERT INTO announces
                         (destination_hash,hops,app_data,timestamp,public_key,ratchet,packet_hash,is_path_response,retained,last_used,name_hash,identity_hash)
                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
                         ON CONFLICT(destination_hash) DO UPDATE SET
@@ -218,8 +231,7 @@ impl SqliteTransportStorage {
                         retained=announces.retained OR excluded.retained,
                         last_used=CASE WHEN announces.last_used IS NULL THEN excluded.last_used
                             WHEN excluded.last_used IS NULL THEN announces.last_used
-                            ELSE max(announces.last_used,excluded.last_used) END",
-                        params![a.dest_hash.as_slice(), a.hops, a.app_data, a.timestamp,
+                            ELSE max(announces.last_used,excluded.last_used) END")?.execute(params![a.dest_hash.as_slice(), a.hops, a.app_data, a.timestamp,
                             a.public_key.as_ref().map(|k| k.as_slice()), a.ratchet.as_ref().map(|k| k.as_slice()),
                             a.packet_hash.as_ref().map(|k| k.as_slice()), a.is_path_response, a.retained, a.last_used, a.name_hash.as_slice(),
                             a.public_key.map(|pk| rns_crypto::sha::truncated_hash(&pk)).as_ref().map(|h| h.as_slice())])?;
@@ -229,38 +241,33 @@ impl SqliteTransportStorage {
                     let destination = owner.destination();
                     require_packet(&tx, &hash, destination)?;
                     let (kind, key) = owner_key(&owner);
-                    tx.execute("INSERT INTO packet_refs(kind,owner_key,destination_hash,packet_hash) VALUES (?1,?2,?3,?4)
-                        ON CONFLICT(kind,owner_key) DO UPDATE SET packet_hash=excluded.packet_hash",
-                        params![kind,key,destination.as_ref().map(|d| d.as_slice()),hash.as_slice()])?;
+                    tx.prepare_cached("INSERT INTO packet_refs(kind,owner_key,destination_hash,packet_hash) VALUES (?1,?2,?3,?4)
+                        ON CONFLICT(kind,owner_key) DO UPDATE SET packet_hash=excluded.packet_hash")?.execute(params![kind,key,destination.as_ref().map(|d| d.as_slice()),hash.as_slice()])?;
                 }
                 Mutation::RemoveReference(owner) => {
                     let (kind, key) = owner_key(&owner);
-                    tx.execute(
-                        "DELETE FROM packet_refs WHERE kind=?1 AND owner_key=?2",
-                        params![kind, key],
-                    )?;
+                    tx.prepare_cached("DELETE FROM packet_refs WHERE kind=?1 AND owner_key=?2")?
+                        .execute(params![kind, key])?;
                 }
                 Mutation::RemoveAnnounce(dest) => {
-                    tx.execute(
-                        "DELETE FROM announces WHERE destination_hash=?1",
-                        [dest.as_slice()],
-                    )?;
+                    tx.prepare_cached("DELETE FROM announces WHERE destination_hash=?1")?
+                        .execute([dest.as_slice()])?;
                 }
                 Mutation::SetRetained {
                     destination,
                     retained,
                 } => {
-                    tx.execute(
+                    tx.prepare_cached(
                         "UPDATE announces SET retained=?2 WHERE destination_hash=?1",
-                        params![destination.as_slice(), retained],
-                    )?;
+                    )?
+                    .execute(params![destination.as_slice(), retained])?;
                 }
                 Mutation::Touch { destination, at } => {
-                    tx.execute("UPDATE announces SET last_used=CASE WHEN last_used IS NULL THEN ?2 ELSE max(last_used,?2) END WHERE destination_hash=?1", params![destination.as_slice(),at])?;
+                    tx.prepare_cached("UPDATE announces SET last_used=CASE WHEN last_used IS NULL THEN ?2 ELSE max(last_used,?2) END WHERE destination_hash=?1")?.execute(params![destination.as_slice(),at])?;
                 }
             }
         }
-        tx.commit()?;
+        self.transactions[0].commit(tx, started, items, bytes)?;
         Ok(())
     }
 }
@@ -341,11 +348,11 @@ fn put_packet(conn: &Connection, hash: &PacketHash, raw: &[u8]) -> Result<()> {
     let destination = validate_packet(hash, raw)?;
     // Hash excludes mutable forwarding headers. Preserve the first wire
     // representation, just like the existing write-if-absent file cache.
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO packet_blobs(packet_hash,destination_hash,raw_packet) VALUES (?1,?2,?3)
         ON CONFLICT(packet_hash) DO NOTHING",
-        params![hash.as_slice(), destination.as_slice(), raw],
-    )?;
+    )?
+    .execute(params![hash.as_slice(), destination.as_slice(), raw])?;
     Ok(())
 }
 
@@ -355,11 +362,8 @@ fn require_packet(
     destination: Option<DestinationHash>,
 ) -> Result<()> {
     let found = conn
-        .query_row(
-            "SELECT destination_hash FROM packet_blobs WHERE packet_hash=?1",
-            [hash.as_slice()],
-            |r| fixed::<16>(r, 0),
-        )
+        .prepare_cached("SELECT destination_hash FROM packet_blobs WHERE packet_hash=?1")?
+        .query_row([hash.as_slice()], |r| fixed::<16>(r, 0))
         .optional()?;
     let found = found.ok_or(StorageError::MissingPacket)?;
     if destination.is_some_and(|d| d != found) {
@@ -414,11 +418,12 @@ impl TransportStorage for SqliteTransportStorage {
         request.validate()?;
         Ok(match request {
             Request::BeginSweep => {
+                let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 tx.execute("DELETE FROM temp.sweep_seen", [])?;
                 tx.execute("UPDATE sweep_state SET generation=generation+1 WHERE id=1", [])?;
                 let generation = tx.query_row("SELECT generation FROM sweep_state WHERE id=1", [], |r| r.get(0))?;
-                tx.commit()?;
+                self.transactions[1].commit(tx, started, 0, 0)?;
                 self.active_sweep = Some(generation);
                 Reply::Generation(generation)
             }
@@ -426,6 +431,7 @@ impl TransportStorage for SqliteTransportStorage {
                 if self.active_sweep != Some(generation) {
                     return Err(StorageError::Invalid("inactive sweep"));
                 }
+                let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 check_generation(&tx, generation)?;
                 {
@@ -437,14 +443,14 @@ impl TransportStorage for SqliteTransportStorage {
                         "INSERT INTO packet_keep(packet_hash,generation) SELECT packet_hash,?2 FROM packet_blobs
                          WHERE packet_hash=?1 AND NOT EXISTS(SELECT 1 FROM packet_keep WHERE packet_hash=?1)",
                     )?;
-                    for hash in hashes {
+                    for hash in &hashes {
                         seen.execute([hash.as_slice()])?;
                         // Existing pins need no main-DB write or fsync. New pins
                         // are still committed durably before acknowledging this chunk.
                         keep.execute(params![hash.as_slice(), generation])?;
                     }
                 }
-                tx.commit()?;
+                self.transactions[2].commit(tx, started, hashes.len(), hashes.capacity() * 32)?;
                 Reply::Applied
             }
             Request::FinishSweep { generation } => {
@@ -453,13 +459,14 @@ impl TransportStorage for SqliteTransportStorage {
                 if self.active_sweep != Some(generation) {
                     return Err(StorageError::Invalid("inactive sweep"));
                 }
+                let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 check_generation(&tx, generation)?;
                 tx.execute(
                     "DELETE FROM packet_keep WHERE NOT EXISTS
                      (SELECT 1 FROM temp.sweep_seen s WHERE s.packet_hash=packet_keep.packet_hash)", [],
                 )?;
-                tx.commit()?;
+                self.transactions[3].commit(tx, started, 0, 0)?;
                 self.active_sweep = None;
                 Reply::Applied
             }
@@ -471,11 +478,12 @@ impl TransportStorage for SqliteTransportStorage {
                 AND NOT EXISTS(SELECT 1 FROM packet_keep k JOIN packet_blobs p ON p.packet_hash=k.packet_hash WHERE p.destination_hash=a.destination_hash)
                 ORDER BY destination_hash LIMIT ?3)",params![unused_before,used_before,limit as i64])?),
             Request::CleanKnownPage { unused_before, used_before, after, limit } => {
+                let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 let keys = gc_page_keys::<16>(&tx,
                     "SELECT destination_hash FROM announces WHERE destination_hash>?1 ORDER BY destination_hash LIMIT ?2",
                     after.as_ref().map(|key| key.as_slice()), limit)?;
-                let mut removed = 0;
+                let mut destinations = Vec::new();
                 {
                     let mut delete = tx.prepare_cached(
                         "DELETE FROM announces WHERE destination_hash=?1 AND retained=0
@@ -484,13 +492,16 @@ impl TransportStorage for SqliteTransportStorage {
                          AND NOT EXISTS(SELECT 1 FROM packet_blobs p JOIN packet_keep k ON k.packet_hash=p.packet_hash WHERE p.destination_hash=announces.destination_hash)",
                     )?;
                     for key in &keys {
-                        removed += delete.execute(params![key.as_slice(), unused_before, used_before])?;
+                        if delete.execute(params![key.as_slice(), unused_before, used_before])? > 0 {
+                            destinations.push(*key);
+                        }
                     }
                 }
-                tx.commit()?;
-                Reply::CleanedPage { removed, next: keys.last().copied() }
+                self.transactions[4].commit(tx, started, keys.len(), keys.len() * 16)?;
+                Reply::CleanedPage { removed: destinations.len(), destinations, next: keys.last().copied() }
             }
             Request::CollectPacketsPage { after, limit } => {
+                let started = std::time::Instant::now();
                 let tx = self.connection.transaction()?;
                 let keys = gc_page_keys::<32>(&tx,
                     "SELECT packet_hash FROM packet_blobs WHERE packet_hash>?1 ORDER BY packet_hash LIMIT ?2",
@@ -507,7 +518,7 @@ impl TransportStorage for SqliteTransportStorage {
                         removed += delete.execute([key.as_slice()])?;
                     }
                 }
-                tx.commit()?;
+                self.transactions[5].commit(tx, started, keys.len(), keys.len() * 32)?;
                 Reply::CollectedPage { removed, next: keys.last().copied() }
             }
             Request::Apply(mutations) => { self.apply(mutations)?; Reply::Applied }

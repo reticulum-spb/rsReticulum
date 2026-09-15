@@ -9622,8 +9622,11 @@ mod tests {
         .args([
             "-B",
             "-c",
-            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tunnel_handler_reference.py"))
-                .expect("optional Python reference script is required to run this ignored test"),
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/tunnel_handler_reference.py"
+            ))
+            .expect("optional Python reference script is required to run this ignored test"),
         ])
         .arg(std::env::var("RNS_PYTHON_ROOT").unwrap_or_else(|_| "/home/room/src/Reticulum".into()))
         .stdin(Stdio::piped())

@@ -337,7 +337,11 @@ fn gc_pages_contract(store: &mut dyn TransportStorage) {
     store.execute(Request::FinishSweep { generation }).unwrap();
     let mut after = None;
     for (page, expected) in [0, 0, 2].into_iter().enumerate() {
-        let Reply::CleanedPage { removed, next } = store
+        let Reply::CleanedPage {
+            removed,
+            next,
+            destinations: deleted,
+        } = store
             .execute(Request::CleanKnownPage {
                 unused_before: 500.0,
                 used_before: 500.0,
@@ -349,6 +353,14 @@ fn gc_pages_contract(store: &mut dyn TransportStorage) {
             panic!()
         };
         assert_eq!(removed, expected);
+        assert_eq!(
+            deleted,
+            if expected == 0 {
+                vec![]
+            } else {
+                destinations[4..6].to_vec()
+            }
+        );
         assert_eq!(
             next,
             Some(destinations[page * 2 + 1]),
@@ -367,7 +379,8 @@ fn gc_pages_contract(store: &mut dyn TransportStorage) {
             .unwrap(),
         Reply::CleanedPage {
             removed: 0,
-            next: None
+            next: None,
+            ..
         }
     ));
     let mut after = None;
@@ -392,7 +405,8 @@ fn gc_pages_contract(store: &mut dyn TransportStorage) {
             .unwrap(),
         Reply::CollectedPage {
             removed: 0,
-            next: None
+            next: None,
+            ..
         }
     ));
     for hash in &hashes[..4] {

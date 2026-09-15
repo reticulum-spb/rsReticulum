@@ -68,14 +68,18 @@ impl StorageHandle {
                     return;
                 }
                 let mut shutdown_replies = Vec::new();
+                let mut metrics = metrics::WorkerMetrics::default();
                 while let Some(work) = rx.blocking_recv() {
                     if let Some(request) = work.request {
                         let operation = request.operation();
-                        let queue_ms = work.queued.elapsed().as_millis() as u64;
+                        let queue = work.queued.elapsed();
+                        let queue_ms = queue.as_millis() as u64;
                         let started = std::time::Instant::now();
                         tracing::debug!(operation, queue_ms, "transport storage operation started");
                         let result = backend.execute(request);
-                        let execution_ms = started.elapsed().as_millis() as u64;
+                        let execution = started.elapsed();
+                        let execution_ms = execution.as_millis() as u64;
+                        metrics.record(operation, queue, execution, result.is_err());
                         if queue_ms >= 100 || execution_ms >= 100 {
                             tracing::warn!(
                                 operation,
