@@ -58,8 +58,41 @@ struct InterfaceControlMetadata {
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
 
+// Keep the JoinHandle in shared state while awaiting it: cancellation of one
+// waiter must not detach the actor or let another waiter report early success.
+enum TransportTaskState {
+    Running(JoinHandle<()>),
+    Finished(Result<(), String>),
+}
+
+#[derive(Clone)]
+struct TransportTask(Arc<Mutex<TransportTaskState>>);
+
+impl TransportTask {
+    fn spawn(task: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(TransportTaskState::Running(
+            tokio::spawn(task),
+        ))))
+    }
+
+    async fn wait(&self) -> Result<(), ReticulumError> {
+        let mut state = self.0.lock().await;
+        if let TransportTaskState::Running(task) = &mut *state {
+            let result = task
+                .await
+                .map_err(|error| format!("transport task failed: {error}"));
+            *state = TransportTaskState::Finished(result);
+        }
+        let TransportTaskState::Finished(result) = &*state else {
+            unreachable!()
+        };
+        result.clone().map_err(ReticulumError::Transport)
+    }
+}
+
 #[derive(Clone)]
 pub struct ReticulumHandle {
+    transport_task: TransportTask,
     pub transport_tx: mpsc::Sender<TransportMessage>,
     /// Driver packets use a separate bounded channel from API/RPC commands.
     interface_transport_tx: mpsc::Sender<TransportMessage>,
@@ -154,6 +187,14 @@ impl DiscoveryStamper for RuntimeDiscoveryStamper {
 }
 
 impl ReticulumHandle {
+    /// Wait for the shutdown signal and for transport to finish flushing and
+    /// closing storage. Call before dropping the owning Tokio runtime.
+    /// Cloned handles may wait concurrently; cancelling a waiter is safe.
+    pub async fn wait_shutdown(&self) -> Result<(), ReticulumError> {
+        self.shutdown.wait().await;
+        self.transport_task.wait().await
+    }
+
     pub fn transport_enabled(&self) -> bool {
         self.config.enable_transport
     }
@@ -1540,7 +1581,7 @@ pub async fn init_with_options(
     {
         actor.initialize_storage(paths.storage_dir.clone());
     }
-    tokio::spawn(async move { actor.run().await });
+    let transport_task = TransportTask::spawn(async move { actor.run().await });
 
     if instance_mode == InstanceMode::Client {
         if rc.enable_transport
@@ -1576,6 +1617,7 @@ pub async fn init_with_options(
         Ok(interfaces) => interfaces,
         Err(e) => {
             let _ = transport_tx.send(TransportMessage::Shutdown).await;
+            transport_task.wait().await?;
             return Err(e);
         }
     };
@@ -1657,6 +1699,7 @@ pub async fn init_with_options(
                         matches!(iface_config, interface_factory::InterfaceConfig::Plugin(_));
                     if rc.panic_on_interface_error && !is_plugin {
                         let _ = transport_tx.send(TransportMessage::Shutdown).await;
+                        transport_task.wait().await?;
                         return Err(ReticulumError::Interface(e));
                     } else {
                         tracing::warn!("failed to spawn interface: {}", e);
@@ -1689,6 +1732,7 @@ pub async fn init_with_options(
     }
 
     let handle = ReticulumHandle {
+        transport_task: transport_task.clone(),
         transport_tx: transport_tx.clone(),
         interface_transport_tx: interface_transport_tx.clone(),
         config_dir: config_dir.clone(),
@@ -5279,6 +5323,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<TransportMessage>(1);
         let (htx, _hrx) = mpsc::channel::<rns_interface::traits::InterfaceHandle>(1);
         ReticulumHandle {
+            transport_task: TransportTask(Arc::new(Mutex::new(TransportTaskState::Finished(Ok(
+                (),
+            ))))),
             interface_transport_tx: tx.clone(),
             transport_tx: tx,
             config_dir: PathBuf::from("/tmp/dummy"),
@@ -5295,6 +5342,153 @@ mod tests {
             network_identity: None,
             discovery: Arc::new(DiscoveryRuntime::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_is_shared_and_cancellation_safe() {
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let mut handle = dummy_handle();
+        handle.transport_task = TransportTask::spawn(async move {
+            pending.await.unwrap();
+        });
+        handle.shutdown.trigger();
+        // Cancellation must leave the task owned and available to a new waiter.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), handle.wait_shutdown())
+                .await
+                .is_err()
+        );
+        let other = handle.clone();
+        let mut first = Box::pin(handle.wait_shutdown());
+        let mut second = Box::pin(other.wait_shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let (a, b) = tokio::join!(first, second);
+        a.unwrap();
+        b.unwrap();
+        handle.wait_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_reports_actor_panic_to_every_waiter() {
+        let mut handle = dummy_handle();
+        handle.transport_task = TransportTask::spawn(async {
+            panic!("injected actor failure");
+        });
+        handle.shutdown.trigger();
+        for _ in 0..2 {
+            assert!(
+                handle
+                    .wait_shutdown()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected actor failure")
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_wait_flushes_sqlite_and_releases_owner_lock() {
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InboundPacket, InterfaceEntry};
+        use rns_transport::storage::{Reply, Request, SqliteOptions, StorageHandle, StorageRole};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE_NAME),
+            "reticulum:\n  share_instance: false\n  sqlite_storage: true\nstorage:\n  announce_batch_delay_ms: 10000\nlogging:\n  rss_interval: 0\ninterfaces: []\n").unwrap();
+        let handle = init(
+            Some(dir.path().to_str().unwrap()),
+            None,
+            ShutdownSignal::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        let (out, _output) = mpsc::channel::<Bytes>(16);
+        let mut entry = InterfaceEntry::new(
+            "shutdown-test".into(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            1000000,
+            500,
+            out,
+        );
+        entry.ingress = rns_transport::ingress::IngressController::disabled();
+        handle
+            .transport_tx
+            .send(TransportMessage::RegisterInterface { id: 999, entry })
+            .await
+            .unwrap();
+        let (callback_tx, mut callbacks) = mpsc::channel(4);
+        handle
+            .transport_tx
+            .send(TransportMessage::RegisterAnnounceHandler {
+                aspect_filter: Some("lxmf.delivery".into()),
+                receive_path_responses: true,
+                callback_tx,
+            })
+            .await
+            .unwrap();
+        let identity = Identity::new();
+        let (dest, raw) = crate::application::build_announce_packet(
+            &identity,
+            "lxmf.delivery",
+            Some(b"shutdown"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        handle
+            .transport_tx
+            .send(TransportMessage::Inbound(InboundPacket {
+                raw: raw.into(),
+                interface_id: 999,
+                rssi: None,
+                snr: None,
+                q: None,
+            }))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), callbacks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.destination_hash, dest);
+        // No storage RPC barrier: stop as soon as the announce is admitted,
+        // without waiting out the configured ten-second batch window.
+        handle.shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let database = dir.path().join("storage/sqlite/transport.sqlite");
+        // Opening another owner proves the old worker has closed, not merely
+        // received a Shutdown message. Recalled data proves commit completed.
+        let worker =
+            StorageHandle::open_sqlite(database, StorageRole::Standalone, SqliteOptions::default())
+                .await
+                .unwrap();
+        assert!(matches!(
+            worker
+                .try_submit(Request::Announce(dest))
+                .unwrap()
+                .wait()
+                .await
+                .unwrap(),
+            Reply::Announce(Some(_))
+        ));
+        worker.try_shutdown().unwrap().wait().await.unwrap();
     }
 
     struct StaticStamper;

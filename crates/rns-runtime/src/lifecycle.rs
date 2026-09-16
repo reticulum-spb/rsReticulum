@@ -44,10 +44,13 @@ impl ShutdownSignal {
     }
 
     pub async fn wait(&self) {
+        // Subscribe before checking the flag so notify_waiters cannot be lost
+        // between the flag check and creation of the notification future.
+        let notified = self.notify.notified();
         if self.is_triggered() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -87,7 +90,7 @@ impl Default for ExitHandler {
     }
 }
 
-/// Install a Ctrl-C (SIGINT) handler that trips `shutdown`. Returned receiver
+/// Install Ctrl-C (SIGINT) and Unix SIGTERM handlers that trip `shutdown`. Returned receiver
 /// yields once on signal for await-based callers.
 ///
 /// On unix the OS-level registration happens synchronously in this call — a
@@ -97,6 +100,19 @@ impl Default for ExitHandler {
 pub fn install_signal_handlers(shutdown: ShutdownSignal) -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel(1);
     let shutdown_clone = shutdown.clone();
+
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            let shutdown = shutdown.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                sigterm.recv().await;
+                signal_shutdown(shutdown, tx).await;
+            });
+        }
+        Err(e) => tracing::warn!(error = %e, "SIGTERM registration failed"),
+    }
 
     #[cfg(unix)]
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {

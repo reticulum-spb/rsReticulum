@@ -152,6 +152,12 @@ pub(crate) async fn main() {
 
             shutdown.wait().await;
             tracing::info!("rnsd-rs shutting down");
+            if let Err(error) = handle.wait_shutdown().await {
+                tracing::error!(%error, "transport shutdown failed");
+                shutdown.request_exit(1);
+            } else {
+                tracing::info!("transport shutdown completed");
+            }
             let exit_code = shutdown.exit_code();
             if exit_code != 0 {
                 std::process::exit(exit_code.into());
