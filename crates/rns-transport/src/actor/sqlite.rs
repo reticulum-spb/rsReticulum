@@ -136,6 +136,7 @@ struct AdmissionMetrics {
     max_queue_entries: usize,
     max_queue_bytes: usize,
     max_staged_bytes: usize,
+    gc_between_batches: u64,
 }
 
 impl Default for AdmissionMetrics {
@@ -149,6 +150,7 @@ impl Default for AdmissionMetrics {
             max_queue_entries: 0,
             max_queue_bytes: 0,
             max_staged_bytes: 0,
+            gc_between_batches: 0,
         }
     }
 }
@@ -161,6 +163,7 @@ impl AdmissionMetrics {
             max_queue_entries = self.max_queue_entries,
             max_queue_bytes = self.max_queue_bytes,
             max_staged_bytes = self.max_staged_bytes,
+            gc_between_batches = self.gc_between_batches,
             "SQLite admission summary"
         );
         self.flushes.report();
@@ -185,6 +188,7 @@ struct Reads {
 }
 #[derive(Debug)]
 struct Prepared {
+    committed_batch: bool,
     message: Option<TransportMessage>,
     entries: Vec<RecentAnnounce>,
     raw: HashMap<[u8; 32], Vec<u8>>,
@@ -657,6 +661,25 @@ impl TransportActor {
         state.raw.clear();
     }
 
+    /// A GC opportunity may precede already-admitted ordinary input, but not
+    /// control/priority messages or unclassified input. Recheck after commit.
+    fn sqlite_gc_slot_ready(&self) -> bool {
+        let state = self.sqlite.as_ref().unwrap();
+        state.error.is_none()
+            && !matches!(state.gc_phase, GcPhase::Idle)
+            && tokio::time::Instant::now() >= state.next_gc
+            && self.inbound_queues.snapshot().total == 0
+            && self.rx.is_empty()
+            && self.control_rx.as_ref().is_none_or(|rx| rx.is_empty())
+            && state.queue.iter().all(|q| {
+                q.priority == 0
+                    && matches!(
+                        q.message,
+                        TransportMessage::Inbound(_) | TransportMessage::AdmittedInbound(_)
+                    )
+            })
+    }
+
     pub(super) async fn run_sqlite(mut self) -> Self {
         let mut tick = tokio::time::interval(Duration::from_millis(JOB_INTERVAL_MS));
         let mut ingress_tick = tokio::time::interval(crate::backbone_ingress::INTERVAL);
@@ -668,6 +691,9 @@ impl TransportActor {
         let mut background: Option<JoinHandle<storage::Result<BackgroundResult>>> = None;
         let mut background_started = std::time::Instant::now();
         let mut invalidate_after_job = Vec::new();
+        // One non-accumulating GC credit per successful foreground batch.
+        let mut gc_commit_slot = false;
+        let mut gc_slot_active = false;
         let mut stopping = false;
         let mut was_foreground = true;
         let mut interface_open = true;
@@ -677,7 +703,22 @@ impl TransportActor {
             if metrics.since.elapsed() >= Duration::from_secs(60) {
                 metrics.report();
             }
-            if job.is_none() {
+            if !stopping
+                && job.is_none()
+                && background.is_none()
+                && gc_commit_slot
+                && invalidate_after_job.is_empty()
+                && self.sqlite.as_ref().unwrap().writes.is_empty()
+                && self.sqlite_gc_slot_ready()
+            {
+                let state = self.sqlite.as_mut().unwrap();
+                gc_commit_slot = false;
+                gc_slot_active = true;
+                state.metrics.gc_between_batches += 1;
+                background_started = std::time::Instant::now();
+                background = Some(tokio::spawn(gc_page(state.worker.clone(), state.gc_phase)));
+            }
+            if job.is_none() && !gc_slot_active {
                 // A prepared read may have relied on a cache hit. Invalidate
                 // only after its message has consumed that entry.
                 if !invalidate_after_job.is_empty() {
@@ -685,6 +726,8 @@ impl TransportActor {
                         &mut invalidate_after_job,
                     )));
                 }
+                let reserve_gc_slot =
+                    !stopping && background.is_none() && self.sqlite_gc_slot_ready();
                 // Ordinary announces and independent requests for unknown paths
                 // can pass staged writes. Reads of stored packets remain barriers.
                 let state = self.sqlite.as_ref().unwrap();
@@ -758,7 +801,15 @@ impl TransportActor {
                 } else if !state.writes.is_empty() && independent_path_request {
                     state.metrics.flushes.unknown_path_bypasses += 1;
                 }
-                let message = state.queue.pop_front().map(|queued| {
+                // Commit separately so the next announce cannot immediately
+                // create another dirty batch before GC gets its opportunity.
+                // This never brings the existing flush deadline forward.
+                let queued = if flush && reserve_gc_slot {
+                    None
+                } else {
+                    state.queue.pop_front()
+                };
+                let message = queued.map(|queued| {
                     let msg = queued.message;
                     state.bytes = state.bytes.saturating_sub(weight(&msg));
                     let admission = queued.enqueued.elapsed();
@@ -850,6 +901,7 @@ impl TransportActor {
                     // An arrival can wait for at most this already-started page;
                     // no second GC page is queued behind it.
                     let phase = state.gc_phase;
+                    gc_commit_slot = false;
                     background_started = std::time::Instant::now();
                     background = Some(tokio::spawn(gc_page(worker, phase)));
                 }
@@ -874,6 +926,7 @@ impl TransportActor {
                     self.sqlite.as_mut().unwrap().busy=background.is_some();
                     match result {
                         Ok(Ok(prepared))=> {
+                            gc_commit_slot |= prepared.committed_batch;
                             self.invalidate_sqlite_cache(prepared.invalidate);
                             for a in prepared.entries {
                                 let state=self.sqlite.as_mut().unwrap();
@@ -896,6 +949,7 @@ impl TransportActor {
                 }
                 result=async {background.as_mut().unwrap().await}, if background.is_some()=> {
                     background=None;
+                    gc_slot_active=false;
                     self.sqlite.as_mut().unwrap().busy=job.is_some();
                     match result {
                         Ok(Ok(result)) => {
@@ -1092,8 +1146,10 @@ async fn prepare_inner(
     mut message: Option<TransportMessage>,
     reads: Reads,
 ) -> storage::Result<Prepared> {
+    let committed_batch = !writes.is_empty();
     write(&worker, writes).await?;
     let mut result = Prepared {
+        committed_batch,
         message: None,
         entries: Vec::new(),
         raw: HashMap::new(),
@@ -1622,6 +1678,135 @@ mod tests {
         interface.ingress = crate::ingress::IngressController::disabled();
         actor.interfaces.insert(1, interface);
         (actor, tx, batches, dir)
+    }
+
+    #[tokio::test]
+    async fn gc_runs_after_commit_before_queued_announce() {
+        struct Ordered {
+            db: storage::MemoryTransportStorage,
+            events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+            read: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl storage::TransportStorage for Ordered {
+            fn execute(&mut self, request: Request) -> storage::Result<Reply> {
+                let event = match &request {
+                    Request::Apply(_) => Some("commit"),
+                    Request::CleanKnownPage { limit, .. } => {
+                        assert_eq!(*limit, 32);
+                        Some("gc")
+                    }
+                    Request::Announce(_) => Some("announce"),
+                    _ => None,
+                };
+                let result = self.db.execute(request);
+                if let Some(event) = event {
+                    self.events.lock().unwrap().push(event);
+                    if event == "announce" {
+                        if let Some(read) = self.read.take() {
+                            let _ = read.send(());
+                        }
+                    }
+                }
+                result
+            }
+        }
+        let (mut actor, tx, _, dir) = batch_actor(false).await;
+        actor
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .worker
+            .try_shutdown()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        actor.sqlite.as_mut().unwrap().worker = StorageHandle::start(8, move || {
+            Ok(Ordered {
+                db: Default::default(),
+                events: recorded,
+                read: Some(read_tx),
+            })
+        })
+        .await
+        .unwrap();
+        let (first, first_dest) = make_valid_announce("lxmf.delivery", 1);
+        actor.handle_message(inbound(first));
+        assert_eq!(actor.sqlite.as_ref().unwrap().writes.len(), 1);
+        let (next, next_dest) = make_valid_announce("lxmf.delivery", 1);
+        actor.enqueue_sqlite(inbound(next));
+        let state = actor.sqlite.as_mut().unwrap();
+        state.gc_phase = GcPhase::Clean(None);
+        state.next_gc = tokio::time::Instant::now();
+        state.flush_at = Some(tokio::time::Instant::now());
+        let task = tokio::spawn(actor.run_sqlite());
+        tokio::time::timeout(Duration::from_secs(5), read_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&events.lock().unwrap()[..3], &["commit", "gc", "announce"]);
+        // RPC barriers also prove both announces survived GC and were committed.
+        for destination_hash in [first_dest, next_dest] {
+            assert!(matches!(
+                query(&tx, Q::Recall { destination_hash }).await,
+                R::Announce(Some(_))
+            ));
+        }
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        assert!(task.await.unwrap().sqlite_snapshot_ready());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_slot_respects_priority_rpc_and_rest_deadline() {
+        let (mut actor, tx, _, dir) = batch_actor(false).await;
+        let state = actor.sqlite.as_mut().unwrap();
+        state.gc_phase = GcPhase::Clean(None);
+        state.next_gc = tokio::time::Instant::now();
+        let (raw, _) = make_valid_announce("lxmf.delivery", 1);
+        actor.enqueue_sqlite(inbound(raw));
+        assert!(
+            actor.sqlite_gc_slot_ready(),
+            "ordinary queued announces permit GC"
+        );
+        actor.sqlite.as_mut().unwrap().next_gc =
+            tokio::time::Instant::now() + Duration::from_secs(3600);
+        assert!(!actor.sqlite_gc_slot_ready());
+        actor.sqlite.as_mut().unwrap().next_gc = tokio::time::Instant::now();
+        actor.enqueue_sqlite(path_request_message([0xF3; 16]));
+        assert!(
+            !actor.sqlite_gc_slot_ready(),
+            "queued priority input takes precedence"
+        );
+        actor.sqlite.as_mut().unwrap().queue.clear();
+        let (reply, _response) = tokio::sync::oneshot::channel();
+        actor.enqueue_sqlite(TransportMessage::Rpc {
+            query: Q::Recall {
+                destination_hash: [0; 16],
+            },
+            response_tx: reply,
+        });
+        assert!(!actor.sqlite_gc_slot_ready(), "queued RPC takes precedence");
+        actor.sqlite.as_mut().unwrap().queue.clear();
+        tx.send(path_request_message([0xF3; 16])).await.unwrap();
+        assert!(
+            !actor.sqlite_gc_slot_ready(),
+            "unclassified channel input takes precedence"
+        );
+        actor
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .worker
+            .try_shutdown()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn path_request_message(dest: [u8; 16]) -> TransportMessage {
