@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// add; the other variants are system-populated. UIs distinguish operator
 /// blocks from automatic defences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum BlackholeReason {
     #[default]
     Manual,
@@ -40,6 +41,7 @@ impl BlackholeReason {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct BlackholeEntry {
     /// Insertion time (Unix seconds).
     pub created: f64,
@@ -64,7 +66,9 @@ impl BlackholeEntry {
 }
 
 #[derive(Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct BlackholeTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<IdentityHash, BlackholeEntry>,
 }
 

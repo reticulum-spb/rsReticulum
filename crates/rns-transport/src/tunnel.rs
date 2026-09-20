@@ -6,14 +6,17 @@ use crate::messages::InterfaceId;
 /// Tunnels let transports stitch together routes that cross a network
 /// boundary the underlying interface cannot reach directly.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct TunnelEntry {
     pub tunnel_id: [u8; 32],
     pub interface_id: InterfaceId,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub tunnel_paths: HashMap<[u8; 16], TunnelPath>,
     pub expires: f64,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct TunnelPath {
     pub timestamp: f64,
     pub next_hop: Option<[u8; 16]>,
@@ -24,7 +27,9 @@ pub struct TunnelPath {
 }
 
 #[derive(Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct TunnelTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<[u8; 32], TunnelEntry>,
 }
 

@@ -17,12 +17,17 @@ enum TransitProofValidation {
 
 /// Admission result owned by the actor. No Clone: a packet must be dispatched
 /// once, without repeating IFAC, dedup, hop adjustment or ingress accounting.
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PreparedInbound {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_bytes))]
     pub(super) raw: bytes::Bytes,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub(super) header: rns_wire::header::PacketHeader,
     pub(super) data_offset: usize,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     admitted_on: Option<crate::tx_queue::InterfaceTx>,
     pub(super) interface_id: InterfaceId,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = visit_verified_announce))]
     announce: Option<VerifiedAnnounce>,
     path_request: Option<super::outbound::PreparedPathRequest>,
     released_from_ingress: bool,
@@ -1870,4 +1875,17 @@ impl TransportActor {
             TransitProofValidation::InvalidSignature
         }
     }
+}
+
+#[cfg(feature = "memory-profile")]
+fn visit_verified_announce(
+    value: &Option<VerifiedAnnounce>,
+    visitor: &mut allocative::Visitor<'_>,
+) {
+    let mut visitor = visitor.enter_self_sized::<Option<VerifiedAnnounce>>();
+    if let Some((announce, _identity)) = value {
+        // Identity crypto internals are opaque; the owned announce payload is visible.
+        visitor.visit_field(allocative::Key::new("app_data"), &announce.app_data);
+    }
+    visitor.exit();
 }

@@ -35,6 +35,8 @@ impl TransportActor {
     }
 
     pub(super) fn on_tick(&mut self) {
+        #[cfg(feature = "memory-profile")]
+        self.record_memory_profile();
         let now = now_f64();
         if now - self.last_memory_report >= 60.0 {
             if tracing::enabled!(tracing::Level::DEBUG) {

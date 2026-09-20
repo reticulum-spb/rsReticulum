@@ -6,10 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+memory-profile = ["std", "dep:allocative"]
 default = ["std"]
 std = ["rns-crypto/std"]
 
 [dependencies]
+allocative = { version = "0.3.6", optional = true }
 rns-crypto = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }

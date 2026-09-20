@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+memory-profile = ["dep:allocative", "rns-wire/memory-profile"]
 default = []
 sqlite = ["dep:rusqlite", "dep:fs2"]
 sqlite-bundled = ["sqlite", "rusqlite/bundled"]
@@ -16,6 +17,7 @@ sqlite-bundled = ["sqlite", "rusqlite/bundled"]
 mobile-throttle = []
 
 [dependencies]
+allocative = { version = "0.3.6", optional = true }
 rns-crypto = { workspace = true, features = ["std"] }
 rns-wire = { workspace = true, features = ["std"] }
 rns-identity = { workspace = true }

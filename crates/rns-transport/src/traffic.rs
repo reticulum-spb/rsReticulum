@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use crate::messages::InterfaceId;
 
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PacketStats {
     pub rxpps: f64,
     pub txpps: f64,
 }
 
 /// Actor ingress / successful egress admissions on external interfaces only.
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PacketRateCounter {
     pub rx: u64,
     pub tx: u64,
@@ -46,6 +48,7 @@ impl PacketRateCounter {
 
 /// Control-plane packet counts and bytes, excluding IFAC and driver framing.
 #[derive(Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct ByteRateSampler {
     previous: Option<(std::time::Instant, u64, u64)>,
     pub rates: (u64, u64),
@@ -71,6 +74,7 @@ impl ByteRateSampler {
 /// Owned by an interface registration, not by a destination or packet hash.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct ControlTraffic {
     pub arxb: u64,
     pub atxb: u64,
@@ -90,6 +94,7 @@ pub struct ControlTraffic {
 /// Bounded monotonic sampler. The first observation establishes a baseline,
 /// matching Python's transport_traffic_counter initialization.
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub(crate) struct ControlTrafficSampler {
     previous: Option<(std::time::Instant, [u64; 4])>,
 }
@@ -155,6 +160,7 @@ impl ControlTraffic {
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InterfaceTraffic {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -167,7 +173,9 @@ pub struct InterfaceTraffic {
     pub tx_speed: f64,
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct TrafficCounter {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     interfaces: HashMap<InterfaceId, InterfaceTraffic>,
 }
 

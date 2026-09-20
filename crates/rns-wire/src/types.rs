@@ -11,6 +11,7 @@ macro_rules! hash_newtype {
     ) => {
         $(#[$meta])*
         #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+        #[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
         #[repr(transparent)]
         $vis struct $Name(pub(crate) [u8; $N]);
 

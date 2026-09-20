@@ -24,6 +24,7 @@ pub use crate::actor::inbound::PreparedInbound;
 /// to reach an existing shared instance. Several routing rules depend on that
 /// distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum InterfaceRole {
     #[default]
     Normal,
@@ -119,6 +120,7 @@ impl InterfaceDiagnostics for LinkMtuDiagnostics {
 /// Actor-owned receive diagnostics, reset with the interface registration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InboundDiagnostics {
     pub protocol_violations: u64,
     pub ifac_violations: u64,
@@ -127,8 +129,10 @@ pub struct InboundDiagnostics {
 
 /// Metadata and TX handle for one registered interface. The actor owns the
 /// sender; driver code holds only the matching receiver.
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InterfaceEntry {
     pub inbound_diagnostics: InboundDiagnostics,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub diagnostics: Option<std::sync::Arc<dyn InterfaceDiagnostics>>,
     pub name: String,
     pub mode: InterfaceMode,
@@ -136,6 +140,7 @@ pub struct InterfaceEntry {
     pub direction: InterfaceDirection,
     pub bitrate: u64,
     pub mtu: u32,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub tx: crate::tx_queue::InterfaceTx,
     pub ifac_key: Option<[u8; 64]>,
     pub ifac_size: usize,
@@ -149,11 +154,15 @@ pub struct InterfaceEntry {
     /// Shared with the driver so the actor sees online-state flips without
     /// polling. `None` when the driver doesn't expose one (e.g. in-memory test
     /// interfaces).
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub online: Option<Arc<AtomicBool>>,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub rxb: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub txb: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Incremented when outbound admission rejects capacity or egress gating — surfaced in
     /// interface stats to flag a driver whose receiver is falling behind.
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub tx_drops: Arc<std::sync::atomic::AtomicU64>,
     pub ingress: IngressController,
     /// Announces awaiting bandwidth-capped retransmission. Drained in
@@ -259,11 +268,13 @@ impl InterfaceEntry {
 
 /// Announce queued for bandwidth-capped retransmission on an interface.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct QueuedAnnounce {
     pub destination_hash: [u8; 16],
     /// Queue-insertion time (Unix seconds); used as tie-breaker in priority ordering.
     pub time: f64,
     pub hops: u8,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_bytes))]
     pub raw: Bytes,
 }
 

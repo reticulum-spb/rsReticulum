@@ -271,6 +271,7 @@ pub enum Reachability {
 /// Liveness state for a known path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum PathState {
     Unknown = 0x00,
     Unresponsive = 0x01,
@@ -279,6 +280,7 @@ pub enum PathState {
 
 /// Configured operating mode for an interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum InterfaceMode {
     Full,
     PointToPoint,
@@ -294,6 +296,7 @@ pub enum InterfaceMode {
 
 /// Which directions an interface carries traffic in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InterfaceDirection {
     pub inbound: bool,
     pub outbound: bool,

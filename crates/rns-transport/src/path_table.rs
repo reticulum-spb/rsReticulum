@@ -10,6 +10,7 @@ use rns_wire::types::DestHash;
 
 /// One known path to a destination.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PathEntry {
     /// Learn time (Unix seconds).
     pub timestamp: f64,
@@ -89,8 +90,11 @@ impl PathEntry {
 /// Destination-hash → path mapping plus a parallel liveness state map so we
 /// can probe unresponsive paths without rewriting the entries.
 #[derive(Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PathTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<DestHash, PathEntry>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     states: HashMap<DestHash, PathState>,
 }
 

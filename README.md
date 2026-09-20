@@ -445,6 +445,9 @@ runtime: seconds between samples, default `300`, or `0` to disable. To see these
 INFO messages, allow INFO globally or add `rns_runtime::process_memory=info`.
 See [CONFIG.md](CONFIG.md#logging) for the configuration reference.
 
+For object/field memory snapshots, build with the optional `memory-profile`
+feature. See [Memory profiling](MEMORY-PROFILING.md) for collection and comparison.
+
 ## Interface Support
 
 ###### Note: This is alpha, if something doesn't work, open an issue with enough context/information to help contribute to fixing it.

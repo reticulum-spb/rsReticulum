@@ -38,13 +38,17 @@ enum BackgroundResult {
     },
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub(super) struct SqliteState {
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     worker: StorageHandle,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub raw: HashMap<[u8; 32], Vec<u8>>,
     queue: VecDeque<Queued>,
     bytes: usize,
     writes: Vec<Mutation>,
     batch_delay: Duration,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     flush_at: Option<tokio::time::Instant>,
     path_response_flush: bool,
     pub busy: bool,
@@ -54,13 +58,16 @@ pub(super) struct SqliteState {
     last_vacuum: f64,
     vacuum_interval: f64,
     vacuum_pages: u32,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     gc_phase: GcPhase,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     next_gc: tokio::time::Instant,
     gc_started: Option<std::time::Instant>,
     gc_announces: usize,
     gc_packets: usize,
     gc_pages: u64,
     gc_page_time: Duration,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     metrics: AdmissionMetrics,
 }
 
@@ -173,8 +180,10 @@ impl AdmissionMetrics {
     }
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 struct Queued {
     enqueued: std::time::Instant,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     message: TransportMessage,
     priority: u8,
 }

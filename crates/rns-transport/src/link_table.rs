@@ -5,6 +5,7 @@ use rns_wire::types::LinkId;
 
 /// Transport-level state for one forwarded or terminated link.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct LinkEntry {
     /// Registration time (Unix seconds).
     pub timestamp: f64,
@@ -49,7 +50,9 @@ impl From<&LinkEntry> for ExpiredLink {
     }
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct LinkTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<LinkId, LinkEntry>,
 }
 

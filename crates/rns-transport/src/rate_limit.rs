@@ -14,6 +14,7 @@ pub const RATE_PENALTY_BASE: f64 = 60.0;
 pub const RATE_PENALTY_MAX: f64 = 3600.0;
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct RateEntry {
     pub timestamps: Vec<f64>,
     /// Announces per second across the window.
@@ -25,7 +26,9 @@ pub struct RateEntry {
     pub blocked_until: f64,
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct RateTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<DestHash, RateEntry>,
 }
 

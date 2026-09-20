@@ -26,6 +26,8 @@ use rns_wire::receipt::{PacketReceipt, ReceiptStatus};
 
 pub(crate) mod inbound;
 mod maintenance;
+#[cfg(feature = "memory-profile")]
+mod memory_profile;
 mod outbound;
 mod persistence;
 mod rpc;
@@ -34,6 +36,7 @@ mod sqlite;
 
 /// Announces retained by a shared client. Routing owners always learn all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum ClientAnnouncePolicy {
     #[default]
     All,
@@ -45,13 +48,18 @@ pub enum ClientAnnouncePolicy {
 /// task. The single-owner model means the hot path has no shared state and no
 /// locks — callers drive the actor by sending typed commands rather than
 /// reaching into the tables directly.
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct TransportActor {
     #[cfg(feature = "sqlite")]
     sqlite: Option<sqlite::SqliteState>,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     rx: mpsc::Receiver<TransportMessage>,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     control_rx: Option<mpsc::Receiver<TransportMessage>>,
     inbound_queues: crate::inbound_queue::InboundQueues<inbound::PreparedInbound>,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     dataplane_ingress: crate::backbone_ingress::IngressPolicy,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     ingress_origin: tokio::time::Instant,
 
     pub path_table: PathTable,
@@ -59,6 +67,7 @@ pub struct TransportActor {
     pub announce_table: AnnounceTable,
     /// Python `held_announces`: normal queued announces temporarily displaced
     /// while a known-path response occupies `announce_table`.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub held_announces: HashMap<[u8; 16], crate::announce::AnnounceEntry>,
     pub reverse_table: ReverseTable,
     pub tunnel_table: TunnelTable,
@@ -67,31 +76,44 @@ pub struct TransportActor {
     pub blackhole_table: BlackholeTable,
     pub traffic: TrafficCounter,
     packet_rates: crate::traffic::PacketRateCounter,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     interface_rates: HashMap<InterfaceId, crate::traffic::ByteRateSampler>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub packet_metrics: HashMap<[u8; 32], PacketMetrics>,
     pub packet_metrics_order: VecDeque<[u8; 32]>,
 
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub receipt_table: HashMap<[u8; 16], PacketReceipt>,
     /// Truncated packet hash → LXMF msg_id for pairing delivery proofs back
     /// to their originating outbound message.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub receipt_msg_ids: HashMap<[u8; 16], String>,
 
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub interfaces: HashMap<InterfaceId, InterfaceEntry>,
 
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_set))]
     pub local_destinations: HashSet<[u8; 16]>,
     /// Authenticated local link bindings survive destination route changes.
     /// Kept until deregistration even if the interface disappears: fail closed.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     local_link_interfaces: HashMap<[u8; 16], InterfaceId>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_channel_map))]
     pub destination_channels:
         HashMap<[u8; 16], mpsc::Sender<crate::link_messages::DestinationEvent>>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub path_requests: HashMap<[u8; 16], f64>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub inflight_path_requests: HashMap<[u8; 16], InflightPathRequest>,
     /// Python `discovery_path_requests`: external interfaces waiting for a
     /// matching announce while this transport recursively searches elsewhere.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub discovery_path_requests: HashMap<[u8; 16], DiscoveryPathRequest>,
     /// Python `discovery_pr_tags`: destination hash plus truncated path-request tag.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_set))]
     pub discovery_pr_tags: HashSet<Vec<u8>>,
     /// Previous generation, retained until the next count-triggered rotation.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_set))]
     pub discovery_pr_tags_prev: HashSet<Vec<u8>>,
     /// Python `pending_discovery_prs`: failed-link rediscovery requests queued
     /// for throttled emission.
@@ -99,20 +121,27 @@ pub struct TransportActor {
     /// Destination/interface pairs temporarily barred from installing paths.
     /// Used when a Direct LinkRequest timed out on one route, so the next
     /// path request can discover alternates instead of instantly reusing it.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub path_interface_suppressions: HashMap<([u8; 16], InterfaceId), f64>,
     last_discovery_pr_tx: f64,
     /// External interface waiting for a path response from a local shared client.
     /// Python calls this `pending_local_path_requests`.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub path_states: HashMap<[u8; 16], PathState>,
 
     /// Tasks blocked on `AwaitPath`. Each entry pairs the oneshot reply with
     /// the registration timestamp so `expire_path_waiters` can bound how long
     /// a caller can wait before receiving a negative result.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_waiters))]
     pub path_waiters: HashMap<[u8; 16], Vec<(tokio::sync::oneshot::Sender<bool>, f64)>>,
 
     last_tables_cull: f64,
     last_memory_report: f64,
+    #[cfg(feature = "memory-profile")]
+    #[allocative(skip)]
+    memory_profile: Option<crate::memory_profile::Recorder>,
     last_links_check: f64,
     last_receipts_check: f64,
     last_announces_check: f64,
@@ -121,6 +150,7 @@ pub struct TransportActor {
     /// actually scheduled, so a tick that fires before storage init doesn't
     /// consume the boot slot.
     last_announce_cache_sweep: f64,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     resource_proof_cache: VecDeque<([u8; 32], [u8; 16], bytes::Bytes)>,
     last_blackhole_check: f64,
     last_rate_cull: f64,
@@ -159,6 +189,7 @@ pub struct TransportActor {
     /// runtime's link layer so the LINKIDENTIFY handler can tear down links
     /// from blackholed identities (Python 1.3.8 Link.py:966-968) without an
     /// actor round-trip. Rebuilt on every blackhole-table mutation.
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub blackholed_snapshot: Arc<std::sync::RwLock<HashSet<[u8; 16]>>>,
 
     /// True when connected to a shared Reticulum instance — the transport
@@ -195,6 +226,7 @@ pub struct TransportActor {
     pub pending_tunnel_entries: Vec<crate::persistence::PersistedTunnelEntry>,
 
     /// Cache of recently learnt announces, keyed by dest_hash for O(1) upsert.
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub recent_announces: HashMap<[u8; 16], RecentAnnounce>,
 
     /// Grace window before cache cleaning runs — protects freshly restored
@@ -220,6 +252,7 @@ pub struct TransportActor {
 /// and dominated the periodic state snapshot. `retained` pins the entry
 /// against the cull sweep (`RetainDestination` / `UnretainDestination`).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct RecentAnnounce {
     pub dest_hash: [u8; 16],
     pub hops: u8,
@@ -244,6 +277,7 @@ pub struct RecentAnnounce {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct DiscoveryPathRequest {
     /// Unique live interfaces waiting for this destination.
     pub requesting_interfaces: Vec<InterfaceId>,
@@ -252,24 +286,29 @@ pub struct DiscoveryPathRequest {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InflightPathRequest {
     pub started_at: f64,
     pub receiving_interface: InterfaceId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PendingDiscoveryPathRequest {
     pub destination_hash: [u8; 16],
     pub blocked_interface: Option<InterfaceId>,
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 struct AnnounceHandlerRegistration {
     aspect_filter: Option<String>,
     receive_path_responses: bool,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     tx: tokio::sync::mpsc::Sender<crate::messages::AnnounceHandlerEvent>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PacketMetrics {
     pub rssi: Option<f32>,
     pub snr: Option<f32>,
@@ -389,6 +428,8 @@ impl TransportActor {
             path_waiters: HashMap::new(),
             last_tables_cull: 0.0,
             last_memory_report: 0.0,
+            #[cfg(feature = "memory-profile")]
+            memory_profile: crate::memory_profile::Recorder::from_env(),
             last_links_check: 0.0,
             last_receipts_check: 0.0,
             last_announces_check: 0.0,

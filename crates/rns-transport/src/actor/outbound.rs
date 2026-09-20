@@ -2,6 +2,7 @@ use super::*;
 use crate::now_f64;
 
 #[derive(Debug)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub(super) struct PreparedPathRequest {
     requested_dest: [u8; 16],
     requestor_transport_id: Option<[u8; 16]>,

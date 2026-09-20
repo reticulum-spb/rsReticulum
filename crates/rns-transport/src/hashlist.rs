@@ -8,8 +8,11 @@ use crate::constants::HASHLIST_MAXSIZE;
 /// `previous` and a new empty `current` begins — giving a bounded, amortised
 /// O(1) membership structure with a window of up to `max_size` entries.
 #[derive(Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PacketHashlist {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_set))]
     current: HashSet<[u8; 32]>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_set))]
     previous: HashSet<[u8; 32]>,
     max_size: usize,
 }

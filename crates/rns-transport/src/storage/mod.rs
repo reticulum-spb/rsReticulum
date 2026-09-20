@@ -73,6 +73,7 @@ pub enum StorageRole {
 /// Owners are stable across restarts, never runtime InterfaceIds. Cache tokens
 /// are caller-assigned and must be explicitly released when retention ends.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum PacketOwner {
     Path(DestinationHash),
     Tunnel {
@@ -92,6 +93,7 @@ impl PacketOwner {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum Mutation {
     /// Inserts metadata and optionally its raw packet in the same transaction.
     /// Re-announcing preserves existing pins and last-used time. Clearing a

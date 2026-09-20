@@ -13,6 +13,7 @@ use crate::hashlist::PacketHashlist;
 use crate::path_table::PathTable;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PersistedPathEntry {
     pub destination_hash: Vec<u8>,
     pub timestamp: f64,
@@ -936,6 +937,7 @@ pub(crate) fn convert_legacy_announce_entries(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PersistedTunnelEntry {
     pub tunnel_id: Vec<u8>,
     pub interface_id: u64,
@@ -952,6 +954,7 @@ pub struct PersistedTunnelEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PersistedTunnelPath {
     pub destination_hash: Vec<u8>,
     #[serde(default)]

@@ -58,7 +58,9 @@ impl IngressOverrides {
 
 /// An announce parked in the hold buffer, awaiting release.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct HeldAnnounce {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_bytes))]
     pub raw: Bytes,
     pub destination_hash: [u8; 16],
     /// Hops at reception — lower values win release priority.
@@ -67,6 +69,7 @@ pub struct HeldAnnounce {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct IngressController {
     pub(crate) traffic: crate::traffic::ControlTraffic,
     pub(crate) traffic_sampler: crate::traffic::ControlTrafficSampler,
@@ -89,6 +92,7 @@ pub struct IngressController {
     pr_burst_cooldown: u8,
     /// Earliest instant at which the next held announce may be released.
     held_release: Instant,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     held_announces: HashMap<[u8; 16], HeldAnnounce>,
 
     burst_freq_new: f64,

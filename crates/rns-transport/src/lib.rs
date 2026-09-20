@@ -35,3 +35,6 @@ pub mod storage;
 pub mod traffic;
 pub mod tunnel;
 pub mod tx_queue;
+
+#[cfg(feature = "memory-profile")]
+pub mod memory_profile;

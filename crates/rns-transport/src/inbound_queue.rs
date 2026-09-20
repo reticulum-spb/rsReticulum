@@ -26,6 +26,7 @@ impl TrafficClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InboundQueueLimits([usize; 4]);
 
 impl Default for InboundQueueLimits {
@@ -73,6 +74,7 @@ pub struct InboundQueueStats {
 /// Single-owner storage: snapshot reads and queue mutations are serialized by
 /// the actor, with no extra mutex or unbounded intermediate buffer.
 #[derive(Debug)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct InboundQueues<T> {
     queues: [VecDeque<T>; 4],
     limits: InboundQueueLimits,

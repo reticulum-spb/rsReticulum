@@ -8,6 +8,7 @@ use rns_wire::types::TruncatedHash;
 /// along the same path. Entries expire after `REVERSE_TIMEOUT` — long enough
 /// to tolerate slow links, short enough that stale routes don't accumulate.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct ReverseEntry {
     pub timestamp: f64,
     pub receiving_interface: InterfaceId,
@@ -18,7 +19,9 @@ pub struct ReverseEntry {
     pub outbound_interface: Option<InterfaceId>,
 }
 
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct ReverseTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<TruncatedHash, ReverseEntry>,
 }
 

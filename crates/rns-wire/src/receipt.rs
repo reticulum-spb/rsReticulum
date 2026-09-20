@@ -8,6 +8,7 @@ pub use crate::constants::{EXPL_LENGTH, IMPL_LENGTH};
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub enum ReceiptStatus {
     Sent = 0x01,
     Delivered = 0x02,
@@ -19,6 +20,7 @@ pub enum ReceiptStatus {
 
 /// Tracks a sent packet until it is delivered, times out, or is culled.
 #[allow(missing_docs)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct PacketReceipt {
     pub hash: [u8; 32],
     pub truncated_hash: [u8; 16],
@@ -32,8 +34,11 @@ pub struct PacketReceipt {
 /// Optional callbacks invoked when a receipt transitions out of `Sent`.
 #[allow(missing_docs)]
 #[derive(Default)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct ReceiptCallbacks {
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub delivery: Option<ReceiptCallback>,
+    #[cfg_attr(feature = "memory-profile", allocative(skip))]
     pub timeout: Option<ReceiptCallback>,
 }
 

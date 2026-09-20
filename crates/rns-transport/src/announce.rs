@@ -5,6 +5,7 @@ use rns_wire::types::DestHash;
 
 /// Rebroadcast state for a single announce.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct AnnounceEntry {
     /// Receive time (Unix seconds).
     pub timestamp: f64,
@@ -27,7 +28,9 @@ pub struct AnnounceEntry {
 }
 
 /// Table of pending announce rebroadcasts, keyed by destination hash.
+#[cfg_attr(feature = "memory-profile", derive(allocative::Allocative))]
 pub struct AnnounceTable {
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     entries: HashMap<DestHash, AnnounceEntry>,
 }
 
