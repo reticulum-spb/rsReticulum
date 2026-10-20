@@ -12,6 +12,56 @@ use rns_transport::messages::{TransportQuery, TransportQueryResponse};
 
 const APP_NAME: &str = "example_utilities.echo.request";
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct EchoConfig {
+    announce_interval: u64,
+    app_name: String,
+}
+
+impl Default for EchoConfig {
+    fn default() -> Self {
+        Self {
+            announce_interval: 300,
+            app_name: APP_NAME.to_owned(),
+        }
+    }
+}
+
+impl EchoConfig {
+    fn load(dir: &Path, create: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = dir.join("config.yaml");
+        let config: Self = match std::fs::read_to_string(&path) {
+            Ok(contents) => serde_saphyr::from_str(&contents)
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let config = Self::default();
+                if create {
+                    std::fs::create_dir_all(dir)?;
+                    std::fs::write(&path, serde_saphyr::to_string(&config)?)?;
+                }
+                config
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if config.announce_interval == 0
+            || tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(config.announce_interval))
+                .is_none()
+        {
+            return Err(format!(
+                "{}: announce_interval must be a positive, representable interval in seconds",
+                path.display()
+            )
+            .into());
+        }
+        if config.app_name.trim().is_empty() {
+            return Err(format!("{}: app_name must not be empty", path.display()).into());
+        }
+        Ok(config)
+    }
+}
+
 #[derive(Parser)]
 #[command(about = "Reticulum echo server and client")]
 struct Args {
@@ -27,7 +77,7 @@ struct Args {
     #[arg(long, conflicts_with = "destination")]
     identity: bool,
 
-    /// Server storage directory for identity and requests.log [default: ~/.rsEcho]
+    /// Echo directory for config.yaml, identity and requests.log [default: ~/.rsEcho]
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 }
@@ -118,14 +168,19 @@ fn log_request(packet: &InboundPacket, signal: &Signal) {
 #[tokio::main]
 async fn main() -> rns_examples::ExampleResult {
     let args = Args::parse();
+    let data_dir = match args.data_dir {
+        Some(path) => path,
+        None => default_data_dir()?,
+    };
+    let config = EchoConfig::load(&data_dir, !args.identity && args.destination.is_none())?;
     if args.identity {
-        let data_dir = match args.data_dir {
-            Some(path) => path,
-            None => default_data_dir()?,
-        };
         let identity = Identity::from_file(&data_dir.join("identity"))?;
-        let destination =
-            Destination::new(Some(&identity), Direction::In, DestType::Single, APP_NAME)?;
+        let destination = Destination::new(
+            Some(&identity),
+            Direction::In,
+            DestType::Single,
+            &config.app_name,
+        )?;
         println!("{}", destination.hex_hash());
         return Ok(());
     }
@@ -136,7 +191,7 @@ async fn main() -> rns_examples::ExampleResult {
         let receipt = send_packet(
             &runtime,
             hash,
-            APP_NAME,
+            &config.app_name,
             DestType::Single,
             &rns_crypto::random::random_bytes(32),
             Some(Duration::from_secs(12)),
@@ -153,25 +208,25 @@ async fn main() -> rns_examples::ExampleResult {
         return Ok(());
     }
 
-    let data_dir = match args.data_dir {
-        Some(path) => path,
-        None => default_data_dir()?,
-    };
     let (identity, log) = server_storage(&data_dir)?;
     tracing::subscriber::set_global_default(file_logger(log))?;
     let (runtime, _shutdown) = rns_examples::runtime(args.config.as_deref()).await?;
     let mut destination =
-        RegisteredDestination::single(runtime.clone(), identity, APP_NAME).await?;
+        RegisteredDestination::single(runtime.clone(), identity, &config.app_name).await?;
     destination.set_proof_strategy(ProofStrategy::ProveAll);
+    destination.announce(None).await?;
+    let period = Duration::from_secs(config.announce_interval);
+    let mut announces = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    announces.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     println!(
-        "Echo server <{}> running; hit enter to announce",
-        destination.hex_hash()
+        "Echo server <{}> running; announcing every {} seconds",
+        destination.hex_hash(),
+        config.announce_interval,
     );
     println!("Server data: {}", data_dir.display());
     loop {
         tokio::select! {
-            line = rns_examples::read_line() => {
-                line?;
+            _ = announces.tick() => {
                 destination.announce(None).await?;
             }
             packet = destination.recv() => {
@@ -187,6 +242,49 @@ async fn main() -> rns_examples::ExampleResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_defaults_and_custom_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("echo");
+        let config = EchoConfig::load(&dir, false).unwrap();
+        assert_eq!(config.announce_interval, 300);
+        assert_eq!(config.app_name, APP_NAME);
+        assert!(!dir.exists());
+        EchoConfig::load(&dir, true).unwrap();
+        assert!(dir.join("config.yaml").is_file());
+        let config = EchoConfig::load(&dir, false).unwrap();
+        assert_eq!(config.announce_interval, 300);
+        assert_eq!(config.app_name, APP_NAME);
+        std::fs::write(
+            dir.join("config.yaml"),
+            "announce_interval: 15\napp_name: custom.echo.request\n",
+        )
+        .unwrap();
+        let config = EchoConfig::load(&dir, true).unwrap();
+        assert_eq!(config.announce_interval, 15);
+        assert_eq!(config.app_name, "custom.echo.request");
+        std::fs::write(dir.join("config.yaml"), "announce_interval: 60\n").unwrap();
+        assert_eq!(EchoConfig::load(&dir, false).unwrap().app_name, APP_NAME);
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_and_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        for contents in [
+            "announce_interval: 0\n",
+            "announce_interval: -1\n",
+            "announce_interval: invalid\n",
+            "app_name: ' '\n",
+            "announce_interva: 30\n",
+            "app_name: [\n",
+        ] {
+            let path = temp.path().join("config.yaml");
+            std::fs::write(&path, contents).unwrap();
+            assert!(EchoConfig::load(temp.path(), true).is_err(), "{contents}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+        }
+    }
 
     #[test]
     fn server_identity_survives_restart_and_log_is_appended() {

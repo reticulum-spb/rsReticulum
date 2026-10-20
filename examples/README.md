@@ -36,7 +36,21 @@ cargo run -p rns-examples --bin echo -- --data-dir /tmp/rsEcho
 cargo run -p rns-examples --bin echo -- --destination <destination-hash>
 ```
 
-Press Enter in server mode to announce the destination. Client mode sends one
+The server creates `config.yaml` in its data directory if it is missing:
+
+```yaml
+announce_interval: 300
+app_name: example_utilities.echo.request
+```
+
+`announce_interval` is a positive integer in seconds. The server announces
+immediately on startup, then periodically without requiring keyboard input.
+Restart echo after changing the configuration. Missing fields use the defaults
+shown above. `app_name` applies to the server, client and `--identity`; changing
+it changes the destination address even with the same saved identity. Configure
+the same `app_name` on the client and server.
+
+Client mode sends one
 request and prints the round-trip time without creating server storage.
 Use `echo --identity` (optionally with `--data-dir PATH`) to print only the saved
 server destination address and exit without starting Reticulum or writing files.

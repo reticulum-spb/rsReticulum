@@ -1958,6 +1958,7 @@ dependencies = [
  "rns-transport",
  "rns-wire",
  "serde",
+ "serde-saphyr",
  "tempfile",
  "tokio",
  "tracing",
