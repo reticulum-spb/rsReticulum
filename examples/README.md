@@ -38,6 +38,9 @@ cargo run -p rns-examples --bin echo -- --destination <destination-hash>
 
 Press Enter in server mode to announce the destination. Client mode sends one
 request and prints the round-trip time without creating server storage.
+Use `echo --identity` (optionally with `--data-dir PATH`) to print only the saved
+server destination address and exit without starting Reticulum or writing files.
+The identity must already exist; this option cannot be combined with `--destination`.
 When reception metrics are available, the server records `rssi_dbm` and `snr_db`
 in its log and prints RSSI/SNR to the console. The client displays RSSI/SNR
 for the received proof reply alongside the round-trip time. These are local

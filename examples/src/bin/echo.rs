@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
-use rns_identity::destination::{DestType, ProofStrategy};
+use rns_identity::destination::{DestType, Destination, Direction, ProofStrategy};
 use rns_identity::identity::Identity;
 use rns_runtime::application::{InboundPacket, RegisteredDestination, await_path, send_packet};
 use rns_runtime::reticulum::ReticulumHandle;
@@ -22,6 +22,10 @@ struct Args {
     /// Send an echo request to this destination hash (server mode if omitted)
     #[arg(long, value_name = "HASH")]
     destination: Option<String>,
+
+    /// Print the saved echo server destination address and exit
+    #[arg(long, conflicts_with = "destination")]
+    identity: bool,
 
     /// Server storage directory for identity and requests.log [default: ~/.rsEcho]
     #[arg(long, value_name = "PATH")]
@@ -114,6 +118,17 @@ fn log_request(packet: &InboundPacket, signal: &Signal) {
 #[tokio::main]
 async fn main() -> rns_examples::ExampleResult {
     let args = Args::parse();
+    if args.identity {
+        let data_dir = match args.data_dir {
+            Some(path) => path,
+            None => default_data_dir()?,
+        };
+        let identity = Identity::from_file(&data_dir.join("identity"))?;
+        let destination =
+            Destination::new(Some(&identity), Direction::In, DestType::Single, APP_NAME)?;
+        println!("{}", destination.hex_hash());
+        return Ok(());
+    }
     if let Some(value) = args.destination {
         let hash = rns_examples::parse_hash(&value)?;
         let (runtime, _shutdown) = rns_examples::runtime(args.config.as_deref()).await?;
