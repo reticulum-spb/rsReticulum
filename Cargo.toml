@@ -94,6 +94,10 @@ rns-transport = { path = "crates/rns-transport", version = "1.5.2" }
 rns-link = { path = "crates/rns-link", version = "1.5.2" }
 rns-protocol = { path = "crates/rns-protocol", version = "1.5.2" }
 rns-interface = { path = "crates/rns-interface", version = "1.5.2", default-features = false }
-rns-runtime = { path = "crates/rns-runtime", version = "1.5.2" }
+rns-runtime = { path = "crates/rns-runtime", version = "1.5.2", default-features = false }
 rns-ratkey = { path = "crates/rns-ratkey", version = "1.5.2" }
 rns-plugin = { path = "crates/rns-plugin", version = "1.5.2" }
+
+[profile.release]
+debug = 2
+strip = "none"

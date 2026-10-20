@@ -9,6 +9,17 @@ cargo run -p rns-examples --bin channel
 cargo run -p rns-examples --bin resource
 ```
 
+By default, examples use the full Reticulum runtime. To build all binaries
+as clients of an already-running shared Reticulum instance:
+
+```text
+cargo build -p rns-examples --bins --no-default-features --features=reticulum-client
+cargo run -p rns-examples --no-default-features --features=reticulum-client --bin minimal
+```
+
+Cargo features are additive: omit `--no-default-features` to keep the full
+runtime enabled. Client-only examples require a running shared instance.
+
 The binaries are executable network examples that mirror the Python examples
 as the public Rust application API reaches parity:
 
