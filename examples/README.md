@@ -20,6 +20,25 @@ cargo run -p rns-examples --no-default-features --features=reticulum-client --bi
 Cargo features are additive: omit `--no-default-features` to keep the full
 runtime enabled. Client-only examples require a running shared instance.
 
+The `echo` binary runs a server when `--destination` is omitted. It creates
+`~/.rsEcho` and stores its persistent private identity in `identity`, keeping
+the server destination address stable across restarts. Requests are appended
+to `requests.log` using the same `tracing` formatter as `rnsd-rs --service`,
+with readable UTC timestamps and no ANSI colors. Entries include the packet
+hash, interface ID, payload size, and proof-sent status. Runtime messages at
+INFO level and above are also written to this file.
+Use `--data-dir PATH` to choose another storage directory; `--config PATH`
+selects the Reticulum configuration directory independently.
+
+```text
+cargo run -p rns-examples --bin echo -- --help
+cargo run -p rns-examples --bin echo -- --data-dir /tmp/rsEcho
+cargo run -p rns-examples --bin echo -- --destination <destination-hash>
+```
+
+Press Enter in server mode to announce the destination. Client mode sends one
+request and prints the round-trip time without creating server storage.
+
 The binaries are executable network examples that mirror the Python examples
 as the public Rust application API reaches parity:
 
