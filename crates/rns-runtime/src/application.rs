@@ -61,6 +61,8 @@ pub struct InboundPacket {
 #[derive(Debug, Clone)]
 pub struct PacketReceipt {
     pub packet_hash: [u8; 32],
+    /// Hash of the received proof, used to query RSSI/SNR at the receiver.
+    pub proof_hash: [u8; 32],
     pub rtt: Duration,
 }
 
@@ -527,10 +529,11 @@ pub async fn send_packet(
             if let DestinationEvent::DeliveryProof {
                 msg_id: received,
                 rtt,
+                proof_hash,
             } = event
                 && received == msg_id
             {
-                return Some(rtt.unwrap_or_else(|| started.elapsed()));
+                return Some((rtt.unwrap_or_else(|| started.elapsed()), proof_hash));
             }
         }
         None
@@ -545,9 +548,10 @@ pub async fn send_packet(
         })
         .await;
     result
-        .map(|rtt| {
+        .map(|(rtt, proof_hash)| {
             Some(PacketReceipt {
                 packet_hash: full_hash,
+                proof_hash,
                 rtt,
             })
         })
@@ -622,10 +626,11 @@ pub async fn send_pre_encrypted_packet_with_receipt(
             if let DestinationEvent::DeliveryProof {
                 msg_id: received,
                 rtt,
+                proof_hash,
             } = event
                 && received == msg_id
             {
-                return Some(rtt.unwrap_or_else(|| started.elapsed()));
+                return Some((rtt.unwrap_or_else(|| started.elapsed()), proof_hash));
             }
         }
         None
@@ -640,8 +645,9 @@ pub async fn send_pre_encrypted_packet_with_receipt(
         })
         .await;
     result
-        .map(|rtt| PacketReceipt {
+        .map(|(rtt, proof_hash)| PacketReceipt {
             packet_hash: submission.packet_hash,
+            proof_hash,
             rtt,
         })
         .ok_or(ApplicationError::Timeout)

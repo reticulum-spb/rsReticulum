@@ -48,6 +48,8 @@ pub enum DestinationEvent {
     DeliveryProof {
         msg_id: String,
         rtt: Option<std::time::Duration>,
+        /// Hash of the received proof, for querying its reception metrics.
+        proof_hash: [u8; 32],
     },
     /// Transport asks the destination to announce itself — used when a shared
     /// instance connects and needs the peer's current identity map.

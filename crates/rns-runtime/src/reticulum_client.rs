@@ -246,13 +246,27 @@ impl ReticulumHandle {
     pub async fn query_control(&self, query: TransportQuery) -> Option<TransportQueryResponse> {
         if matches!(
             query,
-            TransportQuery::GetInterfaceStats | TransportQuery::MediumPathTimeout
+            TransportQuery::GetInterfaceStats
+                | TransportQuery::MediumPathTimeout
+                | TransportQuery::GetPacketRssi { .. }
+                | TransportQuery::GetPacketSnr { .. }
+                | TransportQuery::GetPacketQ { .. }
         ) && let Some(rpc_key) = self.config.rpc_key.as_deref()
         {
-            let request = if matches!(query, TransportQuery::MediumPathTimeout) {
-                crate::rpc::RpcRequest::GetMediumPathTimeout
-            } else {
-                crate::rpc::RpcRequest::GetInterfaceStats
+            let request = match &query {
+                TransportQuery::MediumPathTimeout => crate::rpc::RpcRequest::GetMediumPathTimeout,
+                TransportQuery::GetPacketRssi { packet_hash } => {
+                    crate::rpc::RpcRequest::GetPacketRssi {
+                        packet_hash: packet_hash.to_vec(),
+                    }
+                }
+                TransportQuery::GetPacketSnr { packet_hash } => crate::rpc::RpcRequest::GetPacketSnr {
+                    packet_hash: packet_hash.to_vec(),
+                },
+                TransportQuery::GetPacketQ { packet_hash } => crate::rpc::RpcRequest::GetPacketQ {
+                    packet_hash: packet_hash.to_vec(),
+                },
+                _ => crate::rpc::RpcRequest::GetInterfaceStats,
             };
             let rpc_result = match self.config.shared_rpc_endpoint(&self.socket_base) {
                 SharedInstanceRpcEndpoint::Tcp(port) => {
@@ -271,7 +285,7 @@ impl ReticulumHandle {
             };
             match rpc_result {
                 Ok(crate::rpc::RpcResponse::FloatResult(value))
-                    if matches!(query, TransportQuery::MediumPathTimeout) =>
+                    if !matches!(query, TransportQuery::GetInterfaceStats) =>
                 {
                     return Some(TransportQueryResponse::FloatResult(value));
                 }

@@ -1465,6 +1465,7 @@ impl TransportActor {
                         tx.try_send(crate::link_messages::DestinationEvent::DeliveryProof {
                             msg_id: msg_id.clone(),
                             rtt,
+                            proof_hash: rns_wire::hash::packet_hash(raw, header.flags.header_type),
                         })
                     {
                         self.channel_drops += 1;

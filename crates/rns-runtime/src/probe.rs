@@ -223,7 +223,7 @@ impl DeliveryProofWaiter {
                 Ok(None) => return None,
                 Err(_) => return None,
             };
-            if let DestinationEvent::DeliveryProof { msg_id, rtt } = ev {
+            if let DestinationEvent::DeliveryProof { msg_id, rtt, .. } = ev {
                 if msg_id == self.msg_id {
                     return Some(rtt);
                 }

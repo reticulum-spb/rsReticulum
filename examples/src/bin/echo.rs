@@ -7,6 +7,8 @@ use clap::Parser;
 use rns_identity::destination::{DestType, ProofStrategy};
 use rns_identity::identity::Identity;
 use rns_runtime::application::{InboundPacket, RegisteredDestination, await_path, send_packet};
+use rns_runtime::reticulum::ReticulumHandle;
+use rns_transport::messages::{TransportQuery, TransportQueryResponse};
 
 const APP_NAME: &str = "example_utilities.echo.request";
 
@@ -64,12 +66,47 @@ fn file_logger(log: File) -> impl tracing::Subscriber + Send + Sync {
         .finish()
 }
 
-fn log_request(packet: &InboundPacket) {
+#[derive(Default)]
+struct Signal {
+    rssi: Option<f64>,
+    snr: Option<f64>,
+}
+
+impl std::fmt::Display for Signal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(rssi) = self.rssi {
+            write!(f, ", RSSI {rssi:.1} dBm")?;
+        }
+        if let Some(snr) = self.snr {
+            write!(f, ", SNR {snr:.1} dB")?;
+        }
+        Ok(())
+    }
+}
+
+async fn packet_signal(runtime: &ReticulumHandle, packet_hash: [u8; 32]) -> Signal {
+    let (rssi, snr) = tokio::join!(
+        runtime.query_control(TransportQuery::GetPacketRssi { packet_hash }),
+        runtime.query_control(TransportQuery::GetPacketSnr { packet_hash }),
+    );
+    let value = |response| match response {
+        Some(TransportQueryResponse::FloatResult(value)) => value.filter(|v| v.is_finite()),
+        _ => None,
+    };
+    Signal {
+        rssi: value(rssi),
+        snr: value(snr),
+    }
+}
+
+fn log_request(packet: &InboundPacket, signal: &Signal) {
     tracing::info!(
         packet = %hex::encode(packet.packet_hash),
         interface = packet.interface_id,
         bytes = packet.data.len(),
         proof = "sent",
+        rssi_dbm = signal.rssi,
+        snr_db = signal.snr,
         "Received echo request"
     );
 }
@@ -91,10 +128,12 @@ async fn main() -> rns_examples::ExampleResult {
         )
         .await?
         .ok_or("missing packet receipt")?;
+        let signal = packet_signal(&runtime, receipt.proof_hash).await;
         println!(
-            "Valid reply from <{}>, round-trip time {:.3} ms",
+            "Valid reply from <{}>, round-trip time {:.3} ms{}",
             hex::encode(hash),
-            receipt.rtt.as_secs_f64() * 1000.0
+            receipt.rtt.as_secs_f64() * 1000.0,
+            signal,
         );
         return Ok(());
     }
@@ -106,7 +145,8 @@ async fn main() -> rns_examples::ExampleResult {
     let (identity, log) = server_storage(&data_dir)?;
     tracing::subscriber::set_global_default(file_logger(log))?;
     let (runtime, _shutdown) = rns_examples::runtime(args.config.as_deref()).await?;
-    let mut destination = RegisteredDestination::single(runtime, identity, APP_NAME).await?;
+    let mut destination =
+        RegisteredDestination::single(runtime.clone(), identity, APP_NAME).await?;
     destination.set_proof_strategy(ProofStrategy::ProveAll);
     println!(
         "Echo server <{}> running; hit enter to announce",
@@ -121,8 +161,9 @@ async fn main() -> rns_examples::ExampleResult {
             }
             packet = destination.recv() => {
                 let packet = packet?;
-                log_request(&packet);
-                println!("Received packet {}, proof sent", hex::encode(&packet.packet_hash[..8]));
+                let signal = packet_signal(&runtime, packet.packet_hash).await;
+                log_request(&packet, &signal);
+                println!("Received packet {}, proof sent{}", hex::encode(&packet.packet_hash[..8]), signal);
             }
         }
     }
@@ -143,10 +184,20 @@ mod tests {
             interface_id: 42,
             packet_hash: [7; 32],
         };
-        tracing::subscriber::with_default(file_logger(log), || log_request(&packet));
+        tracing::subscriber::with_default(file_logger(log), || {
+            log_request(&packet, &Signal::default())
+        });
         let (reloaded, log) = server_storage(&dir).unwrap();
         assert_eq!(identity.get_private_key(), reloaded.get_private_key());
-        tracing::subscriber::with_default(file_logger(log), || log_request(&packet));
+        tracing::subscriber::with_default(file_logger(log), || {
+            log_request(
+                &packet,
+                &Signal {
+                    rssi: Some(-92.5),
+                    snr: Some(0.0),
+                },
+            )
+        });
         let contents = std::fs::read_to_string(dir.join("requests.log")).unwrap();
         assert_eq!(contents.lines().count(), 2);
         assert!(contents.lines().all(|line| {
@@ -154,8 +205,12 @@ mod tests {
                 && line.contains("Received echo request")
                 && !line.contains('\u{1b}')
                 && line.contains(&format!("packet={}", hex::encode(packet.packet_hash)))
-                && line.ends_with("interface=42 bytes=3 proof=\"sent\"")
+                && line.contains("interface=42 bytes=3 proof=\"sent\"")
         }));
+        let lines: Vec<_> = contents.lines().collect();
+        assert!(!lines[0].contains("rssi_dbm"));
+        assert!(!lines[0].contains("snr_db"));
+        assert!(lines[1].contains("rssi_dbm=-92.5 snr_db=0"));
         for line in contents.lines() {
             let timestamp = line.split_whitespace().next().unwrap();
             assert_eq!(&timestamp[4..5], "-");
@@ -163,6 +218,35 @@ mod tests {
             assert_eq!(&timestamp[10..11], "T");
             assert!(timestamp.ends_with('Z'));
         }
+    }
+
+    #[test]
+    fn signal_output_includes_only_available_metrics() {
+        assert_eq!(Signal::default().to_string(), "");
+        assert_eq!(
+            Signal {
+                rssi: Some(-90.0),
+                snr: None
+            }
+            .to_string(),
+            ", RSSI -90.0 dBm"
+        );
+        assert_eq!(
+            Signal {
+                rssi: None,
+                snr: Some(0.0)
+            }
+            .to_string(),
+            ", SNR 0.0 dB"
+        );
+        assert_eq!(
+            Signal {
+                rssi: Some(-92.5),
+                snr: Some(-3.5)
+            }
+            .to_string(),
+            ", RSSI -92.5 dBm, SNR -3.5 dB"
+        );
     }
 
     #[test]

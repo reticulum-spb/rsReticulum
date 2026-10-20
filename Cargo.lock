@@ -1955,6 +1955,7 @@ dependencies = [
  "rns-link",
  "rns-protocol",
  "rns-runtime",
+ "rns-transport",
  "rns-wire",
  "serde",
  "tempfile",

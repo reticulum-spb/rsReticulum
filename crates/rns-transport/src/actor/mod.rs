@@ -2313,6 +2313,45 @@ mod tests {
     }
 
     #[test]
+    fn delivery_proof_hash_resolves_reception_metrics() {
+        let (mut actor, _tx) = TransportActor::new();
+        let (interface, _rx) = make_test_interface("radio");
+        actor.interfaces.insert(1, interface);
+        let (events, mut rx) = mpsc::channel(4);
+        actor.destination_channels.insert([9; 16], events);
+        let destination = [7; 16];
+        actor.receipt_table.insert(
+            destination,
+            PacketReceipt::new([8; 32], destination, Some(Duration::from_secs(12))),
+        );
+        actor.receipt_msg_ids.insert(destination, "echo".into());
+        let raw = make_proof_packet(destination, 0);
+        let expected_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+        actor.on_inbound(InboundPacket {
+            raw,
+            interface_id: 1,
+            rssi: Some(-92.5),
+            snr: Some(0.0),
+            q: None,
+        });
+        let crate::link_messages::DestinationEvent::DeliveryProof { proof_hash, msg_id, .. } =
+            rx.try_recv().unwrap()
+        else {
+            panic!("expected delivery proof");
+        };
+        assert_eq!(msg_id, "echo");
+        assert_eq!(proof_hash, expected_hash);
+        assert!(matches!(
+            actor.handle_query(TransportQuery::GetPacketRssi { packet_hash: proof_hash }),
+            TransportQueryResponse::FloatResult(Some(value)) if value == -92.5
+        ));
+        assert!(matches!(
+            actor.handle_query(TransportQuery::GetPacketSnr { packet_hash: proof_hash }),
+            TransportQueryResponse::FloatResult(Some(value)) if value == 0.0
+        ));
+    }
+
+    #[test]
     fn test_actor_creation() {
         let (actor, _tx) = TransportActor::new();
         assert!(actor.path_table.is_empty());

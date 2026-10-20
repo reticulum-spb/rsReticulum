@@ -38,6 +38,12 @@ cargo run -p rns-examples --bin echo -- --destination <destination-hash>
 
 Press Enter in server mode to announce the destination. Client mode sends one
 request and prints the round-trip time without creating server storage.
+When reception metrics are available, the server records `rssi_dbm` and `snr_db`
+in its log and prints RSSI/SNR to the console. The client displays RSSI/SNR
+for the received proof reply alongside the round-trip time. These are local
+reception measurements, not measurements sent back by the remote server.
+Shared-instance clients obtain them from the daemon through control RPC.
+Unavailable metrics are omitted.
 
 The binaries are executable network examples that mirror the Python examples
 as the public Rust application API reaches parity:
