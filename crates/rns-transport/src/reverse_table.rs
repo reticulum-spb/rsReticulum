@@ -50,10 +50,15 @@ impl ReverseTable {
         remaining_hops: u8,
         outbound_interface: Option<InterfaceId>,
     ) {
+        let hash = packet_hash.into();
+        if self.entries.len() >= crate::constants::MAX_REVERSE_ENTRIES
+            && !self.entries.contains_key(&hash)
+        {
+            return;
+        }
         let now = crate::now_f64();
-
         self.entries.insert(
-            packet_hash.into(),
+            hash,
             ReverseEntry {
                 timestamp: now,
                 receiving_interface: interface_id,

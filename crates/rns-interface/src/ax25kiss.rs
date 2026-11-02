@@ -358,8 +358,13 @@ pub async fn spawn_ax25kiss_interface(
                                         Some(p) if !p.is_empty() => p.to_vec(),
                                         _ => continue,
                                     };
+                                    let Some(budgeted_raw) =
+                                        rns_transport::byte_budget::INGRESS.copy(&payload)
+                                    else {
+                                        continue;
+                                    };
                                     let msg = TransportMessage::Inbound(InboundPacket {
-                                        raw: Bytes::from(payload),
+                                        raw: budgeted_raw,
                                         interface_id: id,
                                         rssi: None,
                                         snr: None,

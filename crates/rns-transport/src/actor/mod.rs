@@ -129,6 +129,8 @@ pub struct TransportActor {
     #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub pending_local_path_requests: HashMap<[u8; 16], InterfaceId>,
     #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
+    pending_local_path_started: HashMap<[u8; 16], f64>,
+    #[cfg_attr(feature = "memory-profile", allocative(visit = crate::memory_profile::visit_map))]
     pub path_states: HashMap<[u8; 16], PathState>,
 
     /// Tasks blocked on `AwaitPath`. Each entry pairs the oneshot reply with
@@ -424,6 +426,7 @@ impl TransportActor {
             path_interface_suppressions: HashMap::new(),
             last_discovery_pr_tx: 0.0,
             pending_local_path_requests: HashMap::new(),
+            pending_local_path_started: HashMap::new(),
             path_states: HashMap::new(),
             path_waiters: HashMap::new(),
             last_tables_cull: 0.0,
@@ -809,7 +812,9 @@ impl TransportActor {
                 let is_outbound = entry.direction.outbound;
                 let iface_name = entry.name.clone();
                 let role = entry.role;
-                if role == InterfaceRole::LocalClient && interface_marked_offline(&entry) {
+                if interface_marked_offline(&entry)
+                    && (role == InterfaceRole::LocalClient || entry.tx.is_closed())
+                {
                     tracing::info!(
                         id,
                         name = %iface_name,
@@ -921,6 +926,12 @@ impl TransportActor {
                 if self.path_table.has_path(&dest) {
                     let _ = reply.send(true);
                 } else {
+                    if self.path_waiters.values().map(Vec::len).sum::<usize>() >= MAX_PATH_WAITERS
+                        || self.path_waiters.get(&dest).is_some_and(|v| v.len() >= 16)
+                    {
+                        let _ = reply.send(false);
+                        return;
+                    }
                     self.on_path_request(dest);
                     let now = now_f64();
                     self.path_waiters
@@ -1048,6 +1059,7 @@ impl TransportActor {
         self.discovery_path_requests.clear();
         self.inflight_path_requests.clear();
         self.pending_local_path_requests.clear();
+        self.pending_local_path_started.clear();
         self.pending_discovery_prs.clear();
         self.last_discovery_pr_tx = 0.0;
         self.state_dirty = true;
@@ -1318,6 +1330,8 @@ impl TransportActor {
             !request.requesting_interfaces.is_empty()
         });
         self.interfaces.remove(&id);
+        self.traffic.remove(id);
+        self.interface_rates.remove(&id);
         self.inflight_path_requests.retain(|dest, request| {
             if request.receiving_interface != id {
                 return true;
@@ -1351,6 +1365,13 @@ impl TransportActor {
         duration: f64,
     ) -> bool {
         if duration <= 0.0 || !duration.is_finite() {
+            return false;
+        }
+        if self.path_interface_suppressions.len() >= MAX_PATH_ENTRIES
+            && !self
+                .path_interface_suppressions
+                .contains_key(&(dest, interface_id))
+        {
             return false;
         }
         let until = now_f64() + duration;
@@ -1398,8 +1419,12 @@ impl TransportActor {
         fields(interface_id = id, raw_len = raw.len()),
     )]
     fn send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) {
+        self.try_send_to_interface(id, raw);
+    }
+
+    fn try_send_to_interface(&mut self, id: InterfaceId, raw: &[u8]) -> bool {
         let Some(entry) = self.interfaces.get(&id) else {
-            return;
+            return false;
         };
         if entry.role == InterfaceRole::LocalClient && interface_marked_offline(entry) {
             tracing::info!(
@@ -1408,13 +1433,13 @@ impl TransportActor {
                 "interface marked offline; auto-deregistering"
             );
             self.deregister_interface(id);
-            return;
+            return false;
         }
         let Some(entry) = self.interfaces.get(&id) else {
-            return;
+            return false;
         };
         if !entry.direction.outbound {
-            return;
+            return false;
         }
         let data: Bytes = if let Some(ref ifac_key) = entry.ifac_key {
             Bytes::from(crate::ifac::ifac_sign(raw, ifac_key, entry.ifac_size))
@@ -1440,6 +1465,7 @@ impl TransportActor {
                         ingress.sent_path_request();
                     }
                 }
+                true
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let tx_drops = entry
@@ -1456,6 +1482,7 @@ impl TransportActor {
                         "PACKET DROPPED: interface TX queue full or egress gated"
                     );
                 }
+                false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 tracing::info!(
@@ -1464,6 +1491,7 @@ impl TransportActor {
                     "interface TX channel closed (downstream task exited); auto-deregistering"
                 );
                 self.deregister_interface(id);
+                false
             }
         }
     }
@@ -2334,8 +2362,9 @@ mod tests {
             snr: Some(0.0),
             q: None,
         });
-        let crate::link_messages::DestinationEvent::DeliveryProof { proof_hash, msg_id, .. } =
-            rx.try_recv().unwrap()
+        let crate::link_messages::DestinationEvent::DeliveryProof {
+            proof_hash, msg_id, ..
+        } = rx.try_recv().unwrap()
         else {
             panic!("expected delivery proof");
         };

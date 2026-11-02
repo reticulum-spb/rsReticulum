@@ -18,6 +18,7 @@ pub mod announce;
 pub mod await_path;
 pub mod backbone_ingress;
 pub mod blackhole;
+pub mod byte_budget;
 pub mod constants;
 pub mod discovery;
 pub mod hashlist;

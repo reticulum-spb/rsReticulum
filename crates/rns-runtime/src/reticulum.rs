@@ -57,6 +57,24 @@ struct InterfaceControlMetadata {
 }
 
 type InterfaceControlMap = Arc<std::sync::Mutex<HashMap<u64, InterfaceControlMetadata>>>;
+fn reap_finished_interfaces(controls: &InterfaceControlMap) {
+    let mut finished = Vec::new();
+    interface_tasks()
+        .lock()
+        .expect("interface tasks")
+        .retain(|id, task| {
+            if task.is_finished() {
+                finished.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+    let mut controls = controls.lock().expect("interface controls");
+    for id in finished {
+        controls.remove(&id);
+    }
+}
 
 // Keep the JoinHandle in shared state while awaiting it: cancellation of one
 // waiter must not detach the actor or let another waiter report early success.
@@ -1320,7 +1338,10 @@ pub async fn init_with_options(
                         )
                         .await
                     }
-                    Err(_) => InstanceMode::Standalone,
+                    Err(error) => {
+                        tracing::error!(%error, "shared instance client failed; continuing in Standalone mode");
+                        InstanceMode::Standalone
+                    }
                 }
             } else {
                 let server_config = rns_interface::local::LocalServerConfig {
@@ -1346,7 +1367,8 @@ pub async fn init_with_options(
                         .await;
                         InstanceMode::Shared
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::warn!(%error, port = rc.shared_instance_port, "shared TCP listener failed");
                         if detect_shared_tcp_server(rc.shared_instance_port).await {
                             let client_config = shared_tcp_client_config(rc.shared_instance_port);
                             let client_id = next_id(&id_gen);
@@ -1367,9 +1389,16 @@ pub async fn init_with_options(
                                     )
                                     .await
                                 }
-                                Err(_) => InstanceMode::Standalone,
+                                Err(error) => {
+                                    tracing::error!(%error, "shared instance client failed; continuing in Standalone mode");
+                                    InstanceMode::Standalone
+                                }
                             }
                         } else {
+                            tracing::error!(
+                                port = rc.shared_instance_port,
+                                "shared TCP interface unavailable; continuing in Standalone mode"
+                            );
                             InstanceMode::Standalone
                         }
                     }
@@ -1428,7 +1457,10 @@ pub async fn init_with_options(
                         )
                         .await
                     }
-                    Err(_) => InstanceMode::Standalone,
+                    Err(error) => {
+                        tracing::error!(%error, "shared instance client failed; continuing in Standalone mode");
+                        InstanceMode::Standalone
+                    }
                 }
             } else {
                 let server_config = rns_interface::local::LocalServerConfig {
@@ -1454,7 +1486,8 @@ pub async fn init_with_options(
                         .await;
                         InstanceMode::Shared
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::warn!(%error, socket = %socket_path_display(&socket_path), "shared Unix listener failed");
                         let client_config = rns_interface::local::LocalClientConfig {
                             socket_path,
                             name: "SharedInstanceClient".to_string(),
@@ -1477,7 +1510,10 @@ pub async fn init_with_options(
                                 )
                                 .await
                             }
-                            Err(_) => InstanceMode::Standalone,
+                            Err(error) => {
+                                tracing::error!(%error, "shared instance client failed; continuing in Standalone mode");
+                                InstanceMode::Standalone
+                            }
                         }
                     }
                 }
@@ -2106,6 +2142,7 @@ async fn register_interface_handle_with_role_and_overrides(
         })
         .unwrap_or(0);
     // Stash the driver task so `teardown_interface` can abort it; drop alone only detaches.
+    reap_finished_interfaces(interface_controls);
     interface_tasks()
         .lock()
         .expect("interface_tasks mutex poisoned")
@@ -2188,6 +2225,7 @@ async fn register_interface_with_post_init(
     };
     let name = handle.name.clone();
     let id = handle.id;
+    reap_finished_interfaces(interface_controls);
     interface_tasks()
         .lock()
         .expect("interface_tasks mutex poisoned")

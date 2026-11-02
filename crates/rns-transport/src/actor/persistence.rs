@@ -58,6 +58,9 @@ fn python_announce_cache_index(
         Ok(entries) => {
             let mut names = std::collections::HashSet::new();
             for entry in entries.flatten() {
+                if names.len() >= MAX_PATH_ENTRIES * 2 {
+                    return None;
+                }
                 if let Some(name) = entry.file_name().to_str()
                     && name.len() == 64
                     && name.as_bytes().iter().all(u8::is_ascii_hexdigit)
@@ -571,7 +574,7 @@ impl TransportActor {
                     let mut pending = 0usize;
                     let announce_cache_dir = dir.join("cache").join("announces");
                     let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
-                    for pe in entries {
+                    for pe in entries.into_iter().take(MAX_PATH_ENTRIES) {
                         if pe.expires <= now_ts {
                             expired += 1;
                             continue;
@@ -613,6 +616,9 @@ impl TransportActor {
                                 interface_hash: Some(pe.interface_hash.to_vec()),
                                 packet_hash: Some(pe.packet_hash.to_vec()),
                             });
+                        if self.recent_announces.len() >= MAX_PATH_ENTRIES {
+                            break;
+                        }
                         self.recent_announces
                             .entry(pe.destination_hash)
                             .or_insert_with(|| {
@@ -649,7 +655,7 @@ impl TransportActor {
                     let mut expired = 0usize;
                     let mut legacy = 0usize;
                     let mut pending = 0usize;
-                    for pe in entries {
+                    for pe in entries.into_iter().take(MAX_PATH_ENTRIES) {
                         if pe.destination_hash.len() != 16 {
                             continue;
                         }
@@ -721,7 +727,7 @@ impl TransportActor {
                     let mut pending = 0usize;
                     let announce_cache_dir = dir.join("cache").join("announces");
                     let announce_cache_index = python_announce_cache_index(&announce_cache_dir);
-                    for te in entries {
+                    for te in entries.into_iter().take(MAX_TUNNEL_ENTRIES) {
                         if te.expires <= now_ts {
                             expired += 1;
                             continue;
@@ -732,7 +738,7 @@ impl TransportActor {
                         let mut interface_hash =
                             te.interface_hash.as_ref().map(|hash| hash.to_vec());
 
-                        for tp in te.paths {
+                        for tp in te.paths.into_iter().take(MAX_TUNNEL_PATHS) {
                             if tp.expires <= now_ts {
                                 expired += 1;
                                 continue;
@@ -773,6 +779,9 @@ impl TransportActor {
                                     .collect(),
                                 packet_hash: Some(tp.packet_hash.to_vec()),
                             });
+                            if self.recent_announces.len() >= MAX_PATH_ENTRIES {
+                                break;
+                            }
                             self.recent_announces
                                 .entry(tp.destination_hash)
                                 .or_insert_with(|| {
@@ -828,7 +837,7 @@ impl TransportActor {
                     let mut expired = 0usize;
                     let mut legacy = 0usize;
                     let mut pending = 0usize;
-                    for te in entries {
+                    for te in entries.into_iter().take(MAX_TUNNEL_ENTRIES) {
                         if te.tunnel_id.len() != 32 {
                             continue;
                         }
@@ -887,7 +896,7 @@ impl TransportActor {
             if let Some(entries) = loaded {
                 let count = entries.len();
                 let mut expired = 0usize;
-                for ae in entries {
+                for ae in entries.into_iter().take(MAX_PATH_ENTRIES) {
                     if ae.destination_hash.len() == 16 {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&ae.destination_hash);
@@ -932,6 +941,9 @@ impl TransportActor {
                                 None
                             }
                         });
+                        if self.recent_announces.len() >= MAX_PATH_ENTRIES {
+                            break;
+                        }
                         self.recent_announces
                             .entry(hash)
                             .or_insert_with(|| RecentAnnounce {
@@ -1086,7 +1098,7 @@ impl TransportActor {
                 let mut tunnel_id = [0u8; 32];
                 tunnel_id.copy_from_slice(&te.tunnel_id);
                 let mut tunnel_paths = std::collections::HashMap::new();
-                for tp in &te.paths {
+                for tp in te.paths.iter().take(MAX_TUNNEL_PATHS) {
                     if tp.destination_hash.len() == 16 {
                         let mut dest = [0u8; 16];
                         dest.copy_from_slice(&tp.destination_hash);

@@ -30,7 +30,7 @@
 //! DELETE /api/v1/config/interfaces/{name} — delete without a runtime ID
 //! ```
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,7 +79,7 @@ pub async fn run_api_server(
     let auth = Arc::new(AuthState {
         user: handle.config.api_user.clone().unwrap_or_default(),
         password: handle.config.api_password.clone().unwrap_or_default(),
-        sessions: Mutex::new(HashSet::new()),
+        sessions: Mutex::new(HashMap::new()),
         throttle: Mutex::new(LoginThrottle::default()),
     });
     let state = AppState {
@@ -137,7 +137,7 @@ pub async fn run_api_server(
     tracing::info!(addr = %listen, "REST API listening");
 
     tokio::select! {
-        result = axum::serve(listener, app) => {
+        result = axum::serve(crate::api_listener::BoundedListener(listener), app) => {
             if let Err(e) = result {
                 tracing::warn!(error = %e, "REST API server error");
             }
@@ -164,7 +164,7 @@ struct AppState {
 struct AuthState {
     user: String,
     password: String,
-    sessions: Mutex<HashSet<String>>,
+    sessions: Mutex<HashMap<String, std::time::Instant>>,
     throttle: Mutex<LoginThrottle>,
 }
 
@@ -1112,7 +1112,17 @@ async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> Resp
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
-    s.auth.sessions.lock().await.insert(token.clone());
+    let mut sessions = s.auth.sessions.lock().await;
+    sessions.retain(|_, created| created.elapsed() < std::time::Duration::from_secs(86400));
+    if sessions.len() >= 64 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "session capacity exhausted"})),
+        )
+            .into_response();
+    }
+    sessions.insert(token.clone(), std::time::Instant::now());
+    drop(sessions);
     let cookie = format!("rns_session={token}; Path=/; HttpOnly; SameSite=Strict");
     (
         StatusCode::OK,
@@ -1149,7 +1159,11 @@ async fn require_auth(State(s): State<AppState>, request: Request<Body>, next: N
             .into_response();
     }
     let authorized = match session_token(request.headers()) {
-        Some(token) => s.auth.sessions.lock().await.contains(token),
+        Some(token) => {
+            let mut sessions = s.auth.sessions.lock().await;
+            sessions.retain(|_, created| created.elapsed() < std::time::Duration::from_secs(86400));
+            sessions.contains_key(token)
+        }
         None => false,
     };
     if authorized {

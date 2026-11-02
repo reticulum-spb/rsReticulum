@@ -44,6 +44,11 @@ impl RateTable {
     /// and "blocked" as a single numeric comparison.
     pub fn record(&mut self, dest_hash: impl Into<DestHash>) -> f64 {
         let dest_hash = dest_hash.into();
+        if self.entries.len() >= crate::constants::MAX_RATE_ENTRIES
+            && !self.entries.contains_key(&dest_hash)
+        {
+            return f64::MAX;
+        }
         let now = crate::now_f64();
 
         let entry = self.entries.entry(dest_hash).or_insert_with(|| RateEntry {
@@ -147,6 +152,11 @@ impl RateTable {
         rate_penalty: f64,
     ) -> bool {
         let dest_hash = dest_hash.into();
+        if self.entries.len() >= crate::constants::MAX_RATE_ENTRIES
+            && !self.entries.contains_key(&dest_hash)
+        {
+            return true;
+        }
         let now = crate::now_f64();
 
         let entry = match self.entries.entry(dest_hash) {

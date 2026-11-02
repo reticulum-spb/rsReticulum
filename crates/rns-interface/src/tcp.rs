@@ -233,8 +233,12 @@ async fn tcp_read_loop(
                             continue;
                         }
                         state.record_rx(frame.len());
+                        let Some(budgeted_raw) = rns_transport::byte_budget::INGRESS.copy(&frame)
+                        else {
+                            continue;
+                        };
                         let msg = TransportMessage::Inbound(InboundPacket {
-                            raw: Bytes::from(frame),
+                            raw: budgeted_raw,
                             interface_id,
                             rssi: None,
                             snr: None,
@@ -291,8 +295,12 @@ async fn tcp_read_loop(
                             "TCP read: deframed packet"
                         );
                         state.record_rx(frame.len());
+                        let Some(budgeted_raw) = rns_transport::byte_budget::INGRESS.copy(&frame)
+                        else {
+                            continue;
+                        };
                         let msg = TransportMessage::Inbound(InboundPacket {
-                            raw: Bytes::from(frame),
+                            raw: budgeted_raw,
                             interface_id,
                             rssi: None,
                             snr: None,
@@ -378,15 +386,35 @@ pub async fn spawn_tcp_client(
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
         let mut backoff = RECONNECT_WAIT_INITIAL;
+        let mut pending_connect = None;
 
         loop {
-            let addr = format!("{}:{}", config.target_host, config.target_port);
-            let stream = match tokio::time::timeout(
+            // Preserve the resolver across caller deadlines; connect itself
+            // still has a finite deadline once a numeric address is available.
+            let connection = pending_connect.get_or_insert_with(|| {
+                Box::pin(async {
+                    let addr =
+                        crate::resolver::resolve_targets(&config.target_host, config.target_port)
+                            .await?;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(config.connect_timeout_secs),
+                        TcpStream::connect(addr.as_slice()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP connect deadline")
+                    })?
+                })
+            });
+            let result = tokio::time::timeout(
                 std::time::Duration::from_secs(config.connect_timeout_secs),
-                TcpStream::connect(&addr),
+                connection.as_mut(),
             )
-            .await
-            {
+            .await;
+            if result.is_ok() {
+                pending_connect = None;
+            }
+            let stream = match result {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::warn!(name = %config.name, error = %e, "TCP connect failed");
@@ -554,23 +582,19 @@ async fn spawn_tcp_accepted(
     let (reader, writer) = stream.into_split();
 
     let state_w = state.clone();
-    tokio::spawn(tcp_write_loop(writer, conn_rx, state_w, kiss_framing));
 
     let handle_name = name.clone();
     let dereg_tx = transport_tx.clone();
     let bitrate: u64 = 10_000_000;
     let mtu = crate::traits::optimise_mtu(bitrate).unwrap_or(TCP_HW_MTU);
     let read_task = tokio::spawn(async move {
-        tcp_read_loop(
-            reader,
-            id,
-            transport_tx,
-            state,
-            kiss_framing,
-            mtu,
-            receive_ifac_size,
-        )
-        .await;
+        // Both halves have one owner: EOF, write error or abort drops the
+        // sibling future too. A detached writer used to retain idle sockets
+        // when Deregister raced ahead of interface registration.
+        tokio::select! {
+            _ = tcp_read_loop(reader, id, transport_tx, state, kiss_framing, mtu, receive_ifac_size) => {},
+            _ = tcp_write_loop(writer, conn_rx, state_w, kiss_framing) => {},
+        }
         online2.store(false, Ordering::SeqCst);
         tracing::info!(name = %handle_name, "accepted TCP client disconnected");
         // Proactively notify transport so broadcasts stop targeting this dead tx.
@@ -639,9 +663,15 @@ pub async fn spawn_tcp_server(
     let (tx, _rx) = mpsc::channel::<Bytes>(1);
 
     let read_task = tokio::spawn(async move {
+        let mut clients: Vec<tokio::task::AbortHandle> = Vec::new();
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    clients.retain(|task| !task.is_finished());
+                    if clients.len() >= 64 {
+                        drop(stream);
+                        continue;
+                    }
                     let client_id = id_gen.fetch_add(1, Ordering::SeqCst);
                     let client_name = format!("{}/client_{}", config.name, client_id);
                     tracing::info!(name = %client_name, peer = %peer, "accepted TCP connection");
@@ -658,6 +688,7 @@ pub async fn spawn_tcp_server(
                         },
                     )
                     .await;
+                    clients.push(handle.read_task.abort_handle());
                     if handle_tx.send(handle).await.is_err() {
                         tracing::warn!("handle registry channel closed, stopping accept loop");
                         break;

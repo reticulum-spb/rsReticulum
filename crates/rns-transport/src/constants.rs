@@ -70,9 +70,8 @@ pub const PATH_REQUEST_RG: f64 = 1.5;
 /// Minimum interval between path requests (seconds).
 pub const PATH_REQUEST_MI: f64 = 20.0;
 
-/// Maximum packet hashes before rotation. Set to 2M with rotation at
-/// `maxsize/2` so effective history matches Python's 1M-no-rotation window.
-pub const HASHLIST_MAXSIZE: usize = 2_000_000;
+/// Bounded two-generation packet history for memory-constrained routers.
+pub const HASHLIST_MAXSIZE: usize = 262_144;
 
 /// Job loop period (250ms).
 pub const JOB_INTERVAL_MS: u64 = 250;
@@ -324,3 +323,14 @@ impl InterfaceDirection {
         }
     }
 }
+
+// Embedded-daemon admission limits. Existing entries can still be refreshed
+// at capacity; new keys are dropped until expiry or explicit removal.
+pub const MAX_PATH_ENTRIES: usize = 8192;
+pub const MAX_LINK_ENTRIES: usize = 4096;
+pub const MAX_REVERSE_ENTRIES: usize = 16384;
+pub const MAX_ANNOUNCE_ENTRIES: usize = 4096;
+pub const MAX_RATE_ENTRIES: usize = 8192;
+pub const MAX_TUNNEL_ENTRIES: usize = 128;
+pub const MAX_TUNNEL_PATHS: usize = 128;
+pub const MAX_PATH_WAITERS: usize = 1024;

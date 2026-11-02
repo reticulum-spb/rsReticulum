@@ -148,8 +148,13 @@ pub async fn spawn_serial_interface(
                             if frame.is_empty() {
                                 continue;
                             }
+                            let Some(budgeted_raw) =
+                                rns_transport::byte_budget::INGRESS.copy(&frame)
+                            else {
+                                continue;
+                            };
                             let msg = TransportMessage::Inbound(InboundPacket {
-                                raw: Bytes::from(frame),
+                                raw: budgeted_raw,
                                 interface_id: id,
                                 rssi: None,
                                 snr: None,

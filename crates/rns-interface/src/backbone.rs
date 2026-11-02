@@ -237,8 +237,12 @@ async fn backbone_read_loop(
                         break 'receive;
                     }
                     ingress.received_frame();
+                    let Some(budgeted_raw) = rns_transport::byte_budget::INGRESS.copy(&frame)
+                    else {
+                        continue;
+                    };
                     let msg = TransportMessage::Inbound(InboundPacket {
-                        raw: Bytes::from(frame),
+                        raw: budgeted_raw,
                         interface_id,
                         rssi: None,
                         snr: None,
@@ -508,28 +512,7 @@ fn resolve_listen_addr(config: &BackboneServerConfig) -> String {
     config.listen_ip.clone()
 }
 
-/// Resolve `host:port` preferring the configured address family.
-async fn resolve_target(
-    host: &str,
-    port: u16,
-    prefer_ipv6: bool,
-) -> std::io::Result<std::net::SocketAddr> {
-    let mut addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
-    if addrs.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            format!("no addresses resolved for {host}:{port}"),
-        ));
-    }
-    // Prefer the requested family; else first resolved.
-    let preferred = if prefer_ipv6 {
-        addrs.iter().find(|a| a.is_ipv6()).copied()
-    } else {
-        addrs.iter().find(|a| a.is_ipv4()).copied()
-    };
-    Ok(preferred.unwrap_or_else(|| addrs.remove(0)))
-}
+use crate::resolver::resolve_target;
 
 /// Spawn a backbone server; each accepted connection becomes an `InterfaceHandle`.
 pub async fn spawn_backbone_server(
@@ -581,9 +564,15 @@ pub async fn spawn_backbone_server(
     });
 
     let read_task = tokio::spawn(async move {
+        let mut clients: Vec<tokio::task::AbortHandle> = Vec::new();
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    clients.retain(|task| !task.is_finished());
+                    if clients.len() >= 64 {
+                        drop(stream);
+                        continue;
+                    }
                     if protection.is_blocked_at(peer.ip(), std::time::Instant::now()) {
                         tracing::debug!(%peer, "rejecting fast-flapping Backbone IP");
                         drop(stream);
@@ -639,6 +628,7 @@ pub async fn spawn_backbone_server(
                             .await;
                     });
 
+                    clients.push(read_handle.abort_handle());
                     let handle = InterfaceHandle {
                         id: client_id,
                         parent_id: Some(id),
@@ -739,14 +729,27 @@ pub async fn spawn_backbone_client(
     let read_task = tokio::spawn(async move {
         let max_tries = config.max_reconnect_tries;
         let mut tries: usize = 0;
+        // Keep polling the same resolver after a deadline. Dropping lookup_host
+        // cannot cancel an already running getaddrinfo call.
+        let mut pending_resolution = None;
 
         loop {
-            let target = match tokio::time::timeout(
+            let resolution = pending_resolution.get_or_insert_with(|| {
+                Box::pin(resolve_target(
+                    &config.target_host,
+                    config.target_port,
+                    config.prefer_ipv6,
+                ))
+            });
+            let result = tokio::time::timeout(
                 Duration::from_secs(config.connect_timeout_secs),
-                resolve_target(&config.target_host, config.target_port, config.prefer_ipv6),
+                resolution.as_mut(),
             )
-            .await
-            {
+            .await;
+            if result.is_ok() {
+                pending_resolution = None;
+            }
+            let target = match result {
                 Ok(Ok(addr)) => addr,
                 Ok(Err(e)) => {
                     tracing::warn!(name = %config.name, error = %e, "backbone resolve failed");

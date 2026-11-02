@@ -1,6 +1,7 @@
 //! Local control port for CLI tools (rnstatus, rnpath). Default 37429.
 //! Wire-compatible with Python `multiprocessing.connection`.
 
+static RPC_CLIENTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -70,10 +71,12 @@ async fn run_rpc_server_with_listener(
                 match accept_result {
                     Ok((stream, addr)) => {
                         tracing::debug!("RPC connection from {}", addr);
+                        let Ok(permit) = RPC_CLIENTS.try_acquire() else { continue; };
                         let key = rpc_key.clone();
                         let tx = _transport_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_rpc_client(stream, &key, tx).await {
+                            let _permit = permit;
+                            if let Ok(Err(e)) = tokio::time::timeout(std::time::Duration::from_secs(30), handle_rpc_client(stream, &key, tx)).await {
                                 tracing::debug!("RPC client error: {}", e);
                             }
                         });
@@ -109,10 +112,12 @@ async fn run_unix_rpc_server_with_listener(
                 match accept_result {
                     Ok((stream, _addr)) => {
                         tracing::debug!("Unix RPC connection accepted");
+                        let Ok(permit) = RPC_CLIENTS.try_acquire() else { continue; };
                         let key = rpc_key.clone();
                         let tx = transport_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_rpc_client(stream, &key, tx).await {
+                            let _permit = permit;
+                            if let Ok(Err(e)) = tokio::time::timeout(std::time::Duration::from_secs(30), handle_rpc_client(stream, &key, tx)).await {
                                 tracing::debug!("Unix RPC client error: {}", e);
                             }
                         });

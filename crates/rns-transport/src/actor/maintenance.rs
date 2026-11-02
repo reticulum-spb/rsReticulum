@@ -70,12 +70,12 @@ impl TransportActor {
         }
 
         if now - self.last_tables_cull >= TABLES_CULL_INTERVAL {
-            // Batched culls bound per-tick work; on large tables a single
-            // sweep would stall the actor and back up the inbound channel.
+            // Tables have admission caps. Sweep all expired entries so expiry
+            // throughput cannot fall behind sustained network admission.
             self.cull_client_announces(now);
-            self.path_table.cull_expired_batch(100);
-            self.reverse_table.cull_expired_batch(100);
-            self.tunnel_table.cull_expired_batch(50);
+            self.path_table.cull_expired();
+            self.reverse_table.cull_expired();
+            self.tunnel_table.cull_expired();
             self.cull_stale_tunnel_paths(now);
             self.cull_path_interface_suppressions(now);
 
@@ -246,6 +246,14 @@ impl TransportActor {
         }
 
         self.expire_path_waiters(now);
+        self.pending_local_path_started.retain(|dest, started| {
+            if now - *started > PATH_REQUEST_GATE_TIMEOUT {
+                self.pending_local_path_requests.remove(dest);
+                false
+            } else {
+                self.pending_local_path_requests.contains_key(dest)
+            }
+        });
 
         // Drop pending path-request markers after the upstream gate timeout.
         self.path_requests

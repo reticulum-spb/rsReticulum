@@ -64,7 +64,13 @@ impl LinkTable {
     }
 
     pub fn insert(&mut self, link_id: impl Into<LinkId>, entry: LinkEntry) {
-        self.entries.insert(link_id.into(), entry);
+        let hash: LinkId = link_id.into();
+        if self.entries.len() >= crate::constants::MAX_LINK_ENTRIES
+            && !self.entries.contains_key(&hash)
+        {
+            return;
+        }
+        self.entries.insert(hash, entry);
     }
 
     pub fn get(&self, link_id: &[u8; 16]) -> Option<&LinkEntry> {

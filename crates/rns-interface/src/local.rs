@@ -153,8 +153,12 @@ async fn local_read_loop<R: AsyncReadExt + Unpin>(
                     if frame.len() <= rns_wire::constants::HEADER_MINSIZE {
                         continue;
                     }
+                    let Some(budgeted_raw) = rns_transport::byte_budget::INGRESS.copy(&frame)
+                    else {
+                        continue;
+                    };
                     let msg = TransportMessage::Inbound(InboundPacket {
-                        raw: Bytes::from(frame),
+                        raw: budgeted_raw,
                         interface_id,
                         rssi: None,
                         snr: None,

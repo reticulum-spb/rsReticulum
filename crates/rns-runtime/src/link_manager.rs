@@ -803,6 +803,9 @@ impl LinkManager {
     }
 
     fn handle_link_request(&mut self, raw: &[u8], interface_id: u64, max_mtu: u32) {
+        if self.active_links.len() >= 64 {
+            return;
+        }
         let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(h) => h,
             Err(_) => return,
@@ -1258,6 +1261,38 @@ impl LinkManager {
                             // Split-resource routing set up before the per-segment
                             // File receivers retain only an empty coordinator as a
                             // cancellation anchor, never assembled segment bytes.
+                            if active.inbound_resources.len() >= 8
+                                || active.inbound_resources.contains_key(&adv.resource_hash)
+                                || active.inbound_split_resources.len() >= 8
+                                || active.segment_routing.len() >= 256
+                            {
+                                break 'adv;
+                            }
+                            let map_hashes = adv.get_map_hashes();
+                            let mut transfer_flags = adv.flags;
+                            if adv.total_segments > 1 && adv.segment_index > 1 {
+                                transfer_flags.has_metadata = false;
+                            }
+                            let rtt = active
+                                .link
+                                .rtt
+                                .unwrap_or(std::time::Duration::from_millis(500));
+                            let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+                            let copy_len = adv.random_hash.len().min(rh.len());
+                            rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
+
+                            let Ok(mut transfer) = InboundTransfer::from_advertisement(
+                                adv.num_parts,
+                                adv.transfer_size,
+                                adv.data_size,
+                                rh,
+                                adv.resource_hash,
+                                transfer_flags,
+                                map_hashes,
+                                rtt,
+                            ) else {
+                                break 'adv;
+                            };
                             let file_mode = self.file_completion.is_some()
                                 && !adv.flags.is_request
                                 && !adv.flags.is_response;
@@ -1400,29 +1435,7 @@ impl LinkManager {
                                 );
                             }
 
-                            let map_hashes = adv.get_map_hashes();
-                            let mut transfer_flags = adv.flags;
-                            if adv.total_segments > 1 && adv.segment_index > 1 {
-                                transfer_flags.has_metadata = false;
-                            }
-                            let rtt = active
-                                .link
-                                .rtt
-                                .unwrap_or(std::time::Duration::from_millis(500));
-                            let mut rh = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
-                            let copy_len = adv.random_hash.len().min(rh.len());
-                            rh[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
-
-                            if let Ok(mut transfer) = InboundTransfer::from_advertisement(
-                                adv.num_parts,
-                                adv.transfer_size,
-                                adv.data_size,
-                                rh,
-                                adv.resource_hash,
-                                transfer_flags,
-                                map_hashes,
-                                rtt,
-                            ) {
+                            {
                                 transfer.resource.sdu = active.link.resource_sdu();
                                 // Python Resource.accept → request_next: initial request
                                 // accepts the ADV and names the parts.

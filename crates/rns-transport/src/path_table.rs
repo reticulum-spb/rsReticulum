@@ -127,6 +127,11 @@ impl PathTable {
     /// entry it describes.
     pub fn insert(&mut self, dest_hash: impl Into<DestHash>, entry: PathEntry) {
         let hash: DestHash = dest_hash.into();
+        if self.entries.len() >= crate::constants::MAX_PATH_ENTRIES
+            && !self.entries.contains_key(&hash)
+        {
+            return;
+        }
         self.states.remove(&hash);
         self.entries.insert(hash, entry);
     }
@@ -190,7 +195,11 @@ impl PathTable {
     }
 
     pub fn set_state(&mut self, dest_hash: impl Into<DestHash>, state: PathState) {
-        self.states.insert(dest_hash.into(), state);
+        let hash = dest_hash.into();
+        if self.states.len() < crate::constants::MAX_PATH_ENTRIES || self.states.contains_key(&hash)
+        {
+            self.states.insert(hash, state);
+        }
     }
 
     pub fn get_state(&self, dest_hash: &[u8; 16]) -> PathState {

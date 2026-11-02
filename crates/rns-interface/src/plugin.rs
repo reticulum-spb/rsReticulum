@@ -341,6 +341,7 @@ pub enum PluginSpawnError {
 }
 
 struct PluginHostContext {
+    mtu: usize,
     id: InterfaceId,
     name: String,
     transport_tx: mpsc::Sender<TransportMessage>,
@@ -505,13 +506,17 @@ unsafe extern "C" fn host_rx_packet(
         let Some(context) = (unsafe { (host_context as *const PluginHostContext).as_ref() }) else {
             return;
         };
-        if data.is_null() || data_len == 0 {
+        if data.is_null() || data_len == 0 || data_len > context.mtu.saturating_add(64) {
             tracing::error!(interface_name = %context.name, "plugin supplied an empty RX packet");
             return;
         }
         // SAFETY: The plugin owns a readable buffer for this callback. Bytes
         // copies it before the callback returns.
-        let raw = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(data, data_len) });
+        let Some(raw) = rns_transport::byte_budget::INGRESS
+            .copy(unsafe { std::slice::from_raw_parts(data, data_len) })
+        else {
+            return;
+        };
         let (rssi, snr) = read_rx_metadata(metadata, metadata_size);
         context.deliver_or_buffer(InboundPacket {
             raw,
@@ -577,6 +582,7 @@ async fn spawn_plugin_interface_with_library(
     let rxb = Arc::new(AtomicU64::new(0));
     let txb = Arc::new(AtomicU64::new(0));
     let context = Arc::new(PluginHostContext {
+        mtu: config.mtu as usize,
         id,
         name: config.name.clone(),
         transport_tx,

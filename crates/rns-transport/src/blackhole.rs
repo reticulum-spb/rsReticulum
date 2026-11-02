@@ -93,8 +93,8 @@ impl BlackholeTable {
     ) {
         let now = crate::now_f64();
 
-        self.entries.insert(
-            identity_hash.into(),
+        self.insert_entry(
+            identity_hash,
             BlackholeEntry {
                 created: now,
                 ttl,
@@ -114,8 +114,8 @@ impl BlackholeTable {
     ) {
         let now = crate::now_f64();
 
-        self.entries.insert(
-            identity_hash.into(),
+        self.insert_entry(
+            identity_hash,
             BlackholeEntry {
                 created: now,
                 ttl,
@@ -139,8 +139,8 @@ impl BlackholeTable {
         source: IdentityHash,
         created: f64,
     ) {
-        self.entries.insert(
-            identity_hash.into(),
+        self.insert_entry(
+            identity_hash,
             BlackholeEntry {
                 created,
                 ttl,
@@ -154,7 +154,14 @@ impl BlackholeTable {
     /// Insert a pre-built entry, preserving its `created`/`ttl`/`reason`.
     /// Used when rehydrating the table from persistence.
     pub fn insert_entry(&mut self, identity_hash: impl Into<IdentityHash>, entry: BlackholeEntry) {
-        self.entries.insert(identity_hash.into(), entry);
+        let hash = identity_hash.into();
+        if self.entries.len() >= crate::constants::MAX_PATH_ENTRIES
+            && !self.entries.contains_key(&hash)
+        {
+            tracing::warn!("blackhole table capacity exhausted; new identity not installed");
+            return;
+        }
+        self.entries.insert(hash, entry);
     }
 
     pub fn is_blackholed(&self, identity_hash: &[u8; 16]) -> bool {

@@ -30,7 +30,11 @@ impl StreamReader {
     /// Append `msg` to the buffer. Returns `false` (and ignores the payload)
     /// if the message belongs to a different stream.
     pub fn feed(&mut self, msg: &StreamDataMessage) -> bool {
-        if msg.stream_id != self.stream_id {
+        // False is admission refusal: the caller must stop/retry delivery
+        // rather than acknowledge data that the reader cannot retain.
+        if msg.stream_id != self.stream_id
+            || msg.data.len() > (1024 * 1024usize).saturating_sub(self.buffer.len())
+        {
             return false;
         }
 

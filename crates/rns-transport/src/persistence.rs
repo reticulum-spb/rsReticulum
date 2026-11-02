@@ -100,7 +100,7 @@ pub fn save_path_table(
 /// Loads a path-table snapshot. Entries without `interface_name` (v1/v2)
 /// are dropped at the actor boundary since `interface_id` is volatile.
 pub fn load_path_table(path: &Path) -> Result<Vec<PersistedPathEntry>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedPathTable =
         rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
 
@@ -196,7 +196,7 @@ pub fn save_python_destination_table(
 pub fn load_python_destination_table(
     path: &Path,
 ) -> Result<Vec<PythonDestinationEntry>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
         .map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
     let entries = match value {
@@ -297,7 +297,7 @@ pub fn load_python_cached_announce(
     if !path.exists() {
         return Ok(None);
     }
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
         .map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
     let fields = match value {
@@ -382,7 +382,7 @@ pub fn save_python_tunnel_table(
 }
 
 pub fn load_python_tunnel_table(path: &Path) -> Result<Vec<PythonTunnelEntry>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data))
         .map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
     let entries = match value {
@@ -504,7 +504,7 @@ pub fn save_hashlist(hashlist: &PacketHashlist, path: &Path) -> Result<(), Persi
 }
 
 pub fn load_hashlist(path: &Path) -> Result<Vec<[u8; 32]>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let raw_hashes = match rmp_serde::from_slice::<Vec<Vec<u8>>>(&data) {
         Ok(hashes) => hashes,
         Err(list_err) => {
@@ -585,7 +585,7 @@ pub fn save_blackhole_table(
 }
 
 pub fn load_blackhole_table(path: &Path) -> Result<Vec<PersistedBlackholeEntry>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedBlackholeTable =
         rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
 
@@ -686,7 +686,7 @@ pub fn load_python_blackhole_dir(
         };
         let is_local = source == local_identity_hash;
 
-        let Ok(data) = std::fs::read(&path) else {
+        let Ok(data) = read_bounded(&path) else {
             continue;
         };
         let Ok(Value::Map(map)) = rmpv::decode::read_value(&mut std::io::Cursor::new(data)) else {
@@ -848,7 +848,7 @@ where
 }
 
 pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedAnnounceCache =
         rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
 
@@ -867,7 +867,7 @@ pub fn load_announce_cache(path: &Path) -> Result<Vec<PersistedAnnounceEntry>, P
 pub fn load_announce_cache_legacy_v5(
     path: &Path,
 ) -> Result<Vec<LegacyPersistedAnnounceEntryV5>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let persisted: LegacyPersistedAnnounceCacheV5 =
         rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
     if persisted.version != PersistedAnnounceCache::LEGACY_RAW_VERSION {
@@ -1031,7 +1031,7 @@ pub fn save_tunnel_table(
 }
 
 pub fn load_tunnel_table(path: &Path) -> Result<Vec<PersistedTunnelEntry>, PersistenceError> {
-    let data = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let data = read_bounded(path).map_err(PersistenceError::Io)?;
     let persisted: PersistedTunnelTable =
         rmp_serde::from_slice(&data).map_err(|e| PersistenceError::Deserialize(e.to_string()))?;
 
@@ -1251,10 +1251,10 @@ mod tests {
         let path = dir.join("snapshot.msgpack");
 
         atomic_write_bytes(&path, b"first").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert_eq!(read_bounded(&path).unwrap(), b"first");
         // Overwrite must replace cleanly (rename on top).
         atomic_write_bytes(&path, b"second").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(read_bounded(&path).unwrap(), b"second");
 
         #[cfg(unix)]
         {
@@ -1505,7 +1505,7 @@ mod tests {
         let path = dir.join("packet_hashlist");
 
         save_hashlist(&hashlist, &path).unwrap();
-        let raw = std::fs::read(&path).unwrap();
+        let raw = read_bounded(&path).unwrap();
         let mut python_shape: Vec<Vec<u8>> = rmp_serde::from_slice(&raw).unwrap();
         python_shape.sort();
         assert_eq!(python_shape, vec![aa.to_vec(), bb.to_vec()]);
@@ -1892,4 +1892,20 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+fn read_bounded(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let mut data = Vec::new();
+    std::fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transport snapshot exceeds 16 MiB",
+        ));
+    }
+    Ok(data)
 }

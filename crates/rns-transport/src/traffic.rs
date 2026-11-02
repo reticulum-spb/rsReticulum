@@ -180,6 +180,9 @@ pub struct TrafficCounter {
 }
 
 impl TrafficCounter {
+    pub fn remove(&mut self, id: InterfaceId) {
+        self.interfaces.remove(&id);
+    }
     pub fn new() -> Self {
         Self {
             interfaces: HashMap::new(),

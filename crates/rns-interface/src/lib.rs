@@ -38,6 +38,7 @@ pub mod local;
 pub mod pipe;
 #[cfg(all(feature = "full", target_os = "linux"))]
 pub mod plugin;
+mod resolver;
 #[cfg(feature = "full")]
 pub mod rnode;
 #[cfg(feature = "full")]

@@ -428,6 +428,9 @@ impl TransportActor {
             trace!(dest = %hex::encode(requested_dest), "ignoring duplicate path request");
             return None;
         }
+        if self.discovery_pr_tags.len() >= MAX_DISCOVERY_PR_TAGS {
+            self.discovery_pr_tags_prev = std::mem::take(&mut self.discovery_pr_tags);
+        }
         self.discovery_pr_tags.insert(unique_tag);
 
         if let Some(entry) = self.interfaces.get_mut(&interface_id) {
@@ -500,9 +503,14 @@ impl TransportActor {
 
         if !is_from_local_client {
             if let Some(path) = self.path_table.get_live(&requested_dest) {
-                if self.is_local_client_interface(path.interface_id) {
+                if self.is_local_client_interface(path.interface_id)
+                    && self.pending_local_path_requests.len() < MAX_INFLIGHT_PATH_REQUESTS
+                    && self.pending_local_path_started.len() < MAX_INFLIGHT_PATH_REQUESTS
+                {
                     self.pending_local_path_requests
                         .insert(requested_dest, interface_id);
+                    self.pending_local_path_started
+                        .insert(requested_dest, now_f64());
                 }
             }
         }
@@ -574,7 +582,9 @@ impl TransportActor {
                     PATH_REQUEST_GRACE + roaming_extra
                 };
                 if let Some(held_entry) = self.announce_table.remove(&requested_dest) {
-                    self.held_announces.insert(requested_dest, held_entry);
+                    if self.held_announces.len() < MAX_ANNOUNCE_ENTRIES {
+                        self.held_announces.insert(requested_dest, held_entry);
+                    }
                 }
                 self.announce_table.insert(
                     requested_dest,

@@ -1694,8 +1694,12 @@ pub async fn spawn_auto_interface(
                         }
                     }
                     task_rxb.fetch_add(n as u64, Ordering::Relaxed);
+                    let Some(budgeted_raw) = rns_transport::byte_budget::INGRESS.copy(&&buf[..n])
+                    else {
+                        continue;
+                    };
                     let msg = TransportMessage::Inbound(InboundPacket {
-                        raw: Bytes::copy_from_slice(&buf[..n]),
+                        raw: budgeted_raw,
                         interface_id: id,
                         rssi: None,
                         snr: None,

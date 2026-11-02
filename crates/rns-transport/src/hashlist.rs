@@ -28,7 +28,7 @@ impl PacketHashlist {
         Self {
             current: HashSet::new(),
             previous: HashSet::new(),
-            max_size,
+            max_size: max_size.max(2),
         }
     }
 
@@ -81,7 +81,8 @@ impl PacketHashlist {
     /// Rehydrate from a persisted snapshot. Loaded into `previous` so fresh
     /// packets land in an empty `current` and rotation behaviour is preserved.
     pub fn load_from(&mut self, hashes: Vec<[u8; 32]>) {
-        self.previous = hashes.into_iter().collect();
+        self.current.clear();
+        self.previous = hashes.into_iter().take(self.max_size / 2).collect();
     }
 }
 

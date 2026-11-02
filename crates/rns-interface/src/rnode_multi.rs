@@ -651,8 +651,13 @@ pub async fn spawn_rnode_multi_interface(
                                 let rssi = signals[local_idx].last_rssi.take();
                                 let snr = signals[local_idx].last_snr.take();
 
+                                let Some(budgeted_raw) =
+                                    rns_transport::byte_budget::INGRESS.copy(&frame)
+                                else {
+                                    continue;
+                                };
                                 let msg = TransportMessage::Inbound(InboundPacket {
-                                    raw: Bytes::from(frame),
+                                    raw: budgeted_raw,
                                     interface_id: sub_ids[local_idx],
                                     rssi,
                                     snr,

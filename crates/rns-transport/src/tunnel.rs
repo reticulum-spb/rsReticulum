@@ -44,7 +44,17 @@ impl TunnelTable {
         self.entries.clear();
     }
 
-    pub fn insert(&mut self, entry: TunnelEntry) {
+    pub fn insert(&mut self, mut entry: TunnelEntry) {
+        if self.entries.len() >= crate::constants::MAX_TUNNEL_ENTRIES
+            && !self.entries.contains_key(&entry.tunnel_id)
+        {
+            return;
+        }
+        entry.tunnel_paths = entry
+            .tunnel_paths
+            .into_iter()
+            .take(crate::constants::MAX_TUNNEL_PATHS)
+            .collect();
         self.entries.insert(entry.tunnel_id, entry);
     }
 

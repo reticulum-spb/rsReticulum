@@ -42,7 +42,13 @@ impl AnnounceTable {
     }
 
     pub fn insert(&mut self, dest_hash: impl Into<DestHash>, entry: AnnounceEntry) {
-        self.entries.insert(dest_hash.into(), entry);
+        let hash: DestHash = dest_hash.into();
+        if self.entries.len() >= crate::constants::MAX_ANNOUNCE_ENTRIES
+            && !self.entries.contains_key(&hash)
+        {
+            return;
+        }
+        self.entries.insert(hash, entry);
     }
 
     pub fn get(&self, dest_hash: &[u8; 16]) -> Option<&AnnounceEntry> {

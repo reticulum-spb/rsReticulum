@@ -512,7 +512,30 @@ impl OutboundResource {
 }
 
 /// A receiver-side resource for inbound transfer.
+// Shared by incomplete resources and retained split segments. A permit lives
+// as long as the owning resource, even when moved between coordinator tables.
+static RESOURCE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct ResourceReservation(usize);
+impl ResourceReservation {
+    fn acquire(bytes: usize) -> Result<Self, ResourceError> {
+        use std::sync::atomic::Ordering;
+        RESOURCE_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|n| *n <= 32 * 1024 * 1024)
+            })
+            .map_err(|_| ResourceError::TooLarge)?;
+        Ok(Self(bytes))
+    }
+}
+impl Drop for ResourceReservation {
+    fn drop(&mut self) {
+        RESOURCE_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub struct InboundResource {
+    _reservation: ResourceReservation,
+    received_bytes: usize,
     pub state: ResourceState,
     pub parts: Vec<Option<Vec<u8>>>,
     pub total_parts: usize,
@@ -572,7 +595,9 @@ impl InboundResource {
         const MAX_AES_BLOCK_PAD: usize = 16;
         let max_total_size =
             MAX_EFFICIENT_SIZE + RANDOM_HASH_SIZE + rns_crypto::TOKEN_OVERHEAD + MAX_AES_BLOCK_PAD;
-        if total_size > max_total_size {
+        if total_size > max_total_size
+            || data_size > MAX_EFFICIENT_SIZE * MAX_SEGMENTS + METADATA_MAX_SIZE
+        {
             return Err(ResourceError::TooLarge);
         }
 
@@ -582,11 +607,24 @@ impl InboundResource {
         // is a generous lower bound on any negotiated SDU (real MDU ≈ 475).
         const MIN_PART_SIZE: usize = 32;
         let max_parts = total_size.div_ceil(MIN_PART_SIZE).saturating_add(16);
-        if total_parts > max_parts {
+        if total_parts > max_parts || initial_map_hashes.len() > total_parts {
             return Err(ResourceError::TooLarge);
         }
 
+        let reservation = ResourceReservation::acquire(
+            total_size
+                .saturating_add(if flags.compressed {
+                    MAX_EFFICIENT_SIZE
+                } else {
+                    total_size
+                })
+                .saturating_mul(2)
+                .saturating_add(total_parts.saturating_mul(40))
+                .saturating_add(512),
+        )?;
         Ok(Self {
+            _reservation: reservation,
+            received_bytes: 0,
             state: ResourceState::Transferring,
             parts: vec![None; total_parts],
             total_parts,
@@ -606,6 +644,9 @@ impl InboundResource {
     /// Try to slot `data` into the current window by map-hash match. Returns
     /// true when the part was accepted into a previously-empty slot.
     pub fn receive_part(&mut self, data: Vec<u8>) -> bool {
+        if data.len() > self.total_size.saturating_sub(self.received_bytes) {
+            return false;
+        }
         let mh = get_map_hash(&data, &self.random_hash);
 
         tracing::trace!(
@@ -634,6 +675,7 @@ impl InboundResource {
 
         for i in search_start..search_end {
             if i < self.map_hashes.len() && self.map_hashes[i] == mh && self.parts[i].is_none() {
+                self.received_bytes += data.len();
                 self.parts[i] = Some(data);
                 self.update_consecutive();
                 return true;
@@ -974,6 +1016,7 @@ impl MultiSegmentOutbound {
 /// `assembled_segments`: `set_segment` + `assemble_segment` (unit tests) and
 /// `set_segment_data` (runtime, where `InboundTransfer` owns the segment).
 pub struct MultiSegmentInbound {
+    reservations: Vec<ResourceReservation>,
     pub original_hash: [u8; 32],
     pub total_segments: usize,
     pub segments: Vec<Option<InboundResource>>,
@@ -989,7 +1032,9 @@ impl MultiSegmentInbound {
     /// Allocate slots for `total_segments` segments; seed with the
     /// `original_hash` advertised by the sender for the full payload.
     pub fn new(total_segments: usize, original_hash: [u8; 32]) -> Self {
+        let total_segments = total_segments.min(MAX_SEGMENTS);
         Self {
+            reservations: Vec::new(),
             original_hash,
             total_segments,
             segments: (0..total_segments).map(|_| None).collect(),
@@ -1020,8 +1065,7 @@ impl MultiSegmentInbound {
         let idx = segment_index - 1;
         if let Some(ref mut resource) = self.segments[idx] {
             let data = resource.assemble(decrypt_fn)?;
-            self.assembled_segments[idx] = Some(data);
-            Ok(())
+            self.set_segment_data(segment_index, data)
         } else {
             Err(ResourceError::Incomplete)
         }
@@ -1042,7 +1086,10 @@ impl MultiSegmentInbound {
         if self.assembled_segments[idx].is_some() {
             return Err(ResourceError::DuplicateSegment);
         }
+        let reservation =
+            ResourceReservation::acquire(data.len().saturating_mul(2).saturating_add(128))?;
         self.data_size = self.data_size.saturating_add(data.len());
+        self.reservations.push(reservation);
         self.assembled_segments[idx] = Some(data);
         Ok(())
     }

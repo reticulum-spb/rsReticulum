@@ -7,6 +7,7 @@
 //!   - `tcp://192.168.1.1`           -> TCP, default port 7633
 //!   - `tcp://192.168.1.1:9000`      -> TCP, explicit port
 
+#[cfg(any(feature = "serial", feature = "rnode-tcp"))]
 use bytes::Bytes;
 
 use crate::kiss;
@@ -458,8 +459,11 @@ pub fn process_rnode_response(
             if frame.is_empty() {
                 return RNodeResponse::None;
             }
+            let Some(raw) = rns_transport::byte_budget::INGRESS.copy(frame) else {
+                return RNodeResponse::None;
+            };
             let msg = TransportMessage::Inbound(InboundPacket {
-                raw: Bytes::copy_from_slice(frame),
+                raw,
                 interface_id: id,
                 rssi: *last_rssi,
                 snr: *last_snr,

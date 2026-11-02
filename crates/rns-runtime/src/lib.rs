@@ -5,6 +5,8 @@
 compile_error!("rns-runtime requires either the `client` or `full` feature");
 
 #[cfg(feature = "api")]
+mod api_listener;
+#[cfg(feature = "api")]
 pub mod api_server;
 pub mod application;
 pub mod client_options;

@@ -161,7 +161,7 @@ impl TransportActor {
             if let Some(ref ifac_key) = entry.ifac_key {
                 let ifac_size = entry.ifac_size;
                 match crate::ifac::ifac_verify(&packet.raw, ifac_key, ifac_size) {
-                    Some(stripped) => bytes::Bytes::from(stripped),
+                    Some(stripped) => crate::byte_budget::INGRESS.copy(&stripped)?,
                     None => {
                         trace!(
                             interface_id = packet.interface_id,
@@ -574,6 +574,11 @@ impl TransportActor {
             return;
         }
 
+        if self.recent_announces.len() >= MAX_PATH_ENTRIES
+            && !self.recent_announces.contains_key(&header.destination_hash)
+        {
+            return;
+        }
         let known_public_key = self
             .recent_announces
             .get(&header.destination_hash)
@@ -792,9 +797,13 @@ impl TransportActor {
             };
             self.path_table.insert(header.destination_hash, entry);
             if let Some(tunnel) = self.tunnel_table.get_mut_by_interface(interface_id) {
-                tunnel
-                    .tunnel_paths
-                    .insert(header.destination_hash, tunnel_path);
+                if tunnel.tunnel_paths.len() < MAX_TUNNEL_PATHS
+                    || tunnel.tunnel_paths.contains_key(&header.destination_hash)
+                {
+                    tunnel
+                        .tunnel_paths
+                        .insert(header.destination_hash, tunnel_path);
+                }
                 tunnel.expires = now_f64() + TUNNEL_TIMEOUT as f64;
             }
             self.state_dirty = true;
@@ -806,6 +815,8 @@ impl TransportActor {
                 .discovery_path_requests
                 .remove(&header.destination_hash)
             {
+                self.pending_local_path_started
+                    .remove(&header.destination_hash);
                 if let Some(response) = self.path_response_from_cached_announce(
                     raw,
                     header.destination_hash,
@@ -1075,7 +1086,7 @@ impl TransportActor {
             return;
         }
 
-        tracing::info!(
+        tracing::trace!(
             dest = %hex::encode(header.destination_hash),
             is_local = self.local_destinations.contains(&header.destination_hash),
             has_channel = self.destination_channels.contains_key(&header.destination_hash),
@@ -1105,13 +1116,21 @@ impl TransportActor {
             to_local_client,
         ) {
             let pkt_hash = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
+            if self.reverse_table.len() >= MAX_REVERSE_ENTRIES
+                && self.reverse_table.get(&pkt_hash).is_none()
+            {
+                self.channel_drops = self.channel_drops.saturating_add(1);
+                return;
+            }
+            if !self.try_send_to_interface(target_interface, &forwarded) {
+                return;
+            }
             self.reverse_table.insert_with_outbound(
                 pkt_hash,
                 interface_id,
                 header.hops,
                 Some(target_interface),
             );
-            self.send_to_interface(target_interface, &forwarded);
             if let Some(path) = self.path_table.get_live_mut(&header.destination_hash) {
                 path.touch();
             }

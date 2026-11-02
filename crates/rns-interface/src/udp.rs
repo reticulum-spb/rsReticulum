@@ -136,7 +136,9 @@ pub async fn spawn_udp_interface(
                         continue;
                     }
                     task_rxb.fetch_add(n as u64, Ordering::Relaxed);
-                    let raw = Bytes::copy_from_slice(&buf[..n]);
+                    let Some(raw) = rns_transport::byte_budget::INGRESS.copy(&buf[..n]) else {
+                        continue;
+                    };
                     tracing::debug!(
                         interface_id = id,
                         from = %src,

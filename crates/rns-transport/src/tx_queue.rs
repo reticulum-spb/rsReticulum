@@ -133,6 +133,10 @@ impl InterfaceTx {
         }
     }
     pub fn try_send(&self, raw: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let Some(budgeted) = crate::byte_budget::EGRESS.copy(&raw) else {
+            return Err(mpsc::error::TrySendError::Full(raw));
+        };
+        let raw = budgeted;
         let Self::Managed(queue) = self else {
             let Self::Plain(tx) = self else {
                 unreachable!()
@@ -182,7 +186,12 @@ impl InterfaceTx {
     /// plain channels preserve Tokio's waiting send semantics.
     pub async fn send(&self, raw: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
         match self {
-            Self::Plain(tx) => tx.send(raw).await,
+            Self::Plain(tx) => {
+                let Some(budgeted) = crate::byte_budget::EGRESS.copy(&raw) else {
+                    return Err(mpsc::error::SendError(raw));
+                };
+                tx.send(budgeted).await
+            }
             Self::Managed(_) => self
                 .try_send(raw)
                 .map_err(|e| mpsc::error::SendError(e.into_inner())),
