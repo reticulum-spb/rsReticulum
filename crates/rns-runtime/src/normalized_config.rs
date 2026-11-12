@@ -198,7 +198,12 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ConfigErro
             Err(error) => return Err(error.into()),
         };
         let result = (|| -> Result<(), std::io::Error> {
-            if let Some(permissions) = permissions.clone() {
+            // FAT exposes mount-derived permissions and may reject chmod even
+            // when it would leave the mode unchanged. Only chmod when needed;
+            // still propagate failures to preserve genuinely different modes.
+            if let Some(permissions) = permissions.clone()
+                && file.metadata()?.permissions() != permissions
+            {
                 file.set_permissions(permissions)?;
             }
             file.write_all(content)?;
@@ -219,4 +224,27 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ConfigErro
         "temporary file collision",
     )
     .into())
+}
+
+#[cfg(all(test, feature = "api", unix))]
+mod atomic_write_tests {
+    use super::atomic_write;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn replacement_preserves_restricted_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, b"original").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        atomic_write(&path, b"updated").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"updated");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

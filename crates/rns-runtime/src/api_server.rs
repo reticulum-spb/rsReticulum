@@ -3057,6 +3057,14 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), applied);
 
+        // A subsequent save replaces an existing backup as well as the config.
+        let reapplied = save_config_snapshot(&path, &config, &applied).unwrap();
+        assert_eq!(reapplied, applied);
+        assert_eq!(
+            std::fs::read(dir.join("config.yaml.web-ui.bak")).unwrap(),
+            applied
+        );
+
         rollback_config_snapshot(&path, &applied, &original).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), original);
 
